@@ -3,10 +3,12 @@
 use dioxus::prelude::*;
 
 use super::{LogsView, PanelManager, PanelTabId};
+use crate::shell::layout::LayoutState;
 
 #[component]
 pub fn PanelStrip() -> Element {
     let mut panel: Signal<PanelManager> = use_context();
+    let layout: Signal<LayoutState> = use_context();
     let snapshot = panel.read();
     let active = snapshot.active();
     let view: Vec<(PanelTabId, &'static str, bool)> = snapshot
@@ -14,6 +16,17 @@ pub fn PanelStrip() -> Element {
         .map(|t| (t.id, t.title, t.id == active))
         .collect();
     drop(snapshot);
+
+    if layout.read().panel_collapsed {
+        return rsx! {
+            section {
+                "data-region": "panel",
+                class: "operon-region operon-panel",
+                "data-collapsed": "true",
+                style: "display: none;",
+            }
+        };
+    }
 
     let body: Element = match active.0 {
         "logs" => rsx! { LogsView {} },
@@ -28,6 +41,7 @@ pub fn PanelStrip() -> Element {
         section {
             "data-region": "panel",
             class: "operon-region operon-panel",
+            "data-collapsed": "false",
             div { class: "operon-panel-strip",
                 for (id, title, is_active) in view {
                     div {

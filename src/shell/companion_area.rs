@@ -5,13 +5,30 @@
 
 use dioxus::prelude::*;
 
+use crate::shell::layout::LayoutState;
+
 #[component]
 pub fn CompanionArea() -> Element {
-    rsx! {
-        section {
-            "data-region": "companion-area",
-            class: "operon-region operon-companion-area",
-            div { class: "operon-companion-placeholder", "Companion" }
+    let layout: Signal<LayoutState> = use_context();
+    let collapsed = layout.read().companion_collapsed;
+
+    if collapsed {
+        rsx! {
+            section {
+                "data-region": "companion-area",
+                class: "operon-region operon-companion-area",
+                "data-collapsed": "true",
+                style: "display: none;",
+            }
+        }
+    } else {
+        rsx! {
+            section {
+                "data-region": "companion-area",
+                class: "operon-region operon-companion-area",
+                "data-collapsed": "false",
+                div { class: "operon-companion-placeholder", "Companion" }
+            }
         }
     }
 }
