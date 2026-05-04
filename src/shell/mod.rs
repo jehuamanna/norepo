@@ -1,12 +1,17 @@
 //! VS Code-style Shell layout.
 //!
 //! [`Shell`] arranges the five canonical regions in a CSS Grid (activity bar, side bar,
-//! main area, companion area, status bar). It also owns the global keyboard shortcuts that
-//! affect Shell-level state (`Ctrl+W` / `Cmd+W` to close the active tab).
+//! main area, companion area, status bar). It owns Shell-level keyboard shortcuts:
+//! `Ctrl+W` / `Cmd+W` closes the active tab; `Ctrl+B` / `Cmd+B` toggles the side bar
+//! (collapses if open, restores last-active panel — or the first contributed activity
+//! item if there was none — if closed).
+
+use std::rc::Rc;
 
 use dioxus::prelude::*;
 
-use crate::shell::state::ActiveActivity;
+use crate::plugin::{PluginRegistry, PluginSurface};
+use crate::shell::state::{ActiveActivity, ActivityItemId, LastActiveActivity};
 use crate::tabs::TabManager;
 
 mod activity_bar;
@@ -25,11 +30,17 @@ pub use status_bar::StatusBar;
 #[component]
 pub fn Shell() -> Element {
     let mut tabs: Signal<TabManager> = use_context();
-    let ActiveActivity(active) = use_context();
+    let ActiveActivity(mut active) = use_context();
+    let LastActiveActivity(mut last) = use_context();
+    let registry: Rc<PluginRegistry> = use_context();
 
     let collapsed = active.read().is_none();
     let collapsed_attr = if collapsed { "true" } else { "false" };
-    let extra_style = if collapsed { "--operon-side-bar-width: 0;" } else { "" };
+    let extra_style = if collapsed {
+        "--operon-side-bar-width: 0;"
+    } else {
+        ""
+    };
 
     rsx! {
         div {
@@ -49,6 +60,22 @@ pub fn Shell() -> Element {
                         tabs.write().close(id);
                         event.prevent_default();
                     }
+                } else if key_str.eq_ignore_ascii_case("b") {
+                    let cur = active.read().clone();
+                    if cur.is_some() {
+                        last.set(cur);
+                        active.set(None);
+                    } else {
+                        let to_restore = last.read().clone();
+                        let next = to_restore.or_else(|| {
+                            registry
+                                .contributions(PluginSurface::ActivityBar)
+                                .next()
+                                .map(|p| ActivityItemId(format!("{}:default", p.manifest().id)))
+                        });
+                        active.set(next);
+                    }
+                    event.prevent_default();
                 }
             },
             ActivityBar {}
