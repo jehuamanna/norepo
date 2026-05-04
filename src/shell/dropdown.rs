@@ -10,6 +10,7 @@ use dioxus::prelude::*;
 
 use crate::commands::{CommandContext, CommandRegistry, PaletteState};
 use crate::plugin::PluginRegistry;
+use crate::shell::layout::LayoutState;
 use crate::shell::menubar::MenuId;
 use crate::shell::state::{ActiveActivity, LastActiveActivity};
 use crate::tabs::TabManager;
@@ -24,6 +25,7 @@ pub fn Dropdown(menu: MenuId) -> Element {
     let ActiveActivity(active) = use_context();
     let LastActiveActivity(last_active) = use_context();
     let palette: Signal<PaletteState> = use_context();
+    let layout: Signal<LayoutState> = use_context();
     let mut open_menu: Signal<Option<MenuId>> = use_context();
 
     let category = menu.category_label();
@@ -65,6 +67,7 @@ pub fn Dropdown(menu: MenuId) -> Element {
                                     last_active_activity: last_active,
                                     registry: plugin_reg.clone(),
                                     palette,
+                                    layout,
                                 };
                                 let _ = cmd_reg.execute(&id, &context);
                                 open_menu.set(None);

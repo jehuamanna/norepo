@@ -307,6 +307,40 @@ html, body {
   border-left: 2px solid var(--vscode-focusborder);
 }
 
+.operon-activity-toggle {
+  background: transparent;
+  color: var(--vscode-activitybar-foreground);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 3px;
+  width: 32px;
+  height: 28px;
+  margin: 6px 0;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.operon-activity-toggle:hover {
+  background: var(--vscode-activitybar-activebackground);
+}
+
+.operon-toggle-btn {
+  background: transparent;
+  color: inherit;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 3px;
+  width: 28px;
+  height: 22px;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  padding: 0;
+}
+
+.operon-toggle-btn:hover {
+  background: var(--vscode-tab-activebackground);
+}
+
 .operon-side-bar {
   grid-area: side;
   background: var(--vscode-sidebar-background);

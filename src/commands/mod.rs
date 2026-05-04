@@ -10,6 +10,7 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 
 use crate::plugin::PluginRegistry;
+use crate::shell::layout::LayoutState;
 use crate::shell::state::ActivityItemId;
 use crate::tabs::TabManager;
 use crate::theme::Theme;
@@ -57,6 +58,7 @@ pub struct CommandContext {
     pub last_active_activity: Signal<Option<ActivityItemId>>,
     pub registry: Rc<PluginRegistry>,
     pub palette: Signal<PaletteState>,
+    pub layout: Signal<LayoutState>,
 }
 
 pub type CommandHandler = Box<dyn Fn(&CommandContext)>;

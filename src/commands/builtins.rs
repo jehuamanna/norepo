@@ -43,22 +43,42 @@ pub fn register_builtin_commands(reg: &mut CommandRegistry) -> Result<(), String
         title: "Toggle Side Bar".into(),
         category: "View".into(),
         handler: Box::new(|ctx: &CommandContext| {
+            let mut layout = ctx.layout;
+            layout.with_mut(|s| s.toggle_sidebar());
+            // If the sidebar just expanded with no active panel, pick a sensible default.
             let mut active = ctx.active_activity;
-            let mut last = ctx.last_active_activity;
-            let cur = active.read().clone();
-            if cur.is_some() {
-                last.set(cur);
-                active.set(None);
-            } else {
-                let to_restore = last.read().clone();
-                let next = to_restore.or_else(|| {
+            let last = ctx.last_active_activity;
+            if active.read().is_none() {
+                let next = last.read().clone().or_else(|| {
                     ctx.registry
                         .contributions(PluginSurface::ActivityBar)
                         .next()
                         .map(|p| ActivityItemId(format!("{}:default", p.manifest().id)))
                 });
-                active.set(next);
+                if let Some(id) = next {
+                    active.set(Some(id));
+                }
             }
+        }),
+    })?;
+
+    reg.register(Command {
+        id: "view.toggleCompanion".into(),
+        title: "Toggle Companion".into(),
+        category: "View".into(),
+        handler: Box::new(|ctx: &CommandContext| {
+            let mut layout = ctx.layout;
+            layout.with_mut(|s| s.toggle_companion());
+        }),
+    })?;
+
+    reg.register(Command {
+        id: "view.togglePanel".into(),
+        title: "Toggle Panel".into(),
+        category: "View".into(),
+        handler: Box::new(|ctx: &CommandContext| {
+            let mut layout = ctx.layout;
+            layout.with_mut(|s| s.toggle_panel());
         }),
     })?;
 

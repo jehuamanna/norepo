@@ -12,6 +12,7 @@ use crate::commands::{fuzzy, CommandContext, CommandRegistry, PaletteMode, Palet
 use crate::plugin::manifest::NoteKind;
 use crate::plugin::PluginRegistry;
 use crate::plugins::notes_explorer::samples::SAMPLES;
+use crate::shell::layout::LayoutState;
 use crate::shell::state::{ActiveActivity, LastActiveActivity};
 use crate::tabs::TabManager;
 use crate::theme::Theme;
@@ -93,6 +94,7 @@ pub fn CommandPalette() -> Element {
     let mut tabs: Signal<TabManager> = use_context();
     let ActiveActivity(active) = use_context();
     let LastActiveActivity(last_active) = use_context();
+    let layout: Signal<LayoutState> = use_context();
 
     let snapshot = palette.read();
     let open = snapshot.open;
@@ -163,6 +165,7 @@ pub fn CommandPalette() -> Element {
                                                 last_active_activity: last_active,
                                                 registry: plugin_reg_for_keydown.clone(),
                                                 palette,
+                                                layout,
                                             };
                                             let _ = cmd_reg_for_keydown.execute(&c.id, &context);
                                             palette.write().open = false;

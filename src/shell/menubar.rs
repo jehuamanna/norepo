@@ -4,6 +4,7 @@
 use dioxus::prelude::*;
 
 use crate::shell::dropdown::Dropdown;
+use crate::shell::layout::LayoutState;
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum MenuId {
@@ -49,6 +50,7 @@ impl MenuId {
 #[component]
 pub fn Menubar() -> Element {
     let mut open_menu: Signal<Option<MenuId>> = use_context();
+    let mut layout: Signal<LayoutState> = use_context();
 
     rsx! {
         section {
@@ -88,7 +90,22 @@ pub fn Menubar() -> Element {
                     }
                 }
             }
-            div { class: "operon-menubar-right" }
+            div { class: "operon-menubar-right",
+                button {
+                    class: "operon-toggle-btn",
+                    "data-action": "toggle-panel",
+                    title: "Toggle Panel",
+                    onclick: move |_| { layout.with_mut(|s| s.toggle_panel()); },
+                    "▾"
+                }
+                button {
+                    class: "operon-toggle-btn",
+                    "data-action": "toggle-companion",
+                    title: "Toggle Companion",
+                    onclick: move |_| { layout.with_mut(|s| s.toggle_companion()); },
+                    "▸"
+                }
+            }
         }
     }
 }

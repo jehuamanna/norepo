@@ -42,7 +42,7 @@ pub use status_bar::StatusBar;
 pub fn Shell() -> Element {
     let mut tabs: Signal<TabManager> = use_context();
     let ActiveActivity(mut active) = use_context();
-    let LastActiveActivity(mut last) = use_context();
+    let LastActiveActivity(last) = use_context();
     let registry: Rc<PluginRegistry> = use_context();
     let mut palette: Signal<PaletteState> = use_context();
     let mut open_menu: Signal<Option<menubar::MenuId>> = use_context();
@@ -137,19 +137,17 @@ pub fn Shell() -> Element {
                         event.prevent_default();
                     }
                 } else if key_str.eq_ignore_ascii_case("b") {
-                    let cur = active.read().clone();
-                    if cur.is_some() {
-                        last.set(cur);
-                        active.set(None);
-                    } else {
-                        let to_restore = last.read().clone();
-                        let next = to_restore.or_else(|| {
+                    layout.with_mut(|s| s.toggle_sidebar());
+                    if active.read().is_none() {
+                        let next = last.read().clone().or_else(|| {
                             registry
                                 .contributions(PluginSurface::ActivityBar)
                                 .next()
                                 .map(|p| ActivityItemId(format!("{}:default", p.manifest().id)))
                         });
-                        active.set(next);
+                        if let Some(id) = next {
+                            active.set(Some(id));
+                        }
                     }
                     event.prevent_default();
                 }
