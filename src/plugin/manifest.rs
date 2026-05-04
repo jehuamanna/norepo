@@ -23,6 +23,9 @@ pub enum PluginSurface {
     StatusBarItem,
     CommandPalette,
     MainAreaTabContent,
+    /// Future plugin-supplied bottom-panel tabs. Not iterated this seed; the four built-in
+    /// tabs are hard-coded in `crate::panel::PanelManager::default()`.
+    PanelTabContent,
 }
 
 /// Static descriptor attached to every plugin. `id` must be unique across the whole registry.

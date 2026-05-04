@@ -5,6 +5,8 @@
 
 pub mod app;
 pub mod commands;
+pub mod log;
+pub mod panel;
 pub mod plugin;
 pub mod plugins;
 pub mod shell;
