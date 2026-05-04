@@ -21,6 +21,7 @@ use crate::tabs::TabManager;
 mod activity_bar;
 mod companion_area;
 pub mod dropdown;
+pub mod layout;
 mod main_area;
 pub mod menubar;
 mod side_bar;
