@@ -1,0 +1,20 @@
+{
+  "name": "operon-dioxus-e2e",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Playwright e2e harness for operon-dioxus (web build).",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:debug": "playwright test --debug",
+    "playwright:install": "playwright install --with-deps chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0",
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  }
+}
