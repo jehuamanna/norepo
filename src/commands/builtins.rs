@@ -135,7 +135,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registers_six_built_in_ids() {
+    fn registers_expected_built_in_ids() {
         let mut r = CommandRegistry::new();
         register_builtin_commands(&mut r).unwrap();
         let mut ids: Vec<String> = r.iter().map(|c| c.id.clone()).collect();
@@ -147,6 +147,8 @@ mod tests {
                 "palette.show".into(),
                 "palette.showCommands".into(),
                 "view.closeActiveTab".into(),
+                "view.toggleCompanion".into(),
+                "view.togglePanel".into(),
                 "view.toggleSideBar".into(),
                 "view.toggleTheme".into(),
             ]
