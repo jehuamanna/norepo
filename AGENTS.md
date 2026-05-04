@@ -263,3 +263,7 @@ The initial UI rendered by the component on the client must be identical to the 
 
 * Use the `use_server_future` hook instead of `use_resource`. It runs the future on the server, serializes the result, and sends it to the client, ensuring the client has the data immediately for its first render.
 * Any code that relies on browser-specific APIs (like accessing `localStorage`) must be run *after* hydration. Place this code inside a `use_effect` hook.
+
+# Testing
+
+The full TDD skill (tiers, conventions, walkthroughs, anti-patterns) lives in the project's **Test Case Specs** Archon note (id `7094db6c-00d6-41d1-bc04-8b91cce36a5b`). Every test under this repo MUST follow it. Four tiers: unit / Rust integration / wasm-DOM / Playwright e2e — driven via `just test-unit`, `just test-integration`, `just test-wasm`, `just test-e2e`.
