@@ -1,5 +1,5 @@
 [workspace]
-members = ["."]
+members = [".", "tests-wasm"]
 
 [package]
 name = "operon-dioxus"
