@@ -7,6 +7,7 @@ use dioxus::prelude::*;
 
 use crate::commands::{register_builtin_commands, CommandRegistry, PaletteState};
 use crate::plugin::{register_builtins, PluginContext, PluginRegistry};
+use crate::shell::menubar::MenuId;
 use crate::shell::state::{ActiveActivity, ActivityItemId, LastActiveActivity};
 use crate::shell::Shell;
 use crate::tabs::TabManager;
@@ -35,6 +36,9 @@ pub fn App() -> Element {
 
     let palette: Signal<PaletteState> = use_signal(PaletteState::default);
     use_context_provider(|| palette);
+
+    let open_menu: Signal<Option<MenuId>> = use_signal(|| None);
+    use_context_provider(|| open_menu);
 
     use_context_provider(|| {
         let mut registry = PluginRegistry::new();

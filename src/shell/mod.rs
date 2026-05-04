@@ -19,7 +19,9 @@ use crate::tabs::TabManager;
 
 mod activity_bar;
 mod companion_area;
+pub mod dropdown;
 mod main_area;
+pub mod menubar;
 mod side_bar;
 pub mod state;
 mod status_bar;
@@ -27,6 +29,7 @@ mod status_bar;
 pub use activity_bar::ActivityBar;
 pub use companion_area::CompanionArea;
 pub use main_area::MainArea;
+pub use menubar::{MenuId, Menubar};
 pub use side_bar::SideBar;
 pub use status_bar::StatusBar;
 
@@ -102,6 +105,7 @@ pub fn Shell() -> Element {
                     event.prevent_default();
                 }
             },
+            Menubar {}
             ActivityBar {}
             SideBar {}
             MainArea {}
