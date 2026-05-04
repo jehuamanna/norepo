@@ -12,6 +12,10 @@ edition = "2021"
 [dependencies]
 dioxus = { version = "0.7.1", features = ["router"] }
 pulldown-cmark = { version = "0.10", default-features = false }
+# `std::time::SystemTime::now()` panics with "time not implemented on this platform"
+# under `wasm32-unknown-unknown`. `web-time` is a drop-in replacement that uses
+# `js_sys::Date::now()` on wasm and `std::time` everywhere else.
+web-time = "1"
 
 [features]
 default = ["desktop"]

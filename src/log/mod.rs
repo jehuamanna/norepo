@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
+use web_time::SystemTime;
 
 pub const MAX_ENTRIES: usize = 1000;
 

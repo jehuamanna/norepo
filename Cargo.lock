@@ -3569,6 +3569,7 @@ dependencies = [
  "dioxus",
  "pretty_assertions",
  "pulldown-cmark",
+ "web-time",
 ]
 
 [[package]]
