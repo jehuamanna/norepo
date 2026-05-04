@@ -1,0 +1,36 @@
+/*
+ * Static fallback declarations of theme tokens.
+ *
+ * The source of truth at runtime is the inline style emitted from
+ * src/theme/defaults.rs. This file exists only so editor tooling can resolve
+ * --vscode-* references when previewing markup. Keep values in sync with
+ * src/theme/defaults.rs::dark / ::light.
+ */
+
+:root[data-theme="dark"] {
+  --vscode-editor-background: #1F1F1F;
+  --vscode-editor-foreground: #CCCCCC;
+  --vscode-activitybar-background: #181818;
+  --vscode-activitybar-foreground: #FFFFFF;
+  --vscode-sidebar-background: #181818;
+  --vscode-sidebar-foreground: #CCCCCC;
+  --vscode-statusbar-background: #181818;
+  --vscode-statusbar-foreground: #CCCCCC;
+  --vscode-panel-background: #181818;
+  --vscode-panel-border: #2B2B2B;
+  --vscode-focusborder: #0078D4;
+}
+
+:root[data-theme="light"] {
+  --vscode-editor-background: #FFFFFF;
+  --vscode-editor-foreground: #3B3B3B;
+  --vscode-activitybar-background: #F8F8F8;
+  --vscode-activitybar-foreground: #1F1F1F;
+  --vscode-sidebar-background: #F8F8F8;
+  --vscode-sidebar-foreground: #3B3B3B;
+  --vscode-statusbar-background: #F8F8F8;
+  --vscode-statusbar-foreground: #3B3B3B;
+  --vscode-panel-background: #F8F8F8;
+  --vscode-panel-border: #E5E5E5;
+  --vscode-focusborder: #005FB8;
+}
