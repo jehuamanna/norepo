@@ -17,6 +17,7 @@ const MAIN_CSS: Asset = asset!("/assets/main.css");
 const TAILWIND_CSS: Asset = asset!("/assets/tailwind.css");
 const THEME_CSS: Asset = asset!("/assets/theme.css");
 const SHELL_CSS: Asset = asset!("/assets/shell.css");
+const MARKDOWN_CSS: Asset = asset!("/assets/markdown.css");
 
 #[component]
 pub fn App() -> Element {
@@ -66,6 +67,7 @@ pub fn App() -> Element {
         document::Stylesheet { href: TAILWIND_CSS }
         document::Stylesheet { href: THEME_CSS }
         document::Stylesheet { href: SHELL_CSS }
+        document::Stylesheet { href: MARKDOWN_CSS }
         div {
             id: "operon-root",
             "data-theme": "{data}",

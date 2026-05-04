@@ -87,8 +87,10 @@ pub fn register_builtins(
     registry: &mut PluginRegistry,
     _ctx: &PluginContext,
 ) -> Result<(), String> {
+    use crate::plugins::markdown::MarkdownNotePlugin;
     use crate::plugins::notes_explorer::NotesExplorer;
     registry.add_ui_plugin(Box::new(NotesExplorer::new()))?;
+    registry.add_note_plugin(Box::new(MarkdownNotePlugin::new()))?;
     Ok(())
 }
 
