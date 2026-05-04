@@ -1,11 +1,12 @@
-//! Application root: provides theme, tab manager, and plugin registry contexts; loads
-//! stylesheets; and mounts the [`Shell`].
+//! Application root: provides theme, tab manager, plugin registry, and activity-state
+//! contexts; loads stylesheets; mounts the [`Shell`].
 
 use std::rc::Rc;
 
 use dioxus::prelude::*;
 
 use crate::plugin::{register_builtins, PluginContext, PluginRegistry};
+use crate::shell::state::{ActiveActivity, ActivityItemId, LastActiveActivity};
 use crate::shell::Shell;
 use crate::tabs::TabManager;
 use crate::theme::{self, Theme};
@@ -23,6 +24,12 @@ pub fn App() -> Element {
 
     let tabs: Signal<TabManager> = use_signal(TabManager::new);
     use_context_provider(|| tabs);
+
+    let active: Signal<Option<ActivityItemId>> = use_signal(|| None);
+    use_context_provider(|| ActiveActivity(active));
+
+    let last_active: Signal<Option<ActivityItemId>> = use_signal(|| None);
+    use_context_provider(|| LastActiveActivity(last_active));
 
     use_context_provider(|| {
         let mut registry = PluginRegistry::new();
