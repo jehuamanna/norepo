@@ -40,6 +40,7 @@ pub fn Shell() -> Element {
     let LastActiveActivity(mut last) = use_context();
     let registry: Rc<PluginRegistry> = use_context();
     let mut palette: Signal<PaletteState> = use_context();
+    let mut open_menu: Signal<Option<menubar::MenuId>> = use_context();
 
     let collapsed = active.read().is_none();
     let collapsed_attr = if collapsed { "true" } else { "false" };
@@ -57,10 +58,20 @@ pub fn Shell() -> Element {
             "data-sidebar-collapsed": "{collapsed_attr}",
             style: "{extra_style}",
             onkeydown: move |event| {
+                let key_str = event.key().to_string();
+
+                // Escape closes any open menubar dropdown — works without modifiers.
+                if key_str == "Escape" {
+                    if open_menu.read().is_some() {
+                        open_menu.set(None);
+                        event.prevent_default();
+                        return;
+                    }
+                }
+
                 let mods = event.modifiers();
                 let with_meta = mods.contains(Modifiers::META) || mods.contains(Modifiers::CONTROL);
                 if !with_meta { return; }
-                let key_str = event.key().to_string();
                 let palette_open = palette.read().open;
 
                 if key_str.eq_ignore_ascii_case("p") {
