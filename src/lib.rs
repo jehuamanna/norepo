@@ -4,6 +4,7 @@
 //! plugin/tab/command surfaces without launching the full Dioxus runtime.
 
 pub mod app;
+pub mod commands;
 pub mod plugin;
 pub mod plugins;
 pub mod shell;
