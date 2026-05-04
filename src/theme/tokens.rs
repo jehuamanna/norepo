@@ -87,4 +87,14 @@ mod tests {
             assert!(var.starts_with("--vscode-"), "{var}");
         }
     }
+
+    #[test]
+    fn all_array_lists_every_variant_exactly_once() {
+        let set: HashSet<_> = ThemeToken::ALL.iter().copied().collect();
+        assert_eq!(
+            set.len(),
+            ThemeToken::ALL.len(),
+            "ThemeToken::ALL must contain each variant exactly once"
+        );
+    }
 }

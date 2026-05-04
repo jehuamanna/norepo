@@ -204,3 +204,61 @@ pub fn CommandPalette() -> Element {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::{register_builtin_commands, CommandRegistry};
+
+    fn seeded_registry() -> CommandRegistry {
+        let mut r = CommandRegistry::new();
+        register_builtin_commands(&mut r).expect("builtin commands register");
+        r
+    }
+
+    #[test]
+    fn compute_candidates_returns_all_commands_when_query_empty() {
+        let reg = seeded_registry();
+        let total = reg.iter().count();
+        let result = compute_candidates(PaletteMode::Commands, "", &reg);
+        assert_eq!(
+            result.len(),
+            total,
+            "empty query should pass every registered command through fuzzy::score"
+        );
+    }
+
+    #[test]
+    fn compute_candidates_filters_to_matching_subset_when_query_narrows() {
+        let reg = seeded_registry();
+        let total = reg.iter().count();
+        let result = compute_candidates(PaletteMode::Commands, "togglesidebar", &reg);
+        assert!(
+            result.len() < total,
+            "narrowed query should drop non-matching commands ({} of {})",
+            result.len(),
+            total
+        );
+        assert!(
+            result.iter().any(|c| c.id.contains("toggleSideBar")),
+            "expected view.toggleSideBar in narrowed candidates"
+        );
+    }
+
+    #[test]
+    fn compute_candidates_in_notes_mode_only_yields_note_kind_candidates() {
+        let reg = seeded_registry();
+        let result = compute_candidates(PaletteMode::Notes, "", &reg);
+        assert!(!result.is_empty(), "Notes mode should return seeded samples");
+        for c in &result {
+            assert!(matches!(c.kind, CandidateKind::Note));
+            assert_eq!(c.category, "Notes");
+        }
+    }
+
+    #[test]
+    fn compute_candidates_truncates_to_fifty() {
+        let reg = seeded_registry();
+        let result = compute_candidates(PaletteMode::Commands, "", &reg);
+        assert!(result.len() <= 50, "must be truncated to <= 50; got {}", result.len());
+    }
+}
