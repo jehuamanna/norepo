@@ -1,7 +1,3 @@
-mod app;
-mod shell;
-mod theme;
-
 fn main() {
-    dioxus::launch(app::App);
+    dioxus::launch(operon_dioxus::app::App);
 }

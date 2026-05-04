@@ -1,7 +1,11 @@
-//! Application root: provides the theme context, loads stylesheets, and mounts the [`Shell`].
+//! Application root: provides the theme + plugin registry contexts, loads stylesheets, and
+//! mounts the [`Shell`].
+
+use std::rc::Rc;
 
 use dioxus::prelude::*;
 
+use crate::plugin::{register_builtins, PluginContext, PluginRegistry};
 use crate::shell::Shell;
 use crate::theme::{self, Theme};
 
@@ -15,6 +19,15 @@ const SHELL_CSS: Asset = asset!("/assets/shell.css");
 pub fn App() -> Element {
     let theme: Signal<Theme> = use_signal(theme::defaults::dark);
     use_context_provider(|| theme);
+
+    use_context_provider(|| {
+        let mut registry = PluginRegistry::new();
+        let ctx = PluginContext { theme };
+        if let Err(err) = register_builtins(&mut registry, &ctx) {
+            eprintln!("operon: register_builtins failed: {err}");
+        }
+        Rc::new(registry)
+    });
 
     let snapshot = theme.read();
     let data = snapshot.data_attr();
