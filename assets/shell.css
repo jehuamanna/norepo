@@ -79,6 +79,11 @@ html, body {
   color: var(--vscode-sidebar-foreground);
   border-right: 1px solid var(--vscode-panel-border);
   padding: 8px 12px;
+  font-size: 13px;
+}
+
+.notes-explorer-row:hover {
+  background: var(--vscode-activitybar-activebackground);
 }
 
 .operon-main-area {

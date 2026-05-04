@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod plugin;
+pub mod plugins;
 pub mod shell;
 pub mod tabs;
 pub mod theme;

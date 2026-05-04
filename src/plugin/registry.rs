@@ -82,11 +82,13 @@ impl Default for PluginRegistry {
     }
 }
 
-/// Register all compile-time built-in plugins. Empty for Phase 2; later phases populate this.
+/// Register all compile-time built-in plugins.
 pub fn register_builtins(
-    _registry: &mut PluginRegistry,
+    registry: &mut PluginRegistry,
     _ctx: &PluginContext,
 ) -> Result<(), String> {
+    use crate::plugins::notes_explorer::NotesExplorer;
+    registry.add_ui_plugin(Box::new(NotesExplorer::new()))?;
     Ok(())
 }
 
