@@ -1,5 +1,5 @@
-//! Application root: provides the theme + plugin registry contexts, loads stylesheets, and
-//! mounts the [`Shell`].
+//! Application root: provides theme, tab manager, and plugin registry contexts; loads
+//! stylesheets; and mounts the [`Shell`].
 
 use std::rc::Rc;
 
@@ -7,6 +7,7 @@ use dioxus::prelude::*;
 
 use crate::plugin::{register_builtins, PluginContext, PluginRegistry};
 use crate::shell::Shell;
+use crate::tabs::TabManager;
 use crate::theme::{self, Theme};
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
@@ -20,9 +21,15 @@ pub fn App() -> Element {
     let theme: Signal<Theme> = use_signal(theme::defaults::dark);
     use_context_provider(|| theme);
 
+    let tabs: Signal<TabManager> = use_signal(TabManager::new);
+    use_context_provider(|| tabs);
+
     use_context_provider(|| {
         let mut registry = PluginRegistry::new();
-        let ctx = PluginContext { theme };
+        let ctx = PluginContext {
+            theme,
+            tabs: Some(tabs),
+        };
         if let Err(err) = register_builtins(&mut registry, &ctx) {
             eprintln!("operon: register_builtins failed: {err}");
         }

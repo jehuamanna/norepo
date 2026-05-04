@@ -65,6 +65,70 @@ html, body {
   flex-direction: column;
 }
 
+.operon-tab-strip {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  background: var(--vscode-tab-inactivebackground);
+  border-bottom: 1px solid var(--vscode-panel-border);
+  flex: 0 0 auto;
+  height: 32px;
+}
+
+.operon-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px 0 12px;
+  height: 100%;
+  cursor: pointer;
+  background: var(--vscode-tab-inactivebackground);
+  color: var(--vscode-tab-inactiveforeground);
+  border-right: 1px solid var(--vscode-panel-border);
+  font-size: 13px;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.operon-tab[data-active="true"] {
+  background: var(--vscode-tab-activebackground);
+  color: var(--vscode-tab-activeforeground);
+}
+
+.operon-tab-title {
+  max-width: 24ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.operon-tab-close,
+.operon-tab-marker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.operon-tab-close:hover {
+  background: var(--vscode-panel-border);
+}
+
+.operon-main-body {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 12px 16px;
+}
+
+.operon-main-empty {
+  color: var(--vscode-tab-inactiveforeground);
+  padding: 16px;
+}
+
 .operon-companion-area {
   grid-area: companion;
   background: var(--vscode-panel-background);
