@@ -30,8 +30,16 @@ test-unit:
 test-integration:
     cargo test --tests
 
+# Sync the wasm-pack-cached chromedriver to match the local google-chrome
+# version. Run once after the first wasm-pack invocation seeds the cache,
+# and again whenever Chrome auto-updates and breaks the existing match.
+sync-chromedriver:
+    bash scripts/sync-chromedriver.sh
+
 # Tier 3: browser-DOM integration tests run in headless Chromium.
-# Requires `wasm-pack` on PATH.
+# Requires `wasm-pack` and a `google-chrome` whose major version matches the
+# wasm-pack-cached chromedriver. If you hit a `signal: 9 (SIGKILL)` driver
+# crash on first run, `just sync-chromedriver` and retry.
 test-wasm:
     wasm-pack test --headless --chrome tests-wasm
 
