@@ -158,6 +158,82 @@ html, body {
   padding: 16px;
 }
 
+.operon-palette-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.18);
+  z-index: 1000;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 14vh;
+}
+
+.operon-palette-modal {
+  width: 640px;
+  max-width: calc(100vw - 32px);
+  background: var(--vscode-panel-background);
+  color: var(--vscode-editor-foreground);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  box-shadow: 0 8px 32px var(--vscode-widget-shadow);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.operon-palette-input {
+  border: none;
+  outline: none;
+  padding: 10px 14px;
+  font-size: 14px;
+  background: var(--vscode-panel-background);
+  color: var(--vscode-editor-foreground);
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.operon-palette-input:focus {
+  outline: 1px solid var(--vscode-focusborder);
+  outline-offset: -1px;
+}
+
+.operon-palette-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+.operon-palette-item {
+  display: flex;
+  flex-direction: row;
+  gap: 8px;
+  padding: 6px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.operon-palette-item-category {
+  opacity: 0.6;
+  min-width: 60px;
+}
+
+.operon-palette-item-title {
+  flex: 1 1 auto;
+}
+
+.operon-palette-item:hover {
+  background: var(--vscode-tab-inactivebackground);
+}
+
+.operon-palette-item-active {
+  background: var(--vscode-tab-activebackground);
+  color: var(--vscode-tab-activeforeground);
+  outline: 1px solid var(--vscode-focusborder);
+  outline-offset: -1px;
+}
+
 .operon-companion-area {
   grid-area: companion;
   background: var(--vscode-panel-background);

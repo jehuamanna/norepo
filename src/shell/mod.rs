@@ -1,15 +1,18 @@
 //! VS Code-style Shell layout.
 //!
 //! [`Shell`] arranges the five canonical regions in a CSS Grid (activity bar, side bar,
-//! main area, companion area, status bar). It owns Shell-level keyboard shortcuts:
-//! `Ctrl+W` / `Cmd+W` closes the active tab; `Ctrl+B` / `Cmd+B` toggles the side bar
-//! (collapses if open, restores last-active panel — or the first contributed activity
-//! item if there was none — if closed).
+//! main area, companion area, status bar) and mounts the [`CommandPalette`] as the last
+//! child (modal overlay above all regions). Owns Shell-level keyboard shortcuts:
+//! `Ctrl+W` / `Cmd+W` closes the active tab; `Ctrl+B` / `Cmd+B` toggles the side bar;
+//! `Ctrl+Shift+P` / `Cmd+Shift+P` opens the palette in commands mode; `Ctrl+P` / `Cmd+P`
+//! opens it in notes mode. Tab/SideBar shortcuts are skipped while the palette is open
+//! (the palette captures and stops keystroke propagation from its own input).
 
 use std::rc::Rc;
 
 use dioxus::prelude::*;
 
+use crate::commands::{CommandPalette, PaletteMode, PaletteState};
 use crate::plugin::{PluginRegistry, PluginSurface};
 use crate::shell::state::{ActiveActivity, ActivityItemId, LastActiveActivity};
 use crate::tabs::TabManager;
@@ -33,6 +36,7 @@ pub fn Shell() -> Element {
     let ActiveActivity(mut active) = use_context();
     let LastActiveActivity(mut last) = use_context();
     let registry: Rc<PluginRegistry> = use_context();
+    let mut palette: Signal<PaletteState> = use_context();
 
     let collapsed = active.read().is_none();
     let collapsed_attr = if collapsed { "true" } else { "false" };
@@ -54,6 +58,26 @@ pub fn Shell() -> Element {
                 let with_meta = mods.contains(Modifiers::META) || mods.contains(Modifiers::CONTROL);
                 if !with_meta { return; }
                 let key_str = event.key().to_string();
+                let palette_open = palette.read().open;
+
+                if key_str.eq_ignore_ascii_case("p") {
+                    let mode = if mods.contains(Modifiers::SHIFT) {
+                        PaletteMode::Commands
+                    } else {
+                        PaletteMode::Notes
+                    };
+                    palette.set(PaletteState {
+                        open: true,
+                        mode,
+                        query: String::new(),
+                        selection: 0,
+                    });
+                    event.prevent_default();
+                    return;
+                }
+
+                if palette_open { return; }
+
                 if key_str.eq_ignore_ascii_case("w") {
                     let active_id = tabs.read().active_id();
                     if let Some(id) = active_id {
@@ -83,6 +107,7 @@ pub fn Shell() -> Element {
             MainArea {}
             CompanionArea {}
             StatusBar {}
+            CommandPalette {}
         }
     }
 }

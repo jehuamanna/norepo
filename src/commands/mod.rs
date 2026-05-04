@@ -16,8 +16,10 @@ use crate::theme::Theme;
 
 pub mod builtins;
 pub mod fuzzy;
+pub mod palette;
 
 pub use builtins::register_builtin_commands;
+pub use palette::CommandPalette;
 
 /// What the palette is currently filtering against.
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
