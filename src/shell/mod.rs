@@ -13,6 +13,7 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 
 use crate::commands::{CommandPalette, PaletteMode, PaletteState};
+use crate::panel::PanelStrip;
 use crate::plugin::{PluginRegistry, PluginSurface};
 use crate::shell::state::{ActiveActivity, ActivityItemId, LastActiveActivity};
 use crate::tabs::TabManager;
@@ -120,6 +121,7 @@ pub fn Shell() -> Element {
             ActivityBar {}
             SideBar {}
             MainArea {}
+            PanelStrip {}
             CompanionArea {}
             StatusBar {}
             CommandPalette {}

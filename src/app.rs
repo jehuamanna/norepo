@@ -6,6 +6,9 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 
 use crate::commands::{register_builtin_commands, CommandRegistry, PaletteState};
+use crate::log::LogBuffer;
+use crate::log_info;
+use crate::panel::PanelManager;
 use crate::plugin::{register_builtins, PluginContext, PluginRegistry};
 use crate::shell::menubar::MenuId;
 use crate::shell::state::{ActiveActivity, ActivityItemId, LastActiveActivity};
@@ -40,6 +43,12 @@ pub fn App() -> Element {
     let open_menu: Signal<Option<MenuId>> = use_signal(|| None);
     use_context_provider(|| open_menu);
 
+    let panel: Signal<PanelManager> = use_signal(PanelManager::new);
+    use_context_provider(|| panel);
+
+    let mut log_buffer: Signal<LogBuffer> = use_signal(LogBuffer::new);
+    use_context_provider(|| log_buffer);
+
     use_context_provider(|| {
         let mut registry = PluginRegistry::new();
         let ctx = PluginContext {
@@ -58,6 +67,10 @@ pub fn App() -> Element {
             eprintln!("operon: register_builtin_commands failed: {err}");
         }
         Rc::new(reg)
+    });
+
+    use_hook(|| {
+        log_info!(log_buffer, "Operon: ready");
     });
 
     let snapshot = theme.read();

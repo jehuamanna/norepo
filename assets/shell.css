@@ -24,14 +24,103 @@ html, body {
 .operon-shell-grid {
   display: grid;
   grid-template-columns: 56px var(--operon-side-bar-width, 280px) 1fr var(--operon-companion-width, 320px);
-  grid-template-rows: 28px 1fr 24px;
+  grid-template-rows: 28px 1fr var(--operon-panel-height, 240px) 24px;
   grid-template-areas:
     "menu     menu     menu     menu"
     "activity side     main     companion"
+    "activity side     panel    companion"
     "status   status   status   status";
   height: 100vh;
   width: 100vw;
   overflow: hidden;
+}
+
+.operon-panel {
+  grid-area: panel;
+  background: var(--vscode-panel-background);
+  color: var(--vscode-editor-foreground);
+  border-top: 1px solid var(--vscode-panel-border);
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+}
+
+.operon-panel-strip {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  background: var(--vscode-panel-background);
+  border-bottom: 1px solid var(--vscode-panel-border);
+  height: 28px;
+  align-items: stretch;
+}
+
+.operon-panel-tab {
+  padding: 0 12px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  color: var(--vscode-tab-inactiveforeground);
+  user-select: none;
+  font-size: 12px;
+}
+
+.operon-panel-tab-active {
+  color: var(--vscode-tab-activeforeground);
+  border-bottom: 2px solid var(--vscode-focusborder);
+}
+
+.operon-panel-body {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 6px 10px;
+}
+
+.operon-panel-empty {
+  color: var(--vscode-tab-inactiveforeground);
+  font-style: italic;
+  padding: 6px 0;
+}
+
+.operon-logs {
+  font-family: ui-monospace, "Cascadia Code", "Source Code Pro", "Consolas", monospace;
+  font-size: 12px;
+}
+
+.operon-logs-row {
+  display: flex;
+  flex-direction: row;
+  gap: 8px;
+  white-space: pre-wrap;
+  padding: 1px 0;
+}
+
+.operon-logs-empty {
+  opacity: 0.6;
+  font-style: italic;
+}
+
+.operon-logs-ts {
+  color: var(--vscode-tab-inactiveforeground);
+  flex: 0 0 auto;
+}
+
+.operon-logs-level {
+  color: var(--vscode-tab-inactiveforeground);
+  flex: 0 0 auto;
+  min-width: 56px;
+}
+
+.operon-logs-level-warn {
+  color: var(--vscode-focusborder);
+}
+
+.operon-logs-level-error {
+  color: #f48771;
+}
+
+.operon-logs-message {
+  flex: 1 1 auto;
 }
 
 .operon-menubar {
