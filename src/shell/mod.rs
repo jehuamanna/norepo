@@ -84,9 +84,9 @@ pub fn Shell() -> Element {
                         }
                     };
                     layout.with_mut(|s| match d.kind {
-                        SplitterKind::Left => s.set_sidebar_width(new_size),
-                        SplitterKind::Right => s.set_companion_width(new_size),
-                        SplitterKind::Bottom => s.set_panel_height(new_size),
+                        SplitterKind::Left => s.drag_sidebar(new_size),
+                        SplitterKind::Right => s.drag_companion(new_size),
+                        SplitterKind::Bottom => s.drag_panel(new_size),
                     });
                 }
             },

@@ -99,6 +99,48 @@ impl LayoutState {
             self.panel_collapsed = true;
         }
     }
+
+    /// Apply a target width from a live drag of the left splitter.
+    ///
+    /// Crossing below `SIDEBAR_MIN` snaps the side bar to collapsed; the live
+    /// width is stashed in `last_sidebar_width` once per snap (further frames
+    /// below MIN do not clobber it). Crossing back above MIN uncollapses and
+    /// sets the new width, clamped to MAX.
+    pub fn drag_sidebar(&mut self, target_px: u32) {
+        if target_px < SIDEBAR_MIN {
+            if !self.sidebar_collapsed {
+                self.last_sidebar_width = self.sidebar_width;
+                self.sidebar_collapsed = true;
+            }
+        } else {
+            self.sidebar_width = target_px.min(SIDEBAR_MAX);
+            self.sidebar_collapsed = false;
+        }
+    }
+
+    pub fn drag_companion(&mut self, target_px: u32) {
+        if target_px < COMPANION_MIN {
+            if !self.companion_collapsed {
+                self.last_companion_width = self.companion_width;
+                self.companion_collapsed = true;
+            }
+        } else {
+            self.companion_width = target_px.min(COMPANION_MAX);
+            self.companion_collapsed = false;
+        }
+    }
+
+    pub fn drag_panel(&mut self, target_px: u32) {
+        if target_px < PANEL_MIN {
+            if !self.panel_collapsed {
+                self.last_panel_height = self.panel_height;
+                self.panel_collapsed = true;
+            }
+        } else {
+            self.panel_height = target_px.min(PANEL_MAX);
+            self.panel_collapsed = false;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,5 +257,109 @@ mod tests {
         assert!(s.companion_collapsed);
         assert!(!s.sidebar_collapsed);
         assert!(!s.panel_collapsed);
+    }
+
+    // --- snap-to-edge / drag-from-edge tests (TestCase-Phase-1-snap-collapsing) ---
+
+    #[test]
+    fn drag_sidebar_below_min_snaps_to_collapsed() {
+        let mut s = LayoutState::default();
+        s.set_sidebar_width(300);
+        s.drag_sidebar(SIDEBAR_MIN.saturating_sub(1));
+        assert!(s.sidebar_collapsed, "below MIN must snap to collapsed");
+        assert_eq!(s.last_sidebar_width, 300, "stash live width into last_*");
+        assert_eq!(s.sidebar_track(), 0, "track is zero while collapsed");
+    }
+
+    #[test]
+    fn drag_sidebar_at_min_does_not_collapse() {
+        let mut s = LayoutState::default();
+        s.drag_sidebar(SIDEBAR_MIN);
+        assert!(!s.sidebar_collapsed);
+        assert_eq!(s.sidebar_width, SIDEBAR_MIN);
+    }
+
+    #[test]
+    fn drag_sidebar_above_min_uncollapses_and_resizes() {
+        let mut s = LayoutState::default();
+        s.toggle_sidebar(); // start collapsed
+        assert!(s.sidebar_collapsed);
+        s.drag_sidebar(220);
+        assert!(!s.sidebar_collapsed, "drag above MIN restores from collapsed");
+        assert_eq!(s.sidebar_width, 220);
+    }
+
+    #[test]
+    fn drag_sidebar_above_max_clamps_to_max() {
+        let mut s = LayoutState::default();
+        s.drag_sidebar(SIDEBAR_MAX + 500);
+        assert!(!s.sidebar_collapsed);
+        assert_eq!(s.sidebar_width, SIDEBAR_MAX);
+    }
+
+    #[test]
+    fn drag_sidebar_while_already_collapsed_preserves_last_width() {
+        let mut s = LayoutState::default();
+        s.set_sidebar_width(300);
+        s.drag_sidebar(0);
+        assert_eq!(s.last_sidebar_width, 300);
+        // Subsequent drag frames at zero must NOT overwrite last_sidebar_width to 0,
+        // otherwise re-opening would lose the previous size.
+        s.drag_sidebar(0);
+        s.drag_sidebar(20);
+        assert_eq!(s.last_sidebar_width, 300);
+        assert!(s.sidebar_collapsed);
+    }
+
+    #[test]
+    fn drag_companion_below_min_snaps_to_collapsed() {
+        let mut s = LayoutState::default();
+        s.set_companion_width(380);
+        s.drag_companion(COMPANION_MIN.saturating_sub(1));
+        assert!(s.companion_collapsed);
+        assert_eq!(s.last_companion_width, 380);
+        assert_eq!(s.companion_track(), 0);
+    }
+
+    #[test]
+    fn drag_companion_above_min_uncollapses_and_resizes() {
+        let mut s = LayoutState::default();
+        s.toggle_companion();
+        s.drag_companion(250);
+        assert!(!s.companion_collapsed);
+        assert_eq!(s.companion_width, 250);
+    }
+
+    #[test]
+    fn drag_panel_below_min_snaps_to_collapsed() {
+        let mut s = LayoutState::default();
+        s.set_panel_height(180);
+        s.drag_panel(PANEL_MIN.saturating_sub(1));
+        assert!(s.panel_collapsed);
+        assert_eq!(s.last_panel_height, 180);
+        assert_eq!(s.panel_track(), 0);
+    }
+
+    #[test]
+    fn drag_panel_above_min_uncollapses_and_resizes() {
+        let mut s = LayoutState::default();
+        s.toggle_panel();
+        s.drag_panel(150);
+        assert!(!s.panel_collapsed);
+        assert_eq!(s.panel_height, 150);
+    }
+
+    #[test]
+    fn drag_sidebar_round_trip_via_threshold() {
+        let mut s = LayoutState::default();
+        s.set_sidebar_width(320);
+        // Snap to collapsed.
+        s.drag_sidebar(40);
+        assert!(s.sidebar_collapsed);
+        assert_eq!(s.last_sidebar_width, 320);
+        // Drag back across threshold from a collapsed state.
+        s.drag_sidebar(260);
+        assert!(!s.sidebar_collapsed);
+        assert_eq!(s.sidebar_width, 260);
     }
 }
