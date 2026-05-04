@@ -10,6 +10,7 @@ use crate::log::LogBuffer;
 use crate::log_info;
 use crate::panel::PanelManager;
 use crate::plugin::{register_builtins, PluginContext, PluginRegistry};
+use crate::shell::layout::{DragState, LayoutState};
 use crate::shell::menubar::MenuId;
 use crate::shell::state::{ActiveActivity, ActivityItemId, LastActiveActivity};
 use crate::shell::Shell;
@@ -45,6 +46,12 @@ pub fn App() -> Element {
 
     let panel: Signal<PanelManager> = use_signal(PanelManager::new);
     use_context_provider(|| panel);
+
+    let layout: Signal<LayoutState> = use_signal(LayoutState::default);
+    use_context_provider(|| layout);
+
+    let drag: Signal<Option<DragState>> = use_signal(|| None);
+    use_context_provider(|| drag);
 
     let mut log_buffer: Signal<LogBuffer> = use_signal(LogBuffer::new);
     use_context_provider(|| log_buffer);

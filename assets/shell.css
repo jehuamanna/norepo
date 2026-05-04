@@ -33,6 +33,46 @@ html, body {
   height: 100vh;
   width: 100vw;
   overflow: hidden;
+  position: relative;
+}
+
+.operon-splitter {
+  position: absolute;
+  z-index: 50;
+  background: transparent;
+}
+
+.operon-splitter-vertical {
+  width: 4px;
+  cursor: col-resize;
+}
+
+.operon-splitter-horizontal {
+  height: 4px;
+  cursor: row-resize;
+}
+
+.operon-splitter:hover {
+  background: var(--vscode-focusborder);
+  opacity: 0.6;
+}
+
+.operon-splitter-vertical[data-edge="sidebar"] {
+  left: calc(56px + var(--operon-side-bar-width, 280px) - 2px);
+  top: 28px;
+  bottom: 24px;
+}
+
+.operon-splitter-vertical[data-edge="companion"] {
+  right: calc(var(--operon-companion-width, 320px) - 2px);
+  top: 28px;
+  bottom: 24px;
+}
+
+.operon-splitter-horizontal[data-edge="panel"] {
+  left: calc(56px + var(--operon-side-bar-width, 280px));
+  right: var(--operon-companion-width, 320px);
+  bottom: calc(24px + var(--operon-panel-height, 240px) - 2px);
 }
 
 .operon-panel {

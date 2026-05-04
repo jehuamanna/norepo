@@ -15,6 +15,8 @@ use dioxus::prelude::*;
 use crate::commands::{CommandPalette, PaletteMode, PaletteState};
 use crate::panel::PanelStrip;
 use crate::plugin::{PluginRegistry, PluginSurface};
+use crate::shell::layout::{DragState, LayoutState, SplitterKind};
+use crate::shell::splitter::{BottomSplitter, LeftSplitter, RightSplitter};
 use crate::shell::state::{ActiveActivity, ActivityItemId, LastActiveActivity};
 use crate::tabs::TabManager;
 
@@ -25,6 +27,7 @@ pub mod layout;
 mod main_area;
 pub mod menubar;
 mod side_bar;
+pub mod splitter;
 pub mod state;
 mod status_bar;
 
@@ -43,14 +46,18 @@ pub fn Shell() -> Element {
     let registry: Rc<PluginRegistry> = use_context();
     let mut palette: Signal<PaletteState> = use_context();
     let mut open_menu: Signal<Option<menubar::MenuId>> = use_context();
+    let mut layout: Signal<LayoutState> = use_context();
+    let mut drag: Signal<Option<DragState>> = use_context();
 
-    let collapsed = active.read().is_none();
-    let collapsed_attr = if collapsed { "true" } else { "false" };
-    let extra_style = if collapsed {
-        "--operon-side-bar-width: 0;"
-    } else {
-        ""
-    };
+    let layout_read = layout.read();
+    let layout_style = format!(
+        "--operon-side-bar-width: {}px; --operon-companion-width: {}px; --operon-panel-height: {}px;",
+        layout_read.sidebar_track(),
+        layout_read.companion_track(),
+        layout_read.panel_track(),
+    );
+    let collapsed_attr = if layout_read.sidebar_collapsed { "true" } else { "false" };
+    drop(layout_read);
 
     rsx! {
         div {
@@ -58,7 +65,36 @@ pub fn Shell() -> Element {
             class: "operon-shell-grid",
             tabindex: "-1",
             "data-sidebar-collapsed": "{collapsed_attr}",
-            style: "{extra_style}",
+            style: "{layout_style}",
+            onmousemove: move |e| {
+                let cur = *drag.read();
+                if let Some(d) = cur {
+                    let new_size = match d.kind {
+                        SplitterKind::Left => {
+                            let dx = e.client_coordinates().x as i32 - d.start_pos;
+                            (d.start_size as i32 + dx).max(0) as u32
+                        }
+                        SplitterKind::Right => {
+                            let dx = e.client_coordinates().x as i32 - d.start_pos;
+                            (d.start_size as i32 - dx).max(0) as u32
+                        }
+                        SplitterKind::Bottom => {
+                            let dy = e.client_coordinates().y as i32 - d.start_pos;
+                            (d.start_size as i32 - dy).max(0) as u32
+                        }
+                    };
+                    layout.with_mut(|s| match d.kind {
+                        SplitterKind::Left => s.set_sidebar_width(new_size),
+                        SplitterKind::Right => s.set_companion_width(new_size),
+                        SplitterKind::Bottom => s.set_panel_height(new_size),
+                    });
+                }
+            },
+            onmouseup: move |_| {
+                if drag.read().is_some() {
+                    drag.set(None);
+                }
+            },
             onkeydown: move |event| {
                 let key_str = event.key().to_string();
 
@@ -125,6 +161,9 @@ pub fn Shell() -> Element {
             PanelStrip {}
             CompanionArea {}
             StatusBar {}
+            LeftSplitter {}
+            RightSplitter {}
+            BottomSplitter {}
             CommandPalette {}
         }
     }
