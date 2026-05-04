@@ -89,3 +89,118 @@ pub fn register_builtins(
 ) -> Result<(), String> {
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dioxus::prelude::*;
+
+    use crate::plugin::manifest::{NoteKind, PluginManifest, PluginSurface};
+    use crate::plugin::traits::{NotePlugin, UIPlugin};
+
+    struct StubNote {
+        manifest: PluginManifest,
+    }
+    impl NotePlugin for StubNote {
+        fn manifest(&self) -> &PluginManifest {
+            &self.manifest
+        }
+        fn render(&self, _id: &str, _content: &str) -> Element {
+            rsx! { div { "stub-note" } }
+        }
+    }
+
+    struct StubUi {
+        manifest: PluginManifest,
+    }
+    impl UIPlugin for StubUi {
+        fn manifest(&self) -> &PluginManifest {
+            &self.manifest
+        }
+        fn render(&self, _surface: PluginSurface) -> Element {
+            rsx! { div { "data-stub": "yes", "stub-ui" } }
+        }
+    }
+
+    fn note_stub(id: &str, kind: NoteKind) -> StubNote {
+        StubNote {
+            manifest: PluginManifest {
+                id: id.into(),
+                display_name: id.into(),
+                version: "0.1.0".into(),
+                note_kind: Some(kind),
+                surfaces: Vec::new(),
+            },
+        }
+    }
+
+    fn ui_stub(id: &str, surfaces: Vec<PluginSurface>) -> StubUi {
+        StubUi {
+            manifest: PluginManifest {
+                id: id.into(),
+                display_name: id.into(),
+                version: "0.1.0".into(),
+                note_kind: None,
+                surfaces,
+            },
+        }
+    }
+
+    #[test]
+    fn empty_registry_has_no_plugins() {
+        let r = PluginRegistry::new();
+        assert_eq!(r.note_plugins().count(), 0);
+        assert_eq!(r.contributions(PluginSurface::ActivityBar).count(), 0);
+    }
+
+    #[test]
+    fn note_plugin_for_kind_lookup() {
+        let mut r = PluginRegistry::new();
+        r.add_note_plugin(Box::new(note_stub("md-stub", NoteKind::Markdown)))
+            .unwrap();
+        r.add_note_plugin(Box::new(note_stub("img-stub", NoteKind::Image)))
+            .unwrap();
+        assert_eq!(
+            r.note_plugin_for(&NoteKind::Markdown).unwrap().manifest().id,
+            "md-stub"
+        );
+        assert!(r.note_plugin_for(&NoteKind::Canvas).is_none());
+    }
+
+    #[test]
+    fn contributions_filters_by_surface() {
+        let mut r = PluginRegistry::new();
+        r.add_ui_plugin(Box::new(ui_stub("a", vec![PluginSurface::ActivityBar])))
+            .unwrap();
+        r.add_ui_plugin(Box::new(ui_stub(
+            "p",
+            vec![PluginSurface::CommandPalette],
+        )))
+        .unwrap();
+        assert_eq!(r.contributions(PluginSurface::ActivityBar).count(), 1);
+        assert_eq!(r.contributions(PluginSurface::CommandPalette).count(), 1);
+        assert_eq!(r.contributions(PluginSurface::SideBarPanel).count(), 0);
+    }
+
+    #[test]
+    fn duplicate_id_returns_err() {
+        let mut r = PluginRegistry::new();
+        r.add_ui_plugin(Box::new(ui_stub("dup", vec![PluginSurface::ActivityBar])))
+            .unwrap();
+        let result = r.add_ui_plugin(Box::new(ui_stub(
+            "dup",
+            vec![PluginSurface::CommandPalette],
+        )));
+        assert!(result.is_err());
+        assert_eq!(r.contributions(PluginSurface::CommandPalette).count(), 0);
+    }
+
+    #[test]
+    fn note_id_collides_with_ui_id() {
+        let mut r = PluginRegistry::new();
+        r.add_ui_plugin(Box::new(ui_stub("shared", vec![PluginSurface::ActivityBar])))
+            .unwrap();
+        let res = r.add_note_plugin(Box::new(note_stub("shared", NoteKind::Markdown)));
+        assert!(res.is_err());
+    }
+}
