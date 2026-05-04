@@ -48,3 +48,42 @@ To run for a different platform, use the `--platform platform` flag. E.g.
 dx serve --platform desktop
 ```
 
+# Testing
+
+The project ships a four-tier testing stack. The full TDD skill (tiers, conventions, walkthroughs, anti-patterns) lives in the Archon note **Test Case Specs** (`7094db6c-00d6-41d1-bc04-8b91cce36a5b`). Every test under this repo MUST follow it.
+
+| Tier | Lives in | Run command |
+|---|---|---|
+| Unit (Rust, inline) | `src/**/mod.rs` `#[cfg(test)] mod tests` | `just test-unit` |
+| Integration (Rust) | `tests/*.rs` | `just test-integration` |
+| Browser-DOM | `tests-wasm/tests/*.rs` (`wasm-bindgen-test`) | `just test-wasm` |
+| End-to-end | `e2e/specs/*.spec.ts` (Playwright) | `just test-e2e` |
+
+Run them all in order with `just test-all`.
+
+## One-time setup
+
+Install the developer tools that the recipes depend on:
+
+```bash
+# rust toolchain pin: rust-toolchain.toml will auto-install stable + wasm32 target
+cargo install just dioxus-cli wasm-pack --locked
+# pin node version (uses .nvmrc)
+nvm use
+# install project dependencies (cargo fetch + npm ci + playwright browsers)
+just bootstrap
+```
+
+## Running tests
+
+```bash
+just test-unit          # < 5 s
+just test-integration   # < 30 s
+just test-wasm          # < 60 s, headless Chromium
+just test-e2e           # < 4 min, Chromium against `dx serve --platform web`
+just test-all           # all four, fail-fast
+```
+
+Set `OPERON_E2E_BASE_URL` to point Playwright at an already-running dev
+server (skips the embedded `dx serve` boot).
+
