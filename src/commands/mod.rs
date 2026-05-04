@@ -14,7 +14,10 @@ use crate::shell::state::ActivityItemId;
 use crate::tabs::TabManager;
 use crate::theme::Theme;
 
+pub mod builtins;
 pub mod fuzzy;
+
+pub use builtins::register_builtin_commands;
 
 /// What the palette is currently filtering against.
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]

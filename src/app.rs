@@ -1,10 +1,11 @@
-//! Application root: provides theme, tab manager, plugin registry, and activity-state
-//! contexts; loads stylesheets; mounts the [`Shell`].
+//! Application root: provides theme, tab manager, plugin registry, activity-state, command
+//! registry, and palette-state contexts; loads stylesheets; mounts the [`Shell`].
 
 use std::rc::Rc;
 
 use dioxus::prelude::*;
 
+use crate::commands::{register_builtin_commands, CommandRegistry, PaletteState};
 use crate::plugin::{register_builtins, PluginContext, PluginRegistry};
 use crate::shell::state::{ActiveActivity, ActivityItemId, LastActiveActivity};
 use crate::shell::Shell;
@@ -31,6 +32,9 @@ pub fn App() -> Element {
     let last_active: Signal<Option<ActivityItemId>> = use_signal(|| None);
     use_context_provider(|| LastActiveActivity(last_active));
 
+    let palette: Signal<PaletteState> = use_signal(PaletteState::default);
+    use_context_provider(|| palette);
+
     use_context_provider(|| {
         let mut registry = PluginRegistry::new();
         let ctx = PluginContext {
@@ -41,6 +45,14 @@ pub fn App() -> Element {
             eprintln!("operon: register_builtins failed: {err}");
         }
         Rc::new(registry)
+    });
+
+    use_context_provider(|| {
+        let mut reg = CommandRegistry::new();
+        if let Err(err) = register_builtin_commands(&mut reg) {
+            eprintln!("operon: register_builtin_commands failed: {err}");
+        }
+        Rc::new(reg)
     });
 
     let snapshot = theme.read();
