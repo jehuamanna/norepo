@@ -8,8 +8,10 @@
 use dioxus::prelude::*;
 use std::collections::HashMap;
 
+pub mod contrast;
 pub mod defaults;
 pub mod id;
+pub mod palettes;
 pub mod persistence;
 pub mod registry;
 pub mod tokens;

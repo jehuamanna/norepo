@@ -7,7 +7,7 @@
 //! Phase 1 ships placeholder palettes for the seven non-default ids (cloned from the dark
 //! default); Phase 2 replaces them with canonical hex values per upstream sources.
 
-use super::{defaults, Theme, ThemeId, ThemeKind};
+use super::{palettes, Theme, ThemeId, ThemeKind};
 
 /// Picker-row metadata. Lightweight (no colour map) — used for menu / palette enumeration.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -57,22 +57,19 @@ impl Default for ThemeRegistry {
     }
 }
 
-/// Resolve a placeholder `Theme` for `id`. Phase 2 replaces this with palette-specific calls.
+/// Resolve the canonical `Theme` for `id`. Each variant maps to a palette under
+/// [`crate::theme::palettes`].
 fn build(id: ThemeId) -> Theme {
     match id {
-        ThemeId::VscodeDarkPlus => defaults::dark(),
-        ThemeId::VscodeLightPlus => defaults::light(),
-        // Placeholder palettes — Phase 2 replaces each with its canonical hex set.
-        // We restamp `id` and `kind` so identity is correct even before colours are.
-        other => {
-            let mut base = match other.kind() {
-                ThemeKind::Light => defaults::light(),
-                _ => defaults::dark(),
-            };
-            base.id = other;
-            base.kind = other.kind();
-            base
-        }
+        ThemeId::VscodeDarkPlus => palettes::vscode_dark_plus(),
+        ThemeId::VscodeLightPlus => palettes::vscode_light_plus(),
+        ThemeId::Nord => palettes::nord(),
+        ThemeId::MonokaiPro => palettes::monokai_pro(),
+        ThemeId::SolarizedDark => palettes::solarized_dark(),
+        ThemeId::SolarizedLight => palettes::solarized_light(),
+        ThemeId::Abyss => palettes::abyss(),
+        ThemeId::KimbieDark => palettes::kimbie_dark(),
+        ThemeId::HighContrastDark => palettes::high_contrast_dark(),
     }
 }
 
