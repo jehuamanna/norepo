@@ -17,6 +17,11 @@ pulldown-cmark = { version = "0.10", default-features = false }
 # `js_sys::Date::now()` on wasm and `std::time` everywhere else.
 web-time = "1"
 
+# `web_sys` bindings used only on the wasm web build for localStorage + prefers-color-scheme.
+# Native tests stub these out so the dependency is wasm-only.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["Window", "Storage", "MediaQueryList"] }
+
 [features]
 default = ["desktop"]
 web = ["dioxus/web"]

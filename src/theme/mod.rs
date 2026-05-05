@@ -10,9 +10,12 @@ use std::collections::HashMap;
 
 pub mod defaults;
 pub mod id;
+pub mod persistence;
+pub mod registry;
 pub mod tokens;
 
 pub use id::{ThemeId, ThemeKind};
+pub use registry::{ThemeDescriptor, ThemeRegistry};
 pub use tokens::ThemeToken;
 
 /// Back-compat alias retained for crates outside this module that still refer to `ThemeMode`.
