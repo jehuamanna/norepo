@@ -33,6 +33,10 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# === Agent runtime (Plans-Phase-2) ===
+tokio-stream = "0.1"
+async-stream = "0.3"
+
 # `web_sys` bindings used only on the wasm web build for localStorage + prefers-color-scheme.
 # Native tests stub these out so the dependency is wasm-only.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -76,12 +80,15 @@ tempfile = "3"
 keyring = { version = "2", default-features = false, features = ["linux-secret-service-rt-tokio-crypto-rust"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+rusqlite_migration = { version = "1", optional = true }
 
 [features]
 default = ["desktop"]
 web = ["dioxus/web"]
 desktop = ["dioxus/desktop"]
 mobile = ["dioxus/mobile"]
+sqlite-memory = ["dep:rusqlite", "dep:rusqlite_migration"]
 
 [dev-dependencies]
 pretty_assertions = "1.4"

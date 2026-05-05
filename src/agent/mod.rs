@@ -11,8 +11,13 @@ pub mod budget;
 pub mod bus;
 pub mod config;
 pub mod error;
+pub mod memory;
+pub mod plugins;
 pub mod registry;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod runtime;
 pub mod secrets;
+pub mod session;
 pub mod tracing_init;
 pub mod traits;
 
@@ -23,6 +28,9 @@ pub use config::{
     OperonConfig, ProvidersConfig, RuntimeConfig,
 };
 pub use error::{OperonError, OperonResult};
+pub use memory::InMemoryStore;
+#[cfg(all(feature = "sqlite-memory", not(target_arch = "wasm32")))]
+pub use memory::SqliteMemoryStore;
 pub use registry::{register_agent_plugins, AgentRegistry};
 pub use secrets::{EnvSecretStore, MockSecretStore, SecretStore};
 pub use traits::{
