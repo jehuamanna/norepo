@@ -1,0 +1,19 @@
+{
+  "name": "operon-editor-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TypeScript shim between Operon's Rust EditorBackend trait and Monaco / CodeMirror 6 / Tiptap. Compiled to ESM via esbuild; wasm-bindgen calls the resulting dist/index.js.",
+  "scripts": {
+    "build": "esbuild index.ts --bundle --format=esm --target=es2022 --splitting --outdir=dist --loader:.ttf=file --loader:.css=text --loader:.svg=file",
+    "build:dev": "esbuild index.ts --bundle --format=esm --target=es2022 --splitting --outdir=dist --loader:.ttf=file --loader:.css=text --loader:.svg=file --sourcemap",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "monaco-editor": "^0.50.0"
+  }
+}

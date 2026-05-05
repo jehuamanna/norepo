@@ -21,6 +21,14 @@ bootstrap:
     cargo fetch
     npm ci
     npx playwright install --with-deps chromium
+    cd assets/editor-bridge && bun install
+
+# Compile the TypeScript editor bridge to ESM under assets/editor-bridge/dist/.
+# Required before `dx serve` (web/desktop), `just test-wasm`, or `just test-e2e`
+# can mount a Monaco / CodeMirror 6 / Tiptap backend. Falls back to npx if bun
+# is unavailable.
+build-bridge:
+    cd assets/editor-bridge && (command -v bun >/dev/null 2>&1 && bun run build || npm run build)
 
 # Tier 1: pure-Rust unit tests (inline #[cfg(test)] mod tests blocks).
 test-unit:
@@ -40,11 +48,11 @@ sync-chromedriver:
 # Requires `wasm-pack` and a `google-chrome` whose major version matches the
 # wasm-pack-cached chromedriver. If you hit a `signal: 9 (SIGKILL)` driver
 # crash on first run, `just sync-chromedriver` and retry.
-test-wasm:
+test-wasm: build-bridge
     wasm-pack test --headless --chrome tests-wasm
 
 # Tier 4: Playwright e2e specs against `dx serve --platform web`.
-test-e2e:
+test-e2e: build-bridge
     npx playwright test
 
 # Run all four tiers in order; abort on first failure.
