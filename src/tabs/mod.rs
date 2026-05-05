@@ -1,11 +1,9 @@
 //! Tab state for the main area.
 //!
 //! [`TabManager`] is provided to the tree as `Signal<TabManager>` from the application root.
-//! The [`crate::shell::MainArea`] reads it to decide which note plugin renders the body, and
+//! The [`crate::shell::MainArea`] reads it to decide which format plugin renders the body, and
 //! [`TabStrip`] renders the visible row of tab buttons. Phases 3 onwards mutate it via
 //! `tabs.write()`.
-
-use crate::plugin::manifest::NoteKind;
 
 mod strip;
 
@@ -19,7 +17,8 @@ pub struct TabId(pub u64);
 pub struct Tab {
     pub id: TabId,
     pub note_id: String,
-    pub kind: NoteKind,
+    /// Open-string format identifier — resolves to a `FormatPlugin` via the registry.
+    pub format_id: String,
     pub title: String,
     pub content: String,
     pub dirty: bool,
@@ -43,7 +42,7 @@ impl TabManager {
     pub fn open(
         &mut self,
         note_id: String,
-        kind: NoteKind,
+        format_id: String,
         title: String,
         content: String,
     ) -> TabId {
@@ -61,7 +60,7 @@ impl TabManager {
         self.tabs.push(Tab {
             id,
             note_id,
-            kind,
+            format_id,
             title,
             content,
             dirty: false,
@@ -124,7 +123,7 @@ mod tests {
     use super::*;
 
     fn open_md(tm: &mut TabManager, id: &str, title: &str) -> TabId {
-        tm.open(id.into(), NoteKind::Markdown, title.into(), String::new())
+        tm.open(id.into(), "markdown".into(), title.into(), String::new())
     }
 
     #[test]

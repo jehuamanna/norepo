@@ -25,7 +25,8 @@ impl NotesExplorer {
                 id: "notes-explorer".into(),
                 display_name: "Notes Explorer".into(),
                 version: "0.1.0".into(),
-                note_kind: None,
+                format_id: None,
+                extensions: &[],
                 surfaces: vec![
                     PluginSurface::ActivityBar,
                     PluginSurface::SideBarPanel,

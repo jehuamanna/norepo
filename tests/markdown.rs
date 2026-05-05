@@ -4,9 +4,8 @@
 //! `notes_explorer::samples::SAMPLES`) and asserts that every documented construct lands
 //! as the expected [`MdNode`] kind.
 
-use operon_dioxus::plugin::manifest::NoteKind;
 use operon_dioxus::plugin::PluginRegistry;
-use operon_dioxus::plugins::markdown::{nodes::MdNode, parser, MarkdownNotePlugin};
+use operon_dioxus::plugins::markdown::{nodes::MdNode, parser, MarkdownFormatPlugin};
 use operon_dioxus::plugins::notes_explorer::samples::SAMPLES;
 
 fn fixture() -> &'static str {
@@ -142,13 +141,13 @@ fn frontmatter_is_hidden_in_showcase() {
 }
 
 #[test]
-fn registered_markdown_plugin_resolves_for_kind() {
+fn registered_markdown_plugin_resolves_for_format_id() {
     let mut registry = PluginRegistry::new();
     registry
-        .add_note_plugin(Box::new(MarkdownNotePlugin::new()))
+        .add_format_plugin(Box::new(MarkdownFormatPlugin::new()))
         .unwrap();
     let plugin = registry
-        .note_plugin_for(&NoteKind::Markdown)
+        .format_plugin_for("markdown")
         .expect("plugin registered");
     assert_eq!(plugin.manifest().id, "markdown-note");
 }

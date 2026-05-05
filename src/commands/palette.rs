@@ -15,7 +15,6 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 
 use crate::commands::{fuzzy, CommandContext, CommandRegistry, PaletteMode, PaletteState};
-use crate::plugin::manifest::NoteKind;
 use crate::plugin::PluginRegistry;
 use crate::plugins::notes_explorer::samples::SAMPLES;
 use crate::shell::layout::LayoutState;
@@ -313,7 +312,7 @@ pub fn CommandPalette() -> Element {
                                         CandidateKind::Note => {
                                             tabs.write().open(
                                                 c.id.clone(),
-                                                NoteKind::Markdown,
+                                                "markdown".to_string(),
                                                 c.title.clone(),
                                                 c.payload.clone(),
                                             );

@@ -1,31 +1,32 @@
 //! Plugin registry — owns boxed plugin trait objects and answers lookup queries.
 //!
 //! The registry is built once at app startup, populated by [`register_builtins`], and
-//! provided to the rest of the tree via Dioxus context as `Rc<PluginRegistry>`.
+//! provided to the rest of the tree via Dioxus context as `Rc<PluginRegistry>`. Format
+//! plugins are indexed by their `format_id` string (e.g. `"markdown"`).
 
 use super::context::PluginContext;
-use super::manifest::{NoteKind, PluginSurface};
-use super::traits::{NotePlugin, UIPlugin};
+use super::manifest::PluginSurface;
+use super::traits::{FormatPlugin, UIPlugin};
 
 pub struct PluginRegistry {
-    note_plugins: Vec<Box<dyn NotePlugin>>,
+    format_plugins: Vec<Box<dyn FormatPlugin>>,
     ui_plugins: Vec<Box<dyn UIPlugin>>,
 }
 
 impl PluginRegistry {
     pub fn new() -> Self {
         Self {
-            note_plugins: Vec::new(),
+            format_plugins: Vec::new(),
             ui_plugins: Vec::new(),
         }
     }
 
-    /// Register a note plugin. Errors if its `manifest.id` collides with any prior entry.
-    pub fn add_note_plugin(&mut self, p: Box<dyn NotePlugin>) -> Result<(), String> {
+    /// Register a format plugin. Errors if its `manifest.id` collides with any prior entry.
+    pub fn add_format_plugin(&mut self, p: Box<dyn FormatPlugin>) -> Result<(), String> {
         if self.has_id(&p.manifest().id) {
             return Err(format!("plugin id collision: {}", p.manifest().id));
         }
-        self.note_plugins.push(p);
+        self.format_plugins.push(p);
         Ok(())
     }
 
@@ -39,21 +40,30 @@ impl PluginRegistry {
     }
 
     fn has_id(&self, id: &str) -> bool {
-        self.note_plugins.iter().any(|p| p.manifest().id == id)
+        self.format_plugins.iter().any(|p| p.manifest().id == id)
             || self.ui_plugins.iter().any(|p| p.manifest().id == id)
     }
 
-    /// Iterate every registered note plugin.
-    pub fn note_plugins(&self) -> impl Iterator<Item = &dyn NotePlugin> {
-        self.note_plugins.iter().map(|b| b.as_ref())
+    /// Iterate every registered format plugin.
+    pub fn format_plugins(&self) -> impl Iterator<Item = &dyn FormatPlugin> {
+        self.format_plugins.iter().map(|b| b.as_ref())
     }
 
-    /// Find the note plugin claiming the given [`NoteKind`], if any.
-    pub fn note_plugin_for(&self, kind: &NoteKind) -> Option<&dyn NotePlugin> {
-        self.note_plugins
+    /// Find the format plugin claiming the given `format_id`, if any.
+    pub fn format_plugin_for(&self, format_id: &str) -> Option<&dyn FormatPlugin> {
+        self.format_plugins
             .iter()
             .map(|b| b.as_ref())
-            .find(|p| p.manifest().note_kind.as_ref() == Some(kind))
+            .find(|p| p.manifest().format_id == Some(format_id))
+    }
+
+    /// Find the format plugin whose `extensions` list contains the given `ext` (case-sensitive
+    /// lowercase). Returns the first match.
+    pub fn format_plugin_by_extension(&self, ext: &str) -> Option<&dyn FormatPlugin> {
+        self.format_plugins
+            .iter()
+            .map(|b| b.as_ref())
+            .find(|p| p.manifest().extensions.iter().any(|e| *e == ext))
     }
 
     /// Iterate every UI plugin contributing to `surface`.
@@ -87,10 +97,10 @@ pub fn register_builtins(
     registry: &mut PluginRegistry,
     _ctx: &PluginContext,
 ) -> Result<(), String> {
-    use crate::plugins::markdown::MarkdownNotePlugin;
+    use crate::plugins::markdown::MarkdownFormatPlugin;
     use crate::plugins::notes_explorer::NotesExplorer;
     registry.add_ui_plugin(Box::new(NotesExplorer::new()))?;
-    registry.add_note_plugin(Box::new(MarkdownNotePlugin::new()))?;
+    registry.add_format_plugin(Box::new(MarkdownFormatPlugin::new()))?;
     Ok(())
 }
 
@@ -99,13 +109,13 @@ mod tests {
     use super::*;
     use dioxus::prelude::*;
 
-    use crate::plugin::manifest::{NoteKind, PluginManifest, PluginSurface};
-    use crate::plugin::traits::{NotePlugin, UIPlugin};
+    use crate::plugin::manifest::{PluginManifest, PluginSurface};
+    use crate::plugin::traits::{FormatPlugin, UIPlugin};
 
-    struct StubNote {
+    struct StubFormat {
         manifest: PluginManifest,
     }
-    impl NotePlugin for StubNote {
+    impl FormatPlugin for StubFormat {
         fn manifest(&self) -> &PluginManifest {
             &self.manifest
         }
@@ -126,13 +136,18 @@ mod tests {
         }
     }
 
-    fn note_stub(id: &str, kind: NoteKind) -> StubNote {
-        StubNote {
+    fn format_stub(
+        id: &str,
+        format_id: &'static str,
+        extensions: &'static [&'static str],
+    ) -> StubFormat {
+        StubFormat {
             manifest: PluginManifest {
                 id: id.into(),
                 display_name: id.into(),
                 version: "0.1.0".into(),
-                note_kind: Some(kind),
+                format_id: Some(format_id),
+                extensions,
                 surfaces: Vec::new(),
             },
         }
@@ -144,7 +159,8 @@ mod tests {
                 id: id.into(),
                 display_name: id.into(),
                 version: "0.1.0".into(),
-                note_kind: None,
+                format_id: None,
+                extensions: &[],
                 surfaces,
             },
         }
@@ -153,22 +169,43 @@ mod tests {
     #[test]
     fn empty_registry_has_no_plugins() {
         let r = PluginRegistry::new();
-        assert_eq!(r.note_plugins().count(), 0);
+        assert_eq!(r.format_plugins().count(), 0);
         assert_eq!(r.contributions(PluginSurface::ActivityBar).count(), 0);
     }
 
     #[test]
-    fn note_plugin_for_kind_lookup() {
+    fn format_plugin_for_lookup() {
         let mut r = PluginRegistry::new();
-        r.add_note_plugin(Box::new(note_stub("md-stub", NoteKind::Markdown)))
+        r.add_format_plugin(Box::new(format_stub("md-stub", "markdown", &["md"])))
             .unwrap();
-        r.add_note_plugin(Box::new(note_stub("img-stub", NoteKind::Image)))
+        r.add_format_plugin(Box::new(format_stub("img-stub", "image", &["png"])))
             .unwrap();
         assert_eq!(
-            r.note_plugin_for(&NoteKind::Markdown).unwrap().manifest().id,
+            r.format_plugin_for("markdown").unwrap().manifest().id,
             "md-stub"
         );
-        assert!(r.note_plugin_for(&NoteKind::Canvas).is_none());
+        assert!(r.format_plugin_for("canvas").is_none());
+    }
+
+    #[test]
+    fn format_plugin_by_extension_lookup() {
+        let mut r = PluginRegistry::new();
+        r.add_format_plugin(Box::new(format_stub(
+            "md-stub",
+            "markdown",
+            &["md", "markdown"],
+        )))
+        .unwrap();
+        assert_eq!(
+            r.format_plugin_by_extension("md").unwrap().manifest().id,
+            "md-stub"
+        );
+        assert_eq!(
+            r.format_plugin_by_extension("markdown").unwrap().manifest().id,
+            "md-stub"
+        );
+        assert!(r.format_plugin_by_extension("txt").is_none());
+        assert!(r.format_plugin_by_extension("").is_none());
     }
 
     #[test]
@@ -200,11 +237,11 @@ mod tests {
     }
 
     #[test]
-    fn note_id_collides_with_ui_id() {
+    fn format_id_collides_with_ui_id() {
         let mut r = PluginRegistry::new();
         r.add_ui_plugin(Box::new(ui_stub("shared", vec![PluginSurface::ActivityBar])))
             .unwrap();
-        let res = r.add_note_plugin(Box::new(note_stub("shared", NoteKind::Markdown)));
+        let res = r.add_format_plugin(Box::new(format_stub("shared", "markdown", &["md"])));
         assert!(res.is_err());
     }
 }

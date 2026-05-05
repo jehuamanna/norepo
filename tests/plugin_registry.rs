@@ -1,13 +1,13 @@
 //! Integration tests for the plugin registry.
 //!
 //! Proves that trait-object plugins compose with Dioxus's `Element` return type and that
-//! a single struct can register against both [`NotePlugin`] and [`UIPlugin`] surfaces. This
+//! a single struct can register against both [`FormatPlugin`] and [`UIPlugin`] surfaces. This
 //! is the Phase-2 mitigation for risk R-2 in `Plans-Phase-0-architecture`.
 
 use dioxus::prelude::*;
 
 use operon_dioxus::plugin::{
-    NoteKind, NotePlugin, PluginManifest, PluginRegistry, PluginSurface, UIPlugin,
+    FormatPlugin, PluginManifest, PluginRegistry, PluginSurface, UIPlugin,
 };
 
 /// A plugin that implements both traits — separate boxes share the same id.
@@ -15,7 +15,7 @@ struct DualPlugin {
     manifest: PluginManifest,
 }
 
-impl NotePlugin for DualPlugin {
+impl FormatPlugin for DualPlugin {
     fn manifest(&self) -> &PluginManifest {
         &self.manifest
     }
@@ -43,7 +43,8 @@ fn manifest() -> PluginManifest {
         id: "dual".into(),
         display_name: "Dual".into(),
         version: "0.1.0".into(),
-        note_kind: Some(NoteKind::Markdown),
+        format_id: Some("markdown"),
+        extensions: &["md"],
         surfaces: vec![PluginSurface::ActivityBar, PluginSurface::CommandPalette],
     }
 }
@@ -51,15 +52,15 @@ fn manifest() -> PluginManifest {
 #[test]
 fn registry_round_trip_with_mixed_plugins() {
     let mut registry = PluginRegistry::new();
-    let np: Box<dyn NotePlugin> = Box::new(DualPlugin { manifest: manifest() });
+    let np: Box<dyn FormatPlugin> = Box::new(DualPlugin { manifest: manifest() });
     let up: Box<dyn UIPlugin> = Box::new(DualPlugin {
         manifest: PluginManifest { id: "dual-ui".into(), ..manifest() },
     });
-    registry.add_note_plugin(np).unwrap();
+    registry.add_format_plugin(np).unwrap();
     registry.add_ui_plugin(up).unwrap();
 
     assert_eq!(
-        registry.note_plugin_for(&NoteKind::Markdown).unwrap().manifest().id,
+        registry.format_plugin_for("markdown").unwrap().manifest().id,
         "dual"
     );
     assert_eq!(registry.contributions(PluginSurface::ActivityBar).count(), 1);
@@ -77,7 +78,7 @@ fn trait_object_render_returns_element_for_each_surface() {
 }
 
 #[test]
-fn note_plugin_render_returns_element() {
-    let plugin: Box<dyn NotePlugin> = Box::new(DualPlugin { manifest: manifest() });
+fn format_plugin_render_returns_element() {
+    let plugin: Box<dyn FormatPlugin> = Box::new(DualPlugin { manifest: manifest() });
     let _e: Element = plugin.render("note-1", "# hi");
 }

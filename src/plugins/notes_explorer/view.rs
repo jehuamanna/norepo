@@ -3,7 +3,6 @@
 use dioxus::prelude::*;
 
 use super::samples::SAMPLES;
-use crate::plugin::manifest::NoteKind;
 use crate::tabs::TabManager;
 
 #[component]
@@ -29,7 +28,7 @@ pub fn NotesExplorerPanel() -> Element {
                         onclick: move |_| {
                             tabs.write().open(
                                 id.to_string(),
-                                NoteKind::Markdown,
+                                "markdown".to_string(),
                                 title.to_string(),
                                 content.to_string(),
                             );

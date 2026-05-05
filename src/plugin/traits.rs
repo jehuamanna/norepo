@@ -9,9 +9,12 @@ use dioxus::prelude::*;
 use super::context::PluginContext;
 use super::manifest::{PluginManifest, PluginSurface};
 
-/// Renders a note of a particular [`crate::plugin::NoteKind`] inside the main area's active tab.
-pub trait NotePlugin {
+/// Renders a note of a particular format inside the main area's active tab. The format the
+/// plugin claims is declared via `manifest().format_id` (open string identifier).
+pub trait FormatPlugin {
     fn manifest(&self) -> &PluginManifest;
+    /// Render the note content in read-only View mode. Edit / LivePreview methods land in
+    /// later phases.
     fn render(&self, note_id: &str, content: &str) -> Element;
     fn on_register(&mut self, _ctx: &PluginContext) {}
 }

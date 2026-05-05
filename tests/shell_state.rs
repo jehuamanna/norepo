@@ -32,7 +32,7 @@ fn shell_state_default_graph_is_internally_consistent() {
     // CommandRegistry has the built-ins seeded by register_builtin_commands.
     assert!(cmds.iter().count() >= 6, "builtin commands should be registered");
     // PluginRegistry begins empty until App or tests register plugins.
-    assert_eq!(plugins.note_plugins().count(), 0);
+    assert_eq!(plugins.format_plugins().count(), 0);
     // Layout is in an interactive (non-collapsed) shape so all three tracks
     // contribute non-zero width — wiring is sound.
     assert!(layout.sidebar_track() > 0);
