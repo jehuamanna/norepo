@@ -28,6 +28,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "005_local_mode",
         include_str!("../migrations/005_local_mode.sql"),
     ),
+    (
+        6,
+        "006_local_projects",
+        include_str!("../migrations/006_local_projects.sql"),
+    ),
 ];
 
 fn ensure_migrations_table(conn: &Connection) -> Result<(), StoreError> {
@@ -91,6 +96,7 @@ pub fn migrate_down_all(conn: &mut Connection) -> Result<(), StoreError> {
         "departments",
         "orgs",
         "local_app_settings",
+        "local_project",
         "local_user",
         "users",
         "_schema_migrations",
