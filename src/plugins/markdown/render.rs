@@ -19,7 +19,7 @@ pub fn MarkdownView(content: String) -> Element {
     }
 }
 
-fn render_node(n: &MdNode) -> Element {
+pub fn render_node(n: &MdNode) -> Element {
     match n {
         MdNode::Heading { level, children } => match level {
             1 => rsx! { h1 { {render_children(children)} } },

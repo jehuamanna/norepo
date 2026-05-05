@@ -99,6 +99,7 @@ pub fn register_builtins(
 ) -> Result<(), String> {
     use crate::plugins::json_format::JsonFormatPlugin;
     use crate::plugins::markdown::MarkdownFormatPlugin;
+    use crate::plugins::mdx::MdxFormatPlugin;
     use crate::plugins::notes_explorer::NotesExplorer;
     use crate::plugins::plaintext::PlaintextFormatPlugin;
     use crate::plugins::richtext_tiptap::RichTextTiptapFormatPlugin;
@@ -107,6 +108,7 @@ pub fn register_builtins(
     registry.add_format_plugin(Box::new(PlaintextFormatPlugin::new()))?;
     registry.add_format_plugin(Box::new(JsonFormatPlugin::new()))?;
     registry.add_format_plugin(Box::new(RichTextTiptapFormatPlugin::new()))?;
+    registry.add_format_plugin(Box::new(MdxFormatPlugin::new()))?;
     Ok(())
 }
 

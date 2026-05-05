@@ -4,7 +4,7 @@
 //! pulldown-cmark events; it is unpacked into [`MdNode::List`]'s `items` and never appears
 //! in the public output of `parse`.
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MdNode {
     Heading { level: u8, children: Vec<MdNode> },
     Paragraph { children: Vec<MdNode> },
