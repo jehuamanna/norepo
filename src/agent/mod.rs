@@ -11,6 +11,7 @@ pub mod budget;
 pub mod bus;
 pub mod config;
 pub mod error;
+pub mod mcp;
 pub mod memory;
 pub mod plugins;
 pub mod registry;
