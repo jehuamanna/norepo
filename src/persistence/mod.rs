@@ -16,10 +16,14 @@ use std::pin::Pin;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fs;
 pub mod memory;
+#[cfg(target_arch = "wasm32")]
+pub mod web;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use fs::FilesystemPersistence;
 pub use memory::MemoryPersistence;
+#[cfg(target_arch = "wasm32")]
+pub use web::WebPersistence;
 
 /// Lightweight reference returned by `list()`. The `format_id` is captured at write-time when
 /// the backend can determine it (e.g., from filename extension on disk).
@@ -53,32 +57,36 @@ impl std::error::Error for PersistError {}
 
 /// Bytes-only storage trait. All methods return owned futures so trait objects work cleanly
 /// across desktop sync FS calls and wasm async OPFS/IDB calls.
+///
+/// The future returns are NOT `Send` because the wasm `WebPersistence` impl holds JsValue
+/// handles (which are `!Send`). Dioxus's `spawn` runs on the local thread so this is fine;
+/// any cross-thread storage work happens via background tasks queued elsewhere.
 pub trait Persistence: Send + Sync {
     fn load<'a>(
         &'a self,
         note_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, PersistError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, PersistError>> + 'a>>;
 
     fn save<'a>(
         &'a self,
         note_id: &'a str,
         bytes: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + 'a>>;
 
     fn list<'a>(
         &'a self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<NoteRef>, PersistError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<NoteRef>, PersistError>> + 'a>>;
 
     fn delete<'a>(
         &'a self,
         note_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + 'a>>;
 
     fn rename<'a>(
         &'a self,
         from: &'a str,
         to: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + 'a>>;
 }
 
 /// External-change notification. Desktop FS impl uses the `notify` crate; web impl is a no-op

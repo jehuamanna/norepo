@@ -23,7 +23,7 @@ impl Persistence for MemoryPersistence {
     fn load<'a>(
         &'a self,
         note_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, PersistError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, PersistError>> + 'a>> {
         Box::pin(async move {
             let store = self.inner.lock().map_err(|e| PersistError::Other(e.to_string()))?;
             store.get(note_id).cloned().ok_or(PersistError::NotFound)
@@ -34,7 +34,7 @@ impl Persistence for MemoryPersistence {
         &'a self,
         note_id: &'a str,
         bytes: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + 'a>> {
         Box::pin(async move {
             let mut store = self.inner.lock().map_err(|e| PersistError::Other(e.to_string()))?;
             store.insert(note_id.to_string(), bytes.to_vec());
@@ -44,7 +44,7 @@ impl Persistence for MemoryPersistence {
 
     fn list<'a>(
         &'a self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<NoteRef>, PersistError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<NoteRef>, PersistError>> + 'a>> {
         Box::pin(async move {
             let store = self.inner.lock().map_err(|e| PersistError::Other(e.to_string()))?;
             Ok(store
@@ -61,7 +61,7 @@ impl Persistence for MemoryPersistence {
     fn delete<'a>(
         &'a self,
         note_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + 'a>> {
         Box::pin(async move {
             let mut store = self.inner.lock().map_err(|e| PersistError::Other(e.to_string()))?;
             store.remove(note_id).map(|_| ()).ok_or(PersistError::NotFound)
@@ -72,7 +72,7 @@ impl Persistence for MemoryPersistence {
         &'a self,
         from: &'a str,
         to: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + 'a>> {
         Box::pin(async move {
             let mut store = self.inner.lock().map_err(|e| PersistError::Other(e.to_string()))?;
             let bytes = store.remove(from).ok_or(PersistError::NotFound)?;

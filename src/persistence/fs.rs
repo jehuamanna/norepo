@@ -40,7 +40,7 @@ impl Persistence for FilesystemPersistence {
     fn load<'a>(
         &'a self,
         note_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, PersistError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, PersistError>> + 'a>> {
         Box::pin(async move {
             let path = self.path_for(note_id);
             match std::fs::read(&path) {
@@ -55,7 +55,7 @@ impl Persistence for FilesystemPersistence {
         &'a self,
         note_id: &'a str,
         bytes: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + 'a>> {
         Box::pin(async move {
             let final_path = self.path_for(note_id);
             let temp = tempfile::NamedTempFile::new_in(self.notes_dir.as_path())
@@ -69,7 +69,7 @@ impl Persistence for FilesystemPersistence {
 
     fn list<'a>(
         &'a self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<NoteRef>, PersistError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<NoteRef>, PersistError>> + 'a>> {
         Box::pin(async move {
             let mut out = Vec::new();
             let dir = std::fs::read_dir(self.notes_dir.as_path())
@@ -106,7 +106,7 @@ impl Persistence for FilesystemPersistence {
     fn delete<'a>(
         &'a self,
         note_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + 'a>> {
         Box::pin(async move {
             let path = self.path_for(note_id);
             match std::fs::remove_file(&path) {
@@ -121,7 +121,7 @@ impl Persistence for FilesystemPersistence {
         &'a self,
         from: &'a str,
         to: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + 'a>> {
         Box::pin(async move {
             let from_path = self.path_for(from);
             let to_path = self.path_for(to);

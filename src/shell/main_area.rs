@@ -64,25 +64,14 @@ pub fn MainArea() -> Element {
                         EditorMode::LivePreview => {
                             plugin.render_live_preview(&note_id, &content, on_change)
                         }
-                        EditorMode::Split => {
-                            // Phase 3 ships the dedicated SplitView shell layout. Until
-                            // then, render side-by-side via a simple flex container so the
-                            // capability surface is honest.
-                            let view_content = content.clone();
-                            let view_note_id = note_id.clone();
-                            let edit_note_id = note_id.clone();
-                            rsx! {
-                                div { class: "operon-split-host",
-                                    div { class: "operon-split-pane operon-split-view",
-                                        {plugin.render(&view_note_id, &view_content)}
-                                    }
-                                    div { class: "operon-split-divider" }
-                                    div { class: "operon-split-pane operon-split-edit",
-                                        {plugin.render_edit(&edit_note_id, &content, on_change)}
-                                    }
-                                }
+                        EditorMode::Split => rsx! {
+                            crate::shell::split_view::SplitView {
+                                format_id: format_id.clone(),
+                                note_id: note_id.clone(),
+                                content: content.clone(),
+                                on_change,
                             }
-                        }
+                        },
                     }
                 }
                 None => rsx! {

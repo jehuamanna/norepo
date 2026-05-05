@@ -29,6 +29,7 @@ mod main_area;
 pub mod menubar;
 pub mod mode_toolbar;
 mod side_bar;
+pub mod split_view;
 pub mod splitter;
 pub mod state;
 mod status_bar;
@@ -39,6 +40,7 @@ pub use main_area::MainArea;
 pub use menubar::{MenuId, Menubar};
 pub use mode_toolbar::ModeToolbar;
 pub use side_bar::SideBar;
+pub use split_view::SplitView;
 pub use status_bar::StatusBar;
 
 #[component]

@@ -52,7 +52,7 @@ pub fn MonacoEditorHost(
         use std::rc::Rc;
 
         use crate::editor::{
-            BackendInit, EditorBackend, EditorThemeBlob, MonacoBackend,
+            BackendInit, EditorBackend, MonacoBackend,
         };
         use crate::theme::{editor_theme, Theme};
 
