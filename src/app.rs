@@ -15,7 +15,8 @@ use crate::shell::menubar::MenuId;
 use crate::shell::state::{ActiveActivity, ActivityItemId, LastActiveActivity};
 use crate::shell::Shell;
 use crate::tabs::TabManager;
-use crate::theme::{self, Theme};
+use crate::theme::persistence::{self as theme_persistence, WebLocalStorage};
+use crate::theme::{Theme, ThemeRegistry};
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
 const MAIN_CSS: Asset = asset!("/assets/main.css");
@@ -26,8 +27,14 @@ const MARKDOWN_CSS: Asset = asset!("/assets/markdown.css");
 
 #[component]
 pub fn App() -> Element {
-    let theme: Signal<Theme> = use_signal(theme::defaults::dark);
+    let theme_registry = Rc::new(ThemeRegistry::new());
+    let storage = WebLocalStorage;
+    let initial_id =
+        theme_persistence::resolve_initial_id(&storage, theme_persistence::prefers_dark());
+    let initial = theme_registry.get(initial_id).clone();
+    let theme: Signal<Theme> = use_signal(|| initial);
     use_context_provider(|| theme);
+    use_context_provider(|| theme_registry.clone());
 
     let tabs: Signal<TabManager> = use_signal(TabManager::new);
     use_context_provider(|| tabs);
@@ -82,6 +89,7 @@ pub fn App() -> Element {
 
     let snapshot = theme.read();
     let data = snapshot.data_attr();
+    let data_id = snapshot.data_id_attr();
     let style = snapshot.css_variables();
     drop(snapshot);
 
@@ -95,6 +103,7 @@ pub fn App() -> Element {
         div {
             id: "operon-root",
             "data-theme": "{data}",
+            "data-theme-id": "{data_id}",
             style: "{style}",
             Shell {}
         }

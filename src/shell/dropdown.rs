@@ -14,12 +14,13 @@ use crate::shell::layout::LayoutState;
 use crate::shell::menubar::MenuId;
 use crate::shell::state::{ActiveActivity, LastActiveActivity};
 use crate::tabs::TabManager;
-use crate::theme::Theme;
+use crate::theme::{Theme, ThemeRegistry};
 
 #[component]
 pub fn Dropdown(menu: MenuId) -> Element {
     let cmd_reg: Rc<CommandRegistry> = use_context();
     let plugin_reg: Rc<PluginRegistry> = use_context();
+    let theme_reg: Rc<ThemeRegistry> = use_context();
     let theme: Signal<Theme> = use_context();
     let tabs: Signal<TabManager> = use_context();
     let ActiveActivity(active) = use_context();
@@ -55,6 +56,7 @@ pub fn Dropdown(menu: MenuId) -> Element {
                     let title_text = title.clone();
                     let cmd_reg = cmd_reg.clone();
                     let plugin_reg = plugin_reg.clone();
+                    let theme_reg = theme_reg.clone();
                     rsx! {
                         li {
                             class: "operon-dropdown-item",
@@ -68,6 +70,7 @@ pub fn Dropdown(menu: MenuId) -> Element {
                                     registry: plugin_reg.clone(),
                                     palette,
                                     layout,
+                                    theme_registry: theme_reg.clone(),
                                 };
                                 let _ = cmd_reg.execute(&id, &context);
                                 open_menu.set(None);

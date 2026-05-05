@@ -13,7 +13,7 @@ use crate::plugin::PluginRegistry;
 use crate::shell::layout::LayoutState;
 use crate::shell::state::ActivityItemId;
 use crate::tabs::TabManager;
-use crate::theme::Theme;
+use crate::theme::{Theme, ThemeRegistry};
 
 pub mod builtins;
 pub mod fuzzy;
@@ -59,6 +59,7 @@ pub struct CommandContext {
     pub registry: Rc<PluginRegistry>,
     pub palette: Signal<PaletteState>,
     pub layout: Signal<LayoutState>,
+    pub theme_registry: Rc<ThemeRegistry>,
 }
 
 pub type CommandHandler = Box<dyn Fn(&CommandContext)>;

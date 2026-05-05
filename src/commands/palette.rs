@@ -15,7 +15,7 @@ use crate::plugins::notes_explorer::samples::SAMPLES;
 use crate::shell::layout::LayoutState;
 use crate::shell::state::{ActiveActivity, LastActiveActivity};
 use crate::tabs::TabManager;
-use crate::theme::Theme;
+use crate::theme::{Theme, ThemeRegistry};
 
 #[derive(Clone, Copy)]
 enum CandidateKind {
@@ -90,6 +90,7 @@ pub fn CommandPalette() -> Element {
     let mut palette: Signal<PaletteState> = use_context();
     let cmd_reg: Rc<CommandRegistry> = use_context();
     let plugin_reg: Rc<PluginRegistry> = use_context();
+    let theme_reg: Rc<ThemeRegistry> = use_context();
     let theme: Signal<Theme> = use_context();
     let mut tabs: Signal<TabManager> = use_context();
     let ActiveActivity(active) = use_context();
@@ -166,6 +167,7 @@ pub fn CommandPalette() -> Element {
                                                 registry: plugin_reg_for_keydown.clone(),
                                                 palette,
                                                 layout,
+                                                theme_registry: theme_reg.clone(),
                                             };
                                             let _ = cmd_reg_for_keydown.execute(&c.id, &context);
                                             palette.write().open = false;
