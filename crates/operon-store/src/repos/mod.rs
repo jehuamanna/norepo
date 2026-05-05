@@ -6,6 +6,7 @@ pub mod department;
 pub mod invite;
 pub mod membership;
 pub mod note;
+pub mod note_update;
 pub mod org;
 pub mod project;
 pub mod session;
@@ -20,6 +21,7 @@ pub use department::{Department, DepartmentRepository, SqliteDepartmentRepositor
 pub use invite::{Invite, InviteRepository, SqliteInviteRepository};
 pub use membership::{Membership, MembershipRepository, Role, SqliteMembershipRepository};
 pub use note::{Note, NoteRepository, SqliteNoteRepository};
+pub use note_update::{NoteUpdateRepository, SqliteNoteUpdateRepository};
 pub use org::{Org, OrgFlavour, OrgRepository, SqliteOrgRepository};
 pub use project::{Project, ProjectRepository, SqliteProjectRepository};
 pub use session::{Session, SessionRepository, SqliteSessionRepository};
