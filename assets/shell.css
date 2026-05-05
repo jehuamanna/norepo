@@ -378,6 +378,66 @@ html, body {
 .notes-explorer-row-cut {
   opacity: 0.5;
 }
+.notes-explorer-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0 6px 0;
+}
+.notes-explorer-toolbar-search {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.notes-explorer-toolbar-add {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: inherit;
+  border: 0;
+  border-radius: 3px;
+  cursor: pointer;
+  font: inherit;
+  line-height: 1;
+}
+.notes-explorer-toolbar-add:hover {
+  background: var(--vscode-list-inactiveselectionbackground, var(--vscode-activitybar-activebackground));
+}
+.notes-explorer-search-form {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+}
+.notes-explorer-search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 3px 6px;
+  font-size: 12px;
+  color: inherit;
+  background: var(--vscode-quickinput-background, transparent);
+  border: 1px solid var(--vscode-quickinput-border, var(--vscode-panel-border));
+  border-radius: 3px;
+  outline: none;
+  font-family: inherit;
+}
+.notes-explorer-search-input:focus {
+  border-color: var(--vscode-focusborder);
+}
+.notes-explorer-search-incontent {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: inherit;
+  opacity: 0.8;
+  user-select: none;
+  white-space: nowrap;
+}
 
 .operon-main-area {
   grid-area: main;

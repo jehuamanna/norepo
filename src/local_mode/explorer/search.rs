@@ -52,11 +52,11 @@ pub fn ExplorerSearch(
 
     rsx! {
         div {
-            class: "flex items-center gap-2 px-2 py-2 border-b border-[var(--operon-border)]",
+            class: "notes-explorer-search-form",
             "data-testid": "explorer-search-form",
             input {
                 r#type: "search",
-                class: "flex-1 px-2 py-1 text-xs bg-[var(--operon-input-bg)] border border-[var(--operon-border)] rounded outline-none",
+                class: "notes-explorer-search-input",
                 "data-testid": "explorer-search-input",
                 placeholder: "Search projects and notes",
                 value: "{local_value}",
@@ -79,7 +79,7 @@ pub fn ExplorerSearch(
                 },
             }
             label {
-                class: "flex items-center gap-1 text-xs select-none",
+                class: "notes-explorer-search-incontent",
                 input {
                     r#type: "checkbox",
                     "data-testid": "explorer-search-in-content",

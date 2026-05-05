@@ -673,12 +673,12 @@ pub fn ExplorerPanel() -> Element {
             class: "notes-explorer-list",
             "data-testid": "explorer-panel",
             style: "list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column;",
-            // Header — search input + checkbox + "+" button
+            // Header — search input + checkbox + "+" button. Borderless to match
+            // Cloud's notes-explorer chrome density.
             div {
-                class: "flex items-center gap-2 py-2",
-                style: "border-bottom: 1px solid var(--vscode-panel-border); margin-bottom: 4px;",
+                class: "notes-explorer-toolbar",
                 div {
-                    class: "flex-1",
+                    class: "notes-explorer-toolbar-search",
                     ExplorerSearch {
                         query: search_query,
                         in_content: search_in_content,
@@ -688,7 +688,7 @@ pub fn ExplorerPanel() -> Element {
                 }
                 button {
                     r#type: "button",
-                    class: "w-7 h-7 inline-flex items-center justify-center rounded border border-[var(--operon-border)] hover:bg-[var(--operon-hover)] text-base leading-none",
+                    class: "notes-explorer-toolbar-add",
                     "data-testid": "explorer-add-project",
                     "aria-label": "New project",
                     onclick: on_add_project,
