@@ -11,6 +11,9 @@
 use std::future::Future;
 use std::pin::Pin;
 
+pub mod monaco;
+pub use monaco::MonacoBackend;
+
 /// Editor mode the active tab is in. The shell renders different surfaces per mode and the
 /// active plugin's [`crate::plugin::FormatPlugin`] capability flag determines which buttons
 /// appear in the mode toolbar.

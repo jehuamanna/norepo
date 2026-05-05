@@ -3661,10 +3661,13 @@ name = "operon-dioxus"
 version = "0.1.0"
 dependencies = [
  "dioxus",
+ "js-sys",
  "notify",
  "pretty_assertions",
  "pulldown-cmark",
  "tempfile",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
  "web-time",
 ]

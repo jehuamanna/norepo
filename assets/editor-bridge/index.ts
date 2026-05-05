@@ -12,6 +12,11 @@ declare global {
   interface Window {
     /** Loaded-libraries marker used by tests to assert lazy-load behaviour. */
     __operon_loaded?: Set<string>;
+    /** Bridge surface the Rust EditorBackend impls call into via wasm-bindgen.
+     * Populated by this entry script on first import. */
+    operonBridge?: {
+      mount: (target: HTMLElement, init: BackendInit) => Promise<Handle>;
+    };
   }
 }
 
@@ -41,6 +46,13 @@ export async function mount(target: HTMLElement, init: BackendInit): Promise<Han
       throw new Error(`unknown backend kind: ${String(_exhaustive)}`);
     }
   }
+}
+
+// Install the bridge on the window global so wasm-bindgen-side code can call it without a
+// static module reference. Idempotent — re-importing this module won't shadow an existing
+// installation.
+if (typeof window !== "undefined" && !window.operonBridge) {
+  window.operonBridge = { mount };
 }
 
 // Re-export shared types so consumers can import { Handle } from this entry.
