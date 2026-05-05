@@ -5,8 +5,10 @@
 //! [`TabStrip`] renders the visible row of tab buttons. Phases 3 onwards mutate it via
 //! `tabs.write()`.
 
+mod save_loop;
 mod strip;
 
+pub use save_loop::{SaveScheduler, DEBOUNCE_MS};
 pub use strip::TabStrip;
 
 use crate::editor::{EditorMode, EditorState};

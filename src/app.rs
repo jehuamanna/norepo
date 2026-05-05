@@ -17,7 +17,7 @@ use crate::shell::layout::{DragState, LayoutState};
 use crate::shell::menubar::MenuId;
 use crate::shell::state::{ActiveActivity, ActivityItemId, LastActiveActivity};
 use crate::shell::Shell;
-use crate::tabs::TabManager;
+use crate::tabs::{SaveScheduler, TabManager};
 use crate::theme::persistence::{self as theme_persistence, WebLocalStorage};
 use crate::theme::{Theme, ThemeRegistry};
 
@@ -66,7 +66,10 @@ pub fn App() -> Element {
     let mut log_buffer: Signal<LogBuffer> = use_signal(LogBuffer::new);
     use_context_provider(|| log_buffer);
 
-    use_context_provider(|| provide_persistence());
+    let persistence = provide_persistence();
+    let scheduler = SaveScheduler::new(persistence.clone());
+    use_context_provider(|| persistence);
+    use_context_provider(|| scheduler);
 
     use_context_provider(|| {
         let mut registry = PluginRegistry::new();

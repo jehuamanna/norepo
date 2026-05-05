@@ -8,12 +8,13 @@ use dioxus::prelude::*;
 use crate::editor::EditorMode;
 use crate::plugin::PluginRegistry;
 use crate::shell::mode_toolbar::ModeToolbar;
-use crate::tabs::{TabId, TabManager, TabStrip};
+use crate::tabs::{SaveScheduler, TabId, TabManager, TabStrip};
 
 #[component]
 pub fn MainArea() -> Element {
-    let mut tabs: Signal<TabManager> = use_context();
+    let tabs: Signal<TabManager> = use_context();
     let registry: Rc<PluginRegistry> = use_context();
+    let scheduler: SaveScheduler = use_context();
 
     let active_info: Option<(TabId, String, String, String, EditorMode)> = {
         let snapshot = tabs.read();
@@ -37,10 +38,25 @@ pub fn MainArea() -> Element {
         Some((tab_id, format_id, note_id, content, mode)) => {
             match registry.format_plugin_for(&format_id) {
                 Some(plugin) => {
-                    // on_change writes the new content back through the TabManager. Plugins
-                    // that don't need to mutate (View, plain rendering) don't invoke it.
+                    // on_change writes the new content back through the TabManager and
+                    // schedules a debounced save through Persistence. The scheduler clears
+                    // dirty on success. Signal<TabManager> is Copy, so we hand a fresh
+                    // copy into each closure that needs to call .write().
+                    let scheduler_for_change = scheduler.clone();
+                    let note_id_for_change = note_id.clone();
+                    let tabs_handle = tabs;
                     let on_change = EventHandler::new(move |new_content: String| {
-                        tabs.write().set_content(tab_id, new_content);
+                        let mut t = tabs_handle;
+                        t.write().set_content(tab_id, new_content.clone());
+                        scheduler_for_change.schedule(
+                            tab_id,
+                            note_id_for_change.clone(),
+                            new_content,
+                            move || {
+                                let mut t = tabs_handle;
+                                t.write().set_dirty(tab_id, false);
+                            },
+                        );
                     });
                     match mode {
                         EditorMode::View => plugin.render(&note_id, &content),

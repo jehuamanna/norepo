@@ -11,6 +11,10 @@ edition = "2021"
 
 [dependencies]
 dioxus = { version = "0.7.1", features = ["router"] }
+# `futures-timer` powers SaveScheduler's debounce. The `wasm-bindgen` feature is required for
+# the wasm32 target to use `setTimeout`-based futures (gloo-timers under the hood); without it
+# `Delay` panics with "no executor present" in the browser.
+futures-timer = { version = "3.0.3", features = ["wasm-bindgen"] }
 pulldown-cmark = { version = "0.10", default-features = false }
 # `std::time::SystemTime::now()` panics with "time not implemented on this platform"
 # under `wasm32-unknown-unknown`. `web-time` is a drop-in replacement that uses
