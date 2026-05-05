@@ -34,8 +34,9 @@ export async function mount(target: HTMLElement, init: BackendInit): Promise<Han
       return mountMonaco(target, init);
     }
     case "codemirror": {
-      // Phase 4 lands the CM6 backend.
-      throw new Error("codemirror backend not yet implemented");
+      const { mountCodeMirror } = await import("./codemirror.js");
+      markLoaded("codemirror");
+      return mountCodeMirror(target, init);
     }
     case "tiptap": {
       // Phase 5 lands the Tiptap backend.

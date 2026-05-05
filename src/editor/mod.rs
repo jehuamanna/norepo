@@ -11,7 +11,9 @@
 use std::future::Future;
 use std::pin::Pin;
 
+pub mod codemirror;
 pub mod monaco;
+pub use codemirror::CodeMirror6Backend;
 pub use monaco::MonacoBackend;
 
 /// Editor mode the active tab is in. The shell renders different surfaces per mode and the

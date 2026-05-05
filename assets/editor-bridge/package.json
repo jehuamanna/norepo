@@ -14,6 +14,11 @@
     "typescript": "^5.4.0"
   },
   "dependencies": {
+    "@codemirror/lang-markdown": "^6.5.0",
+    "@codemirror/language": "^6.12.3",
+    "@codemirror/state": "^6.6.0",
+    "@codemirror/view": "^6.41.1",
+    "@lezer/markdown": "^1.6.3",
     "monaco-editor": "^0.50.0"
   }
 }

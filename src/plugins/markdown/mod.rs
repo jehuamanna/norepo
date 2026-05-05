@@ -47,8 +47,7 @@ impl FormatPlugin for MarkdownFormatPlugin {
     }
 
     fn capabilities(&self) -> FormatCaps {
-        // LIVE_PREVIEW capability flips on once Phase 4 lands the CodeMirror 6 backend.
-        FormatCaps::VIEW | FormatCaps::EDIT
+        FormatCaps::VIEW | FormatCaps::EDIT | FormatCaps::LIVE_PREVIEW
     }
 
     fn render(&self, _note_id: &str, content: &str) -> Element {
@@ -66,6 +65,24 @@ impl FormatPlugin for MarkdownFormatPlugin {
         let content = content.to_string();
         rsx! {
             crate::shell::editor_host::MonacoEditorHost {
+                note_id,
+                content,
+                language: LanguageDescriptor::markdown(),
+                on_change,
+            }
+        }
+    }
+
+    fn render_live_preview(
+        &self,
+        note_id: &str,
+        content: &str,
+        on_change: EventHandler<String>,
+    ) -> Element {
+        let note_id = note_id.to_string();
+        let content = content.to_string();
+        rsx! {
+            crate::shell::codemirror_host::CodeMirrorEditorHost {
                 note_id,
                 content,
                 language: LanguageDescriptor::markdown(),

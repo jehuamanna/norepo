@@ -22,6 +22,7 @@ use crate::tabs::TabManager;
 
 mod activity_bar;
 mod companion_area;
+pub mod codemirror_host;
 pub mod dropdown;
 pub mod editor_host;
 pub mod layout;
