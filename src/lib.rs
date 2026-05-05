@@ -5,8 +5,10 @@
 
 pub mod app;
 pub mod commands;
+pub mod editor;
 pub mod log;
 pub mod panel;
+pub mod persistence;
 pub mod plugin;
 pub mod plugins;
 pub mod shell;
