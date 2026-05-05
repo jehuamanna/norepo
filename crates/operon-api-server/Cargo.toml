@@ -1,0 +1,36 @@
+[package]
+name = "operon-api-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+operon-auth = { path = "../operon-auth" }
+operon-store = { path = "../operon-store" }
+axum = { version = "0.8", features = ["macros", "ws", "tracing"] }
+axum-extra = { version = "0.10", features = ["cookie"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tokio = { version = "1", features = ["full"] }
+hyper = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+async-trait = "0.1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+time = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+hyper-util = { version = "0.1", features = ["client", "http1"] }
+tower = { version = "0.5", features = ["util"] }
+
+[features]
+default = []
+auth-bypass = []
+
+[[bin]]
+name = "operon-api-server"
+path = "src/main.rs"
