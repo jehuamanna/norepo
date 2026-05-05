@@ -69,7 +69,7 @@ pub fn ContextMenu(props: ContextMenuProps) -> Element {
                 }
             },
             div {
-                class: "min-w-[10rem] rounded-md border border-[var(--operon-border)] bg-[var(--operon-bg)] text-[var(--operon-fg)] shadow-lg py-1 text-sm",
+                class: "operon-context-menu",
                 style: "{style}",
                 "data-testid": "context-menu",
                 tabindex: "-1",
@@ -103,11 +103,10 @@ fn ContextMenuRow(props: ContextMenuRowProps) -> Element {
     let on_click = props.item.on_click;
     let on_dismiss = props.on_dismiss;
 
-    let base = "block w-full text-left px-3 py-1";
     let class_attr = if enabled {
-        format!("{base} hover:bg-[var(--operon-hover)] cursor-pointer")
+        "operon-context-menu-row"
     } else {
-        format!("{base} opacity-40 cursor-not-allowed")
+        "operon-context-menu-row operon-context-menu-row-disabled"
     };
 
     rsx! {
