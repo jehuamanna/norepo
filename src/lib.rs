@@ -12,3 +12,4 @@ pub mod plugins;
 pub mod shell;
 pub mod tabs;
 pub mod theme;
+pub mod ui;

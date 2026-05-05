@@ -7,6 +7,7 @@
 use dioxus::prelude::*;
 
 use crate::plugin::{PluginManifest, PluginSurface, UIPlugin};
+use crate::ui::Icon;
 
 pub mod samples;
 pub mod view;
@@ -51,8 +52,8 @@ impl UIPlugin for NotesExplorer {
                 div {
                     class: "operon-activity-icon",
                     title: "Notes Explorer",
-                    style: "display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; font-size: 18px;",
-                    "📚"
+                    style: "display: flex; align-items: center; justify-content: center; width: 100%; height: 100%;",
+                    Icon { name: "book".to_string(), size: 20, title: "Notes Explorer".to_string() }
                 }
             },
             PluginSurface::SideBarPanel => rsx! { NotesExplorerPanel {} },

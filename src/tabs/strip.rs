@@ -6,6 +6,7 @@
 use dioxus::prelude::*;
 
 use super::{Tab, TabId, TabManager};
+use crate::ui::Icon;
 
 #[component]
 pub fn TabStrip() -> Element {
@@ -32,7 +33,11 @@ pub fn TabStrip() -> Element {
                             evt.stop_propagation();
                             tabs.write().close(id);
                         },
-                        if dirty { "●" } else { "×" }
+                        if dirty {
+                            Icon { name: "circle-dot".to_string(), size: 12 }
+                        } else {
+                            Icon { name: "x".to_string(), size: 12, title: "Close tab".to_string() }
+                        }
                     }
                 }
             }

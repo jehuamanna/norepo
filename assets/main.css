@@ -64,9 +64,38 @@ body {
 #blog {
     margin-top: 50px;
   }
-  
+
 #blog a {
     color: #ffffff;
     margin-top: 50px;
+}
+
+/* Icon component (src/ui/icon.rs).
+   Inline SVGs that inherit color from the parent so each theme tints them
+   automatically via the existing --vscode-* foreground vars. */
+.operon-icon {
+    display: inline-block;
+    flex: none;
+    vertical-align: middle;
+    fill: currentColor;
+    pointer-events: none;
+}
+
+.operon-activity-item .operon-icon,
+.operon-activity-icon .operon-icon,
+.operon-activity-toggle .operon-icon {
+    width: 20px;
+    height: 20px;
+}
+
+.operon-tab-close .operon-icon,
+.operon-tab-marker .operon-icon {
+    width: 12px;
+    height: 12px;
+}
+
+.operon-toggle-btn .operon-icon {
+    width: 14px;
+    height: 14px;
 }
 

@@ -5,6 +5,7 @@ use dioxus::prelude::*;
 
 use crate::shell::dropdown::Dropdown;
 use crate::shell::layout::LayoutState;
+use crate::ui::Icon;
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum MenuId {
@@ -96,14 +97,14 @@ pub fn Menubar() -> Element {
                     "data-action": "toggle-panel",
                     title: "Toggle Panel",
                     onclick: move |_| { layout.with_mut(|s| s.toggle_panel()); },
-                    "▾"
+                    Icon { name: "panel".to_string() }
                 }
                 button {
                     class: "operon-toggle-btn",
                     "data-action": "toggle-companion",
                     title: "Toggle Companion",
                     onclick: move |_| { layout.with_mut(|s| s.toggle_companion()); },
-                    "▸"
+                    Icon { name: "sidebar-right".to_string() }
                 }
             }
         }

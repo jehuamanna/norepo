@@ -11,6 +11,7 @@ use dioxus::prelude::*;
 use crate::plugin::{PluginRegistry, PluginSurface};
 use crate::shell::layout::LayoutState;
 use crate::shell::state::{ActiveActivity, ActivityItemId, LastActiveActivity};
+use crate::ui::Icon;
 
 #[component]
 pub fn ActivityBar() -> Element {
@@ -21,7 +22,7 @@ pub fn ActivityBar() -> Element {
 
     let active_id = active.read().clone();
     let collapsed = layout.read().sidebar_collapsed;
-    let toggle_label = if collapsed { "▶" } else { "◧" };
+    let toggle_icon = if collapsed { "chevron-right" } else { "square" };
 
     let registry_for_toggle = registry.clone();
 
@@ -75,7 +76,7 @@ pub fn ActivityBar() -> Element {
                         }
                     }
                 },
-                "{toggle_label}"
+                Icon { name: toggle_icon.to_string() }
             }
         }
     }
