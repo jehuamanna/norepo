@@ -1,10 +1,13 @@
 /*
  * Static fallback declarations of theme tokens.
  *
- * The source of truth at runtime is the inline style emitted from
- * src/theme/defaults.rs. This file exists only so editor tooling can resolve
- * --vscode-* references when previewing markup. Keep values in sync with
- * src/theme/defaults.rs::dark / ::light.
+ * The runtime source of truth is the inline style emitted from
+ * src/theme/defaults.rs onto <html> by App's use_effect (src/app.rs).
+ * This file mirrors those values so the cascade stays correct even if a
+ * descendant subtree misses a re-render, and so editor tooling can resolve
+ * --vscode-* references when previewing markup.
+ *
+ * Keep values in sync with src/theme/defaults.rs::dark / ::light.
  */
 
 :root[data-theme="dark"] {
@@ -12,13 +15,44 @@
   --vscode-editor-foreground: #CCCCCC;
   --vscode-activitybar-background: #181818;
   --vscode-activitybar-foreground: #FFFFFF;
+  --vscode-activitybar-activebackground: #1F1F1F;
+  --vscode-activitybar-activeforeground: #FFFFFF;
   --vscode-sidebar-background: #181818;
   --vscode-sidebar-foreground: #CCCCCC;
   --vscode-statusbar-background: #181818;
   --vscode-statusbar-foreground: #CCCCCC;
+  --vscode-tab-activebackground: #1F1F1F;
+  --vscode-tab-inactivebackground: #181818;
+  --vscode-tab-activeforeground: #FFFFFF;
+  --vscode-tab-inactiveforeground: #9D9D9D;
   --vscode-panel-background: #181818;
   --vscode-panel-border: #2B2B2B;
   --vscode-focusborder: #0078D4;
+  --vscode-widget-shadow: rgba(0,0,0,0.36);
+  --vscode-titlebar-activebackground: #181818;
+  --vscode-titlebar-activeforeground: #CCCCCC;
+  --vscode-menubar-background: #181818;
+  --vscode-menubar-foreground: #CCCCCC;
+  --vscode-menubar-selectionbackground: #0078D433;
+  --vscode-activitybar-hoverbackground: #FFFFFF1A;
+  --vscode-sidebarsectionheader-background: #181818;
+  --vscode-sidebar-border: #2B2B2B;
+  --vscode-tab-hoverbackground: #1F1F1F;
+  --vscode-tab-border: #181818;
+  --vscode-tab-activeborder: #0078D4;
+  --vscode-panelheader-background: #181818;
+  --vscode-quickinput-background: #252526;
+  --vscode-quickinput-foreground: #CCCCCC;
+  --vscode-quickinput-border: #2B2B2B;
+  --vscode-quickinputlist-focusbackground: #04395E;
+  --vscode-dropdown-background: #252526;
+  --vscode-list-activeselectionbackground: #04395E;
+  --vscode-list-inactiveselectionbackground: #37373D;
+  --vscode-editorgroup-border: #2B2B2B;
+  --vscode-sash-hoverborder: #0078D4;
+  --vscode-scrollbarslider-background: #79797966;
+  --vscode-scrollbarslider-hoverbackground: #646464B3;
+  --vscode-scrollbarslider-activebackground: #BFBFBF66;
 }
 
 :root[data-theme="light"] {
@@ -26,11 +60,42 @@
   --vscode-editor-foreground: #3B3B3B;
   --vscode-activitybar-background: #F8F8F8;
   --vscode-activitybar-foreground: #1F1F1F;
+  --vscode-activitybar-activebackground: #FFFFFF;
+  --vscode-activitybar-activeforeground: #1F1F1F;
   --vscode-sidebar-background: #F8F8F8;
   --vscode-sidebar-foreground: #3B3B3B;
   --vscode-statusbar-background: #F8F8F8;
   --vscode-statusbar-foreground: #3B3B3B;
+  --vscode-tab-activebackground: #FFFFFF;
+  --vscode-tab-inactivebackground: #F8F8F8;
+  --vscode-tab-activeforeground: #1F1F1F;
+  --vscode-tab-inactiveforeground: #6F6F6F;
   --vscode-panel-background: #F8F8F8;
   --vscode-panel-border: #E5E5E5;
   --vscode-focusborder: #005FB8;
+  --vscode-widget-shadow: rgba(0,0,0,0.16);
+  --vscode-titlebar-activebackground: #F8F8F8;
+  --vscode-titlebar-activeforeground: #3B3B3B;
+  --vscode-menubar-background: #F8F8F8;
+  --vscode-menubar-foreground: #3B3B3B;
+  --vscode-menubar-selectionbackground: #005FB81F;
+  --vscode-activitybar-hoverbackground: #0000001A;
+  --vscode-sidebarsectionheader-background: #F8F8F8;
+  --vscode-sidebar-border: #E5E5E5;
+  --vscode-tab-hoverbackground: #FFFFFF;
+  --vscode-tab-border: #E5E5E5;
+  --vscode-tab-activeborder: #005FB8;
+  --vscode-panelheader-background: #F8F8F8;
+  --vscode-quickinput-background: #F8F8F8;
+  --vscode-quickinput-foreground: #3B3B3B;
+  --vscode-quickinput-border: #E5E5E5;
+  --vscode-quickinputlist-focusbackground: #0060C040;
+  --vscode-dropdown-background: #FFFFFF;
+  --vscode-list-activeselectionbackground: #0060C040;
+  --vscode-list-inactiveselectionbackground: #E4E6F1;
+  --vscode-editorgroup-border: #E5E5E5;
+  --vscode-sash-hoverborder: #005FB8;
+  --vscode-scrollbarslider-background: #64646466;
+  --vscode-scrollbarslider-hoverbackground: #646464B3;
+  --vscode-scrollbarslider-activebackground: #000000A6;
 }

@@ -42,7 +42,8 @@ pub fn App() -> Element {
     let tabs: Signal<TabManager> = use_signal(TabManager::new);
     use_context_provider(|| tabs);
 
-    let active: Signal<Option<ActivityItemId>> = use_signal(|| None);
+    let active: Signal<Option<ActivityItemId>> =
+        use_signal(|| Some(ActivityItemId("notes-explorer:default".to_string())));
     use_context_provider(|| ActiveActivity(active));
 
     let last_active: Signal<Option<ActivityItemId>> = use_signal(|| None);
@@ -95,11 +96,19 @@ pub fn App() -> Element {
         log_info!(log_buffer, "Operon: ready");
     });
 
-    let snapshot = theme.read();
-    let data = snapshot.data_attr();
-    let data_id = snapshot.data_id_attr();
-    let style = snapshot.css_variables();
-    drop(snapshot);
+    use_effect(move || {
+        let snapshot = theme.read();
+        let data = snapshot.data_attr();
+        let data_id = snapshot.data_id_attr();
+        let style = snapshot.css_variables();
+        drop(snapshot);
+        let script = format!(
+            "document.documentElement.setAttribute('data-theme', '{data}');\
+             document.documentElement.setAttribute('data-theme-id', '{data_id}');\
+             document.documentElement.setAttribute('style', '{style}');"
+        );
+        document::eval(&script);
+    });
 
     rsx! {
         document::Link { rel: "icon", href: FAVICON }
@@ -110,9 +119,6 @@ pub fn App() -> Element {
         document::Stylesheet { href: MARKDOWN_CSS }
         div {
             id: "operon-root",
-            "data-theme": "{data}",
-            "data-theme-id": "{data_id}",
-            style: "{style}",
             Shell {}
         }
     }
