@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use operon_auth::email::{EmailSender, LogEmailSender};
+use operon_notes::NoteHub;
 use operon_store::repos::{
     SqliteAttachmentRepository, SqliteAuditLogRepository, SqliteDepartmentRepository,
     SqliteInviteRepository, SqliteMembershipRepository, SqliteNoteRepository,
-    SqliteOrgRepository, SqliteProjectRepository, SqliteSessionRepository,
-    SqliteTeamMemberRepository, SqliteTeamProjectRepository, SqliteTeamRepository,
-    SqliteUserRepository,
+    SqliteNoteUpdateRepository, SqliteOrgRepository, SqliteProjectRepository,
+    SqliteSessionRepository, SqliteTeamMemberRepository, SqliteTeamProjectRepository,
+    SqliteTeamRepository, SqliteUserRepository,
 };
 use operon_store::{Store, StoreConfig, StoreMode};
 
@@ -27,7 +28,9 @@ pub struct AppState {
     pub invites: Arc<SqliteInviteRepository>,
     pub attachments: Arc<SqliteAttachmentRepository>,
     pub audit: Arc<SqliteAuditLogRepository>,
+    pub note_updates: Arc<SqliteNoteUpdateRepository>,
     pub email: Arc<dyn EmailSender>,
+    pub hub: Arc<NoteHub>,
 }
 
 impl AppState {
@@ -46,13 +49,18 @@ impl AppState {
 
     pub fn from_store(store: Store, hostname: String) -> Self {
         let email: Arc<dyn EmailSender> = Arc::new(LogEmailSender);
+        let notes_arc: Arc<SqliteNoteRepository> =
+            Arc::new(SqliteNoteRepository::new(store.clone()));
+        let note_updates_arc: Arc<SqliteNoteUpdateRepository> =
+            Arc::new(SqliteNoteUpdateRepository::new(store.clone()));
+        let hub = Arc::new(NoteHub::new(notes_arc.clone(), note_updates_arc.clone()));
         Self {
             users: Arc::new(SqliteUserRepository::new(store.clone())),
             orgs: Arc::new(SqliteOrgRepository::new(store.clone())),
             departments: Arc::new(SqliteDepartmentRepository::new(store.clone())),
             teams: Arc::new(SqliteTeamRepository::new(store.clone())),
             projects: Arc::new(SqliteProjectRepository::new(store.clone())),
-            notes: Arc::new(SqliteNoteRepository::new(store.clone())),
+            notes: notes_arc,
             memberships: Arc::new(SqliteMembershipRepository::new(store.clone())),
             team_members: Arc::new(SqliteTeamMemberRepository::new(store.clone())),
             team_projects: Arc::new(SqliteTeamProjectRepository::new(store.clone())),
@@ -60,7 +68,9 @@ impl AppState {
             invites: Arc::new(SqliteInviteRepository::new(store.clone())),
             attachments: Arc::new(SqliteAttachmentRepository::new(store.clone())),
             audit: Arc::new(SqliteAuditLogRepository::new(store.clone())),
+            note_updates: note_updates_arc,
             email,
+            hub,
             hostname,
             store,
         }
