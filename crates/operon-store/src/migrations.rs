@@ -2,11 +2,18 @@ use rusqlite::Connection;
 
 use crate::error::StoreError;
 
-const MIGRATIONS: &[(i64, &str, &str)] = &[(
-    1,
-    "001_initial",
-    include_str!("../migrations/001_initial.sql"),
-)];
+const MIGRATIONS: &[(i64, &str, &str)] = &[
+    (
+        1,
+        "001_initial",
+        include_str!("../migrations/001_initial.sql"),
+    ),
+    (
+        2,
+        "002_users_password_flags",
+        include_str!("../migrations/002_users_password_flags.sql"),
+    ),
+];
 
 fn ensure_migrations_table(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch(
