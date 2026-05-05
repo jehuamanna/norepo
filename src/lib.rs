@@ -7,6 +7,7 @@ pub mod agent;
 pub mod app;
 pub mod commands;
 pub mod editor;
+pub mod local_mode;
 pub mod log;
 pub mod panel;
 pub mod persistence;

@@ -76,6 +76,9 @@ uuid = { version = "1", features = ["v4", "serde", "js"] }
 notify = "6"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+# Plans-Phase-1: Local Mode wires the SQLite-backed local_user / local_app_settings
+# repos into the desktop app. rusqlite is bundled and gated on non-wasm targets.
+operon-store = { path = "crates/operon-store" }
 
 [features]
 default = ["desktop"]

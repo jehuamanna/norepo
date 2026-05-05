@@ -4885,6 +4885,7 @@ dependencies = [
  "operon-core",
  "operon-plugins-anthropic",
  "operon-plugins-mcp",
+ "operon-store",
  "pretty_assertions",
  "pulldown-cmark",
  "serde",

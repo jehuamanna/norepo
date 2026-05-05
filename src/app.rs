@@ -8,11 +8,13 @@ use dioxus::prelude::*;
 use std::sync::Arc;
 
 use crate::commands::{register_builtin_commands, CommandRegistry, PaletteState};
+use crate::local_mode::{LocalShell, StartupChooser};
 use crate::log::LogBuffer;
 use crate::log_info;
 use crate::panel::PanelManager;
 use crate::persistence::{MemoryPersistence, Persistence};
 use crate::plugin::{register_builtins, PluginContext, PluginRegistry};
+use crate::rbag::state::{AppState, Mode};
 use crate::shell::layout::{DragState, LayoutState};
 use crate::shell::menubar::MenuId;
 use crate::shell::state::{ActiveActivity, ActivityItemId, LastActiveActivity};
@@ -67,7 +69,31 @@ pub fn App() -> Element {
     let mut log_buffer: Signal<LogBuffer> = use_signal(LogBuffer::new);
     use_context_provider(|| log_buffer);
 
-    let persistence = provide_persistence();
+    // Local Mode wiring: install the LocalUserRepo / LocalSettingsRepo before any
+    // component (e.g. StartupChooser, LocalShell) reads them. Then resolve the
+    // remembered mode from local_app_settings; if absent, AppState defaults to
+    // NonLocal but we render the chooser instead of mounting a shell.
+    crate::local_mode::provide_local_state();
+
+    let mut app_state: Signal<AppState> = use_signal(AppState::default);
+    use_context_provider(|| app_state);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let initial_mode_remembered: Option<Mode> = {
+        let crate::local_mode::LocalSettingsRepo(settings) = use_context();
+        use_hook(|| crate::local_mode::read_remembered_mode(&settings))
+    };
+    #[cfg(target_arch = "wasm32")]
+    let initial_mode_remembered: Option<Mode> = Some(Mode::NonLocal);
+
+    use_hook(|| {
+        if let Some(m) = initial_mode_remembered {
+            app_state.with_mut(|s| s.mode = m);
+        }
+    });
+
+    let resolved_mode = app_state.read().mode;
+    let persistence = provide_persistence(resolved_mode);
     let scheduler = SaveScheduler::new(persistence.clone());
     use_context_provider(|| persistence);
     use_context_provider(|| scheduler);
@@ -110,6 +136,9 @@ pub fn App() -> Element {
         document::eval(&script);
     });
 
+    let mode_known = initial_mode_remembered.is_some();
+    let current_mode = app_state.read().mode;
+
     rsx! {
         document::Link { rel: "icon", href: FAVICON }
         document::Stylesheet { href: MAIN_CSS }
@@ -119,20 +148,30 @@ pub fn App() -> Element {
         document::Stylesheet { href: MARKDOWN_CSS }
         div {
             id: "operon-root",
-            Shell {}
+            if !mode_known {
+                StartupChooser {}
+            } else if current_mode == Mode::Local {
+                LocalShell {}
+            } else {
+                Shell {}
+            }
         }
     }
 }
 
 /// Construct the per-platform `Persistence` for the running app. On desktop, attempts to use
 /// `~/.local/share/operon/notes` (or the OS-equivalent) and falls back to `MemoryPersistence`
-/// if directory creation fails. On wasm, returns `MemoryPersistence` until Phase 3 lands the
-/// real `WebPersistence` (OPFS first, IndexedDB fallback).
-fn provide_persistence() -> Arc<dyn Persistence> {
+/// if directory creation fails. Local Mode roots persistence under a `local/` subdir so it
+/// stays separate from cloud-mode synced state. On wasm, returns `MemoryPersistence` until
+/// Phase 3 lands the real `WebPersistence` (OPFS first, IndexedDB fallback).
+fn provide_persistence(mode: Mode) -> Arc<dyn Persistence> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         use crate::persistence::FilesystemPersistence;
-        let dir = default_notes_dir();
+        let dir = match mode {
+            Mode::Local => default_notes_dir().join("local"),
+            Mode::NonLocal => default_notes_dir(),
+        };
         match FilesystemPersistence::new(&dir) {
             Ok(p) => Arc::new(p),
             Err(e) => {
@@ -146,6 +185,7 @@ fn provide_persistence() -> Arc<dyn Persistence> {
     }
     #[cfg(target_arch = "wasm32")]
     {
+        let _ = mode;
         Arc::new(MemoryPersistence::new())
     }
 }
