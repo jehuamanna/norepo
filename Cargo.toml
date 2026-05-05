@@ -21,6 +21,18 @@ pulldown-cmark = { version = "0.10", default-features = false }
 # `js_sys::Date::now()` on wasm and `std::time` everywhere else.
 web-time = "1"
 
+# === Agent runtime substrate (Plans-Phase-1) ===
+async-trait = "0.1"
+bitflags = "2"
+figment = { version = "0.10", features = ["toml", "env"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
 # `web_sys` bindings used only on the wasm web build for localStorage + prefers-color-scheme.
 # Native tests stub these out so the dependency is wasm-only.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -55,10 +67,15 @@ web-sys = { version = "0.3", features = [
     "StorageManager",
     "Window",
 ] }
+tracing-wasm = "0.2"
+uuid = { version = "1", features = ["v4", "serde", "js"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 notify = "6"
 tempfile = "3"
+keyring = { version = "2", default-features = false, features = ["linux-secret-service-rt-tokio-crypto-rust"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [features]
 default = ["desktop"]

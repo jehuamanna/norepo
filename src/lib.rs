@@ -3,6 +3,7 @@
 //! The crate exposes its modules so that integration tests under `tests/` can drive the
 //! plugin/tab/command surfaces without launching the full Dioxus runtime.
 
+pub mod agent;
 pub mod app;
 pub mod commands;
 pub mod editor;
