@@ -1,7 +1,7 @@
 //! Tab strip rendered atop the main area.
 //!
 //! Reads `Signal<TabManager>` from context. Click activates a tab; clicking the close icon
-//! closes it. A `●` marker replaces the close `×` while a tab is dirty.
+//! closes it. A circle-dot marker replaces the close-x icon while a tab is dirty.
 
 use dioxus::prelude::*;
 
