@@ -9,6 +9,8 @@ mod strip;
 
 pub use strip::TabStrip;
 
+use crate::editor::{EditorMode, EditorState};
+
 /// Monotonic tab identifier. Newtype around `u64`; never reused.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct TabId(pub u64);
@@ -22,6 +24,13 @@ pub struct Tab {
     pub title: String,
     pub content: String,
     pub dirty: bool,
+    /// Active editor mode for this tab — drives which `FormatPlugin` method `MainArea`
+    /// dispatches to. Defaults to `View`.
+    pub mode: EditorMode,
+    /// Cached editor cursor / selection / scroll. Populated by `MainArea` snapshot on
+    /// mode change so re-entering Edit / LivePreview restores the user's caret in
+    /// backends that share the same offset domain.
+    pub editor_state: Option<EditorState>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -64,9 +73,34 @@ impl TabManager {
             title,
             content,
             dirty: false,
+            mode: EditorMode::default(),
+            editor_state: None,
         });
         self.active = Some(id);
         id
+    }
+
+    /// Set the editor mode for `id`. No-op if the tab doesn't exist.
+    pub fn set_mode(&mut self, id: TabId, mode: EditorMode) {
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+            t.mode = mode;
+        }
+    }
+
+    /// Snapshot the current editor cursor/selection/scroll for `id`. No-op if the tab
+    /// doesn't exist.
+    pub fn set_editor_state(&mut self, id: TabId, state: Option<EditorState>) {
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+            t.editor_state = state;
+        }
+    }
+
+    /// Update the content for `id` and flip `dirty` to true. No-op if the tab doesn't exist.
+    pub fn set_content(&mut self, id: TabId, content: String) {
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+            t.content = content;
+            t.dirty = true;
+        }
     }
 
     /// Close the tab with `id`. No-op if it doesn't exist. If the closed tab was active,

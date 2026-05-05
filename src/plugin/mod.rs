@@ -16,4 +16,4 @@ pub mod traits;
 pub use context::PluginContext;
 pub use manifest::{PluginManifest, PluginSurface};
 pub use registry::{register_builtins, PluginRegistry};
-pub use traits::{FormatPlugin, UIPlugin};
+pub use traits::{FormatCaps, FormatPlugin, UIPlugin};
