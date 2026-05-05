@@ -6,6 +6,7 @@ pub mod department;
 pub mod invite;
 pub mod local_note;
 pub mod local_project;
+pub mod local_search;
 pub mod local_settings;
 pub mod local_tree_state;
 pub mod local_user;
@@ -26,6 +27,9 @@ pub use department::{Department, DepartmentRepository, SqliteDepartmentRepositor
 pub use invite::{Invite, InviteRepository, SqliteInviteRepository};
 pub use local_note::{LocalNote, LocalNoteRepository, SqliteLocalNoteRepository};
 pub use local_project::{LocalProject, LocalProjectRepository, SqliteLocalProjectRepository};
+pub use local_search::{
+    LocalSearchRepository, SearchHit, SearchKind, SqliteLocalSearchRepository, DEFAULT_SEARCH_LIMIT,
+};
 pub use local_settings::{LocalSettingsRepository, SqliteLocalSettingsRepository};
 pub use local_tree_state::{LocalTreeStateRepository, SqliteLocalTreeStateRepository};
 pub use local_user::{LocalUser, LocalUserRepository, SqliteLocalUserRepository};
