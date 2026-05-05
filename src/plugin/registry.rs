@@ -97,10 +97,14 @@ pub fn register_builtins(
     registry: &mut PluginRegistry,
     _ctx: &PluginContext,
 ) -> Result<(), String> {
+    use crate::plugins::json_format::JsonFormatPlugin;
     use crate::plugins::markdown::MarkdownFormatPlugin;
     use crate::plugins::notes_explorer::NotesExplorer;
+    use crate::plugins::plaintext::PlaintextFormatPlugin;
     registry.add_ui_plugin(Box::new(NotesExplorer::new()))?;
     registry.add_format_plugin(Box::new(MarkdownFormatPlugin::new()))?;
+    registry.add_format_plugin(Box::new(PlaintextFormatPlugin::new()))?;
+    registry.add_format_plugin(Box::new(JsonFormatPlugin::new()))?;
     Ok(())
 }
 

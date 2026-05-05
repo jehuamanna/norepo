@@ -50,7 +50,7 @@ pub enum EditorCommand {
 /// Static descriptor a format plugin hands the editor backend at mount time. `monaco_language`
 /// is one of Monaco's built-in language ids (`"markdown"`, `"json"`, `"plaintext"`);
 /// `monarch_grammar` is the optional per-format Monarch tokenizer (used by Phase-6 MDX).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LanguageDescriptor {
     pub id: &'static str,
     pub monaco_language: &'static str,

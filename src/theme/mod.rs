@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 pub mod contrast;
 pub mod defaults;
+pub mod editor_theme;
 pub mod id;
 pub mod palettes;
 pub mod persistence;
