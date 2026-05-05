@@ -13,7 +13,7 @@ use crate::plugin::PluginRegistry;
 use crate::shell::layout::LayoutState;
 use crate::shell::state::ActivityItemId;
 use crate::tabs::TabManager;
-use crate::theme::{Theme, ThemeRegistry};
+use crate::theme::{Theme, ThemeId, ThemeRegistry};
 
 pub mod builtins;
 pub mod fuzzy;
@@ -27,6 +27,7 @@ pub use palette::CommandPalette;
 pub enum PaletteMode {
     Commands,
     Notes,
+    Themes,
 }
 
 /// Reactive palette state, provided as `Signal<PaletteState>`.
@@ -36,6 +37,13 @@ pub struct PaletteState {
     pub mode: PaletteMode,
     pub query: String,
     pub selection: usize,
+    /// Theme picker only: the theme id active at the moment the picker was opened. Set when
+    /// entering [`PaletteMode::Themes`] and consulted on Escape / backdrop close to restore
+    /// the prior theme. Always cleared when the palette closes.
+    pub themes_original: Option<ThemeId>,
+    /// Theme picker only: the id most recently applied as a live preview. Used to de-bounce
+    /// repeated `theme_signal.set` calls when the focused row hasn't changed.
+    pub themes_focus_cache: Option<ThemeId>,
 }
 
 impl Default for PaletteState {
@@ -45,6 +53,8 @@ impl Default for PaletteState {
             mode: PaletteMode::Commands,
             query: String::new(),
             selection: 0,
+            themes_original: None,
+            themes_focus_cache: None,
         }
     }
 }

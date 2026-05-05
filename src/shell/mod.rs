@@ -123,6 +123,8 @@ pub fn Shell() -> Element {
                         mode,
                         query: String::new(),
                         selection: 0,
+                        themes_original: None,
+                        themes_focus_cache: None,
                     });
                     event.prevent_default();
                     return;

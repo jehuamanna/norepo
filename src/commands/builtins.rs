@@ -30,6 +30,29 @@ pub fn register_builtin_commands(reg: &mut CommandRegistry) -> Result<(), String
     })?;
 
     reg.register(Command {
+        id: "workbench.action.selectTheme".into(),
+        title: "Color Theme...".into(),
+        category: "View".into(),
+        handler: Box::new(|ctx: &CommandContext| {
+            // Capture the currently active theme so Escape can revert.
+            let original = ctx.theme.read().id;
+            let active_idx = crate::theme::ThemeId::ALL
+                .iter()
+                .position(|&id| id == original)
+                .unwrap_or(0);
+            let mut palette = ctx.palette;
+            palette.set(PaletteState {
+                open: true,
+                mode: PaletteMode::Themes,
+                query: String::new(),
+                selection: active_idx,
+                themes_original: Some(original),
+                themes_focus_cache: Some(original),
+            });
+        }),
+    })?;
+
+    reg.register(Command {
         id: "view.closeActiveTab".into(),
         title: "Close Active Tab".into(),
         category: "View".into(),
@@ -97,6 +120,8 @@ pub fn register_builtin_commands(reg: &mut CommandRegistry) -> Result<(), String
                 mode: PaletteMode::Notes,
                 query: String::new(),
                 selection: 0,
+                themes_original: None,
+                themes_focus_cache: None,
             });
         }),
     })?;
@@ -112,6 +137,8 @@ pub fn register_builtin_commands(reg: &mut CommandRegistry) -> Result<(), String
                 mode: PaletteMode::Notes,
                 query: String::new(),
                 selection: 0,
+                themes_original: None,
+                themes_focus_cache: None,
             });
         }),
     })?;
@@ -127,6 +154,8 @@ pub fn register_builtin_commands(reg: &mut CommandRegistry) -> Result<(), String
                 mode: PaletteMode::Commands,
                 query: String::new(),
                 selection: 0,
+                themes_original: None,
+                themes_focus_cache: None,
             });
         }),
     })?;
@@ -155,6 +184,7 @@ mod tests {
                 "view.togglePanel".into(),
                 "view.toggleSideBar".into(),
                 "view.toggleTheme".into(),
+                "workbench.action.selectTheme".into(),
             ]
         );
     }
