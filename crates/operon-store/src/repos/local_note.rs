@@ -37,6 +37,49 @@ pub trait LocalNoteRepository: Send + Sync {
     fn rename(&self, id: Uuid, title: &str) -> Result<(), StoreError>;
     fn delete(&self, id: Uuid) -> Result<(), StoreError>;
     fn touch_updated(&self, id: Uuid) -> Result<(), StoreError>;
+
+    /// Move `id` to `(new_project_id, new_parent, new_sibling_index)`. The whole
+    /// subtree (descendants) follows. Sibling indexes in the destination are
+    /// shifted to keep the dense ordering invariant. Atomic in a single tx.
+    /// Returns `InvalidArgument` if the move would create a cycle (target is
+    /// the node itself or one of its descendants).
+    fn move_to(
+        &self,
+        id: Uuid,
+        new_project_id: Uuid,
+        new_parent: Option<Uuid>,
+        new_sibling_index: i64,
+    ) -> Result<(), StoreError>;
+
+    /// Deep-copy the subtree rooted at `id` into
+    /// `(into_project, into_parent, new_sibling_index)`. New UUIDs are minted
+    /// for every node; structure (depth, sibling_index relative to siblings,
+    /// parent links) is preserved. Atomic in a single tx. Returns the new
+    /// root's id.
+    fn duplicate_subtree(
+        &self,
+        id: Uuid,
+        into_project: Uuid,
+        into_parent: Option<Uuid>,
+        new_sibling_index: i64,
+    ) -> Result<Uuid, StoreError>;
+
+    /// Reparent `id` so it becomes the last child of its previous sibling.
+    /// No-op when the node is already the first sibling at its level.
+    fn indent(&self, id: Uuid) -> Result<(), StoreError>;
+
+    /// Reparent `id` to its grandparent (or to project root when
+    /// grandparent is `None`), placing it immediately after the old parent.
+    /// No-op when the node is already at depth 0.
+    fn outdent(&self, id: Uuid) -> Result<(), StoreError>;
+
+    /// Swap `sibling_index` with the previous sibling at the same level.
+    /// No-op at the first sibling.
+    fn move_up(&self, id: Uuid) -> Result<(), StoreError>;
+
+    /// Swap `sibling_index` with the next sibling at the same level.
+    /// No-op at the last sibling.
+    fn move_down(&self, id: Uuid) -> Result<(), StoreError>;
 }
 
 pub struct SqliteLocalNoteRepository {
@@ -230,6 +273,724 @@ impl LocalNoteRepository for SqliteLocalNoteRepository {
         }
         Ok(())
     }
+
+    fn move_to(
+        &self,
+        id: Uuid,
+        new_project_id: Uuid,
+        new_parent: Option<Uuid>,
+        new_sibling_index: i64,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.store.conn()?;
+        let tx = conn.transaction()?;
+
+        // Load the moved node.
+        let node_row: Option<(String, Option<String>, i64, i64)> = tx
+            .query_row(
+                "SELECT project_id, parent_id, sibling_index, depth FROM local_note WHERE id = ?1",
+                params![id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((old_project_text, old_parent_text, old_sibling_index, old_depth)) = node_row
+        else {
+            return Err(StoreError::NotFound);
+        };
+        let old_project = Uuid::parse_str(&old_project_text).map_err(|_| {
+            StoreError::InvalidArgument(format!("invalid uuid: {old_project_text}"))
+        })?;
+        let old_parent = match old_parent_text {
+            Some(s) => Some(
+                Uuid::parse_str(&s)
+                    .map_err(|_| StoreError::InvalidArgument(format!("invalid uuid: {s}")))?,
+            ),
+            None => None,
+        };
+
+        // Reject moving onto self.
+        if new_parent == Some(id) {
+            return Err(StoreError::InvalidArgument(
+                "cannot move a note inside itself".into(),
+            ));
+        }
+
+        // Validate the new parent (when set) belongs to the destination project,
+        // and detect cycle (target is a descendant of the moved node).
+        let new_parent_depth = match new_parent {
+            Some(npid) => {
+                let parent_row: Option<(String, i64)> = tx
+                    .query_row(
+                        "SELECT project_id, depth FROM local_note WHERE id = ?1",
+                        params![npid.to_string()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()?;
+                let (parent_project_text, parent_depth) = parent_row.ok_or_else(|| {
+                    StoreError::InvalidArgument(format!("parent note {npid} not found"))
+                })?;
+                let parent_project_uuid = Uuid::parse_str(&parent_project_text)
+                    .map_err(|_| invalid_uuid(parent_project_text))?;
+                if parent_project_uuid != new_project_id {
+                    return Err(StoreError::InvalidArgument(
+                        "parent note belongs to a different project".into(),
+                    ));
+                }
+                // Cycle check: walk up from new_parent through ancestors. If we
+                // ever hit `id`, the move would be cyclic.
+                let mut cursor = Some(npid);
+                while let Some(c) = cursor {
+                    if c == id {
+                        return Err(StoreError::InvalidArgument(
+                            "cannot move a note into one of its descendants".into(),
+                        ));
+                    }
+                    let next: Option<String> = tx
+                        .query_row(
+                            "SELECT parent_id FROM local_note WHERE id = ?1",
+                            params![c.to_string()],
+                            |row| row.get::<_, Option<String>>(0),
+                        )
+                        .optional()?
+                        .flatten();
+                    cursor = match next {
+                        Some(s) => Some(Uuid::parse_str(&s).map_err(|_| {
+                            StoreError::InvalidArgument(format!("invalid uuid: {s}"))
+                        })?),
+                        None => None,
+                    };
+                }
+                parent_depth
+            }
+            None => -1,
+        };
+        let new_depth = new_parent_depth + 1;
+
+        // Sibling-index shifts are split based on whether the move stays inside
+        // the same (project, parent) bucket.
+        let same_bucket = old_project == new_project_id && old_parent == new_parent;
+        let now = now_ms();
+
+        // Compute the dest count BEFORE removing the source slot in same-bucket cases.
+        let dest_count: i64 = match new_parent {
+            Some(npid) => tx.query_row(
+                "SELECT COUNT(*) FROM local_note
+                 WHERE project_id = ?1 AND parent_id = ?2",
+                params![new_project_id.to_string(), npid.to_string()],
+                |row| row.get(0),
+            )?,
+            None => tx.query_row(
+                "SELECT COUNT(*) FROM local_note
+                 WHERE project_id = ?1 AND parent_id IS NULL",
+                params![new_project_id.to_string()],
+                |row| row.get(0),
+            )?,
+        };
+
+        if same_bucket {
+            let max_target = dest_count.saturating_sub(1);
+            let target = new_sibling_index.clamp(0, max_target);
+            if target != old_sibling_index {
+                if target > old_sibling_index {
+                    // Shift (old, target] up by one.
+                    match new_parent {
+                        Some(npid) => {
+                            tx.execute(
+                                "UPDATE local_note SET sibling_index = sibling_index - 1
+                                 WHERE project_id = ?1 AND parent_id = ?2
+                                   AND sibling_index > ?3 AND sibling_index <= ?4",
+                                params![
+                                    new_project_id.to_string(),
+                                    npid.to_string(),
+                                    old_sibling_index,
+                                    target
+                                ],
+                            )?;
+                        }
+                        None => {
+                            tx.execute(
+                                "UPDATE local_note SET sibling_index = sibling_index - 1
+                                 WHERE project_id = ?1 AND parent_id IS NULL
+                                   AND sibling_index > ?2 AND sibling_index <= ?3",
+                                params![new_project_id.to_string(), old_sibling_index, target],
+                            )?;
+                        }
+                    }
+                } else {
+                    // Shift [target, old) down by one.
+                    match new_parent {
+                        Some(npid) => {
+                            tx.execute(
+                                "UPDATE local_note SET sibling_index = sibling_index + 1
+                                 WHERE project_id = ?1 AND parent_id = ?2
+                                   AND sibling_index >= ?3 AND sibling_index < ?4",
+                                params![
+                                    new_project_id.to_string(),
+                                    npid.to_string(),
+                                    target,
+                                    old_sibling_index
+                                ],
+                            )?;
+                        }
+                        None => {
+                            tx.execute(
+                                "UPDATE local_note SET sibling_index = sibling_index + 1
+                                 WHERE project_id = ?1 AND parent_id IS NULL
+                                   AND sibling_index >= ?2 AND sibling_index < ?3",
+                                params![new_project_id.to_string(), target, old_sibling_index],
+                            )?;
+                        }
+                    }
+                }
+                tx.execute(
+                    "UPDATE local_note SET sibling_index = ?2, updated_at_ms = ?3 WHERE id = ?1",
+                    params![id.to_string(), target, now],
+                )?;
+            }
+        } else {
+            // Cross-bucket move. Close the gap in the source bucket; open a slot
+            // in the destination bucket.
+            match old_parent {
+                Some(opid) => {
+                    tx.execute(
+                        "UPDATE local_note SET sibling_index = sibling_index - 1
+                         WHERE project_id = ?1 AND parent_id = ?2
+                           AND sibling_index > ?3",
+                        params![old_project.to_string(), opid.to_string(), old_sibling_index],
+                    )?;
+                }
+                None => {
+                    tx.execute(
+                        "UPDATE local_note SET sibling_index = sibling_index - 1
+                         WHERE project_id = ?1 AND parent_id IS NULL
+                           AND sibling_index > ?2",
+                        params![old_project.to_string(), old_sibling_index],
+                    )?;
+                }
+            }
+
+            let max_target = dest_count;
+            let target = new_sibling_index.clamp(0, max_target);
+            match new_parent {
+                Some(npid) => {
+                    tx.execute(
+                        "UPDATE local_note SET sibling_index = sibling_index + 1
+                         WHERE project_id = ?1 AND parent_id = ?2
+                           AND sibling_index >= ?3",
+                        params![new_project_id.to_string(), npid.to_string(), target],
+                    )?;
+                }
+                None => {
+                    tx.execute(
+                        "UPDATE local_note SET sibling_index = sibling_index + 1
+                         WHERE project_id = ?1 AND parent_id IS NULL
+                           AND sibling_index >= ?2",
+                        params![new_project_id.to_string(), target],
+                    )?;
+                }
+            }
+
+            // Update the moved node itself.
+            tx.execute(
+                "UPDATE local_note
+                 SET project_id = ?2, parent_id = ?3, sibling_index = ?4,
+                     depth = ?5, updated_at_ms = ?6
+                 WHERE id = ?1",
+                params![
+                    id.to_string(),
+                    new_project_id.to_string(),
+                    new_parent.map(|p| p.to_string()),
+                    target,
+                    new_depth,
+                    now,
+                ],
+            )?;
+
+            // Recompute depth + project_id for descendants. delta = new_depth - old_depth.
+            let delta = new_depth - old_depth;
+            // Walk the subtree breadth-first, collecting ids.
+            let mut ids: Vec<String> = Vec::new();
+            let mut frontier: Vec<String> = vec![id.to_string()];
+            while let Some(parent_text) = frontier.pop() {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM local_note
+                     WHERE parent_id = ?1",
+                )?;
+                let rows = stmt.query_map(params![parent_text], |row| row.get::<_, String>(0))?;
+                for r in rows {
+                    let child = r?;
+                    ids.push(child.clone());
+                    frontier.push(child);
+                }
+            }
+            for child_id in ids {
+                tx.execute(
+                    "UPDATE local_note SET project_id = ?2, depth = depth + ?3, updated_at_ms = ?4
+                     WHERE id = ?1",
+                    params![child_id, new_project_id.to_string(), delta, now],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn duplicate_subtree(
+        &self,
+        id: Uuid,
+        into_project: Uuid,
+        into_parent: Option<Uuid>,
+        new_sibling_index: i64,
+    ) -> Result<Uuid, StoreError> {
+        let mut conn = self.store.conn()?;
+        let tx = conn.transaction()?;
+
+        // Validate destination parent (when set).
+        let dest_parent_depth = match into_parent {
+            Some(pid) => {
+                let parent_row: Option<(String, i64)> = tx
+                    .query_row(
+                        "SELECT project_id, depth FROM local_note WHERE id = ?1",
+                        params![pid.to_string()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()?;
+                let (parent_project_text, parent_depth) = parent_row.ok_or_else(|| {
+                    StoreError::InvalidArgument(format!("parent note {pid} not found"))
+                })?;
+                let parent_project_uuid = Uuid::parse_str(&parent_project_text)
+                    .map_err(|_| invalid_uuid(parent_project_text))?;
+                if parent_project_uuid != into_project {
+                    return Err(StoreError::InvalidArgument(
+                        "parent note belongs to a different project".into(),
+                    ));
+                }
+                parent_depth
+            }
+            None => -1,
+        };
+
+        // Load the source root.
+        let source_row: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT depth, title FROM local_note WHERE id = ?1",
+                params![id.to_string()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((source_depth, source_title)) = source_row else {
+            return Err(StoreError::NotFound);
+        };
+
+        // Open a slot in destination bucket.
+        let dest_count: i64 = match into_parent {
+            Some(pid) => tx.query_row(
+                "SELECT COUNT(*) FROM local_note
+                 WHERE project_id = ?1 AND parent_id = ?2",
+                params![into_project.to_string(), pid.to_string()],
+                |row| row.get(0),
+            )?,
+            None => tx.query_row(
+                "SELECT COUNT(*) FROM local_note
+                 WHERE project_id = ?1 AND parent_id IS NULL",
+                params![into_project.to_string()],
+                |row| row.get(0),
+            )?,
+        };
+        let target = new_sibling_index.clamp(0, dest_count);
+        match into_parent {
+            Some(pid) => {
+                tx.execute(
+                    "UPDATE local_note SET sibling_index = sibling_index + 1
+                     WHERE project_id = ?1 AND parent_id = ?2 AND sibling_index >= ?3",
+                    params![into_project.to_string(), pid.to_string(), target],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "UPDATE local_note SET sibling_index = sibling_index + 1
+                     WHERE project_id = ?1 AND parent_id IS NULL AND sibling_index >= ?2",
+                    params![into_project.to_string(), target],
+                )?;
+            }
+        }
+
+        let now = now_ms();
+        let new_root_id = Uuid::new_v4();
+        let new_root_depth = dest_parent_depth + 1;
+        tx.execute(
+            "INSERT INTO local_note (id, project_id, parent_id, sibling_index, depth,
+                                     title, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![
+                new_root_id.to_string(),
+                into_project.to_string(),
+                into_parent.map(|p| p.to_string()),
+                target,
+                new_root_depth,
+                source_title,
+                now,
+            ],
+        )?;
+
+        // BFS over source descendants, mapping original id -> new id, copying
+        // them in order of (parent, sibling_index).
+        let mut id_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        id_map.insert(id.to_string(), new_root_id.to_string());
+        let depth_delta = new_root_depth - source_depth;
+        let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        queue.push_back(id.to_string());
+        while let Some(parent_text) = queue.pop_front() {
+            let new_parent_text = id_map.get(&parent_text).cloned().expect("parent mapped");
+            let mut stmt = tx.prepare(
+                "SELECT id, sibling_index, depth, title FROM local_note
+                 WHERE parent_id = ?1
+                 ORDER BY sibling_index ASC",
+            )?;
+            let rows = stmt.query_map(params![parent_text], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            // Materialise so we can re-borrow tx for inserts.
+            let collected: Vec<(String, i64, i64, String)> = rows.collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            for (child_old_id, child_sibling, child_depth, child_title) in collected {
+                let child_new_id = Uuid::new_v4().to_string();
+                tx.execute(
+                    "INSERT INTO local_note (id, project_id, parent_id, sibling_index, depth,
+                                             title, created_at_ms, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                    params![
+                        child_new_id,
+                        into_project.to_string(),
+                        new_parent_text,
+                        child_sibling,
+                        child_depth + depth_delta,
+                        child_title,
+                        now,
+                    ],
+                )?;
+                id_map.insert(child_old_id.clone(), child_new_id);
+                queue.push_back(child_old_id);
+            }
+        }
+
+        tx.commit()?;
+        Ok(new_root_id)
+    }
+
+    fn indent(&self, id: Uuid) -> Result<(), StoreError> {
+        let mut conn = self.store.conn()?;
+        let tx = conn.transaction()?;
+        let row: Option<(String, Option<String>, i64, i64)> = tx
+            .query_row(
+                "SELECT project_id, parent_id, sibling_index, depth FROM local_note WHERE id = ?1",
+                params![id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((project_text, parent_text, sibling_index, old_depth)) = row else {
+            return Err(StoreError::NotFound);
+        };
+        if sibling_index == 0 {
+            tx.commit()?;
+            return Ok(());
+        }
+        let project_id = Uuid::parse_str(&project_text).map_err(|_| invalid_uuid(project_text))?;
+
+        // Find the previous sibling.
+        let prev_sibling: Option<String> = match &parent_text {
+            Some(pt) => tx
+                .query_row(
+                    "SELECT id FROM local_note
+                     WHERE project_id = ?1 AND parent_id = ?2 AND sibling_index = ?3",
+                    params![project_id.to_string(), pt, sibling_index - 1],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?,
+            None => tx
+                .query_row(
+                    "SELECT id FROM local_note
+                     WHERE project_id = ?1 AND parent_id IS NULL AND sibling_index = ?2",
+                    params![project_id.to_string(), sibling_index - 1],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?,
+        };
+        let Some(prev_sibling_text) = prev_sibling else {
+            tx.commit()?;
+            return Ok(());
+        };
+        let prev_sibling_id =
+            Uuid::parse_str(&prev_sibling_text).map_err(|_| invalid_uuid(prev_sibling_text))?;
+
+        // Compute new sibling_index = max child index of new parent + 1.
+        let next_index: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(sibling_index), -1) + 1 FROM local_note
+             WHERE project_id = ?1 AND parent_id = ?2",
+            params![project_id.to_string(), prev_sibling_id.to_string()],
+            |row| row.get(0),
+        )?;
+
+        // Close gap in old bucket (everything after `sibling_index`).
+        match &parent_text {
+            Some(pt) => {
+                tx.execute(
+                    "UPDATE local_note SET sibling_index = sibling_index - 1
+                     WHERE project_id = ?1 AND parent_id = ?2 AND sibling_index > ?3",
+                    params![project_id.to_string(), pt, sibling_index],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "UPDATE local_note SET sibling_index = sibling_index - 1
+                     WHERE project_id = ?1 AND parent_id IS NULL AND sibling_index > ?2",
+                    params![project_id.to_string(), sibling_index],
+                )?;
+            }
+        }
+
+        let now = now_ms();
+        let new_depth = old_depth + 1;
+        let depth_delta = new_depth - old_depth;
+        tx.execute(
+            "UPDATE local_note
+             SET parent_id = ?2, sibling_index = ?3, depth = ?4, updated_at_ms = ?5
+             WHERE id = ?1",
+            params![
+                id.to_string(),
+                prev_sibling_id.to_string(),
+                next_index,
+                new_depth,
+                now
+            ],
+        )?;
+
+        // Recompute descendant depths (delta = +1).
+        if depth_delta != 0 {
+            let mut frontier: Vec<String> = vec![id.to_string()];
+            let mut to_update: Vec<String> = Vec::new();
+            while let Some(parent_text) = frontier.pop() {
+                let mut stmt = tx.prepare("SELECT id FROM local_note WHERE parent_id = ?1")?;
+                let rows = stmt.query_map(params![parent_text], |row| row.get::<_, String>(0))?;
+                for r in rows {
+                    let c = r?;
+                    to_update.push(c.clone());
+                    frontier.push(c);
+                }
+            }
+            for child_id in to_update {
+                tx.execute(
+                    "UPDATE local_note SET depth = depth + ?2, updated_at_ms = ?3 WHERE id = ?1",
+                    params![child_id, depth_delta, now],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn outdent(&self, id: Uuid) -> Result<(), StoreError> {
+        let mut conn = self.store.conn()?;
+        let tx = conn.transaction()?;
+        let row: Option<(String, Option<String>, i64, i64)> = tx
+            .query_row(
+                "SELECT project_id, parent_id, sibling_index, depth FROM local_note WHERE id = ?1",
+                params![id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((project_text, parent_text, sibling_index, old_depth)) = row else {
+            return Err(StoreError::NotFound);
+        };
+        if old_depth == 0 || parent_text.is_none() {
+            tx.commit()?;
+            return Ok(());
+        }
+        let project_id = Uuid::parse_str(&project_text).map_err(|_| invalid_uuid(project_text))?;
+        let parent_text = parent_text.expect("checked above");
+        let parent_id =
+            Uuid::parse_str(&parent_text).map_err(|_| invalid_uuid(parent_text.clone()))?;
+
+        // Read the parent to find the grandparent + parent's sibling_index.
+        let parent_info: (Option<String>, i64) = tx.query_row(
+            "SELECT parent_id, sibling_index FROM local_note WHERE id = ?1",
+            params![parent_id.to_string()],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        let (grandparent_text, parent_sibling_index) = parent_info;
+        let grandparent_id = match grandparent_text.as_deref() {
+            Some(s) => Some(Uuid::parse_str(s).map_err(|_| invalid_uuid(s.to_string()))?),
+            None => None,
+        };
+
+        // Close gap in old (parent) bucket: everything after `sibling_index`.
+        tx.execute(
+            "UPDATE local_note SET sibling_index = sibling_index - 1
+             WHERE project_id = ?1 AND parent_id = ?2 AND sibling_index > ?3",
+            params![project_id.to_string(), parent_id.to_string(), sibling_index],
+        )?;
+
+        // Open slot at parent_sibling_index + 1 in grandparent's bucket.
+        let target = parent_sibling_index + 1;
+        match grandparent_id {
+            Some(gpid) => {
+                tx.execute(
+                    "UPDATE local_note SET sibling_index = sibling_index + 1
+                     WHERE project_id = ?1 AND parent_id = ?2 AND sibling_index >= ?3",
+                    params![project_id.to_string(), gpid.to_string(), target],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "UPDATE local_note SET sibling_index = sibling_index + 1
+                     WHERE project_id = ?1 AND parent_id IS NULL AND sibling_index >= ?2",
+                    params![project_id.to_string(), target],
+                )?;
+            }
+        }
+
+        let now = now_ms();
+        let new_depth = old_depth - 1;
+        let depth_delta = new_depth - old_depth;
+        tx.execute(
+            "UPDATE local_note
+             SET parent_id = ?2, sibling_index = ?3, depth = ?4, updated_at_ms = ?5
+             WHERE id = ?1",
+            params![
+                id.to_string(),
+                grandparent_id.map(|g| g.to_string()),
+                target,
+                new_depth,
+                now
+            ],
+        )?;
+
+        // Recompute descendant depths (delta = -1).
+        if depth_delta != 0 {
+            let mut frontier: Vec<String> = vec![id.to_string()];
+            let mut to_update: Vec<String> = Vec::new();
+            while let Some(parent_text) = frontier.pop() {
+                let mut stmt = tx.prepare("SELECT id FROM local_note WHERE parent_id = ?1")?;
+                let rows = stmt.query_map(params![parent_text], |row| row.get::<_, String>(0))?;
+                for r in rows {
+                    let c = r?;
+                    to_update.push(c.clone());
+                    frontier.push(c);
+                }
+            }
+            for child_id in to_update {
+                tx.execute(
+                    "UPDATE local_note SET depth = depth + ?2, updated_at_ms = ?3 WHERE id = ?1",
+                    params![child_id, depth_delta, now],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn move_up(&self, id: Uuid) -> Result<(), StoreError> {
+        swap_with_neighbour(&self.store, id, -1)
+    }
+
+    fn move_down(&self, id: Uuid) -> Result<(), StoreError> {
+        swap_with_neighbour(&self.store, id, 1)
+    }
+}
+
+fn swap_with_neighbour(store: &Store, id: Uuid, dir: i64) -> Result<(), StoreError> {
+    debug_assert!(dir == 1 || dir == -1);
+    let mut conn = store.conn()?;
+    let tx = conn.transaction()?;
+    let row: Option<(String, Option<String>, i64)> = tx
+        .query_row(
+            "SELECT project_id, parent_id, sibling_index FROM local_note WHERE id = ?1",
+            params![id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((project_text, parent_text, sibling_index)) = row else {
+        return Err(StoreError::NotFound);
+    };
+    let target_index = sibling_index + dir;
+    if target_index < 0 {
+        tx.commit()?;
+        return Ok(());
+    }
+    let neighbour: Option<String> = match &parent_text {
+        Some(pt) => tx
+            .query_row(
+                "SELECT id FROM local_note
+                 WHERE project_id = ?1 AND parent_id = ?2 AND sibling_index = ?3",
+                params![project_text, pt, target_index],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?,
+        None => tx
+            .query_row(
+                "SELECT id FROM local_note
+                 WHERE project_id = ?1 AND parent_id IS NULL AND sibling_index = ?2",
+                params![project_text, target_index],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?,
+    };
+    let Some(neighbour_text) = neighbour else {
+        tx.commit()?;
+        return Ok(());
+    };
+    let now = now_ms();
+    // Two-step swap to avoid colliding on the (project_id, parent_id, sibling_index)
+    // bucket — first stash the moved row at -1, then update neighbour, then place it.
+    tx.execute(
+        "UPDATE local_note SET sibling_index = -1, updated_at_ms = ?2 WHERE id = ?1",
+        params![id.to_string(), now],
+    )?;
+    tx.execute(
+        "UPDATE local_note SET sibling_index = ?2, updated_at_ms = ?3 WHERE id = ?1",
+        params![neighbour_text, sibling_index, now],
+    )?;
+    tx.execute(
+        "UPDATE local_note SET sibling_index = ?2, updated_at_ms = ?3 WHERE id = ?1",
+        params![id.to_string(), target_index, now],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Same key surface as the `LocalNoteRepository` for callers that want to read
@@ -380,5 +1141,264 @@ mod tests {
         n.delete(Uuid::new_v4()).unwrap();
         let listed = n.list_for_project(project_id).unwrap();
         assert_eq!(listed.len(), 1);
+    }
+
+    fn fetch(n: &SqliteLocalNoteRepository, project_id: Uuid, id: Uuid) -> LocalNote {
+        n.list_for_project(project_id)
+            .unwrap()
+            .into_iter()
+            .find(|x| x.id == id)
+            .expect("note present")
+    }
+
+    #[test]
+    fn local_note_repo_move_to_changes_project_and_parent_atomically() {
+        let store = open_in_memory().unwrap();
+        let project_repo = SqliteLocalProjectRepository::new(store.clone());
+        let n = SqliteLocalNoteRepository::new(store);
+        let p1 = project_repo.create("p1").unwrap();
+        let p2 = project_repo.create("p2").unwrap();
+
+        let a = n.create(p1.id, None, "a").unwrap();
+        let _b = n.create(p1.id, None, "b").unwrap();
+        let c = n.create(p2.id, None, "c").unwrap();
+
+        // Move `a` from p1 root into p2 under `c` at index 0.
+        n.move_to(a.id, p2.id, Some(c.id), 0).unwrap();
+
+        let p1_notes = n.list_for_project(p1.id).unwrap();
+        assert_eq!(p1_notes.len(), 1, "only b remains in p1");
+        assert_eq!(p1_notes[0].title, "b");
+        assert_eq!(p1_notes[0].sibling_index, 0, "b's index should be repacked");
+
+        let p2_notes = n.list_for_project(p2.id).unwrap();
+        let moved = p2_notes.iter().find(|x| x.id == a.id).unwrap();
+        assert_eq!(moved.project_id, p2.id);
+        assert_eq!(moved.parent_id, Some(c.id));
+        assert_eq!(moved.sibling_index, 0);
+        assert_eq!(moved.depth, 1);
+    }
+
+    #[test]
+    fn local_note_repo_move_to_rejects_self_descendant_cycle() {
+        let (_p, n, project_id) = make_pair();
+        let root = n.create(project_id, None, "root").unwrap();
+        let child = n.create(project_id, Some(root.id), "child").unwrap();
+        let grand = n.create(project_id, Some(child.id), "grand").unwrap();
+
+        // Self-move.
+        let err = n
+            .move_to(root.id, project_id, Some(root.id), 0)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidArgument(_)), "got {err:?}");
+        // Move into a descendant.
+        let err = n
+            .move_to(root.id, project_id, Some(child.id), 0)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidArgument(_)), "got {err:?}");
+        let err = n
+            .move_to(root.id, project_id, Some(grand.id), 0)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidArgument(_)), "got {err:?}");
+
+        // Original tree is untouched.
+        let listed = n.list_for_project(project_id).unwrap();
+        assert_eq!(listed.len(), 3);
+        assert_eq!(fetch(&n, project_id, root.id).depth, 0);
+        assert_eq!(fetch(&n, project_id, child.id).depth, 1);
+        assert_eq!(fetch(&n, project_id, grand.id).depth, 2);
+    }
+
+    #[test]
+    fn local_note_repo_move_to_recomputes_depth_for_descendants() {
+        let store = open_in_memory().unwrap();
+        let project_repo = SqliteLocalProjectRepository::new(store.clone());
+        let n = SqliteLocalNoteRepository::new(store);
+        let p1 = project_repo.create("p1").unwrap();
+        let p2 = project_repo.create("p2").unwrap();
+
+        let a = n.create(p1.id, None, "a").unwrap();
+        let b = n.create(p1.id, Some(a.id), "b").unwrap();
+        let c = n.create(p1.id, Some(b.id), "c").unwrap();
+
+        let host = n.create(p2.id, None, "host").unwrap();
+        let host_child = n.create(p2.id, Some(host.id), "host_child").unwrap();
+
+        // Move a (depth 0 in p1) to be a child of host_child in p2 (which is depth 1).
+        n.move_to(a.id, p2.id, Some(host_child.id), 0).unwrap();
+
+        let p2_notes = n.list_for_project(p2.id).unwrap();
+        let a_now = p2_notes.iter().find(|x| x.id == a.id).unwrap();
+        let b_now = p2_notes.iter().find(|x| x.id == b.id).unwrap();
+        let c_now = p2_notes.iter().find(|x| x.id == c.id).unwrap();
+        assert_eq!(a_now.depth, 2);
+        assert_eq!(b_now.depth, 3);
+        assert_eq!(c_now.depth, 4);
+        assert_eq!(a_now.project_id, p2.id);
+        assert_eq!(b_now.project_id, p2.id);
+        assert_eq!(c_now.project_id, p2.id);
+        // p1 is now empty.
+        let p1_notes = n.list_for_project(p1.id).unwrap();
+        assert!(p1_notes.is_empty());
+    }
+
+    #[test]
+    fn local_note_repo_duplicate_subtree_assigns_new_uuids_and_preserves_shape() {
+        let (_p, n, project_id) = make_pair();
+        let root = n.create(project_id, None, "root").unwrap();
+        let c1 = n.create(project_id, Some(root.id), "c1").unwrap();
+        let _c2 = n.create(project_id, Some(root.id), "c2").unwrap();
+        let _g = n.create(project_id, Some(c1.id), "g").unwrap();
+
+        let new_root_id = n.duplicate_subtree(root.id, project_id, None, 999).unwrap();
+        assert_ne!(new_root_id, root.id);
+
+        let listed = n.list_for_project(project_id).unwrap();
+        // Originals = 4, copies = 4, total = 8.
+        assert_eq!(listed.len(), 8);
+
+        let new_root = listed.iter().find(|x| x.id == new_root_id).unwrap();
+        assert_eq!(new_root.title, "root");
+        assert_eq!(new_root.depth, 0);
+        assert!(new_root.parent_id.is_none());
+
+        let new_root_children: Vec<&LocalNote> = listed
+            .iter()
+            .filter(|x| x.parent_id == Some(new_root_id))
+            .collect();
+        assert_eq!(new_root_children.len(), 2);
+        let titles: Vec<&str> = new_root_children.iter().map(|x| x.title.as_str()).collect();
+        assert!(titles.contains(&"c1"));
+        assert!(titles.contains(&"c2"));
+
+        // Sibling indexes for the duplicated root should be packed (placed at end).
+        let roots: Vec<&LocalNote> = listed.iter().filter(|x| x.parent_id.is_none()).collect();
+        assert_eq!(roots.len(), 2);
+        let mut indexes: Vec<i64> = roots.iter().map(|x| x.sibling_index).collect();
+        indexes.sort();
+        assert_eq!(indexes, vec![0, 1]);
+
+        // The copy's grand-child depth must be 2 (one below its copy parent).
+        let new_c1 = new_root_children.iter().find(|x| x.title == "c1").unwrap();
+        let new_g_list: Vec<&LocalNote> = listed
+            .iter()
+            .filter(|x| x.parent_id == Some(new_c1.id))
+            .collect();
+        assert_eq!(new_g_list.len(), 1);
+        assert_eq!(new_g_list[0].depth, 2);
+        assert_eq!(new_g_list[0].title, "g");
+        assert_ne!(new_g_list[0].id, c1.id);
+    }
+
+    #[test]
+    fn local_note_repo_indent_makes_child_of_previous_sibling_and_increments_depth() {
+        let (_p, n, project_id) = make_pair();
+        let a = n.create(project_id, None, "a").unwrap();
+        let b = n.create(project_id, None, "b").unwrap();
+        let g = n.create(project_id, Some(b.id), "g").unwrap();
+
+        n.indent(b.id).unwrap();
+
+        let b_now = fetch(&n, project_id, b.id);
+        assert_eq!(b_now.parent_id, Some(a.id));
+        assert_eq!(b_now.depth, 1);
+        assert_eq!(b_now.sibling_index, 0);
+        // Descendant depth follows.
+        let g_now = fetch(&n, project_id, g.id);
+        assert_eq!(g_now.depth, 2);
+        // Roots collapse: only `a`.
+        let roots: Vec<LocalNote> = n
+            .list_for_project(project_id)
+            .unwrap()
+            .into_iter()
+            .filter(|x| x.parent_id.is_none())
+            .collect();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].id, a.id);
+    }
+
+    #[test]
+    fn local_note_repo_indent_at_first_sibling_is_noop() {
+        let (_p, n, project_id) = make_pair();
+        let a = n.create(project_id, None, "a").unwrap();
+        let b = n.create(project_id, None, "b").unwrap();
+        n.indent(a.id).unwrap();
+        let listed = n.list_for_project(project_id).unwrap();
+        let a_now = listed.iter().find(|x| x.id == a.id).unwrap();
+        assert!(a_now.parent_id.is_none());
+        assert_eq!(a_now.sibling_index, 0);
+        assert_eq!(a_now.depth, 0);
+        let b_now = listed.iter().find(|x| x.id == b.id).unwrap();
+        assert!(b_now.parent_id.is_none());
+        assert_eq!(b_now.sibling_index, 1);
+    }
+
+    #[test]
+    fn local_note_repo_outdent_reparents_to_grandparent_and_decrements_depth() {
+        let (_p, n, project_id) = make_pair();
+        let a = n.create(project_id, None, "a").unwrap();
+        let b = n.create(project_id, Some(a.id), "b").unwrap();
+        let c = n.create(project_id, Some(b.id), "c").unwrap();
+        let d = n.create(project_id, Some(c.id), "d").unwrap();
+
+        n.outdent(c.id).unwrap();
+
+        let c_now = fetch(&n, project_id, c.id);
+        assert_eq!(c_now.parent_id, Some(a.id));
+        assert_eq!(c_now.depth, 1);
+        assert_eq!(c_now.sibling_index, 1, "placed after old parent b");
+        // Descendant follows (d).
+        let d_now = fetch(&n, project_id, d.id);
+        assert_eq!(d_now.depth, 2);
+        assert_eq!(d_now.parent_id, Some(c.id));
+    }
+
+    #[test]
+    fn local_note_repo_outdent_at_depth_zero_is_noop() {
+        let (_p, n, project_id) = make_pair();
+        let a = n.create(project_id, None, "a").unwrap();
+        n.outdent(a.id).unwrap();
+        let a_now = fetch(&n, project_id, a.id);
+        assert!(a_now.parent_id.is_none());
+        assert_eq!(a_now.depth, 0);
+        assert_eq!(a_now.sibling_index, 0);
+    }
+
+    #[test]
+    fn local_note_repo_move_up_swaps_with_previous_sibling() {
+        let (_p, n, project_id) = make_pair();
+        let a = n.create(project_id, None, "a").unwrap();
+        let b = n.create(project_id, None, "b").unwrap();
+        let c = n.create(project_id, None, "c").unwrap();
+
+        n.move_up(c.id).unwrap();
+        let listed = n.list_for_project(project_id).unwrap();
+        let order: Vec<(Uuid, i64)> = listed
+            .iter()
+            .filter(|x| x.parent_id.is_none())
+            .map(|x| (x.id, x.sibling_index))
+            .collect();
+        let by_index: Vec<Uuid> = {
+            let mut v = order.clone();
+            v.sort_by_key(|x| x.1);
+            v.into_iter().map(|x| x.0).collect()
+        };
+        assert_eq!(by_index, vec![a.id, c.id, b.id]);
+
+        // Move-up at the first slot is a no-op.
+        n.move_up(a.id).unwrap();
+        let listed2 = n.list_for_project(project_id).unwrap();
+        let a_now = listed2.iter().find(|x| x.id == a.id).unwrap();
+        assert_eq!(a_now.sibling_index, 0);
+    }
+
+    #[test]
+    fn local_note_repo_move_down_at_last_sibling_is_noop() {
+        let (_p, n, project_id) = make_pair();
+        let _a = n.create(project_id, None, "a").unwrap();
+        let b = n.create(project_id, None, "b").unwrap();
+        n.move_down(b.id).unwrap();
+        let b_now = fetch(&n, project_id, b.id);
+        assert_eq!(b_now.sibling_index, 1);
     }
 }
