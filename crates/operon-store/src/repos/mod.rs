@@ -1,6 +1,7 @@
 //! Repository traits + SQLite implementations, one module per aggregate.
 
 pub mod attachment;
+pub mod audit;
 pub mod department;
 pub mod invite;
 pub mod membership;
@@ -14,6 +15,7 @@ pub mod team_project;
 pub mod user;
 
 pub use attachment::{Attachment, AttachmentRepository, SqliteAttachmentRepository};
+pub use audit::{AuditEntry, AuditLogRepository, AuditOutcome, SqliteAuditLogRepository};
 pub use department::{Department, DepartmentRepository, SqliteDepartmentRepository};
 pub use invite::{Invite, InviteRepository, SqliteInviteRepository};
 pub use membership::{Membership, MembershipRepository, Role, SqliteMembershipRepository};

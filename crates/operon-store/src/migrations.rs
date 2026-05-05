@@ -13,6 +13,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "002_users_password_flags",
         include_str!("../migrations/002_users_password_flags.sql"),
     ),
+    (
+        3,
+        "003_audit_log",
+        include_str!("../migrations/003_audit_log.sql"),
+    ),
 ];
 
 fn ensure_migrations_table(conn: &Connection) -> Result<(), StoreError> {
@@ -62,6 +67,7 @@ pub fn migrate_down_all(conn: &mut Connection) -> Result<(), StoreError> {
     let tx = conn.transaction()?;
     // Drop in reverse FK order.
     let drops = [
+        "audit_log",
         "attachments",
         "sessions",
         "invites",
