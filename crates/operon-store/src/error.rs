@@ -10,6 +10,8 @@ pub enum StoreError {
     InvalidUuid(String),
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     #[error("open: {0}")]
     Open(String),
     #[error("migrate: {0}")]

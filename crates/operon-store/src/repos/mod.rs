@@ -4,6 +4,8 @@ pub mod attachment;
 pub mod audit;
 pub mod department;
 pub mod invite;
+pub mod local_settings;
+pub mod local_user;
 pub mod membership;
 pub mod note;
 pub mod note_update;
@@ -19,6 +21,8 @@ pub use attachment::{Attachment, AttachmentRepository, SqliteAttachmentRepositor
 pub use audit::{AuditEntry, AuditLogRepository, AuditOutcome, SqliteAuditLogRepository};
 pub use department::{Department, DepartmentRepository, SqliteDepartmentRepository};
 pub use invite::{Invite, InviteRepository, SqliteInviteRepository};
+pub use local_settings::{LocalSettingsRepository, SqliteLocalSettingsRepository};
+pub use local_user::{LocalUser, LocalUserRepository, SqliteLocalUserRepository};
 pub use membership::{Membership, MembershipRepository, Role, SqliteMembershipRepository};
 pub use note::{Note, NoteRepository, SqliteNoteRepository};
 pub use note_update::{NoteUpdateRepository, SqliteNoteUpdateRepository};

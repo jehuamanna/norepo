@@ -94,6 +94,13 @@ impl Store {
         Self::open(StoreConfig::memory(StoreMode::NonLocal))
     }
 
+    /// Convenience: open a fresh `:memory:` store in `Local` mode. Used by Phase-1
+    /// local-mode unit tests and by app-level fallbacks where an in-memory store is
+    /// acceptable (e.g. wasm builds).
+    pub fn open_in_memory() -> Result<Self, StoreError> {
+        Self::open(StoreConfig::memory(StoreMode::Local))
+    }
+
     pub fn mode(&self) -> StoreMode {
         self.mode
     }

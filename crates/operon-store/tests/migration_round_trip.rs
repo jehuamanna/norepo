@@ -14,6 +14,8 @@ const EXPECTED_TABLES: &[&str] = &[
     "invites",
     "sessions",
     "attachments",
+    "local_user",
+    "local_app_settings",
 ];
 
 fn list_tables(store: &operon_store::Store) -> Vec<String> {
