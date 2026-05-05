@@ -15,9 +15,11 @@ use std::pin::Pin;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fs;
+pub mod memory;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use fs::FilesystemPersistence;
+pub use memory::MemoryPersistence;
 
 /// Lightweight reference returned by `list()`. The `format_id` is captured at write-time when
 /// the backend can determine it (e.g., from filename extension on disk).

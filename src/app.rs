@@ -5,10 +5,13 @@ use std::rc::Rc;
 
 use dioxus::prelude::*;
 
+use std::sync::Arc;
+
 use crate::commands::{register_builtin_commands, CommandRegistry, PaletteState};
 use crate::log::LogBuffer;
 use crate::log_info;
 use crate::panel::PanelManager;
+use crate::persistence::{MemoryPersistence, Persistence};
 use crate::plugin::{register_builtins, PluginContext, PluginRegistry};
 use crate::shell::layout::{DragState, LayoutState};
 use crate::shell::menubar::MenuId;
@@ -63,6 +66,8 @@ pub fn App() -> Element {
     let mut log_buffer: Signal<LogBuffer> = use_signal(LogBuffer::new);
     use_context_provider(|| log_buffer);
 
+    use_context_provider(|| provide_persistence());
+
     use_context_provider(|| {
         let mut registry = PluginRegistry::new();
         let ctx = PluginContext {
@@ -108,4 +113,41 @@ pub fn App() -> Element {
             Shell {}
         }
     }
+}
+
+/// Construct the per-platform `Persistence` for the running app. On desktop, attempts to use
+/// `~/.local/share/operon/notes` (or the OS-equivalent) and falls back to `MemoryPersistence`
+/// if directory creation fails. On wasm, returns `MemoryPersistence` until Phase 3 lands the
+/// real `WebPersistence` (OPFS first, IndexedDB fallback).
+fn provide_persistence() -> Arc<dyn Persistence> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use crate::persistence::FilesystemPersistence;
+        let dir = default_notes_dir();
+        match FilesystemPersistence::new(&dir) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!(
+                    "operon: filesystem persistence init failed for {dir:?} ({e}); \
+                     falling back to in-memory storage"
+                );
+                Arc::new(MemoryPersistence::new())
+            }
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Arc::new(MemoryPersistence::new())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn default_notes_dir() -> std::path::PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        return std::path::PathBuf::from(home).join(".local/share/operon/notes");
+    }
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        return std::path::PathBuf::from(home).join("AppData/Local/operon/notes");
+    }
+    std::env::temp_dir().join("operon/notes")
 }
