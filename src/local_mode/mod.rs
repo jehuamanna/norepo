@@ -8,13 +8,15 @@
 #[cfg(not(target_arch = "wasm32"))]
 pub mod desktop;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod editor;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod explorer;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ui;
 #[cfg(not(target_arch = "wasm32"))]
 pub use desktop::*;
 #[cfg(not(target_arch = "wasm32"))]
-pub use explorer::{ExplorerPanel, LocalProjectVersion, SelectedProject};
+pub use explorer::{ExplorerPanel, LocalProjectVersion, SelectedNote, SelectedProject};
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_stub;

@@ -33,6 +33,10 @@ pub struct Tab {
     /// mode change so re-entering Edit / LivePreview restores the user's caret in
     /// backends that share the same offset domain.
     pub editor_state: Option<EditorState>,
+    /// When true, the debounced [`SaveScheduler`] short-circuits — the tab uses
+    /// explicit save (button + Ctrl+S) instead of autosave. Local-Mode note tabs
+    /// set this to `true`; cloud-mode tabs leave it `false` for autosave.
+    pub manual_save: bool,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -49,13 +53,38 @@ impl TabManager {
 
     /// Open a tab. If a tab with the same `note_id` already exists, it is activated and its
     /// id is returned (no second tab is created). Otherwise a fresh tab is appended and made
-    /// active.
+    /// active. The new tab uses the autosave scheduler (`manual_save = false`); use
+    /// [`Self::open_manual_save`] for tabs that opt into explicit save.
     pub fn open(
         &mut self,
         note_id: String,
         format_id: String,
         title: String,
         content: String,
+    ) -> TabId {
+        self.open_inner(note_id, format_id, title, content, false)
+    }
+
+    /// Open a tab whose saves are gated on the user pressing the Save button or
+    /// `Ctrl+S` instead of running through the debounced [`SaveScheduler`].
+    /// Used by Local-Mode note tabs.
+    pub fn open_manual_save(
+        &mut self,
+        note_id: String,
+        format_id: String,
+        title: String,
+        content: String,
+    ) -> TabId {
+        self.open_inner(note_id, format_id, title, content, true)
+    }
+
+    fn open_inner(
+        &mut self,
+        note_id: String,
+        format_id: String,
+        title: String,
+        content: String,
+        manual_save: bool,
     ) -> TabId {
         if let Some(id) = self
             .tabs
@@ -77,9 +106,16 @@ impl TabManager {
             dirty: false,
             mode: EditorMode::default(),
             editor_state: None,
+            manual_save,
         });
         self.active = Some(id);
         id
+    }
+
+    /// Look up a tab by id. Used by the SaveScheduler short-circuit and the
+    /// LocalShell save handler.
+    pub fn get(&self, id: TabId) -> Option<&Tab> {
+        self.tabs.iter().find(|t| t.id == id)
     }
 
     /// Set the editor mode for `id`. No-op if the tab doesn't exist.
@@ -142,7 +178,8 @@ impl TabManager {
     }
 
     pub fn active(&self) -> Option<&Tab> {
-        self.active.and_then(|id| self.tabs.iter().find(|t| t.id == id))
+        self.active
+            .and_then(|id| self.tabs.iter().find(|t| t.id == id))
     }
 
     pub fn active_id(&self) -> Option<TabId> {
@@ -245,5 +282,21 @@ mod tests {
         let len_before = tm.iter().count();
         tm.close(TabId(9999));
         assert_eq!(tm.iter().count(), len_before);
+    }
+
+    #[test]
+    fn open_defaults_manual_save_to_false() {
+        let mut tm = TabManager::new();
+        let id = open_md(&mut tm, "n1", "T");
+        let t = tm.get(id).unwrap();
+        assert!(!t.manual_save);
+    }
+
+    #[test]
+    fn open_manual_save_sets_flag_true() {
+        let mut tm = TabManager::new();
+        let id = tm.open_manual_save("n1".into(), "markdown".into(), "T".into(), String::new());
+        let t = tm.get(id).unwrap();
+        assert!(t.manual_save);
     }
 }

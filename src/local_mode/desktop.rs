@@ -4,15 +4,21 @@ use std::sync::Arc;
 
 use dioxus::prelude::*;
 use operon_store::repos::{
-    LocalProjectRepository, LocalSettingsRepository, LocalUserRepository,
-    SqliteLocalProjectRepository, SqliteLocalSettingsRepository, SqliteLocalUserRepository,
+    LocalNoteRepository, LocalProjectRepository, LocalSettingsRepository, LocalTreeStateRepository,
+    LocalUserRepository, SqliteLocalNoteRepository, SqliteLocalProjectRepository,
+    SqliteLocalSettingsRepository, SqliteLocalTreeStateRepository, SqliteLocalUserRepository,
 };
 use operon_store::{Store, StoreConfig};
 use uuid::Uuid;
 
-use super::explorer::{ExplorerPanel, LocalProjectVersion, SelectedProject};
+use super::editor::{install_save_action, LocalNoteEditor, LocalSaveAction};
+use super::explorer::{
+    ExplorerPanel, LocalNoteVersion, LocalProjectVersion, SelectedNote, SelectedProject,
+};
 use super::{MODE_VALUE_CLOUD, MODE_VALUE_LOCAL, SETTINGS_KEY_MODE_REMEMBERED};
+use crate::persistence::Persistence;
 use crate::rbag::state::{AppState, Mode};
+use crate::tabs::{SaveScheduler, TabManager};
 
 /// Provider component: mounts a [`Store`] for Local Mode and exposes the
 /// repository trait objects via context. Mount near the app root.
@@ -24,10 +30,16 @@ pub fn LocalStateProvider(children: Element) -> Element {
     let settings_repo: Arc<dyn LocalSettingsRepository> =
         Arc::new(SqliteLocalSettingsRepository::new(store.clone()));
     let project_repo: Arc<dyn LocalProjectRepository> =
-        Arc::new(SqliteLocalProjectRepository::new(store));
+        Arc::new(SqliteLocalProjectRepository::new(store.clone()));
+    let note_repo: Arc<dyn LocalNoteRepository> =
+        Arc::new(SqliteLocalNoteRepository::new(store.clone()));
+    let tree_repo: Arc<dyn LocalTreeStateRepository> =
+        Arc::new(SqliteLocalTreeStateRepository::new(store));
     use_context_provider(|| LocalUserRepo(user_repo));
     use_context_provider(|| LocalSettingsRepo(settings_repo));
     use_context_provider(|| LocalProjectRepo(project_repo));
+    use_context_provider(|| LocalNoteRepo(note_repo));
+    use_context_provider(|| LocalTreeStateRepo(tree_repo));
     rsx! { {children} }
 }
 
@@ -42,6 +54,12 @@ pub struct LocalSettingsRepo(pub Arc<dyn LocalSettingsRepository>);
 #[derive(Clone)]
 pub struct LocalProjectRepo(pub Arc<dyn LocalProjectRepository>);
 
+#[derive(Clone)]
+pub struct LocalNoteRepo(pub Arc<dyn LocalNoteRepository>);
+
+#[derive(Clone)]
+pub struct LocalTreeStateRepo(pub Arc<dyn LocalTreeStateRepository>);
+
 /// Convenience used by `app.rs` and tests to install the repos. Equivalent to
 /// rendering [`LocalStateProvider`] but callable from a hook position.
 pub fn provide_local_state() {
@@ -51,10 +69,16 @@ pub fn provide_local_state() {
     let settings_repo: Arc<dyn LocalSettingsRepository> =
         Arc::new(SqliteLocalSettingsRepository::new(store.clone()));
     let project_repo: Arc<dyn LocalProjectRepository> =
-        Arc::new(SqliteLocalProjectRepository::new(store));
+        Arc::new(SqliteLocalProjectRepository::new(store.clone()));
+    let note_repo: Arc<dyn LocalNoteRepository> =
+        Arc::new(SqliteLocalNoteRepository::new(store.clone()));
+    let tree_repo: Arc<dyn LocalTreeStateRepository> =
+        Arc::new(SqliteLocalTreeStateRepository::new(store));
     use_context_provider(|| LocalUserRepo(user_repo));
     use_context_provider(|| LocalSettingsRepo(settings_repo));
     use_context_provider(|| LocalProjectRepo(project_repo));
+    use_context_provider(|| LocalNoteRepo(note_repo));
+    use_context_provider(|| LocalTreeStateRepo(tree_repo));
 }
 
 fn open_local_store() -> Store {
@@ -81,10 +105,16 @@ fn default_store_path() -> std::path::PathBuf {
 }
 
 /// Top-level Local-Mode shell. Phase-1 renders the badge + settings gear and a
-/// placeholder workspace; later phases fill the centre.
+/// placeholder workspace; later phases fill the centre. Phase-3 mounts the
+/// explicit-save action and an editor surface for the active Local-Mode tab.
 #[component]
 pub fn LocalShell() -> Element {
     let LocalUserRepo(user_repo) = use_context();
+    let LocalNoteRepo(note_repo) = use_context();
+    let persistence: Arc<dyn Persistence> = use_context();
+    let tabs: Signal<TabManager> = use_context();
+    let _scheduler: SaveScheduler = use_context();
+
     let mut username: Signal<String> = use_signal(|| {
         user_repo
             .get()
@@ -109,13 +139,40 @@ pub fn LocalShell() -> Element {
     // explorer panel and any future toolbar / status surface share it.
     let project_version: Signal<u64> = use_signal(|| 0);
     use_context_provider(|| LocalProjectVersion(project_version));
+    let note_version: Signal<u64> = use_signal(|| 0);
+    use_context_provider(|| LocalNoteVersion(note_version));
     let selected_project: Signal<Option<Uuid>> = use_signal(|| None);
     use_context_provider(|| SelectedProject(selected_project));
+    let selected_note: Signal<Option<Uuid>> = use_signal(|| None);
+    use_context_provider(|| SelectedNote(selected_note));
+
+    // Explicit-save action — the Save button + Ctrl+S call this.
+    let save_callback =
+        use_hook(|| install_save_action(tabs, persistence.clone(), note_repo.clone()));
+    let save_action = LocalSaveAction {
+        callback: save_callback,
+    };
+    use_context_provider(|| save_action.clone());
+
+    let active_tab_id = tabs.read().active_id();
 
     rsx! {
         div {
             class: "flex flex-col h-screen w-screen bg-[var(--operon-bg)] text-[var(--operon-fg)]",
             "data-testid": "local-shell",
+            tabindex: "-1",
+            onkeydown: move |evt| {
+                let mods = evt.modifiers();
+                let with_meta = mods.contains(Modifiers::META) || mods.contains(Modifiers::CONTROL);
+                if with_meta
+                    && !mods.contains(Modifiers::SHIFT)
+                    && !mods.contains(Modifiers::ALT)
+                    && evt.key().to_string().eq_ignore_ascii_case("s")
+                {
+                    evt.prevent_default();
+                    save_action.callback.call(());
+                }
+            },
             // Top bar
             div {
                 class: "flex items-center justify-end px-4 py-2 border-b border-[var(--operon-border)]",
@@ -132,8 +189,16 @@ pub fn LocalShell() -> Element {
                     ExplorerPanel {}
                 }
                 main {
-                    class: "flex-1 flex items-center justify-center text-sm opacity-70",
-                    "Local Mode workspace — coming soon"
+                    class: "flex-1 flex flex-col min-h-0",
+                    if let Some(tab_id) = active_tab_id {
+                        LocalNoteEditor { tab_id, action: save_action.clone() }
+                    } else {
+                        div {
+                            class: "flex-1 flex items-center justify-center text-sm opacity-70",
+                            "data-testid": "local-empty-workspace",
+                            "Pick a note to start writing."
+                        }
+                    }
                 }
             }
             // Bottom bar

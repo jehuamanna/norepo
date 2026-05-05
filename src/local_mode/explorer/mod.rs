@@ -1,16 +1,27 @@
-//! Local-Mode explorer panel: lists `local_project` rows with rename/delete
-//! and a "+" button to create a new (default-named) project.
+//! Local-Mode explorer panel: lists `local_project` rows with rename/delete and
+//! a "+" button to create a new (default-named) project. Phase 3 nests notes
+//! under each project, persisted via `local_note` + `local_tree_state`.
 
+mod note_row;
 mod project_row;
+mod tree_node;
+mod tree_state;
 
+pub use note_row::NoteRow;
 pub use project_row::ProjectRow;
+pub use tree_node::{flatten_visible, NoteForest};
+pub use tree_state::TreeStateQueue;
+
+use std::collections::HashMap;
 
 use dioxus::prelude::*;
-use operon_store::repos::LocalProject;
+use operon_store::repos::{LocalNote, LocalProject};
 use uuid::Uuid;
 
-use crate::local_mode::desktop::LocalProjectRepo;
+use crate::local_mode::desktop::{LocalNoteRepo, LocalProjectRepo, LocalTreeStateRepo};
+use crate::local_mode::editor::{open_local_note_tab, LocalSaveAction};
 use crate::local_mode::ui::ConfirmDialog;
+use crate::tabs::{SaveScheduler, TabManager};
 
 /// App-scope signal: bumped on every successful project mutation. The panel
 /// re-fetches its row list whenever this changes.
@@ -21,19 +32,41 @@ pub struct LocalProjectVersion(pub Signal<u64>);
 #[derive(Clone, Copy)]
 pub struct SelectedProject(pub Signal<Option<Uuid>>);
 
+/// App-scope signal: id of the currently selected (and open in tab) note, if any.
+#[derive(Clone, Copy)]
+pub struct SelectedNote(pub Signal<Option<Uuid>>);
+
+/// Bumped on every note mutation. The panel re-fetches notes for the
+/// affected project when this changes.
+#[derive(Clone, Copy)]
+pub struct LocalNoteVersion(pub Signal<u64>);
+
+const SCOPE_WORKSPACE: &str = "workspace";
+
+fn scope_for_project(project_id: Uuid) -> String {
+    format!("project:{project_id}")
+}
+
 #[component]
 pub fn ExplorerPanel() -> Element {
-    let LocalProjectRepo(repo) = use_context();
-    let LocalProjectVersion(mut version) = use_context();
-    let SelectedProject(mut selected) = use_context();
+    let LocalProjectRepo(project_repo) = use_context();
+    let LocalNoteRepo(note_repo) = use_context();
+    let LocalTreeStateRepo(tree_repo) = use_context();
+    let LocalProjectVersion(mut project_version) = use_context();
+    let LocalNoteVersion(mut note_version) = use_context();
+    let SelectedProject(mut selected_project) = use_context();
+    let SelectedNote(mut selected_note) = use_context();
+    let tabs: Signal<TabManager> = use_context();
+    let save_scheduler: SaveScheduler = use_context();
+    let _save_action: LocalSaveAction = use_context();
 
-    // Re-fetch when the version signal bumps.
+    // Re-fetch project list when version bumps.
     let projects: Signal<Vec<LocalProject>> = use_signal(Vec::new);
     let mut projects_setter = projects;
     {
-        let repo = repo.clone();
+        let repo = project_repo.clone();
         use_effect(move || {
-            let _ = version.read();
+            let _ = project_version.read();
             match repo.list() {
                 Ok(rows) => projects_setter.set(rows),
                 Err(e) => eprintln!("operon: list local_project failed: {e}"),
@@ -41,69 +74,265 @@ pub fn ExplorerPanel() -> Element {
         });
     }
 
-    let renaming: Signal<Option<Uuid>> = use_signal(|| None);
-    let pending_delete: Signal<Option<Uuid>> = use_signal(|| None);
-    let mut renaming_setter = renaming;
-    let mut pending_delete_setter = pending_delete;
+    // Workspace-scope tree-state snapshot (which projects are open).
+    let workspace_open: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
+    let mut workspace_open_setter = workspace_open;
+    {
+        let repo = tree_repo.clone();
+        use_effect(move || {
+            // Re-hydrate when the project list changes (covers freshly-created
+            // projects whose state wasn't fetched on first mount).
+            let _ = project_version.read();
+            match repo.snapshot_for_scope(SCOPE_WORKSPACE) {
+                Ok(snap) => workspace_open_setter.set(snap),
+                Err(e) => eprintln!("operon: tree-state snapshot failed: {e}"),
+            }
+        });
+    }
 
-    let on_select = use_callback(move |id: Uuid| {
-        selected.set(Some(id));
+    // Per-project note lists, keyed by project_id. Re-fetched on note_version bump.
+    let notes_by_project: Signal<HashMap<Uuid, Vec<LocalNote>>> = use_signal(HashMap::new);
+    let mut notes_setter = notes_by_project;
+    {
+        let repo = note_repo.clone();
+        use_effect(move || {
+            let _ = note_version.read();
+            let project_list = projects.read().clone();
+            let mut map = HashMap::new();
+            for p in project_list.iter() {
+                match repo.list_for_project(p.id) {
+                    Ok(rows) => {
+                        map.insert(p.id, rows);
+                    }
+                    Err(e) => eprintln!("operon: list_for_project {} failed: {e}", p.id),
+                }
+            }
+            notes_setter.set(map);
+        });
+    }
+
+    // Per-project note open/closed snapshots, lazily hydrated when a project opens.
+    let project_note_open: Signal<HashMap<Uuid, HashMap<String, bool>>> = use_signal(HashMap::new);
+
+    // Tree-state debounce queue.
+    let tree_queue: Signal<TreeStateQueue> = use_signal(|| TreeStateQueue::new(tree_repo.clone()));
+
+    let renaming_project: Signal<Option<Uuid>> = use_signal(|| None);
+    let pending_delete_project: Signal<Option<Uuid>> = use_signal(|| None);
+    let renaming_note: Signal<Option<Uuid>> = use_signal(|| None);
+    let pending_delete_note: Signal<Option<Uuid>> = use_signal(|| None);
+    let mut renaming_project_setter = renaming_project;
+    let mut pending_delete_project_setter = pending_delete_project;
+    let mut renaming_note_setter = renaming_note;
+    let mut pending_delete_note_setter = pending_delete_note;
+
+    // ===== Project handlers =====
+    let on_select_project = use_callback(move |id: Uuid| {
+        selected_project.set(Some(id));
     });
 
-    let repo_for_create = repo.clone();
-    let on_add = move |_| match repo_for_create.create("") {
+    let project_repo_for_create = project_repo.clone();
+    let on_add_project = move |_| match project_repo_for_create.create("") {
         Ok(p) => {
-            version.with_mut(|v| *v += 1);
-            selected.set(Some(p.id));
-            renaming_setter.set(Some(p.id));
+            project_version.with_mut(|v| *v += 1);
+            selected_project.set(Some(p.id));
+            renaming_project_setter.set(Some(p.id));
         }
         Err(e) => eprintln!("operon: create local_project failed: {e}"),
     };
 
-    let repo_for_rename = repo.clone();
-    let on_rename = use_callback(move |(id, new_name): (Uuid, String)| {
-        // Empty string is the inline-rename "cancel" sentinel — just exit rename
-        // mode without touching the DB.
+    let project_repo_for_rename = project_repo.clone();
+    let on_rename_project = use_callback(move |(id, new_name): (Uuid, String)| {
         if new_name.trim().is_empty() {
-            renaming_setter.set(None);
+            renaming_project_setter.set(None);
             return;
         }
-        match repo_for_rename.rename(id, &new_name) {
+        match project_repo_for_rename.rename(id, &new_name) {
             Ok(()) => {
-                version.with_mut(|v| *v += 1);
-                renaming_setter.set(None);
+                project_version.with_mut(|v| *v += 1);
+                renaming_project_setter.set(None);
             }
             Err(e) => {
                 eprintln!("operon: rename local_project failed: {e}");
-                renaming_setter.set(None);
+                renaming_project_setter.set(None);
             }
         }
     });
 
-    let on_request_rename = use_callback(move |id: Uuid| {
-        renaming_setter.set(Some(id));
+    let on_request_rename_project = use_callback(move |id: Uuid| {
+        renaming_project_setter.set(Some(id));
+    });
+    let on_request_delete_project = use_callback(move |id: Uuid| {
+        pending_delete_project_setter.set(Some(id));
+    });
+    let on_delete_project_noop = use_callback(move |_id: Uuid| {});
+
+    // Toggle project open/closed; persists via the debounce queue.
+    let queue_for_project_toggle = tree_queue;
+    let mut workspace_open_for_toggle = workspace_open;
+    let project_note_open_for_toggle = project_note_open;
+    let tree_repo_for_hydrate = tree_repo.clone();
+    let on_toggle_project = use_callback(move |id: Uuid| {
+        let now_open = workspace_open_for_toggle
+            .read()
+            .get(&id.to_string())
+            .copied()
+            .unwrap_or(false);
+        let next = !now_open;
+        workspace_open_for_toggle.with_mut(|m| {
+            m.insert(id.to_string(), next);
+        });
+        queue_for_project_toggle
+            .read()
+            .enqueue(SCOPE_WORKSPACE, id.to_string(), next);
+
+        // Lazily hydrate the project's note-tree state when first opened.
+        if next {
+            let mut po = project_note_open_for_toggle;
+            if !po.read().contains_key(&id) {
+                match tree_repo_for_hydrate.snapshot_for_scope(&scope_for_project(id)) {
+                    Ok(snap) => {
+                        po.with_mut(|m| {
+                            m.insert(id, snap);
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("operon: snapshot_for_scope project:{id} failed: {e}")
+                    }
+                }
+            }
+        }
     });
 
-    let on_request_delete = use_callback(move |id: Uuid| {
-        pending_delete_setter.set(Some(id));
+    let note_repo_for_add_root = note_repo.clone();
+    let on_add_root_note = use_callback(move |project_id: Uuid| {
+        match note_repo_for_add_root.create(project_id, None, "") {
+            Ok(n) => {
+                note_version.with_mut(|v| *v += 1);
+                renaming_note_setter.set(Some(n.id));
+            }
+            Err(e) => eprintln!("operon: create local_note failed: {e}"),
+        }
     });
 
-    // The actual delete happens from the confirm dialog below.
-    let on_delete = use_callback(move |_id: Uuid| {});
+    // ===== Note handlers =====
+    let mut tabs_for_select = tabs;
+    let scheduler_for_select = save_scheduler.clone();
+    let on_select_note = use_callback(move |note_id: Uuid| {
+        selected_note.set(Some(note_id));
+        // Find note metadata to get the title; fall back to the id.
+        let title = notes_by_project
+            .read()
+            .values()
+            .flat_map(|list| list.iter())
+            .find(|n| n.id == note_id)
+            .map(|n| n.title.clone())
+            .unwrap_or_else(|| note_id.to_string());
+        let _ = open_local_note_tab(
+            tabs_for_select,
+            scheduler_for_select.clone(),
+            note_id,
+            title,
+            String::new(),
+        );
+        let _ = tabs_for_select.write();
+    });
 
+    let note_repo_for_rename = note_repo.clone();
+    let on_rename_note = use_callback(move |(id, new_title): (Uuid, String)| {
+        if new_title.trim().is_empty() {
+            renaming_note_setter.set(None);
+            return;
+        }
+        match note_repo_for_rename.rename(id, &new_title) {
+            Ok(()) => {
+                note_version.with_mut(|v| *v += 1);
+                renaming_note_setter.set(None);
+            }
+            Err(e) => {
+                eprintln!("operon: rename local_note failed: {e}");
+                renaming_note_setter.set(None);
+            }
+        }
+    });
+
+    let on_request_rename_note = use_callback(move |id: Uuid| {
+        renaming_note_setter.set(Some(id));
+    });
+    let on_request_delete_note = use_callback(move |id: Uuid| {
+        pending_delete_note_setter.set(Some(id));
+    });
+
+    let note_repo_for_add_child = note_repo.clone();
+    let on_add_child_note = use_callback(move |parent_id: Uuid| {
+        // Find parent's project_id.
+        let project_id = notes_by_project
+            .read()
+            .iter()
+            .find_map(|(pid, list)| list.iter().find(|n| n.id == parent_id).map(|_| *pid));
+        let Some(project_id) = project_id else {
+            eprintln!("operon: add child note: parent {parent_id} not found");
+            return;
+        };
+        match note_repo_for_add_child.create(project_id, Some(parent_id), "") {
+            Ok(n) => {
+                note_version.with_mut(|v| *v += 1);
+                renaming_note_setter.set(Some(n.id));
+            }
+            Err(e) => eprintln!("operon: create child note failed: {e}"),
+        }
+    });
+
+    // Toggle a note open/closed.
+    let queue_for_note_toggle = tree_queue;
+    let mut project_note_open_setter = project_note_open;
+    let on_toggle_note = use_callback(move |(project_id, note_id): (Uuid, Uuid)| {
+        let scope = scope_for_project(project_id);
+        let now_open = project_note_open_setter
+            .read()
+            .get(&project_id)
+            .and_then(|m| m.get(&note_id.to_string()).copied())
+            .unwrap_or(false);
+        let next = !now_open;
+        project_note_open_setter.with_mut(|map| {
+            map.entry(project_id)
+                .or_default()
+                .insert(note_id.to_string(), next);
+        });
+        queue_for_note_toggle
+            .read()
+            .enqueue(scope, note_id.to_string(), next);
+    });
+
+    // ===== Render =====
     let projects_snapshot = projects.read().clone();
-    let renaming_now = *renaming.read();
-    let selected_now = *selected.read();
+    let renaming_project_now = *renaming_project.read();
+    let renaming_note_now = *renaming_note.read();
+    let selected_project_now = *selected_project.read();
+    let selected_note_now = *selected_note.read();
 
-    let pending_delete_id = *pending_delete.read();
-    let pending_delete_name = pending_delete_id.and_then(|did| {
+    let pending_delete_project_id = *pending_delete_project.read();
+    let pending_delete_project_name = pending_delete_project_id.and_then(|did| {
         projects_snapshot
             .iter()
             .find(|p| p.id == did)
             .map(|p| p.name.clone())
     });
+    let pending_delete_note_id = *pending_delete_note.read();
+    let pending_delete_note_title = pending_delete_note_id.and_then(|did| {
+        notes_by_project
+            .read()
+            .values()
+            .flat_map(|list| list.iter())
+            .find(|n| n.id == did)
+            .map(|n| n.title.clone())
+    });
 
-    let repo_for_delete = repo.clone();
+    let project_repo_for_delete = project_repo.clone();
+    let note_repo_for_delete = note_repo.clone();
+    let workspace_snap = workspace_open.read().clone();
+    let project_note_open_snap = project_note_open.read().clone();
+    let notes_snap = notes_by_project.read().clone();
 
     rsx! {
         div {
@@ -124,7 +353,7 @@ pub fn ExplorerPanel() -> Element {
                     class: "w-7 h-7 inline-flex items-center justify-center rounded border border-[var(--operon-border)] hover:bg-[var(--operon-hover)] text-base leading-none",
                     "data-testid": "explorer-add-project",
                     "aria-label": "New project",
-                    onclick: on_add,
+                    onclick: on_add_project,
                     "+"
                 }
             }
@@ -139,44 +368,173 @@ pub fn ExplorerPanel() -> Element {
                     }
                 } else {
                     for project in projects_snapshot.iter().cloned() {
-                        ProjectRow {
+                        ProjectSubtree {
                             key: "{project.id}",
                             project: project.clone(),
-                            selected: selected_now == Some(project.id),
-                            in_rename: renaming_now == Some(project.id),
-                            on_select: on_select,
-                            on_rename: on_rename,
-                            on_delete: on_delete,
-                            on_request_rename: on_request_rename,
-                            on_request_delete: on_request_delete,
+                            is_open: workspace_snap
+                                .get(&project.id.to_string())
+                                .copied()
+                                .unwrap_or(false),
+                            selected: selected_project_now == Some(project.id),
+                            in_rename: renaming_project_now == Some(project.id),
+                            notes: notes_snap.get(&project.id).cloned().unwrap_or_default(),
+                            note_open_snap: project_note_open_snap
+                                .get(&project.id)
+                                .cloned()
+                                .unwrap_or_default(),
+                            renaming_note: renaming_note_now,
+                            selected_note: selected_note_now,
+                            on_select_project: on_select_project,
+                            on_rename_project: on_rename_project,
+                            on_delete_project: on_delete_project_noop,
+                            on_request_rename_project: on_request_rename_project,
+                            on_request_delete_project: on_request_delete_project,
+                            on_toggle_project: on_toggle_project,
+                            on_add_root_note: on_add_root_note,
+                            on_select_note: on_select_note,
+                            on_toggle_note: on_toggle_note,
+                            on_rename_note: on_rename_note,
+                            on_request_rename_note: on_request_rename_note,
+                            on_request_delete_note: on_request_delete_note,
+                            on_add_child_note: on_add_child_note,
                         }
                     }
                 }
             }
         }
-        if let Some(did) = pending_delete_id {
+        if let Some(did) = pending_delete_project_id {
             ConfirmDialog {
                 title: "Delete project".to_string(),
                 message: format!(
                     "Delete project \"{}\"?\nThis cannot be undone.",
-                    pending_delete_name.clone().unwrap_or_default()
+                    pending_delete_project_name.clone().unwrap_or_default()
                 ),
                 confirm_label: "Delete".to_string(),
                 on_confirm: Callback::new(move |_| {
-                    match repo_for_delete.delete(did) {
+                    match project_repo_for_delete.delete(did) {
                         Ok(()) => {
-                            version.with_mut(|v| *v += 1);
-                            if selected_now == Some(did) {
-                                selected.set(None);
+                            project_version.with_mut(|v| *v += 1);
+                            note_version.with_mut(|v| *v += 1);
+                            if selected_project_now == Some(did) {
+                                selected_project.set(None);
                             }
                         }
                         Err(e) => eprintln!("operon: delete local_project failed: {e}"),
                     }
-                    pending_delete_setter.set(None);
+                    pending_delete_project_setter.set(None);
                 }),
                 on_cancel: Callback::new(move |_| {
-                    pending_delete_setter.set(None);
+                    pending_delete_project_setter.set(None);
                 }),
+            }
+        }
+        if let Some(did) = pending_delete_note_id {
+            ConfirmDialog {
+                title: "Delete note".to_string(),
+                message: format!(
+                    "Delete note \"{}\"?\nChild notes are deleted too.\nThis cannot be undone.",
+                    pending_delete_note_title.clone().unwrap_or_default()
+                ),
+                confirm_label: "Delete".to_string(),
+                on_confirm: Callback::new(move |_| {
+                    match note_repo_for_delete.delete(did) {
+                        Ok(()) => {
+                            note_version.with_mut(|v| *v += 1);
+                            if selected_note_now == Some(did) {
+                                selected_note.set(None);
+                            }
+                        }
+                        Err(e) => eprintln!("operon: delete local_note failed: {e}"),
+                    }
+                    pending_delete_note_setter.set(None);
+                }),
+                on_cancel: Callback::new(move |_| {
+                    pending_delete_note_setter.set(None);
+                }),
+            }
+        }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct ProjectSubtreeProps {
+    project: LocalProject,
+    is_open: bool,
+    selected: bool,
+    in_rename: bool,
+    notes: Vec<LocalNote>,
+    note_open_snap: HashMap<String, bool>,
+    renaming_note: Option<Uuid>,
+    selected_note: Option<Uuid>,
+    on_select_project: Callback<Uuid>,
+    on_rename_project: Callback<(Uuid, String)>,
+    on_delete_project: Callback<Uuid>,
+    on_request_rename_project: Callback<Uuid>,
+    on_request_delete_project: Callback<Uuid>,
+    on_toggle_project: Callback<Uuid>,
+    on_add_root_note: Callback<Uuid>,
+    on_select_note: Callback<Uuid>,
+    on_toggle_note: Callback<(Uuid, Uuid)>,
+    on_rename_note: Callback<(Uuid, String)>,
+    on_request_rename_note: Callback<Uuid>,
+    on_request_delete_note: Callback<Uuid>,
+    on_add_child_note: Callback<Uuid>,
+}
+
+#[component]
+fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
+    let project_id = props.project.id;
+    let forest = NoteForest::from_flat(props.notes.clone());
+    let visible = if props.is_open {
+        flatten_visible(&forest, &|id: &Uuid| {
+            props
+                .note_open_snap
+                .get(&id.to_string())
+                .copied()
+                .unwrap_or(false)
+        })
+    } else {
+        Vec::new()
+    };
+
+    let on_toggle_note = props.on_toggle_note;
+    let toggle_note_for_project: Callback<Uuid> = use_callback(move |note_id: Uuid| {
+        on_toggle_note.call((project_id, note_id));
+    });
+
+    rsx! {
+        ProjectRow {
+            project: props.project.clone(),
+            is_open: props.is_open,
+            selected: props.selected,
+            in_rename: props.in_rename,
+            on_select: props.on_select_project,
+            on_rename: props.on_rename_project,
+            on_delete: props.on_delete_project,
+            on_request_rename: props.on_request_rename_project,
+            on_request_delete: props.on_request_delete_project,
+            on_toggle: props.on_toggle_project,
+            on_add_note: props.on_add_root_note,
+        }
+        for note in visible.into_iter() {
+            NoteRow {
+                key: "{note.id}",
+                note: note.clone(),
+                depth: note.depth,
+                has_children: forest.has_children(&note.id),
+                is_open: props
+                    .note_open_snap
+                    .get(&note.id.to_string())
+                    .copied()
+                    .unwrap_or(false),
+                selected: props.selected_note == Some(note.id),
+                in_rename: props.renaming_note == Some(note.id),
+                on_select: props.on_select_note,
+                on_toggle_open: toggle_note_for_project,
+                on_rename: props.on_rename_note,
+                on_request_rename: props.on_request_rename_note,
+                on_request_delete: props.on_request_delete_note,
+                on_add_child: props.on_add_child_note,
             }
         }
     }
