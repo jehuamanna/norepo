@@ -20,7 +20,10 @@ use uuid::Uuid;
 
 use crate::local_mode::desktop::{LocalNoteRepo, LocalProjectRepo, LocalTreeStateRepo};
 use crate::local_mode::editor::{open_local_note_tab, LocalSaveAction};
-use crate::local_mode::ui::ConfirmDialog;
+use crate::local_mode::ui::{
+    ClipKind, ClipPayload, Clipboard, ConfirmDialog, DragKind, DragSession, DropPosition,
+    LocalClipboard,
+};
 use crate::tabs::{SaveScheduler, TabManager};
 
 /// App-scope signal: bumped on every successful project mutation. The panel
@@ -56,6 +59,8 @@ pub fn ExplorerPanel() -> Element {
     let LocalNoteVersion(mut note_version) = use_context();
     let SelectedProject(mut selected_project) = use_context();
     let SelectedNote(mut selected_note) = use_context();
+    let DragSession(drag_session) = use_context();
+    let LocalClipboard(clipboard) = use_context();
     let tabs: Signal<TabManager> = use_context();
     let save_scheduler: SaveScheduler = use_context();
     let _save_action: LocalSaveAction = use_context();
@@ -283,6 +288,203 @@ pub fn ExplorerPanel() -> Element {
         }
     });
 
+    // ===== Phase-4 handlers: indent/outdent/move/clipboard =====
+    let note_repo_for_indent = note_repo.clone();
+    let on_indent_note = use_callback(move |id: Uuid| match note_repo_for_indent.indent(id) {
+        Ok(()) => note_version.with_mut(|v| *v += 1),
+        Err(e) => eprintln!("operon: indent note failed: {e}"),
+    });
+    let note_repo_for_outdent = note_repo.clone();
+    let on_outdent_note = use_callback(move |id: Uuid| match note_repo_for_outdent.outdent(id) {
+        Ok(()) => note_version.with_mut(|v| *v += 1),
+        Err(e) => eprintln!("operon: outdent note failed: {e}"),
+    });
+    let note_repo_for_up = note_repo.clone();
+    let on_move_up_note = use_callback(move |id: Uuid| match note_repo_for_up.move_up(id) {
+        Ok(()) => note_version.with_mut(|v| *v += 1),
+        Err(e) => eprintln!("operon: move_up note failed: {e}"),
+    });
+    let note_repo_for_down = note_repo.clone();
+    let on_move_down_note = use_callback(move |id: Uuid| match note_repo_for_down.move_down(id) {
+        Ok(()) => note_version.with_mut(|v| *v += 1),
+        Err(e) => eprintln!("operon: move_down note failed: {e}"),
+    });
+
+    // Clipboard helpers shared by row context-menu items.
+    let mut clipboard_for_cut = clipboard;
+    let on_cut_note = use_callback(move |id: Uuid| {
+        clipboard_for_cut.set(Some(Clipboard::cut_note(id)));
+    });
+    let mut clipboard_for_copy = clipboard;
+    let on_copy_note = use_callback(move |id: Uuid| {
+        clipboard_for_copy.set(Some(Clipboard::copy_note(id)));
+    });
+    let mut clipboard_for_cut_p = clipboard;
+    let on_cut_project = use_callback(move |id: Uuid| {
+        clipboard_for_cut_p.set(Some(Clipboard::cut_project(id)));
+    });
+    let mut clipboard_for_copy_p = clipboard;
+    let on_copy_project = use_callback(move |id: Uuid| {
+        clipboard_for_copy_p.set(Some(Clipboard::copy_project(id)));
+    });
+
+    // Paste from row context menu (target = row id). Selected note → child;
+    // selected project → root.
+    let note_repo_for_paste = note_repo.clone();
+    let mut clipboard_for_paste = clipboard;
+    let on_paste_into_note = use_callback(move |target: Uuid| {
+        let Some(clip) = *clipboard_for_paste.read() else {
+            return;
+        };
+        // Locate the destination project via the target note.
+        let project_id = notes_by_project
+            .read()
+            .iter()
+            .find_map(|(pid, list)| list.iter().find(|n| n.id == target).map(|_| *pid));
+        let Some(project_id) = project_id else {
+            return;
+        };
+        let last_index = note_repo_for_paste
+            .list_for_project(project_id)
+            .map(|rows| rows.iter().filter(|r| r.parent_id == Some(target)).count() as i64)
+            .unwrap_or(0);
+        let outcome = match (clip.kind, clip.payload) {
+            (ClipKind::Cut, ClipPayload::Note(nid)) => {
+                note_repo_for_paste.move_to(nid, project_id, Some(target), last_index)
+            }
+            (ClipKind::Copy, ClipPayload::Note(nid)) => note_repo_for_paste
+                .duplicate_subtree(nid, project_id, Some(target), last_index)
+                .map(|_| ()),
+            (_, ClipPayload::Project(_)) => Ok(()),
+        };
+        if let Err(e) = outcome {
+            eprintln!("operon: paste-into-note failed: {e}");
+            return;
+        }
+        note_version.with_mut(|v| *v += 1);
+        if matches!(clip.kind, ClipKind::Cut) {
+            clipboard_for_paste.set(None);
+        }
+    });
+
+    let note_repo_for_paste_proj = note_repo.clone();
+    let mut clipboard_for_paste_proj = clipboard;
+    let on_paste_into_project = use_callback(move |target_project: Uuid| {
+        let Some(clip) = *clipboard_for_paste_proj.read() else {
+            return;
+        };
+        let last_index = note_repo_for_paste_proj
+            .list_for_project(target_project)
+            .map(|rows| rows.iter().filter(|r| r.parent_id.is_none()).count() as i64)
+            .unwrap_or(0);
+        let outcome = match (clip.kind, clip.payload) {
+            (ClipKind::Cut, ClipPayload::Note(nid)) => {
+                note_repo_for_paste_proj.move_to(nid, target_project, None, last_index)
+            }
+            (ClipKind::Copy, ClipPayload::Note(nid)) => note_repo_for_paste_proj
+                .duplicate_subtree(nid, target_project, None, last_index)
+                .map(|_| ()),
+            (_, ClipPayload::Project(_)) => Ok(()),
+        };
+        if let Err(e) = outcome {
+            eprintln!("operon: paste-into-project failed: {e}");
+            return;
+        }
+        note_version.with_mut(|v| *v += 1);
+        if matches!(clip.kind, ClipKind::Cut) {
+            clipboard_for_paste_proj.set(None);
+        }
+    });
+
+    // Drag-drop: reorder projects (Project ↔ Project).
+    let project_repo_for_drop = project_repo.clone();
+    let on_drop_project_on_project =
+        use_callback(move |(src, target, pos): (Uuid, Uuid, DropPosition)| {
+            if matches!(pos, DropPosition::Into) || src == target {
+                return;
+            }
+            let projects_now = match project_repo_for_drop.list() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("operon: list projects (drop) failed: {e}");
+                    return;
+                }
+            };
+            let target_idx = match projects_now.iter().position(|p| p.id == target) {
+                Some(i) => i as i64,
+                None => return,
+            };
+            let new_idx = match pos {
+                DropPosition::Before => target_idx,
+                DropPosition::After => target_idx + 1,
+                DropPosition::Into => return,
+            };
+            if let Err(e) = project_repo_for_drop.reorder(src, new_idx) {
+                eprintln!("operon: reorder project failed: {e}");
+                return;
+            }
+            project_version.with_mut(|v| *v += 1);
+        });
+
+    // Drag-drop: note onto project (Into = move to project root last; Before/After = no-op).
+    let note_repo_for_drop_pr = note_repo.clone();
+    let on_drop_note_on_project =
+        use_callback(move |(src, target, pos): (Uuid, Uuid, DropPosition)| {
+            if !matches!(pos, DropPosition::Into) {
+                return;
+            }
+            let last_index = note_repo_for_drop_pr
+                .list_for_project(target)
+                .map(|rows| rows.iter().filter(|r| r.parent_id.is_none()).count() as i64)
+                .unwrap_or(0);
+            if let Err(e) = note_repo_for_drop_pr.move_to(src, target, None, last_index) {
+                eprintln!("operon: drop note onto project failed: {e}");
+                return;
+            }
+            note_version.with_mut(|v| *v += 1);
+        });
+
+    // Drag-drop: note onto note. Before/After → sibling at target.parent_id;
+    // Into → child of target.
+    let note_repo_for_drop_n = note_repo.clone();
+    let on_drop_note_on_note =
+        use_callback(move |(src, target, pos): (Uuid, Uuid, DropPosition)| {
+            if src == target {
+                return;
+            }
+            // Look up target's project + parent.
+            let info = notes_by_project.read().iter().find_map(|(pid, list)| {
+                list.iter()
+                    .find(|n| n.id == target)
+                    .map(|n| (*pid, n.parent_id, n.sibling_index))
+            });
+            let Some((project_id, target_parent, target_sibling)) = info else {
+                return;
+            };
+            let outcome = match pos {
+                DropPosition::Into => {
+                    let last_index = note_repo_for_drop_n
+                        .list_for_project(project_id)
+                        .map(|rows| {
+                            rows.iter().filter(|r| r.parent_id == Some(target)).count() as i64
+                        })
+                        .unwrap_or(0);
+                    note_repo_for_drop_n.move_to(src, project_id, Some(target), last_index)
+                }
+                DropPosition::Before => {
+                    note_repo_for_drop_n.move_to(src, project_id, target_parent, target_sibling)
+                }
+                DropPosition::After => {
+                    note_repo_for_drop_n.move_to(src, project_id, target_parent, target_sibling + 1)
+                }
+            };
+            if let Err(e) = outcome {
+                eprintln!("operon: drop note onto note failed: {e}");
+                return;
+            }
+            note_version.with_mut(|v| *v += 1);
+        });
+
     // Toggle a note open/closed.
     let queue_for_note_toggle = tree_queue;
     let mut project_note_open_setter = project_note_open;
@@ -333,6 +535,15 @@ pub fn ExplorerPanel() -> Element {
     let workspace_snap = workspace_open.read().clone();
     let project_note_open_snap = project_note_open.read().clone();
     let notes_snap = notes_by_project.read().clone();
+    let clipboard_snap = *clipboard.read();
+    let drag_session_now = *drag_session.read();
+    let has_clip_note = matches!(
+        clipboard_snap,
+        Some(Clipboard {
+            payload: ClipPayload::Note(_),
+            ..
+        })
+    );
 
     rsx! {
         div {
@@ -384,6 +595,9 @@ pub fn ExplorerPanel() -> Element {
                                 .unwrap_or_default(),
                             renaming_note: renaming_note_now,
                             selected_note: selected_note_now,
+                            clipboard: clipboard_snap,
+                            has_clip_note: has_clip_note,
+                            drag_session: drag_session_now,
                             on_select_project: on_select_project,
                             on_rename_project: on_rename_project,
                             on_delete_project: on_delete_project_noop,
@@ -397,6 +611,19 @@ pub fn ExplorerPanel() -> Element {
                             on_request_rename_note: on_request_rename_note,
                             on_request_delete_note: on_request_delete_note,
                             on_add_child_note: on_add_child_note,
+                            on_indent_note: on_indent_note,
+                            on_outdent_note: on_outdent_note,
+                            on_move_up_note: on_move_up_note,
+                            on_move_down_note: on_move_down_note,
+                            on_cut_note: on_cut_note,
+                            on_copy_note: on_copy_note,
+                            on_paste_into_note: on_paste_into_note,
+                            on_cut_project: on_cut_project,
+                            on_copy_project: on_copy_project,
+                            on_paste_into_project: on_paste_into_project,
+                            on_drop_project_on_project: on_drop_project_on_project,
+                            on_drop_note_on_project: on_drop_note_on_project,
+                            on_drop_note_on_note: on_drop_note_on_note,
                         }
                     }
                 }
@@ -466,6 +693,9 @@ struct ProjectSubtreeProps {
     note_open_snap: HashMap<String, bool>,
     renaming_note: Option<Uuid>,
     selected_note: Option<Uuid>,
+    clipboard: Option<Clipboard>,
+    has_clip_note: bool,
+    drag_session: Option<DragKind>,
     on_select_project: Callback<Uuid>,
     on_rename_project: Callback<(Uuid, String)>,
     on_delete_project: Callback<Uuid>,
@@ -479,6 +709,19 @@ struct ProjectSubtreeProps {
     on_request_rename_note: Callback<Uuid>,
     on_request_delete_note: Callback<Uuid>,
     on_add_child_note: Callback<Uuid>,
+    on_indent_note: Callback<Uuid>,
+    on_outdent_note: Callback<Uuid>,
+    on_move_up_note: Callback<Uuid>,
+    on_move_down_note: Callback<Uuid>,
+    on_cut_note: Callback<Uuid>,
+    on_copy_note: Callback<Uuid>,
+    on_paste_into_note: Callback<Uuid>,
+    on_cut_project: Callback<Uuid>,
+    on_copy_project: Callback<Uuid>,
+    on_paste_into_project: Callback<Uuid>,
+    on_drop_project_on_project: Callback<(Uuid, Uuid, DropPosition)>,
+    on_drop_note_on_project: Callback<(Uuid, Uuid, DropPosition)>,
+    on_drop_note_on_note: Callback<(Uuid, Uuid, DropPosition)>,
 }
 
 #[component]
@@ -497,10 +740,27 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
         Vec::new()
     };
 
+    // Build a sibling-index map: (parent, sibling_index, max_sibling_index) for
+    // each visible note. Used by NoteRow to enable/disable indent / move-up / etc.
+    let mut max_sibling_by_parent: HashMap<Option<Uuid>, i64> = HashMap::new();
+    for note in props.notes.iter() {
+        let entry = max_sibling_by_parent
+            .entry(note.parent_id)
+            .or_insert(note.sibling_index);
+        if note.sibling_index > *entry {
+            *entry = note.sibling_index;
+        }
+    }
+
     let on_toggle_note = props.on_toggle_note;
     let toggle_note_for_project: Callback<Uuid> = use_callback(move |note_id: Uuid| {
         on_toggle_note.call((project_id, note_id));
     });
+
+    let cut_project = props
+        .clipboard
+        .map(|c| c.is_cut_project(project_id))
+        .unwrap_or(false);
 
     rsx! {
         ProjectRow {
@@ -508,6 +768,9 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
             is_open: props.is_open,
             selected: props.selected,
             in_rename: props.in_rename,
+            cut: cut_project,
+            has_clip_note: props.has_clip_note,
+            drag_active: props.drag_session.is_some(),
             on_select: props.on_select_project,
             on_rename: props.on_rename_project,
             on_delete: props.on_delete_project,
@@ -515,26 +778,59 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
             on_request_delete: props.on_request_delete_project,
             on_toggle: props.on_toggle_project,
             on_add_note: props.on_add_root_note,
+            on_cut: props.on_cut_project,
+            on_copy: props.on_copy_project,
+            on_paste: props.on_paste_into_project,
+            on_drop_project_on_project: props.on_drop_project_on_project,
+            on_drop_note_on_project: props.on_drop_note_on_project,
         }
         for note in visible.into_iter() {
-            NoteRow {
-                key: "{note.id}",
-                note: note.clone(),
-                depth: note.depth,
-                has_children: forest.has_children(&note.id),
-                is_open: props
-                    .note_open_snap
-                    .get(&note.id.to_string())
+            {
+                let max_sibling = max_sibling_by_parent
+                    .get(&note.parent_id)
                     .copied()
-                    .unwrap_or(false),
-                selected: props.selected_note == Some(note.id),
-                in_rename: props.renaming_note == Some(note.id),
-                on_select: props.on_select_note,
-                on_toggle_open: toggle_note_for_project,
-                on_rename: props.on_rename_note,
-                on_request_rename: props.on_request_rename_note,
-                on_request_delete: props.on_request_delete_note,
-                on_add_child: props.on_add_child_note,
+                    .unwrap_or(0);
+                let is_first = note.sibling_index == 0;
+                let is_last = note.sibling_index == max_sibling;
+                let depth = note.depth;
+                let cut = props
+                    .clipboard
+                    .map(|c| c.is_cut_note(note.id))
+                    .unwrap_or(false);
+                rsx! {
+                    NoteRow {
+                        key: "{note.id}",
+                        note: note.clone(),
+                        depth,
+                        has_children: forest.has_children(&note.id),
+                        is_open: props
+                            .note_open_snap
+                            .get(&note.id.to_string())
+                            .copied()
+                            .unwrap_or(false),
+                        selected: props.selected_note == Some(note.id),
+                        in_rename: props.renaming_note == Some(note.id),
+                        is_first_sibling: is_first,
+                        is_last_sibling: is_last,
+                        cut,
+                        has_clip_note: props.has_clip_note,
+                        drag_active: props.drag_session.is_some(),
+                        on_select: props.on_select_note,
+                        on_toggle_open: toggle_note_for_project,
+                        on_rename: props.on_rename_note,
+                        on_request_rename: props.on_request_rename_note,
+                        on_request_delete: props.on_request_delete_note,
+                        on_add_child: props.on_add_child_note,
+                        on_indent: props.on_indent_note,
+                        on_outdent: props.on_outdent_note,
+                        on_move_up: props.on_move_up_note,
+                        on_move_down: props.on_move_down_note,
+                        on_cut: props.on_cut_note,
+                        on_copy: props.on_copy_note,
+                        on_paste: props.on_paste_into_note,
+                        on_drop_note_on_note: props.on_drop_note_on_note,
+                    }
+                }
             }
         }
     }

@@ -1,12 +1,16 @@
 //! A single note row inside the explorer panel. Indented by `depth * 16px`,
 //! shows a disclosure caret only when it has children, and supports inline
-//! rename / context menu (Rename / Delete + disabled placeholders).
+//! rename / context menu (Phase-4: cut/copy/paste, indent/outdent, move-up/down).
 
 use dioxus::prelude::*;
+use keyboard_types::Modifiers;
 use operon_store::repos::LocalNote;
 use uuid::Uuid;
 
-use crate::local_mode::ui::{ContextMenu, ContextMenuItem, InlineRename};
+use crate::local_mode::ui::{
+    classify_drop_position, ContextMenu, ContextMenuItem, DragKind, DragSession, DropPosition,
+    InlineRename,
+};
 
 #[derive(Props, Clone, PartialEq)]
 pub struct NoteRowProps {
@@ -16,18 +20,34 @@ pub struct NoteRowProps {
     pub is_open: bool,
     pub selected: bool,
     pub in_rename: bool,
+    pub is_first_sibling: bool,
+    pub is_last_sibling: bool,
+    pub cut: bool,
+    pub has_clip_note: bool,
+    pub drag_active: bool,
     pub on_select: Callback<Uuid>,
     pub on_toggle_open: Callback<Uuid>,
     pub on_rename: Callback<(Uuid, String)>,
     pub on_request_rename: Callback<Uuid>,
     pub on_request_delete: Callback<Uuid>,
     pub on_add_child: Callback<Uuid>,
+    pub on_indent: Callback<Uuid>,
+    pub on_outdent: Callback<Uuid>,
+    pub on_move_up: Callback<Uuid>,
+    pub on_move_down: Callback<Uuid>,
+    pub on_cut: Callback<Uuid>,
+    pub on_copy: Callback<Uuid>,
+    pub on_paste: Callback<Uuid>,
+    pub on_drop_note_on_note: Callback<(Uuid, Uuid, DropPosition)>,
 }
 
 #[component]
 pub fn NoteRow(props: NoteRowProps) -> Element {
     let menu_pos: Signal<Option<(i32, i32)>> = use_signal(|| None);
     let mut menu_pos_setter = menu_pos;
+    let drop_indicator: Signal<Option<DropPosition>> = use_signal(|| None);
+    let mut drop_indicator_setter = drop_indicator;
+    let DragSession(mut drag_session) = use_context();
 
     let note = props.note.clone();
     let id = note.id;
@@ -39,6 +59,11 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let is_open = props.is_open;
     let selected = props.selected;
     let in_rename = props.in_rename;
+    let is_first_sibling = props.is_first_sibling;
+    let is_last_sibling = props.is_last_sibling;
+    let cut = props.cut;
+    let has_clip_note = props.has_clip_note;
+    let drag_active = props.drag_active;
 
     let on_select = props.on_select;
     let on_toggle_open = props.on_toggle_open;
@@ -46,16 +71,67 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let on_request_rename = props.on_request_rename;
     let on_request_delete = props.on_request_delete;
     let on_add_child = props.on_add_child;
+    let on_indent = props.on_indent;
+    let on_outdent = props.on_outdent;
+    let on_move_up = props.on_move_up;
+    let on_move_down = props.on_move_down;
+    let on_cut = props.on_cut;
+    let on_copy = props.on_copy;
+    let on_paste = props.on_paste;
+    let on_drop_note_on_note = props.on_drop_note_on_note;
 
-    let row_class = if selected {
-        "flex items-center gap-1 px-2 py-1 cursor-pointer text-sm bg-[var(--operon-hover)]"
+    let mut row_class = if selected {
+        String::from(
+            "flex items-center gap-1 px-2 py-1 cursor-pointer text-sm bg-[var(--operon-hover)] relative",
+        )
     } else {
-        "flex items-center gap-1 px-2 py-1 cursor-pointer text-sm hover:bg-[var(--operon-hover)] group"
+        String::from(
+            "flex items-center gap-1 px-2 py-1 cursor-pointer text-sm hover:bg-[var(--operon-hover)] group relative",
+        )
     };
+    if cut {
+        row_class.push_str(" opacity-50");
+    }
     let style = format!("padding-left: {}px;", 8 + indent_px);
 
     let initial_title = title.clone();
     let dismiss_menu = use_callback(move |_: ()| menu_pos_setter.set(None));
+
+    let mut paste_item = ContextMenuItem::new(
+        "Paste",
+        Callback::new(move |_| {
+            on_paste.call(id);
+        }),
+    );
+    paste_item.enabled = has_clip_note;
+    let mut indent_item = ContextMenuItem::new(
+        "Indent",
+        Callback::new(move |_| {
+            on_indent.call(id);
+        }),
+    );
+    indent_item.enabled = !is_first_sibling;
+    let mut outdent_item = ContextMenuItem::new(
+        "Outdent",
+        Callback::new(move |_| {
+            on_outdent.call(id);
+        }),
+    );
+    outdent_item.enabled = depth > 0;
+    let mut move_up_item = ContextMenuItem::new(
+        "Move up",
+        Callback::new(move |_| {
+            on_move_up.call(id);
+        }),
+    );
+    move_up_item.enabled = !is_first_sibling;
+    let mut move_down_item = ContextMenuItem::new(
+        "Move down",
+        Callback::new(move |_| {
+            on_move_down.call(id);
+        }),
+    );
+    move_down_item.enabled = !is_last_sibling;
 
     let menu_items: Vec<ContextMenuItem> = vec![
         ContextMenuItem::new(
@@ -71,14 +147,28 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
             }),
         ),
         ContextMenuItem::new(
+            "Cut",
+            Callback::new(move |_| {
+                on_cut.call(id);
+            }),
+        ),
+        ContextMenuItem::new(
+            "Copy",
+            Callback::new(move |_| {
+                on_copy.call(id);
+            }),
+        ),
+        paste_item,
+        indent_item,
+        outdent_item,
+        move_up_item,
+        move_down_item,
+        ContextMenuItem::new(
             "Delete",
             Callback::new(move |_| {
                 on_request_delete.call(id);
             }),
         ),
-        ContextMenuItem::disabled("Cut"),
-        ContextMenuItem::disabled("Copy"),
-        ContextMenuItem::disabled("Paste"),
     ];
 
     let caret_glyph = if has_children {
@@ -91,15 +181,21 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
         ""
     };
 
+    let drop_pos_now = *drop_indicator.read();
+
     rsx! {
         div {
             class: "{row_class}",
             style: "{style}",
             "data-testid": "note-row",
+            "data-explorer": "true",
             "data-note-id": "{id_str}",
             "data-note-depth": "{depth}",
             "data-selected": if selected { "true" } else { "false" },
             "data-open": if is_open { "true" } else { "false" },
+            "data-cut": if cut { "true" } else { "false" },
+            tabindex: "0",
+            draggable: "true",
             onclick: move |evt| {
                 evt.stop_propagation();
                 on_select.call(id);
@@ -116,11 +212,64 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 let coords = evt.client_coordinates();
                 menu_pos_setter.set(Some((coords.x as i32, coords.y as i32)));
             },
-            // Disclosure caret — only visible when has_children, but we render
-            // a fixed-width slot either way so labels line up.
+            onkeydown: move |evt| {
+                let key = evt.key().to_string();
+                let mods = evt.modifiers();
+                if key == "Tab" {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    if mods.contains(Modifiers::SHIFT) {
+                        on_outdent.call(id);
+                    } else {
+                        on_indent.call(id);
+                    }
+                } else if key == "ArrowUp" && mods.contains(Modifiers::ALT) {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    on_move_up.call(id);
+                } else if key == "ArrowDown" && mods.contains(Modifiers::ALT) {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    on_move_down.call(id);
+                }
+            },
+            ondragstart: move |_| {
+                drag_session.set(Some(DragKind::Note(id)));
+            },
+            ondragend: move |_| {
+                drag_session.set(None);
+                drop_indicator_setter.set(None);
+            },
+            ondragover: move |evt| {
+                evt.prevent_default();
+                let kind = *drag_session.read();
+                let coords = evt.element_coordinates();
+                let pos = classify_drop_position(coords.y, 28.0);
+                let allow = matches!(kind, Some(DragKind::Note(src)) if src != id);
+                drop_indicator_setter.set(if allow { Some(pos) } else { None });
+            },
+            ondragleave: move |_| {
+                drop_indicator_setter.set(None);
+            },
+            ondrop: move |evt| {
+                evt.prevent_default();
+                let kind = *drag_session.read();
+                let coords = evt.element_coordinates();
+                let pos = classify_drop_position(coords.y, 28.0);
+                if let Some(DragKind::Note(src)) = kind {
+                    if src != id {
+                        on_drop_note_on_note.call((src, id, pos));
+                    }
+                }
+                drag_session.set(None);
+                drop_indicator_setter.set(None);
+            },
+            // Disclosure caret + drag handle. Even when has_children is false
+            // we render the slot so labels align; data-testid="drag-handle"
+            // is on the whole row via the parent (see HTML5 draggable attr).
             span {
                 class: "inline-flex w-3 shrink-0 select-none text-xs opacity-70",
-                "data-testid": "note-row-disclosure",
+                "data-testid": "drag-handle",
                 "data-has-children": if has_children { "true" } else { "false" },
                 onclick: move |evt| {
                     evt.stop_propagation();
@@ -129,6 +278,13 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                     }
                 },
                 "{caret_glyph}"
+            }
+            if cut {
+                span {
+                    class: "sr-only",
+                    "data-testid": "clipboard-indicator",
+                    "Cut"
+                }
             }
             if in_rename {
                 InlineRename {
@@ -159,6 +315,11 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                     "+"
                 }
             }
+            if drag_active {
+                if let Some(p) = drop_pos_now {
+                    DropIndicator { position: p }
+                }
+            }
         }
         if let Some((x, y)) = *menu_pos.read() {
             ContextMenu {
@@ -167,6 +328,30 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 items: menu_items,
                 on_dismiss: dismiss_menu,
             }
+        }
+    }
+}
+
+#[component]
+fn DropIndicator(position: DropPosition) -> Element {
+    let (testid, class) = match position {
+        DropPosition::Before => (
+            "drop-indicator-before",
+            "absolute left-0 right-0 top-0 h-0.5 bg-[var(--operon-accent)]",
+        ),
+        DropPosition::Into => (
+            "drop-indicator-into",
+            "absolute inset-0 ring-2 ring-[var(--operon-accent)] pointer-events-none",
+        ),
+        DropPosition::After => (
+            "drop-indicator-after",
+            "absolute left-0 right-0 bottom-0 h-0.5 bg-[var(--operon-accent)]",
+        ),
+    };
+    rsx! {
+        span {
+            class: "{class}",
+            "data-testid": "{testid}",
         }
     }
 }

@@ -2,10 +2,14 @@
 //! context menu, inline rename input, and confirm dialog used by the explorer
 //! panel; later phases (notes, search) reuse the same building blocks.
 
+pub mod clipboard;
 pub mod confirm;
 pub mod context_menu;
+pub mod drag_drop;
 pub mod inline_rename;
 
+pub use clipboard::{ClipKind, ClipPayload, Clipboard, LocalClipboard};
 pub use confirm::ConfirmDialog;
 pub use context_menu::{ContextMenu, ContextMenuItem};
+pub use drag_drop::{classify_drop_position, DragKind, DragSession, DropPosition};
 pub use inline_rename::InlineRename;

@@ -15,6 +15,7 @@ use super::editor::{install_save_action, LocalNoteEditor, LocalSaveAction};
 use super::explorer::{
     ExplorerPanel, LocalNoteVersion, LocalProjectVersion, SelectedNote, SelectedProject,
 };
+use super::ui::{ClipKind, ClipPayload, Clipboard, DragKind, DragSession, LocalClipboard};
 use super::{MODE_VALUE_CLOUD, MODE_VALUE_LOCAL, SETTINGS_KEY_MODE_REMEMBERED};
 use crate::persistence::Persistence;
 use crate::rbag::state::{AppState, Mode};
@@ -145,6 +146,12 @@ pub fn LocalShell() -> Element {
     use_context_provider(|| SelectedProject(selected_project));
     let selected_note: Signal<Option<Uuid>> = use_signal(|| None);
     use_context_provider(|| SelectedNote(selected_note));
+    // Phase-4: drag session + clipboard live at app scope so explorer rows can
+    // co-ordinate without prop-drilling.
+    let drag_session: Signal<Option<DragKind>> = use_signal(|| None);
+    use_context_provider(|| DragSession(drag_session));
+    let clipboard: Signal<Option<Clipboard>> = use_signal(|| None);
+    use_context_provider(|| LocalClipboard(clipboard));
 
     // Explicit-save action — the Save button + Ctrl+S call this.
     let save_callback =
@@ -155,6 +162,17 @@ pub fn LocalShell() -> Element {
     use_context_provider(|| save_action.clone());
 
     let active_tab_id = tabs.read().active_id();
+
+    // Capture the repos used by the paste keyboard handler.
+    let note_repo_for_keys = note_repo.clone();
+    let project_repo_for_keys: Arc<dyn LocalProjectRepository> = {
+        let LocalProjectRepo(r) = use_context();
+        r
+    };
+    let mut clipboard_setter = clipboard;
+    let mut selected_project_setter = selected_project;
+    let mut note_version_setter = note_version;
+    let project_repo_keys = project_repo_for_keys.clone();
 
     rsx! {
         div {
@@ -171,7 +189,54 @@ pub fn LocalShell() -> Element {
                 {
                     evt.prevent_default();
                     save_action.callback.call(());
+                    return;
                 }
+                if with_meta && !mods.contains(Modifiers::ALT) {
+                    let key = evt.key().to_string();
+                    if key.eq_ignore_ascii_case("x") || key.eq_ignore_ascii_case("c") {
+                        // Cut/Copy require a selected note (or project as fallback).
+                        let payload = if let Some(nid) = *selected_note.read() {
+                            Some(ClipPayload::Note(nid))
+                        } else {
+                            (*selected_project.read()).map(ClipPayload::Project)
+                        };
+                        if let Some(payload) = payload {
+                            let kind = if key.eq_ignore_ascii_case("x") {
+                                ClipKind::Cut
+                            } else {
+                                ClipKind::Copy
+                            };
+                            clipboard_setter.set(Some(Clipboard { kind, payload }));
+                            evt.prevent_default();
+                            return;
+                        }
+                    }
+                    if key.eq_ignore_ascii_case("v") {
+                        let clip = *clipboard.read();
+                        if let Some(clip) = clip {
+                            paste_clipboard(
+                                clip,
+                                *selected_note.read(),
+                                *selected_project.read(),
+                                &note_repo_for_keys,
+                                &project_repo_keys,
+                            );
+                            note_version_setter.with_mut(|v| *v += 1);
+                            if matches!(clip.kind, ClipKind::Cut) {
+                                clipboard_setter.set(None);
+                            }
+                            evt.prevent_default();
+                            return;
+                        }
+                    }
+                }
+                if evt.key().to_string() == "Escape" && clipboard.read().is_some() {
+                    clipboard_setter.set(None);
+                    evt.prevent_default();
+                    return;
+                }
+                // Make warnings about unused mut go away when neither cut nor paste fires.
+                let _ = &mut selected_project_setter;
             },
             // Top bar
             div {
@@ -358,6 +423,77 @@ pub fn StartupChooser() -> Element {
                     "Cloud (RBAG)"
                 }
             }
+        }
+    }
+}
+
+/// Resolve a Paste action: cut moves a note (or project) into the selected
+/// target; copy duplicates the subtree. Targets follow the Phase-4 rules:
+/// selected note → child of that note; selected project (no note) → last
+/// root-level note in that project; nothing selected → last root-level note
+/// in the first project.
+fn paste_clipboard(
+    clip: Clipboard,
+    selected_note: Option<Uuid>,
+    selected_project: Option<Uuid>,
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    project_repo: &Arc<dyn LocalProjectRepository>,
+) {
+    // Resolve the destination project + parent.
+    let (dest_project, dest_parent) = if let Some(note_id) = selected_note {
+        // Need to find the project that owns this note. Easiest: probe each project.
+        let projects = project_repo.list().unwrap_or_default();
+        let owning = projects
+            .iter()
+            .find(|p| {
+                note_repo
+                    .list_for_project(p.id)
+                    .ok()
+                    .map(|rows| rows.iter().any(|r| r.id == note_id))
+                    .unwrap_or(false)
+            })
+            .map(|p| p.id);
+        match owning {
+            Some(pid) => (pid, Some(note_id)),
+            None => return,
+        }
+    } else if let Some(pid) = selected_project {
+        (pid, None)
+    } else {
+        let projects = project_repo.list().unwrap_or_default();
+        match projects.first() {
+            Some(p) => (p.id, None),
+            None => return,
+        }
+    };
+
+    let last_index = match dest_parent {
+        Some(pid) => note_repo
+            .list_for_project(dest_project)
+            .map(|rows| rows.iter().filter(|r| r.parent_id == Some(pid)).count() as i64)
+            .unwrap_or(0),
+        None => note_repo
+            .list_for_project(dest_project)
+            .map(|rows| rows.iter().filter(|r| r.parent_id.is_none()).count() as i64)
+            .unwrap_or(0),
+    };
+
+    match (clip.kind, clip.payload) {
+        (ClipKind::Cut, ClipPayload::Note(nid)) => {
+            if let Err(e) = note_repo.move_to(nid, dest_project, dest_parent, last_index) {
+                eprintln!("operon: paste cut note failed: {e}");
+            }
+        }
+        (ClipKind::Copy, ClipPayload::Note(nid)) => {
+            if let Err(e) = note_repo.duplicate_subtree(nid, dest_project, dest_parent, last_index)
+            {
+                eprintln!("operon: paste copy note failed: {e}");
+            }
+        }
+        (_, ClipPayload::Project(_)) => {
+            // Project cut/copy via keyboard is reserved for future phases — the
+            // explorer ignores it for now (clipboard will be cleared by the
+            // caller when needed).
         }
     }
 }
