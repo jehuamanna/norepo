@@ -12,6 +12,7 @@ pub mod panel;
 pub mod persistence;
 pub mod plugin;
 pub mod plugins;
+pub mod rbag;
 pub mod shell;
 pub mod tabs;
 pub mod theme;
