@@ -1,9 +1,11 @@
 //! axum HTTP API for Operon-dioxus. Exposes auth + (in later phases) admin and
 //! note routes.
 
+pub mod audit;
 pub mod bootstrap;
 pub mod error;
 pub mod extractors;
+pub mod permissions;
 pub mod routes;
 pub mod state;
 
@@ -18,7 +20,14 @@ pub fn router(state: AppState) -> Router {
         .merge(routes::auth::router())
         .merge(routes::session::router())
         .merge(routes::admin_invites::router())
+        .merge(routes::admin_users::router())
         .merge(routes::me::router())
+        .merge(routes::orgs::router())
+        .merge(routes::departments::router())
+        .merge(routes::teams::router())
+        .merge(routes::projects::router())
+        .merge(routes::memberships::router())
+        .merge(routes::team_assignments::router())
         .with_state(state)
 }
 
