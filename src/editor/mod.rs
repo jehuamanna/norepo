@@ -13,8 +13,16 @@ use std::pin::Pin;
 
 pub mod codemirror;
 pub mod monaco;
+pub mod tiptap;
 pub use codemirror::CodeMirror6Backend;
 pub use monaco::MonacoBackend;
+pub use tiptap::TiptapBackend;
+
+impl LanguageDescriptor {
+    pub const fn richtext_tiptap() -> Self {
+        Self { id: "richtext-tiptap", monaco_language: "plaintext", monarch_grammar: None }
+    }
+}
 
 /// Editor mode the active tab is in. The shell renders different surfaces per mode and the
 /// active plugin's [`crate::plugin::FormatPlugin`] capability flag determines which buttons

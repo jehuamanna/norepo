@@ -39,8 +39,9 @@ export async function mount(target: HTMLElement, init: BackendInit): Promise<Han
       return mountCodeMirror(target, init);
     }
     case "tiptap": {
-      // Phase 5 lands the Tiptap backend.
-      throw new Error("tiptap backend not yet implemented");
+      const { mountTiptap } = await import("./tiptap.js");
+      markLoaded("tiptap");
+      return mountTiptap(target, init);
     }
     default: {
       const _exhaustive: never = init.kind;

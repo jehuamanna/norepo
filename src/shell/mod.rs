@@ -34,6 +34,7 @@ pub mod split_view;
 pub mod splitter;
 pub mod state;
 mod status_bar;
+pub mod tiptap_host;
 
 pub use activity_bar::ActivityBar;
 pub use companion_area::CompanionArea;

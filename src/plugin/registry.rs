@@ -101,10 +101,12 @@ pub fn register_builtins(
     use crate::plugins::markdown::MarkdownFormatPlugin;
     use crate::plugins::notes_explorer::NotesExplorer;
     use crate::plugins::plaintext::PlaintextFormatPlugin;
+    use crate::plugins::richtext_tiptap::RichTextTiptapFormatPlugin;
     registry.add_ui_plugin(Box::new(NotesExplorer::new()))?;
     registry.add_format_plugin(Box::new(MarkdownFormatPlugin::new()))?;
     registry.add_format_plugin(Box::new(PlaintextFormatPlugin::new()))?;
     registry.add_format_plugin(Box::new(JsonFormatPlugin::new()))?;
+    registry.add_format_plugin(Box::new(RichTextTiptapFormatPlugin::new()))?;
     Ok(())
 }
 
