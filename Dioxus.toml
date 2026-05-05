@@ -8,8 +8,19 @@ title = "operon-dioxus"
 # include `assets` in web platform
 [web.resource]
 
-# Additional CSS style files
-style = []
+# Additional CSS style files baked into the served HTML <head>. Listing them
+# here (rather than relying on document::Stylesheet from inside App's render)
+# avoids a visible flash of unstyled content: the browser starts fetching
+# these as soon as it parses the <link> tags, in parallel with WASM loading,
+# so by the time Dioxus mounts the chrome the grid CSS is usually already
+# applied.
+style = [
+    "/assets/main.css",
+    "/assets/tailwind.css",
+    "/assets/theme.css",
+    "/assets/shell.css",
+    "/assets/markdown.css",
+]
 
 # Additional JavaScript files
 script = []
