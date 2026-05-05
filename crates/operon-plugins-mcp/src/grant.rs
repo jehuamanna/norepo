@@ -6,8 +6,8 @@
 //! - `SecretStoreGrantHandler`: looks up `mcp-grant/{server}/{tool}` in a SecretStore;
 //!   returns Ok(true) if value is "allow", false otherwise.
 
-use crate::agent::error::OperonResult;
-use crate::agent::secrets::SecretStore;
+use operon_core::error::OperonResult;
+use operon_core::secrets::SecretStore;
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -66,7 +66,7 @@ impl GrantHandler for SecretStoreGrantHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::secrets::MockSecretStore;
+    use operon_core::secrets::MockSecretStore;
 
     #[tokio::test]
     async fn auto_approve_returns_true() {

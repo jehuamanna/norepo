@@ -1,9 +1,9 @@
 //! AgentRuntime — ReAct loop on top of ChatPlugin + ToolPlugin + MemoryPlugin.
 
-use crate::agent::budget::Budget;
-use crate::agent::bus::{BusEvent, EventBus};
-use crate::agent::error::OperonResult;
-use crate::agent::traits::{
+use crate::budget::Budget;
+use crate::bus::{BusEvent, EventBus};
+use crate::error::OperonResult;
+use crate::traits::{
     CancellationToken, ChatDelta, ChatPlugin, ChatRequest, ContentBlock, MemoryPlugin, Message,
     Role, Scope, ToolPlugin, Usage,
 };

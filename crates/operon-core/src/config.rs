@@ -1,4 +1,4 @@
-use crate::agent::error::{OperonError, OperonResult};
+use crate::error::{OperonError, OperonResult};
 use figment::{
     providers::{Env, Format, Toml},
     Figment,

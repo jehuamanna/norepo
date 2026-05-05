@@ -1,4 +1,4 @@
-use crate::agent::error::OperonResult;
+use crate::error::OperonResult;
 use async_trait::async_trait;
 use bitflags::bitflags;
 use futures::Stream;

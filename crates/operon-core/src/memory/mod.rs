@@ -6,7 +6,7 @@ pub use in_memory::InMemoryStore;
 #[cfg(all(feature = "sqlite-memory", not(target_arch = "wasm32")))]
 pub use sqlite::SqliteMemoryStore;
 
-use crate::agent::traits::{ContentBlock, MemoryPlugin, Message, Role, Scope};
+use crate::traits::{ContentBlock, MemoryPlugin, Message, Role, Scope};
 use std::collections::HashSet;
 use uuid::Uuid;
 

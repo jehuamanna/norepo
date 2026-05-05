@@ -1,5 +1,6 @@
 [workspace]
-members = [".", "tests-wasm"]
+members = [".", "tests-wasm", "crates/operon-core", "crates/operon-plugins-anthropic", "crates/operon-plugins-mcp"]
+default-members = ["."]
 
 [package]
 name = "operon-dioxus"
@@ -21,21 +22,19 @@ pulldown-cmark = { version = "0.10", default-features = false }
 # `js_sys::Date::now()` on wasm and `std::time` everywhere else.
 web-time = "1"
 
-# === Agent runtime substrate (Plans-Phase-1) ===
+# === Agent runtime crates (Plans-Phase-4 split) ===
+operon-core = { path = "crates/operon-core" }
+operon-plugins-anthropic = { path = "crates/operon-plugins-anthropic" }
+operon-plugins-mcp = { path = "crates/operon-plugins-mcp" }
+
+# === Agent-runtime support deps (re-exported / used by integration tests) ===
 async-trait = "0.1"
-bitflags = "2"
-figment = { version = "0.10", features = ["toml", "env"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1"
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
-
-# === Agent runtime (Plans-Phase-2) ===
-tokio-stream = "0.1"
-async-stream = "0.3"
 
 # `web_sys` bindings used only on the wasm web build for localStorage + prefers-color-scheme.
 # Native tests stub these out so the dependency is wasm-only.
@@ -71,26 +70,19 @@ web-sys = { version = "0.3", features = [
     "StorageManager",
     "Window",
 ] }
-tracing-wasm = "0.2"
 uuid = { version = "1", features = ["v4", "serde", "js"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 notify = "6"
 tempfile = "3"
-keyring = { version = "2", default-features = false, features = ["linux-secret-service-rt-tokio-crypto-rust"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-rusqlite = { version = "0.32", features = ["bundled"], optional = true }
-rusqlite_migration = { version = "1", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
-bytes = "1"
 
 [features]
 default = ["desktop"]
 web = ["dioxus/web"]
 desktop = ["dioxus/desktop"]
 mobile = ["dioxus/mobile"]
-sqlite-memory = ["dep:rusqlite", "dep:rusqlite_migration"]
+sqlite-memory = ["operon-core/sqlite-memory"]
 
 [dev-dependencies]
 pretty_assertions = "1.4"

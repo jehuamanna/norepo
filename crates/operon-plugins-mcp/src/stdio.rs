@@ -4,9 +4,9 @@
 //! MCP servers use this; the LSP-style `Content-Length` framing is not implemented
 //! here (defer to a follow-up).
 
-use crate::agent::error::{OperonError, OperonResult};
-use crate::agent::mcp::grant::GrantHandler;
-use crate::agent::traits::{
+use operon_core::error::{OperonError, OperonResult};
+use crate::grant::GrantHandler;
+use operon_core::traits::{
     CancellationToken, Capabilities, McpClient, Plugin, ToolDef,
 };
 use async_trait::async_trait;

@@ -4202,23 +4202,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "operon-dioxus"
+name = "operon-core"
 version = "0.1.0"
 dependencies = [
- "async-stream",
  "async-trait",
  "bitflags 2.11.1",
- "bytes",
- "dioxus",
  "figment",
  "futures",
- "futures-timer",
- "js-sys",
  "keyring",
- "notify",
- "pretty_assertions",
- "pulldown-cmark",
- "reqwest",
  "rusqlite",
  "rusqlite_migration",
  "serde",
@@ -4232,10 +4223,65 @@ dependencies = [
  "tracing-subscriber",
  "tracing-wasm",
  "uuid",
+ "web-time",
+]
+
+[[package]]
+name = "operon-dioxus"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dioxus",
+ "futures",
+ "futures-timer",
+ "js-sys",
+ "notify",
+ "operon-core",
+ "operon-plugins-anthropic",
+ "operon-plugins-mcp",
+ "pretty_assertions",
+ "pulldown-cmark",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
  "web-time",
+]
+
+[[package]]
+name = "operon-plugins-anthropic"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "operon-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "operon-plugins-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "operon-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

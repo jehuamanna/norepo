@@ -1,4 +1,4 @@
-use crate::agent::traits::{ChatPlugin, McpClient, MemoryPlugin, ToolPlugin};
+use crate::traits::{ChatPlugin, McpClient, MemoryPlugin, ToolPlugin};
 use std::sync::Arc;
 
 pub struct AgentRegistry {
@@ -58,8 +58,8 @@ pub fn register_agent_plugins() -> AgentRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::error::OperonResult;
-    use crate::agent::traits::{
+    use crate::error::OperonResult;
+    use crate::traits::{
         Capabilities, ChatRequest, ChatStream, Plugin,
     };
     use async_trait::async_trait;
@@ -86,7 +86,7 @@ mod tests {
         async fn complete(
             &self,
             _req: ChatRequest,
-            _ct: super::super::traits::CancellationToken,
+            _ct: crate::traits::CancellationToken,
         ) -> OperonResult<ChatStream> {
             Ok(Box::pin(futures::stream::empty()))
         }

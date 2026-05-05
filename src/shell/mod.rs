@@ -22,6 +22,8 @@ use crate::tabs::TabManager;
 
 mod activity_bar;
 mod companion_area;
+#[cfg(not(target_arch = "wasm32"))]
+mod companion_chat;
 pub mod codemirror_host;
 pub mod dropdown;
 pub mod editor_host;

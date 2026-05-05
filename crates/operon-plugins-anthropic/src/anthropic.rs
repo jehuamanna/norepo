@@ -4,10 +4,10 @@
 //! prompt and the last tool definition, and surfaces cache hit telemetry through the
 //! `Stop` ChatDelta's `Usage` (prompt, prompt_cached, completion).
 
-use crate::agent::error::{OperonError, OperonResult};
-use crate::agent::plugins::sse::{SseEvent, SseStream};
-use crate::agent::secrets::SecretStore;
-use crate::agent::traits::{
+use operon_core::error::{OperonError, OperonResult};
+use crate::sse::{SseEvent, SseStream};
+use operon_core::secrets::SecretStore;
+use operon_core::traits::{
     CancellationToken, Capabilities, ChatDelta, ChatPlugin, ChatRequest, ChatStream, ContentBlock,
     Message, Plugin, Role, StopReason, Usage,
 };
@@ -450,8 +450,8 @@ fn map_stop_reason(s: &str) -> StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::secrets::MockSecretStore;
-    use crate::agent::traits::{Message, Role};
+    use operon_core::secrets::MockSecretStore;
+    use operon_core::traits::{Message, Role};
     use std::collections::HashMap;
 
     #[test]
@@ -462,12 +462,12 @@ mod tests {
             system: Some("you are operon".into()),
             messages: vec![],
             tools: vec![
-                crate::agent::traits::ToolDef {
+                operon_core::traits::ToolDef {
                     name: "a".into(),
                     description: "first".into(),
                     input_schema: serde_json::json!({}),
                 },
-                crate::agent::traits::ToolDef {
+                operon_core::traits::ToolDef {
                     name: "b".into(),
                     description: "second".into(),
                     input_schema: serde_json::json!({}),

@@ -5,8 +5,8 @@
 //! - `from_jsonl(path)` — reads a `.jsonl` file with one ChatDelta per line, blank lines
 //!   separating turns.
 
-use crate::agent::error::{OperonError, OperonResult};
-use crate::agent::traits::{
+use crate::error::{OperonError, OperonResult};
+use crate::traits::{
     CancellationToken, Capabilities, ChatDelta, ChatPlugin, ChatRequest, ChatStream, Plugin,
 };
 use async_trait::async_trait;
@@ -96,7 +96,7 @@ impl ChatPlugin for MockChatPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::traits::{StopReason, Usage};
+    use crate::traits::{StopReason, Usage};
     use futures::StreamExt;
 
     #[tokio::test]

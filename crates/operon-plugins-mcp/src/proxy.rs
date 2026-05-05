@@ -1,7 +1,7 @@
 //! McpToolProxy — adapts an MCP-served tool into a `ToolPlugin`.
 
-use crate::agent::error::OperonResult;
-use crate::agent::traits::{
+use operon_core::error::OperonResult;
+use operon_core::traits::{
     CancellationToken, Capabilities, McpClient, Plugin, ToolDef, ToolPlugin,
 };
 use async_trait::async_trait;

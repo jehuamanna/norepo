@@ -1,4 +1,4 @@
-use crate::agent::traits::CancellationToken;
+use crate::traits::CancellationToken;
 use uuid::Uuid;
 
 /// Handle to a running agent session. Holds the cancellation token so callers
@@ -6,7 +6,7 @@ use uuid::Uuid;
 #[cfg(not(target_arch = "wasm32"))]
 pub struct AgentSession {
     pub id: Uuid,
-    pub bus_rx: tokio::sync::broadcast::Receiver<crate::agent::bus::BusEvent>,
+    pub bus_rx: tokio::sync::broadcast::Receiver<crate::bus::BusEvent>,
     pub ct: CancellationToken,
 }
 

@@ -5,8 +5,8 @@
 //!
 //! `EchoToolPlugin::new("name")` returns a tool that echoes its input as output.
 
-use crate::agent::error::{OperonError, OperonResult};
-use crate::agent::traits::{
+use crate::error::{OperonError, OperonResult};
+use crate::traits::{
     CancellationToken, Capabilities, ChatDelta, ChatPlugin, ChatRequest, ChatStream, Plugin,
     StopReason, ToolDef, ToolPlugin, Usage,
 };

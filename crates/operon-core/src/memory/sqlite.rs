@@ -2,8 +2,8 @@
 //!
 //! Uses synchronous rusqlite wrapped in `tokio::task::spawn_blocking` for async API.
 
-use crate::agent::error::{OperonError, OperonResult};
-use crate::agent::traits::{
+use crate::error::{OperonError, OperonResult};
+use crate::traits::{
     Capabilities, ContentBlock, Hit, MemoryPlugin, Message, Plugin, Role, Scope,
 };
 use async_trait::async_trait;
@@ -17,7 +17,7 @@ pub struct SqliteMemoryStore {
     conn: Arc<Mutex<Connection>>,
 }
 
-const MIGRATION_001: &str = include_str!("../../../migrations/sqlite/001_messages.sql");
+const MIGRATION_001: &str = include_str!("../../migrations/sqlite/001_messages.sql");
 
 impl SqliteMemoryStore {
     pub fn open(path: impl AsRef<Path>) -> OperonResult<Self> {
@@ -235,7 +235,7 @@ impl MemoryPlugin for SqliteMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::memory::run_conformance;
+    use crate::memory::run_conformance;
 
     #[tokio::test]
     async fn conformance_sqlite_in_memory() {

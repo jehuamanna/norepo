@@ -1,5 +1,5 @@
-use crate::agent::error::{OperonError, OperonResult};
-use crate::agent::traits::{
+use crate::error::{OperonError, OperonResult};
+use crate::traits::{
     Capabilities, ContentBlock, Hit, MemoryPlugin, Message, Plugin, Scope,
 };
 use async_trait::async_trait;
@@ -123,7 +123,7 @@ impl MemoryPlugin for InMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::memory::run_conformance;
+    use crate::memory::run_conformance;
 
     #[tokio::test]
     async fn conformance_in_memory() {
@@ -139,7 +139,7 @@ mod tests {
         for i in 0..5 {
             let m = Message {
                 id: Uuid::new_v4(),
-                role: crate::agent::traits::Role::User,
+                role: crate::traits::Role::User,
                 content: vec![ContentBlock::Text(format!("hit-{i}"))],
                 created_at_ms: i as u64,
                 session,

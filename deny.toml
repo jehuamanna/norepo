@@ -1,0 +1,20 @@
+# cargo-deny configuration
+#
+# Enforces the architectural constraint from Plans-Phase-0:
+#   "operon-core and operon-plugins-* must remain UI-agnostic — no dioxus."
+#
+# Run: `cargo deny check bans`
+
+[graph]
+all-features = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+# Forbid dioxus from operon-core and the plugin crates. The GUI crate
+# (operon-dioxus) is allowed to depend on dioxus.
+[[bans.deny]]
+name = "dioxus"
+wrappers = ["operon-dioxus"]
+reason = "operon-core and operon-plugins-* must remain UI-agnostic"
