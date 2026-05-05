@@ -8,7 +8,7 @@ use dioxus::prelude::*;
 use crate::commands::{Command, CommandContext, CommandRegistry, PaletteMode, PaletteState};
 use crate::plugin::PluginSurface;
 use crate::shell::state::ActivityItemId;
-use crate::theme::{self, ThemeMode};
+use crate::theme::{self, ThemeKind};
 
 pub fn register_builtin_commands(reg: &mut CommandRegistry) -> Result<(), String> {
     reg.register(Command {
@@ -17,9 +17,9 @@ pub fn register_builtin_commands(reg: &mut CommandRegistry) -> Result<(), String
         category: "View".into(),
         handler: Box::new(|ctx: &CommandContext| {
             let mut theme_signal = ctx.theme;
-            let next = match theme_signal.read().mode {
-                ThemeMode::Dark => theme::defaults::light(),
-                ThemeMode::Light => theme::defaults::dark(),
+            let next = match theme_signal.read().kind {
+                ThemeKind::Dark | ThemeKind::HighContrast => theme::defaults::light(),
+                ThemeKind::Light => theme::defaults::dark(),
             };
             theme_signal.set(next);
         }),

@@ -2,7 +2,7 @@
 //!
 //! See <https://code.visualstudio.com/api/references/theme-color>. Each variant maps to a CSS
 //! custom property name via [`ThemeToken::css_var`]; values are populated by
-//! [`crate::theme::defaults`].
+//! [`crate::theme::defaults`] and [`crate::theme::palettes`].
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
 pub enum ThemeToken {
@@ -24,6 +24,31 @@ pub enum ThemeToken {
     PanelBorder,
     FocusBorder,
     WidgetShadow,
+    // Phase 1 expansion — surface tokens the shell actually renders today.
+    TitleBarActiveBackground,
+    TitleBarActiveForeground,
+    MenubarBackground,
+    MenubarForeground,
+    MenubarSelectionBackground,
+    ActivityBarHoverBackground,
+    SideBarSectionHeaderBackground,
+    SideBarBorder,
+    TabHoverBackground,
+    TabBorder,
+    TabActiveBorder,
+    PanelHeaderBackground,
+    CommandPaletteBackground,
+    CommandPaletteForeground,
+    CommandPaletteBorder,
+    CommandPaletteSelectionBackground,
+    DropdownBackground,
+    ListActiveSelectionBackground,
+    ListInactiveSelectionBackground,
+    SplitterBackground,
+    SplitterHoverBackground,
+    ScrollbarSliderBackground,
+    ScrollbarSliderHoverBackground,
+    ScrollbarSliderActiveBackground,
 }
 
 impl ThemeToken {
@@ -47,6 +72,30 @@ impl ThemeToken {
         Self::PanelBorder,
         Self::FocusBorder,
         Self::WidgetShadow,
+        Self::TitleBarActiveBackground,
+        Self::TitleBarActiveForeground,
+        Self::MenubarBackground,
+        Self::MenubarForeground,
+        Self::MenubarSelectionBackground,
+        Self::ActivityBarHoverBackground,
+        Self::SideBarSectionHeaderBackground,
+        Self::SideBarBorder,
+        Self::TabHoverBackground,
+        Self::TabBorder,
+        Self::TabActiveBorder,
+        Self::PanelHeaderBackground,
+        Self::CommandPaletteBackground,
+        Self::CommandPaletteForeground,
+        Self::CommandPaletteBorder,
+        Self::CommandPaletteSelectionBackground,
+        Self::DropdownBackground,
+        Self::ListActiveSelectionBackground,
+        Self::ListInactiveSelectionBackground,
+        Self::SplitterBackground,
+        Self::SplitterHoverBackground,
+        Self::ScrollbarSliderBackground,
+        Self::ScrollbarSliderHoverBackground,
+        Self::ScrollbarSliderActiveBackground,
     ];
 
     /// CSS custom property name (including the leading `--`) for this token.
@@ -70,6 +119,36 @@ impl ThemeToken {
             Self::PanelBorder => "--vscode-panel-border",
             Self::FocusBorder => "--vscode-focusborder",
             Self::WidgetShadow => "--vscode-widget-shadow",
+            Self::TitleBarActiveBackground => "--vscode-titlebar-activebackground",
+            Self::TitleBarActiveForeground => "--vscode-titlebar-activeforeground",
+            Self::MenubarBackground => "--vscode-menubar-background",
+            Self::MenubarForeground => "--vscode-menubar-foreground",
+            Self::MenubarSelectionBackground => "--vscode-menubar-selectionbackground",
+            Self::ActivityBarHoverBackground => "--vscode-activitybar-hoverbackground",
+            Self::SideBarSectionHeaderBackground => "--vscode-sidebarsectionheader-background",
+            Self::SideBarBorder => "--vscode-sidebar-border",
+            Self::TabHoverBackground => "--vscode-tab-hoverbackground",
+            Self::TabBorder => "--vscode-tab-border",
+            Self::TabActiveBorder => "--vscode-tab-activeborder",
+            Self::PanelHeaderBackground => "--vscode-panelheader-background",
+            Self::CommandPaletteBackground => "--vscode-quickinput-background",
+            Self::CommandPaletteForeground => "--vscode-quickinput-foreground",
+            Self::CommandPaletteBorder => "--vscode-quickinput-border",
+            Self::CommandPaletteSelectionBackground => {
+                "--vscode-quickinputlist-focusbackground"
+            }
+            Self::DropdownBackground => "--vscode-dropdown-background",
+            Self::ListActiveSelectionBackground => "--vscode-list-activeselectionbackground",
+            Self::ListInactiveSelectionBackground => {
+                "--vscode-list-inactiveselectionbackground"
+            }
+            Self::SplitterBackground => "--vscode-editorgroup-border",
+            Self::SplitterHoverBackground => "--vscode-sash-hoverborder",
+            Self::ScrollbarSliderBackground => "--vscode-scrollbarslider-background",
+            Self::ScrollbarSliderHoverBackground => "--vscode-scrollbarslider-hoverbackground",
+            Self::ScrollbarSliderActiveBackground => {
+                "--vscode-scrollbarslider-activebackground"
+            }
         }
     }
 }
@@ -96,5 +175,12 @@ mod tests {
             ThemeToken::ALL.len(),
             "ThemeToken::ALL must contain each variant exactly once"
         );
+    }
+
+    #[test]
+    fn all_array_has_at_least_42_tokens() {
+        // Phase 1 expanded the original 18 tokens to cover the rendered shell surface.
+        // Lower bound guards against accidental removal during refactors.
+        assert!(ThemeToken::ALL.len() >= 42, "got {}", ThemeToken::ALL.len());
     }
 }

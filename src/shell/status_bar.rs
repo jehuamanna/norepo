@@ -5,15 +5,16 @@
 
 use dioxus::prelude::*;
 
-use crate::theme::{self, Theme, ThemeMode};
+use crate::theme::{self, Theme, ThemeKind};
 
 #[component]
 pub fn StatusBar() -> Element {
     let mut theme_signal: Signal<Theme> = use_context();
 
-    let mode_label = match theme_signal.read().mode {
-        ThemeMode::Dark => "Dark",
-        ThemeMode::Light => "Light",
+    let mode_label = match theme_signal.read().kind {
+        ThemeKind::Dark => "Dark",
+        ThemeKind::Light => "Light",
+        ThemeKind::HighContrast => "HC",
     };
 
     rsx! {
@@ -27,9 +28,9 @@ pub fn StatusBar() -> Element {
                 "data-action": "toggle-theme",
                 style: "background: transparent; color: inherit; border: 1px solid var(--vscode-panel-border); padding: 2px 8px; cursor: pointer; font: inherit;",
                 onclick: move |_| {
-                    let next = match theme_signal.read().mode {
-                        ThemeMode::Dark => theme::defaults::light(),
-                        ThemeMode::Light => theme::defaults::dark(),
+                    let next = match theme_signal.read().kind {
+                        ThemeKind::Dark | ThemeKind::HighContrast => theme::defaults::light(),
+                        ThemeKind::Light => theme::defaults::dark(),
                     };
                     theme_signal.set(next);
                 },
