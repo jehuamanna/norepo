@@ -61,20 +61,67 @@ pub fn MainArea() -> Element {
                             },
                         );
                     });
+                    let local_save: Option<crate::local_mode::LocalSaveAction> =
+                        try_consume_context();
                     match mode {
                         EditorMode::View => plugin.render(&note_id, &content),
-                        EditorMode::Edit => plugin.render_edit(&note_id, &content, on_change),
+                        EditorMode::Edit => {
+                            // Local Mode notes use a textarea — Monaco doesn't
+                            // mount on the desktop build. Cloud paths still go
+                            // through the format plugin's editor backend.
+                            if is_local {
+                                if let Some(action) = local_save {
+                                    rsx! {
+                                        crate::local_mode::LocalNoteEditor { tab_id, action }
+                                    }
+                                } else {
+                                    plugin.render_edit(&note_id, &content, on_change)
+                                }
+                            } else {
+                                plugin.render_edit(&note_id, &content, on_change)
+                            }
+                        }
                         EditorMode::LivePreview => {
                             plugin.render_live_preview(&note_id, &content, on_change)
                         }
-                        EditorMode::Split => rsx! {
-                            crate::shell::split_view::SplitView {
-                                format_id: format_id.clone(),
-                                note_id: note_id.clone(),
-                                content: content.clone(),
-                                on_change,
+                        EditorMode::Split => {
+                            // Local Split: side-by-side textarea + rendered view.
+                            if is_local {
+                                if let Some(action) = local_save {
+                                    rsx! {
+                                        div {
+                                            class: "operon-local-split",
+                                            div {
+                                                class: "operon-local-split-edit",
+                                                crate::local_mode::LocalNoteEditor { tab_id, action }
+                                            }
+                                            div {
+                                                class: "operon-local-split-view",
+                                                {plugin.render(&note_id, &content)}
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    rsx! {
+                                        crate::shell::split_view::SplitView {
+                                            format_id: format_id.clone(),
+                                            note_id: note_id.clone(),
+                                            content: content.clone(),
+                                            on_change,
+                                        }
+                                    }
+                                }
+                            } else {
+                                rsx! {
+                                    crate::shell::split_view::SplitView {
+                                        format_id: format_id.clone(),
+                                        note_id: note_id.clone(),
+                                        content: content.clone(),
+                                        on_change,
+                                    }
+                                }
                             }
-                        },
+                        }
                     }
                 }
                 None => rsx! {

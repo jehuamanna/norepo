@@ -71,6 +71,7 @@ pub fn Dropdown(menu: MenuId) -> Element {
                                     palette,
                                     layout,
                                     theme_registry: theme_reg.clone(),
+                                    local_save: try_consume_context(),
                                 };
                                 let _ = cmd_reg.execute(&id, &context);
                                 open_menu.set(None);
@@ -101,8 +102,11 @@ mod tests {
         let mut r = CommandRegistry::new();
         register_builtin_commands(&mut r).unwrap();
         assert!(!empty_for(&r, MenuId::View), "View has built-ins");
-        assert!(!empty_for(&r, MenuId::Help), "Help maps to Palette which has built-ins");
-        assert!(empty_for(&r, MenuId::File));
+        assert!(
+            !empty_for(&r, MenuId::Help),
+            "Help maps to Palette which has built-ins"
+        );
+        assert!(!empty_for(&r, MenuId::File), "File now hosts file.saveNote");
         assert!(empty_for(&r, MenuId::Edit));
         assert!(empty_for(&r, MenuId::Selection));
         assert!(empty_for(&r, MenuId::Run));

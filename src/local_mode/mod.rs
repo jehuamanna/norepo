@@ -16,7 +16,7 @@ pub mod ui;
 #[cfg(not(target_arch = "wasm32"))]
 pub use desktop::*;
 #[cfg(not(target_arch = "wasm32"))]
-pub use editor::{LocalSaveAction, LocalSaveButton};
+pub use editor::{LocalNoteEditor, LocalSaveAction, LocalSaveButton};
 #[cfg(not(target_arch = "wasm32"))]
 pub use explorer::{ExplorerPanel, LocalProjectVersion, SelectedNote, SelectedProject};
 

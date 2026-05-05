@@ -574,6 +574,48 @@ html, body {
   margin: 0 0 6px 0;
 }
 
+/* Local-Mode editor textarea — used in Edit mode (and the edit pane of
+ * Split mode) because the cloud Monaco backend doesn't mount on desktop. */
+.operon-local-editor {
+  display: block;
+  width: 100%;
+  height: 100%;
+  flex: 1 1 auto;
+  padding: 12px;
+  border: 0;
+  outline: none;
+  resize: none;
+  font: inherit;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace);
+  font-size: 13px;
+  line-height: 1.5;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-editor-foreground);
+}
+.operon-local-editor-empty {
+  padding: 16px;
+  font-size: 12px;
+  opacity: 0.6;
+}
+.operon-local-split {
+  display: flex;
+  flex-direction: row;
+  width: 100%;
+  height: 100%;
+  flex: 1 1 auto;
+}
+.operon-local-split-edit,
+.operon-local-split-view {
+  flex: 1 1 50%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+.operon-local-split-edit {
+  border-right: 1px solid var(--vscode-panel-border);
+}
+
 .operon-main-area {
   grid-area: main;
   background: var(--vscode-editor-background);

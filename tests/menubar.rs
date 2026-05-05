@@ -22,15 +22,24 @@ fn help_category_label_resolves_to_palette_built_ins() {
     let mut reg = CommandRegistry::new();
     register_builtin_commands(&mut reg).unwrap();
     let n = count_for_category(&reg, MenuId::Help.category_label());
-    assert!(n >= 1, "expected at least 1 Palette command for Help, got {n}");
+    assert!(
+        n >= 1,
+        "expected at least 1 Palette command for Help, got {n}"
+    );
 }
 
 #[test]
 fn unfilled_categories_render_empty() {
     let mut reg = CommandRegistry::new();
     register_builtin_commands(&mut reg).unwrap();
-    for menu in [MenuId::File, MenuId::Edit, MenuId::Selection, MenuId::Run] {
+    // File now hosts the Local-Mode `file.saveNote` command — exclude it.
+    for menu in [MenuId::Edit, MenuId::Selection, MenuId::Run] {
         let n = count_for_category(&reg, menu.category_label());
-        assert_eq!(n, 0, "{menu:?} should be empty after Phase-5 builtins; got {n}");
+        assert_eq!(
+            n, 0,
+            "{menu:?} should be empty after Phase-5 builtins; got {n}"
+        );
     }
+    let file_n = count_for_category(&reg, MenuId::File.category_label());
+    assert_eq!(file_n, 1, "File should host exactly file.saveNote");
 }

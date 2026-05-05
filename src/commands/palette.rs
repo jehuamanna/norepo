@@ -301,6 +301,7 @@ pub fn CommandPalette() -> Element {
                                                 palette,
                                                 layout,
                                                 theme_registry: theme_reg_for_keydown.clone(),
+                                                local_save: try_consume_context(),
                                             };
                                             let _ = cmd_reg_for_keydown.execute(&c.id, &context);
                                             // Only auto-close if the command didn't switch
@@ -407,8 +408,7 @@ mod tests {
         let reg = seeded_registry();
         let theme_reg = ThemeRegistry::new();
         let total = reg.iter().count();
-        let result =
-            compute_candidates(PaletteMode::Commands, "togglesidebar", &reg, &theme_reg);
+        let result = compute_candidates(PaletteMode::Commands, "togglesidebar", &reg, &theme_reg);
         assert!(
             result.len() < total,
             "narrowed query should drop non-matching commands ({} of {})",
@@ -426,7 +426,10 @@ mod tests {
         let reg = seeded_registry();
         let theme_reg = ThemeRegistry::new();
         let result = compute_candidates(PaletteMode::Notes, "", &reg, &theme_reg);
-        assert!(!result.is_empty(), "Notes mode should return seeded samples");
+        assert!(
+            !result.is_empty(),
+            "Notes mode should return seeded samples"
+        );
         for c in &result {
             assert!(matches!(c.kind, CandidateKind::Note));
             assert_eq!(c.category, "Notes");
@@ -438,7 +441,11 @@ mod tests {
         let reg = seeded_registry();
         let theme_reg = ThemeRegistry::new();
         let result = compute_candidates(PaletteMode::Commands, "", &reg, &theme_reg);
-        assert!(result.len() <= 50, "must be truncated to <= 50; got {}", result.len());
+        assert!(
+            result.len() <= 50,
+            "must be truncated to <= 50; got {}",
+            result.len()
+        );
     }
 
     #[test]

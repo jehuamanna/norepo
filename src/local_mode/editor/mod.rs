@@ -114,62 +114,53 @@ pub fn LocalSaveButton(action: LocalSaveAction, dirty: bool) -> Element {
     }
 }
 
-/// The body view for an open Local-Mode note tab. Renders a textarea (the
-/// shared `Shell`'s richer editor stack is gated on the cloud-mode plugin
-/// pipeline; Phase-3 keeps the surface minimal and replaces it in Phase-4
-/// when the editor backends mount under LocalShell).
+/// Local-Mode editor body: a plain textarea bound to `Tab.content`.
+///
+/// The shared cloud `MarkdownFormatPlugin::render_edit` mounts Monaco, which
+/// today only initializes on `target_arch = "wasm32"` — the desktop build
+/// renders a non-functional placeholder. Local Mode bypasses that placeholder
+/// with this simple textarea so notes are actually editable. Save lives off
+/// `Ctrl+S` (Shell-level binding + a textarea-local fallback) and the floating
+/// `LocalSaveButton` rendered by `LocalShellOverlay`. Tab title chrome comes
+/// from the existing `TabStrip` above this body.
 #[component]
 pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
     let mut tabs: Signal<TabManager> = use_context();
     let snapshot = tabs.read().get(tab_id).cloned();
     let Some(tab) = snapshot else {
-        return rsx! { div { class: "text-xs opacity-60", "data-testid": "editor-empty", "No note selected." } };
+        return rsx! {
+            div {
+                class: "operon-local-editor-empty",
+                "data-testid": "editor-empty",
+                "No note selected."
+            }
+        };
     };
-    let dirty = tab.dirty;
     let content = tab.content.clone();
-    let title = tab.title.clone();
 
     rsx! {
-        div {
-            class: "flex flex-col h-full w-full",
-            "data-testid": "local-note-editor",
+        textarea {
+            class: "operon-local-editor",
+            "data-testid": "local-note-textarea",
             "data-tab-id": "{tab_id.0}",
-            div {
-                class: "flex items-center justify-between px-2 py-1 border-b border-[var(--operon-border)]",
-                div {
-                    class: "flex items-center gap-2 text-sm truncate",
-                    "data-testid": "tab-title",
-                    if dirty {
-                        span {
-                            class: "opacity-80",
-                            "data-testid": "tab-title-dirty-indicator",
-                            "\u{2022} "
-                        }
-                    }
-                    span { class: "truncate", "{title}" }
+            value: "{content}",
+            spellcheck: "false",
+            autofocus: true,
+            oninput: move |evt| {
+                tabs.write().set_content(tab_id, evt.value());
+            },
+            onkeydown: move |evt| {
+                let mods = evt.modifiers();
+                let with_meta = mods.contains(Modifiers::META) || mods.contains(Modifiers::CONTROL);
+                if with_meta
+                    && !mods.contains(Modifiers::SHIFT)
+                    && !mods.contains(Modifiers::ALT)
+                    && evt.key().to_string().eq_ignore_ascii_case("s")
+                {
+                    evt.prevent_default();
+                    action.callback.call(());
                 }
-                LocalSaveButton { action: action.clone(), dirty }
-            }
-            textarea {
-                class: "flex-1 w-full p-2 text-sm font-mono bg-[var(--operon-bg)] text-[var(--operon-fg)] outline-none resize-none",
-                "data-testid": "local-note-textarea",
-                value: "{content}",
-                oninput: move |evt| {
-                    tabs.write().set_content(tab_id, evt.value());
-                },
-                onkeydown: move |evt| {
-                    let mods = evt.modifiers();
-                    let with_meta = mods.contains(Modifiers::META) || mods.contains(Modifiers::CONTROL);
-                    if with_meta
-                        && !mods.contains(Modifiers::SHIFT)
-                        && !mods.contains(Modifiers::ALT)
-                        && evt.key().to_string().eq_ignore_ascii_case("s")
-                    {
-                        evt.prevent_default();
-                        action.callback.call(());
-                    }
-                },
-            }
+            },
         }
     }
 }

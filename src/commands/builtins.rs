@@ -13,6 +13,19 @@ use crate::theme::ThemeKind;
 
 pub fn register_builtin_commands(reg: &mut CommandRegistry) -> Result<(), String> {
     reg.register(Command {
+        id: "file.saveNote".into(),
+        title: "Save Note".into(),
+        category: "File".into(),
+        handler: Box::new(|ctx: &CommandContext| {
+            // Local-Mode-only: Cloud has its own debounced autosave path and
+            // leaves `local_save` as None, so this is a no-op there.
+            if let Some(action) = &ctx.local_save {
+                action.callback.call(());
+            }
+        }),
+    })?;
+
+    reg.register(Command {
         id: "view.toggleTheme".into(),
         title: "Toggle Theme".into(),
         category: "View".into(),
@@ -176,7 +189,8 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "notes.openSample".to_string(),
+                "file.saveNote".to_string(),
+                "notes.openSample".into(),
                 "palette.show".into(),
                 "palette.showCommands".into(),
                 "view.closeActiveTab".into(),
