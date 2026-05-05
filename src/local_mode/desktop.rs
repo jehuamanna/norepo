@@ -4,15 +4,17 @@ use std::sync::Arc;
 
 use dioxus::prelude::*;
 use operon_store::repos::{
-    LocalSettingsRepository, LocalUserRepository, SqliteLocalSettingsRepository,
-    SqliteLocalUserRepository,
+    LocalProjectRepository, LocalSettingsRepository, LocalUserRepository,
+    SqliteLocalProjectRepository, SqliteLocalSettingsRepository, SqliteLocalUserRepository,
 };
 use operon_store::{Store, StoreConfig};
+use uuid::Uuid;
 
+use super::explorer::{ExplorerPanel, LocalProjectVersion, SelectedProject};
 use super::{MODE_VALUE_CLOUD, MODE_VALUE_LOCAL, SETTINGS_KEY_MODE_REMEMBERED};
 use crate::rbag::state::{AppState, Mode};
 
-/// Provider component: mounts a [`Store`] for Local Mode and exposes both
+/// Provider component: mounts a [`Store`] for Local Mode and exposes the
 /// repository trait objects via context. Mount near the app root.
 #[component]
 pub fn LocalStateProvider(children: Element) -> Element {
@@ -20,9 +22,12 @@ pub fn LocalStateProvider(children: Element) -> Element {
     let user_repo: Arc<dyn LocalUserRepository> =
         Arc::new(SqliteLocalUserRepository::new(store.clone()));
     let settings_repo: Arc<dyn LocalSettingsRepository> =
-        Arc::new(SqliteLocalSettingsRepository::new(store));
+        Arc::new(SqliteLocalSettingsRepository::new(store.clone()));
+    let project_repo: Arc<dyn LocalProjectRepository> =
+        Arc::new(SqliteLocalProjectRepository::new(store));
     use_context_provider(|| LocalUserRepo(user_repo));
     use_context_provider(|| LocalSettingsRepo(settings_repo));
+    use_context_provider(|| LocalProjectRepo(project_repo));
     rsx! { {children} }
 }
 
@@ -34,6 +39,9 @@ pub struct LocalUserRepo(pub Arc<dyn LocalUserRepository>);
 #[derive(Clone)]
 pub struct LocalSettingsRepo(pub Arc<dyn LocalSettingsRepository>);
 
+#[derive(Clone)]
+pub struct LocalProjectRepo(pub Arc<dyn LocalProjectRepository>);
+
 /// Convenience used by `app.rs` and tests to install the repos. Equivalent to
 /// rendering [`LocalStateProvider`] but callable from a hook position.
 pub fn provide_local_state() {
@@ -41,9 +49,12 @@ pub fn provide_local_state() {
     let user_repo: Arc<dyn LocalUserRepository> =
         Arc::new(SqliteLocalUserRepository::new(store.clone()));
     let settings_repo: Arc<dyn LocalSettingsRepository> =
-        Arc::new(SqliteLocalSettingsRepository::new(store));
+        Arc::new(SqliteLocalSettingsRepository::new(store.clone()));
+    let project_repo: Arc<dyn LocalProjectRepository> =
+        Arc::new(SqliteLocalProjectRepository::new(store));
     use_context_provider(|| LocalUserRepo(user_repo));
     use_context_provider(|| LocalSettingsRepo(settings_repo));
+    use_context_provider(|| LocalProjectRepo(project_repo));
 }
 
 fn open_local_store() -> Store {
@@ -94,6 +105,13 @@ pub fn LocalShell() -> Element {
 
     let mut settings_open: Signal<bool> = use_signal(|| false);
 
+    // App-scope explorer state. Provided here (the LocalShell root) so the
+    // explorer panel and any future toolbar / status surface share it.
+    let project_version: Signal<u64> = use_signal(|| 0);
+    use_context_provider(|| LocalProjectVersion(project_version));
+    let selected_project: Signal<Option<Uuid>> = use_signal(|| None);
+    use_context_provider(|| SelectedProject(selected_project));
+
     rsx! {
         div {
             class: "flex flex-col h-screen w-screen bg-[var(--operon-bg)] text-[var(--operon-fg)]",
@@ -106,10 +124,17 @@ pub fn LocalShell() -> Element {
                     username: username.read().clone(),
                 }
             }
-            // Workspace placeholder
+            // Sidebar + workspace.
             div {
-                class: "flex-1 flex items-center justify-center text-sm opacity-70",
-                "Local Mode workspace — coming soon"
+                class: "flex-1 flex min-h-0",
+                aside {
+                    class: "w-64 shrink-0 flex flex-col min-h-0",
+                    ExplorerPanel {}
+                }
+                main {
+                    class: "flex-1 flex items-center justify-center text-sm opacity-70",
+                    "Local Mode workspace — coming soon"
+                }
             }
             // Bottom bar
             div {

@@ -6,9 +6,15 @@
 //! `app.rs` mounts either `LocalShell` or `Shell` based on `AppState.mode`.
 
 #[cfg(not(target_arch = "wasm32"))]
-mod desktop;
+pub mod desktop;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod explorer;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ui;
 #[cfg(not(target_arch = "wasm32"))]
 pub use desktop::*;
+#[cfg(not(target_arch = "wasm32"))]
+pub use explorer::{ExplorerPanel, LocalProjectVersion, SelectedProject};
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_stub;
