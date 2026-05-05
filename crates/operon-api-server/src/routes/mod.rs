@@ -2,6 +2,7 @@ pub mod admin_invites;
 pub mod admin_users;
 pub mod auth;
 pub mod departments;
+pub mod export_import;
 pub mod me;
 pub mod memberships;
 pub mod notes;

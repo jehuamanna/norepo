@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "tests-wasm", "crates/operon-core", "crates/operon-plugins-anthropic", "crates/operon-plugins-mcp", "crates/operon-store", "crates/operon-auth", "crates/operon-api-server", "crates/operon-notes"]
+members = [".", "tests-wasm", "crates/operon-core", "crates/operon-plugins-anthropic", "crates/operon-plugins-mcp", "crates/operon-store", "crates/operon-auth", "crates/operon-api-server", "crates/operon-notes", "crates/operon-export"]
 default-members = ["."]
 
 [package]

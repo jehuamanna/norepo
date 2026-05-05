@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 operon-auth = { path = "../operon-auth" }
+operon-export = { path = "../operon-export" }
 operon-notes = { path = "../operon-notes" }
 operon-store = { path = "../operon-store" }
 axum = { version = "0.8", features = ["macros", "ws", "tracing"] }
@@ -24,6 +25,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 time = "0.3"
 futures = "0.3"
 loro = "1"
+dashmap = "6"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

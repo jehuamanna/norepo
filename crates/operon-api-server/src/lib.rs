@@ -29,6 +29,7 @@ pub fn router(state: AppState) -> Router {
         .merge(routes::memberships::router())
         .merge(routes::team_assignments::router())
         .merge(routes::notes::router())
+        .merge(routes::export_import::router())
         .with_state(state)
 }
 

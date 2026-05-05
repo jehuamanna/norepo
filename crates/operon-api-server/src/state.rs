@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use operon_auth::email::{EmailSender, LogEmailSender};
 use operon_notes::NoteHub;
+
+use crate::routes::export_import::ExportTokenStore;
 use operon_store::repos::{
     SqliteAttachmentRepository, SqliteAuditLogRepository, SqliteDepartmentRepository,
     SqliteInviteRepository, SqliteMembershipRepository, SqliteNoteRepository,
@@ -31,6 +33,7 @@ pub struct AppState {
     pub note_updates: Arc<SqliteNoteUpdateRepository>,
     pub email: Arc<dyn EmailSender>,
     pub hub: Arc<NoteHub>,
+    pub export_tokens: ExportTokenStore,
 }
 
 impl AppState {
@@ -71,6 +74,7 @@ impl AppState {
             note_updates: note_updates_arc,
             email,
             hub,
+            export_tokens: ExportTokenStore::new(),
             hostname,
             store,
         }
