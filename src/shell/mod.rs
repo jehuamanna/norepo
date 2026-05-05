@@ -62,13 +62,22 @@ pub fn Shell() -> Element {
     let local_save: Option<crate::local_mode::LocalSaveAction> = try_consume_context();
 
     let layout_read = layout.read();
+    // When no activity is selected, side_bar.rs hides the panel via
+    // `display: none`, but the grid column track still occupies its width
+    // unless we zero it out here. Same applies to the explicit collapse flag.
+    let no_active = active.read().is_none();
+    let side_track = if layout_read.sidebar_collapsed || no_active {
+        0
+    } else {
+        layout_read.sidebar_track()
+    };
     let layout_style = format!(
         "--operon-side-bar-width: {}px; --operon-companion-width: {}px; --operon-panel-height: {}px;",
-        layout_read.sidebar_track(),
+        side_track,
         layout_read.companion_track(),
         layout_read.panel_track(),
     );
-    let collapsed_attr = if layout_read.sidebar_collapsed {
+    let collapsed_attr = if layout_read.sidebar_collapsed || no_active {
         "true"
     } else {
         "false"
