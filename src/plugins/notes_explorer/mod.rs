@@ -53,7 +53,7 @@ impl UIPlugin for NotesExplorer {
                     class: "operon-activity-icon",
                     title: "Notes Explorer",
                     style: "display: flex; align-items: center; justify-content: center; width: 100%; height: 100%;",
-                    Icon { name: "book".to_string(), size: 20, title: "Notes Explorer".to_string() }
+                    Icon { name: "book".to_string(), size: 20 }
                 }
             },
             PluginSurface::SideBarPanel => rsx! { NotesExplorerPanel {} },
