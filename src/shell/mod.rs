@@ -26,6 +26,7 @@ pub mod dropdown;
 pub mod layout;
 mod main_area;
 pub mod menubar;
+pub mod mode_toolbar;
 mod side_bar;
 pub mod splitter;
 pub mod state;
@@ -35,6 +36,7 @@ pub use activity_bar::ActivityBar;
 pub use companion_area::CompanionArea;
 pub use main_area::MainArea;
 pub use menubar::{MenuId, Menubar};
+pub use mode_toolbar::ModeToolbar;
 pub use side_bar::SideBar;
 pub use status_bar::StatusBar;
 
