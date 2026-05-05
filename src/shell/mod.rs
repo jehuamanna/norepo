@@ -15,16 +15,17 @@ use dioxus::prelude::*;
 use crate::commands::{CommandPalette, PaletteMode, PaletteState};
 use crate::panel::PanelStrip;
 use crate::plugin::{PluginRegistry, PluginSurface};
+use crate::rbag::state::{AppState, Mode};
 use crate::shell::layout::{DragState, LayoutState, SplitterKind};
 use crate::shell::splitter::{BottomSplitter, LeftSplitter, RightSplitter};
 use crate::shell::state::{ActiveActivity, ActivityItemId, LastActiveActivity};
 use crate::tabs::TabManager;
 
 mod activity_bar;
+pub mod codemirror_host;
 mod companion_area;
 #[cfg(not(target_arch = "wasm32"))]
 mod companion_chat;
-pub mod codemirror_host;
 pub mod dropdown;
 pub mod editor_host;
 pub mod layout;
@@ -57,6 +58,8 @@ pub fn Shell() -> Element {
     let mut open_menu: Signal<Option<menubar::MenuId>> = use_context();
     let mut layout: Signal<LayoutState> = use_context();
     let mut drag: Signal<Option<DragState>> = use_context();
+    let app_state: Signal<AppState> = use_context();
+    let local_save: Option<crate::local_mode::LocalSaveAction> = try_consume_context();
 
     let layout_read = layout.read();
     let layout_style = format!(
@@ -65,7 +68,11 @@ pub fn Shell() -> Element {
         layout_read.companion_track(),
         layout_read.panel_track(),
     );
-    let collapsed_attr = if layout_read.sidebar_collapsed { "true" } else { "false" };
+    let collapsed_attr = if layout_read.sidebar_collapsed {
+        "true"
+    } else {
+        "false"
+    };
     drop(layout_read);
 
     rsx! {
@@ -119,6 +126,22 @@ pub fn Shell() -> Element {
                 let mods = event.modifiers();
                 let with_meta = mods.contains(Modifiers::META) || mods.contains(Modifiers::CONTROL);
                 if !with_meta { return; }
+
+                // Mode-gated Ctrl+S: when Local Mode is active and a save
+                // action is installed (from `provide_local_app_signals`), it
+                // intercepts Ctrl+S before any later branch.
+                if !mods.contains(Modifiers::SHIFT)
+                    && !mods.contains(Modifiers::ALT)
+                    && key_str.eq_ignore_ascii_case("s")
+                    && app_state.read().mode == Mode::Local
+                {
+                    if let Some(action) = &local_save {
+                        action.callback.call(());
+                        event.prevent_default();
+                        return;
+                    }
+                }
+
                 let palette_open = palette.read().open;
 
                 if key_str.eq_ignore_ascii_case("p") {

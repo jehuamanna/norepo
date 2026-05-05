@@ -9,6 +9,7 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 
 use crate::plugin::{PluginRegistry, PluginSurface};
+use crate::rbag::state::{AppState, Mode};
 use crate::shell::layout::LayoutState;
 use crate::shell::state::{ActiveActivity, ActivityItemId, LastActiveActivity};
 use crate::ui::Icon;
@@ -19,6 +20,9 @@ pub fn ActivityBar() -> Element {
     let ActiveActivity(mut active) = use_context();
     let LastActiveActivity(mut last) = use_context();
     let mut layout: Signal<LayoutState> = use_context();
+    let app_state: Signal<AppState> = use_context();
+    let settings_open: Option<crate::local_mode::SettingsOpen> = try_consume_context();
+    let is_local = app_state.read().mode == Mode::Local;
 
     let active_id = active.read().clone();
     let collapsed = layout.read().sidebar_collapsed;
@@ -58,6 +62,18 @@ pub fn ActivityBar() -> Element {
                 }
             }
             div { style: "flex: 1 1 auto;" }
+            if let (true, Some(so_ctx)) = (is_local, settings_open) {
+                button {
+                    class: "operon-activity-toggle",
+                    "data-testid": "settings-gear",
+                    title: "Settings",
+                    onclick: {
+                        let mut so = so_ctx.0;
+                        move |_| { so.set(true); }
+                    },
+                    Icon { name: "settings".to_string() }
+                }
+            }
             button {
                 class: "operon-activity-toggle",
                 "data-action": "toggle-sidebar",

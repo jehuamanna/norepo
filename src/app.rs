@@ -8,7 +8,7 @@ use dioxus::prelude::*;
 use std::sync::Arc;
 
 use crate::commands::{register_builtin_commands, CommandRegistry, PaletteState};
-use crate::local_mode::{LocalShell, StartupChooser};
+use crate::local_mode::StartupChooser;
 use crate::log::LogBuffer;
 use crate::log_info;
 use crate::panel::PanelManager;
@@ -44,8 +44,39 @@ pub fn App() -> Element {
     let tabs: Signal<TabManager> = use_signal(TabManager::new);
     use_context_provider(|| tabs);
 
-    let active: Signal<Option<ActivityItemId>> =
-        use_signal(|| Some(ActivityItemId("notes-explorer:default".to_string())));
+    // Local Mode wiring: install the LocalUserRepo / LocalSettingsRepo before any
+    // component reads them. Then resolve the remembered mode from
+    // `local_app_settings`; if absent, AppState defaults to NonLocal but we
+    // render the chooser instead of mounting a shell.
+    crate::local_mode::provide_local_state();
+
+    let mut app_state: Signal<AppState> = use_signal(AppState::default);
+    use_context_provider(|| app_state);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let initial_mode_remembered: Option<Mode> = {
+        let crate::local_mode::LocalSettingsRepo(settings) = use_context();
+        use_hook(|| crate::local_mode::read_remembered_mode(&settings))
+    };
+    #[cfg(target_arch = "wasm32")]
+    let initial_mode_remembered: Option<Mode> = Some(Mode::NonLocal);
+
+    use_hook(|| {
+        if let Some(m) = initial_mode_remembered {
+            app_state.with_mut(|s| s.mode = m);
+        }
+    });
+
+    // Mode is now resolved — pick the right default activity item and the
+    // right plugin registry contributions accordingly.
+    let initial_activity_id = match initial_mode_remembered {
+        Some(Mode::Local) => Some(ActivityItemId(
+            "local-projects-explorer:default".to_string(),
+        )),
+        Some(Mode::NonLocal) => Some(ActivityItemId("notes-explorer:default".to_string())),
+        None => None,
+    };
+    let active: Signal<Option<ActivityItemId>> = use_signal(|| initial_activity_id);
     use_context_provider(|| ActiveActivity(active));
 
     let last_active: Signal<Option<ActivityItemId>> = use_signal(|| None);
@@ -69,29 +100,6 @@ pub fn App() -> Element {
     let mut log_buffer: Signal<LogBuffer> = use_signal(LogBuffer::new);
     use_context_provider(|| log_buffer);
 
-    // Local Mode wiring: install the LocalUserRepo / LocalSettingsRepo before any
-    // component (e.g. StartupChooser, LocalShell) reads them. Then resolve the
-    // remembered mode from local_app_settings; if absent, AppState defaults to
-    // NonLocal but we render the chooser instead of mounting a shell.
-    crate::local_mode::provide_local_state();
-
-    let mut app_state: Signal<AppState> = use_signal(AppState::default);
-    use_context_provider(|| app_state);
-
-    #[cfg(not(target_arch = "wasm32"))]
-    let initial_mode_remembered: Option<Mode> = {
-        let crate::local_mode::LocalSettingsRepo(settings) = use_context();
-        use_hook(|| crate::local_mode::read_remembered_mode(&settings))
-    };
-    #[cfg(target_arch = "wasm32")]
-    let initial_mode_remembered: Option<Mode> = Some(Mode::NonLocal);
-
-    use_hook(|| {
-        if let Some(m) = initial_mode_remembered {
-            app_state.with_mut(|s| s.mode = m);
-        }
-    });
-
     let resolved_mode = app_state.read().mode;
     let persistence = provide_persistence(resolved_mode);
     let scheduler = SaveScheduler::new(persistence.clone());
@@ -104,11 +112,21 @@ pub fn App() -> Element {
             theme,
             tabs: Some(tabs),
         };
-        if let Err(err) = register_builtins(&mut registry, &ctx) {
-            eprintln!("operon: register_builtins failed: {err}");
+        let outcome = match resolved_mode {
+            Mode::Local => crate::plugin::register_local_builtins(&mut registry, &ctx),
+            Mode::NonLocal => register_builtins(&mut registry, &ctx),
+        };
+        if let Err(err) = outcome {
+            eprintln!("operon: plugin register_builtins ({resolved_mode:?}) failed: {err}");
         }
         Rc::new(registry)
     });
+
+    // Local-only app-scope signals — must be installed before mounting Shell so
+    // the mode-aware StatusBar/ActivityBar/SideBar plugin can read them.
+    if resolved_mode == Mode::Local {
+        crate::local_mode::provide_local_app_signals();
+    }
 
     use_context_provider(|| {
         let mut reg = CommandRegistry::new();
@@ -151,7 +169,7 @@ pub fn App() -> Element {
             if !mode_known {
                 StartupChooser {}
             } else if current_mode == Mode::Local {
-                LocalShell {}
+                crate::local_mode::LocalShellOverlay { Shell {} }
             } else {
                 Shell {}
             }

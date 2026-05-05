@@ -36,6 +36,16 @@ const PATHS: &[(&str, &str)] = &[
     ("chevron-left", "M9.5 12.5L5 8l4.5-4.5 1 1L7 8l3.5 3.5z"),
     ("chevron-right", "M6.5 12.5L11 8 6.5 3.5l-1 1L9 8l-3.5 3.5z"),
     ("chevron-up", "M3.5 9.5L8 5l4.5 4.5-1 1L8 7l-3.5 3.5z"),
+    // Open folder — LocalProjectsExplorer activity icon.
+    (
+        "folder",
+        "M2 4v9h12V5H8L7 4H2zm1 1h3.5l1 1H13v6H3V5z",
+    ),
+    // Outlined gear — Local-Mode settings affordance in the activity bar.
+    (
+        "settings",
+        "M8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5zm-1.2-3.5l-.5 1.6a4.4 4.4 0 0 0-1 .6l-1.6-.4-1.2 2 1.1 1.2a4.4 4.4 0 0 0 0 1.2L2.5 9.4l1.2 2 1.6-.4q.45.4 1 .6l.5 1.6h2.4l.5-1.6q.55-.2 1-.6l1.6.4 1.2-2-1.1-1.2a4.4 4.4 0 0 0 0-1.2L13.5 6l-1.2-2-1.6.4q-.45-.4-1-.6L9.2 2z",
+    ),
     // Hollow rectangle with a right-third splitter — companion-area toggle.
     (
         "sidebar-right",
@@ -81,7 +91,11 @@ pub fn Icon(props: IconProps) -> Element {
         Some(extra) => format!("operon-icon {extra}"),
         None => "operon-icon".to_string(),
     };
-    let aria_hidden = if props.title.is_some() { "false" } else { "true" };
+    let aria_hidden = if props.title.is_some() {
+        "false"
+    } else {
+        "true"
+    };
     let size_str = props.size.to_string();
 
     rsx! {
@@ -146,6 +160,8 @@ mod tests {
             "book",
             "panel",
             "sidebar-right",
+            "folder",
+            "settings",
         ] {
             assert!(has(required), "missing icon: {required}");
         }

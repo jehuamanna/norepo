@@ -92,18 +92,35 @@ impl Default for PluginRegistry {
     }
 }
 
-/// Register all compile-time built-in plugins.
+/// Register all compile-time built-in plugins for Cloud Mode (the canonical
+/// chrome): NotesExplorer + every format plugin.
 pub fn register_builtins(
     registry: &mut PluginRegistry,
     _ctx: &PluginContext,
 ) -> Result<(), String> {
+    use crate::plugins::notes_explorer::NotesExplorer;
+    registry.add_ui_plugin(Box::new(NotesExplorer::new()))?;
+    register_format_builtins(registry)
+}
+
+/// Register Local-Mode plugins: LocalProjectsExplorer (replaces NotesExplorer)
+/// + the same format plugin set as Cloud. Cloud and Local share the editor
+/// pipeline; only the activity-bar / sidebar contributions differ.
+pub fn register_local_builtins(
+    registry: &mut PluginRegistry,
+    _ctx: &PluginContext,
+) -> Result<(), String> {
+    use crate::plugins::local_projects_explorer::LocalProjectsExplorer;
+    registry.add_ui_plugin(Box::new(LocalProjectsExplorer::new()))?;
+    register_format_builtins(registry)
+}
+
+fn register_format_builtins(registry: &mut PluginRegistry) -> Result<(), String> {
     use crate::plugins::json_format::JsonFormatPlugin;
     use crate::plugins::markdown::MarkdownFormatPlugin;
     use crate::plugins::mdx::MdxFormatPlugin;
-    use crate::plugins::notes_explorer::NotesExplorer;
     use crate::plugins::plaintext::PlaintextFormatPlugin;
     use crate::plugins::richtext_tiptap::RichTextTiptapFormatPlugin;
-    registry.add_ui_plugin(Box::new(NotesExplorer::new()))?;
     registry.add_format_plugin(Box::new(MarkdownFormatPlugin::new()))?;
     registry.add_format_plugin(Box::new(PlaintextFormatPlugin::new()))?;
     registry.add_format_plugin(Box::new(JsonFormatPlugin::new()))?;
@@ -209,7 +226,10 @@ mod tests {
             "md-stub"
         );
         assert_eq!(
-            r.format_plugin_by_extension("markdown").unwrap().manifest().id,
+            r.format_plugin_by_extension("markdown")
+                .unwrap()
+                .manifest()
+                .id,
             "md-stub"
         );
         assert!(r.format_plugin_by_extension("txt").is_none());
@@ -221,11 +241,8 @@ mod tests {
         let mut r = PluginRegistry::new();
         r.add_ui_plugin(Box::new(ui_stub("a", vec![PluginSurface::ActivityBar])))
             .unwrap();
-        r.add_ui_plugin(Box::new(ui_stub(
-            "p",
-            vec![PluginSurface::CommandPalette],
-        )))
-        .unwrap();
+        r.add_ui_plugin(Box::new(ui_stub("p", vec![PluginSurface::CommandPalette])))
+            .unwrap();
         assert_eq!(r.contributions(PluginSurface::ActivityBar).count(), 1);
         assert_eq!(r.contributions(PluginSurface::CommandPalette).count(), 1);
         assert_eq!(r.contributions(PluginSurface::SideBarPanel).count(), 0);
@@ -247,8 +264,11 @@ mod tests {
     #[test]
     fn format_id_collides_with_ui_id() {
         let mut r = PluginRegistry::new();
-        r.add_ui_plugin(Box::new(ui_stub("shared", vec![PluginSurface::ActivityBar])))
-            .unwrap();
+        r.add_ui_plugin(Box::new(ui_stub(
+            "shared",
+            vec![PluginSurface::ActivityBar],
+        )))
+        .unwrap();
         let res = r.add_format_plugin(Box::new(format_stub("shared", "markdown", &["md"])));
         assert!(res.is_err());
     }

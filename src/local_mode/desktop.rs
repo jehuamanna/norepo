@@ -12,7 +12,7 @@ use operon_store::repos::{
 use operon_store::{Store, StoreConfig};
 use uuid::Uuid;
 
-use super::editor::{install_save_action, LocalNoteEditor, LocalSaveAction};
+use super::editor::{install_save_action, LocalNoteEditor, LocalSaveAction, LocalSaveButton};
 use super::explorer::{
     ExplorerPanel, ExplorerSearchFocus, ExplorerSearchRepo, LocalNoteVersion, LocalProjectVersion,
     SelectedNote, SelectedProject,
@@ -65,6 +65,17 @@ pub struct LocalNoteRepo(pub Arc<dyn LocalNoteRepository>);
 
 #[derive(Clone)]
 pub struct LocalTreeStateRepo(pub Arc<dyn LocalTreeStateRepository>);
+
+/// App-scope signal: gear → settings panel toggle. Lives at App scope so the
+/// ActivityBar gear (rendered inside Cloud `Shell`) and the overlay can share it.
+#[derive(Clone, Copy)]
+pub struct SettingsOpen(pub Signal<bool>);
+
+/// App-scope signal: latest Local username. StatusBar reads it; SettingsPanel
+/// updates it on save. Seeded from `LocalUserRepo::get()`; falls back to
+/// "Local user" with an upsert when the row is empty.
+#[derive(Clone, Copy)]
+pub struct LocalUsername(pub Signal<String>);
 
 /// Convenience used by `app.rs` and tests to install the repos. Equivalent to
 /// rendering [`LocalStateProvider`] but callable from a hook position.
@@ -530,5 +541,172 @@ pub fn read_remembered_mode(settings: &Arc<dyn LocalSettingsRepository>) -> Opti
         MODE_VALUE_LOCAL => Some(Mode::Local),
         MODE_VALUE_CLOUD => Some(Mode::NonLocal),
         _ => None,
+    }
+}
+
+/// Lift every Local-Mode app-scope signal to App scope so the Cloud `Shell`
+/// chrome (mode-aware StatusBar / ActivityBar / SideBar plugin contributions)
+/// can read them without prop-drilling. Call from `app.rs` only when
+/// `Mode::Local`, after `provide_local_state()`.
+pub fn provide_local_app_signals() {
+    let LocalUserRepo(user_repo) = use_context();
+    let LocalNoteRepo(note_repo) = use_context();
+    let persistence: Arc<dyn Persistence> = use_context();
+    let tabs: Signal<TabManager> = use_context();
+
+    // Seed username from the DB; upsert a default row when missing so the
+    // status bar always renders a value.
+    let mut username: Signal<String> = use_signal(|| {
+        user_repo
+            .get()
+            .ok()
+            .flatten()
+            .map(|u| u.username)
+            .unwrap_or_else(|| "Local user".to_string())
+    });
+    let user_repo_for_seed = user_repo.clone();
+    use_hook(move || {
+        if let Ok(None) = user_repo_for_seed.get() {
+            if let Ok(seeded) = user_repo_for_seed.upsert("Local user") {
+                username.set(seeded.username);
+            }
+        }
+    });
+    use_context_provider(|| LocalUsername(username));
+
+    let settings_open: Signal<bool> = use_signal(|| false);
+    use_context_provider(|| SettingsOpen(settings_open));
+
+    let project_version: Signal<u64> = use_signal(|| 0);
+    use_context_provider(|| LocalProjectVersion(project_version));
+    let note_version: Signal<u64> = use_signal(|| 0);
+    use_context_provider(|| LocalNoteVersion(note_version));
+    let selected_project: Signal<Option<Uuid>> = use_signal(|| None);
+    use_context_provider(|| SelectedProject(selected_project));
+    let selected_note: Signal<Option<Uuid>> = use_signal(|| None);
+    use_context_provider(|| SelectedNote(selected_note));
+    let drag_session: Signal<Option<DragKind>> = use_signal(|| None);
+    use_context_provider(|| DragSession(drag_session));
+    let clipboard: Signal<Option<Clipboard>> = use_signal(|| None);
+    use_context_provider(|| LocalClipboard(clipboard));
+    let search_focus_tick: Signal<u64> = use_signal(|| 0);
+    use_context_provider(|| ExplorerSearchFocus(search_focus_tick));
+
+    let save_callback =
+        use_hook(|| install_save_action(tabs, persistence.clone(), note_repo.clone()));
+    use_context_provider(|| LocalSaveAction {
+        callback: save_callback,
+    });
+}
+
+/// Wraps the Cloud `Shell` for Local Mode. Owns the Local-only keyboard
+/// bindings (Ctrl+X / Ctrl+C / Ctrl+V / Esc-clear-clip / Ctrl+Shift+F),
+/// renders the `SettingsPanel` overlay when `SettingsOpen` flips on, and
+/// surfaces a small floating Save button for `manual_save` tabs.
+#[component]
+pub fn LocalShellOverlay(children: Element) -> Element {
+    let LocalNoteRepo(note_repo) = use_context();
+    let LocalProjectRepo(project_repo) = use_context();
+    let LocalClipboard(clipboard) = use_context();
+    let SelectedProject(selected_project) = use_context();
+    let SelectedNote(selected_note) = use_context();
+    let LocalNoteVersion(note_version) = use_context();
+    let ExplorerSearchFocus(search_focus_tick) = use_context();
+    let SettingsOpen(settings_open) = use_context();
+    let LocalUsername(username) = use_context();
+    let tabs: Signal<TabManager> = use_context();
+    let save_action: LocalSaveAction = use_context();
+
+    let mut clipboard_setter = clipboard;
+    let mut selected_project_setter = selected_project;
+    let mut note_version_setter = note_version;
+    let mut search_focus_tick_setter = search_focus_tick;
+    let _ = username;
+    let _ = settings_open;
+    let note_repo_for_keys = note_repo.clone();
+    let project_repo_for_keys = project_repo.clone();
+
+    let active_tab_dirty_and_manual = {
+        let tm = tabs.read();
+        tm.active().map(|t| (t.id, t.dirty, t.manual_save))
+    };
+
+    rsx! {
+        div {
+            tabindex: "-1",
+            "data-testid": "local-shell",
+            style: "display: contents;",
+            onkeydown: move |evt| {
+                let mods = evt.modifiers();
+                let with_meta = mods.contains(Modifiers::META) || mods.contains(Modifiers::CONTROL);
+                let key = evt.key().to_string();
+                if with_meta
+                    && mods.contains(Modifiers::SHIFT)
+                    && !mods.contains(Modifiers::ALT)
+                    && key.eq_ignore_ascii_case("f")
+                {
+                    evt.prevent_default();
+                    search_focus_tick_setter.with_mut(|t| *t += 1);
+                    return;
+                }
+                if with_meta && !mods.contains(Modifiers::ALT) && !mods.contains(Modifiers::SHIFT) {
+                    if key.eq_ignore_ascii_case("x") || key.eq_ignore_ascii_case("c") {
+                        let payload = if let Some(nid) = *selected_note.read() {
+                            Some(ClipPayload::Note(nid))
+                        } else {
+                            (*selected_project.read()).map(ClipPayload::Project)
+                        };
+                        if let Some(payload) = payload {
+                            let kind = if key.eq_ignore_ascii_case("x") {
+                                ClipKind::Cut
+                            } else {
+                                ClipKind::Copy
+                            };
+                            clipboard_setter.set(Some(Clipboard { kind, payload }));
+                            evt.prevent_default();
+                            return;
+                        }
+                    }
+                    if key.eq_ignore_ascii_case("v") {
+                        let clip = *clipboard.read();
+                        if let Some(clip) = clip {
+                            paste_clipboard(
+                                clip,
+                                *selected_note.read(),
+                                *selected_project.read(),
+                                &note_repo_for_keys,
+                                &project_repo_for_keys,
+                            );
+                            note_version_setter.with_mut(|v| *v += 1);
+                            if matches!(clip.kind, ClipKind::Cut) {
+                                clipboard_setter.set(None);
+                            }
+                            evt.prevent_default();
+                            return;
+                        }
+                    }
+                }
+                if key == "Escape" && clipboard.read().is_some() {
+                    clipboard_setter.set(None);
+                    evt.prevent_default();
+                    return;
+                }
+                let _ = &mut selected_project_setter;
+            },
+            {children}
+            // Floating Save button: only for Local-Mode tabs (manual_save = true).
+            if let Some((_, dirty, true)) = active_tab_dirty_and_manual {
+                div {
+                    style: "position: fixed; top: 36px; right: 12px; z-index: 40;",
+                    LocalSaveButton { action: save_action.clone(), dirty }
+                }
+            }
+            if *settings_open.read() {
+                SettingsPanel {
+                    open: settings_open,
+                    username,
+                }
+            }
+        }
     }
 }
