@@ -22,7 +22,7 @@ pub fn ConfirmDialog(props: ConfirmDialogProps) -> Element {
 
     rsx! {
         div {
-            class: "fixed inset-0 bg-black/40 flex items-center justify-center z-[60]",
+            class: "operon-modal-scrim",
             "data-testid": "confirm-dialog",
             onclick: move |_| on_cancel.call(()),
             onkeydown: move |evt| {
@@ -36,22 +36,22 @@ pub fn ConfirmDialog(props: ConfirmDialogProps) -> Element {
                 }
             },
             div {
-                class: "bg-[var(--operon-bg)] text-[var(--operon-fg)] border border-[var(--operon-border)] rounded-md p-4 w-96 shadow-lg",
+                class: "operon-modal-card",
                 onclick: move |evt| evt.stop_propagation(),
-                h2 { class: "text-sm font-semibold mb-2", "{title}" }
-                p { class: "text-sm opacity-80 mb-4 whitespace-pre-line", "{message}" }
+                h2 { class: "operon-modal-title", "{title}" }
+                p { class: "operon-modal-message", "{message}" }
                 div {
-                    class: "flex justify-end gap-2",
+                    class: "operon-modal-actions",
                     button {
                         r#type: "button",
-                        class: "px-3 py-1 text-xs rounded border border-[var(--operon-border)]",
+                        class: "operon-modal-button",
                         "data-testid": "confirm-dialog-cancel",
                         onclick: move |_| on_cancel.call(()),
                         "Cancel"
                     }
                     button {
                         r#type: "button",
-                        class: "px-3 py-1 text-xs rounded bg-red-600 text-white",
+                        class: "operon-modal-button operon-modal-button-danger",
                         "data-testid": "confirm-dialog-confirm",
                         onclick: move |_| on_confirm.call(()),
                         "{confirm_label}"

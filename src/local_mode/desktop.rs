@@ -149,8 +149,9 @@ pub fn SettingsPanel(open: Signal<bool>, username: Signal<String>) -> Element {
 
     rsx! {
         div {
-            class: "fixed inset-0 bg-black/40 flex items-center justify-center z-50",
+            class: "operon-modal-scrim",
             "data-testid": "settings-panel",
+            onclick: move |_| close(),
             onkeydown: move |evt| {
                 if evt.key().to_string() == "Escape" {
                     close();
@@ -158,35 +159,32 @@ pub fn SettingsPanel(open: Signal<bool>, username: Signal<String>) -> Element {
                 }
             },
             div {
-                class: "bg-[var(--operon-bg)] text-[var(--operon-fg)] border border-[var(--operon-border)] rounded-md p-4 w-80 shadow-lg",
+                class: "operon-modal-card",
                 onclick: move |evt| evt.stop_propagation(),
-                h2 { class: "text-sm font-semibold mb-3", "Local user" }
-                label {
-                    class: "block text-xs mb-1 opacity-70",
-                    "Username"
-                }
+                h2 { class: "operon-modal-title", "Local user" }
+                label { class: "operon-modal-label", "Username" }
                 input {
                     r#type: "text",
-                    class: "w-full px-2 py-1 mb-2 bg-[var(--operon-input-bg)] border border-[var(--operon-border)] rounded text-sm",
+                    class: "operon-modal-input",
                     "data-testid": "username-input",
                     value: "{draft.read()}",
                     autofocus: true,
                     oninput: move |evt| draft.set(evt.value()),
                 }
                 if let Some(msg) = error.read().clone() {
-                    p { class: "text-xs text-red-500 mb-2", "{msg}" }
+                    p { class: "operon-modal-error", "{msg}" }
                 }
                 div {
-                    class: "flex justify-end gap-2 mt-2",
+                    class: "operon-modal-actions",
                     button {
                         r#type: "button",
-                        class: "px-3 py-1 text-xs rounded border border-[var(--operon-border)]",
+                        class: "operon-modal-button",
                         onclick: move |_| close(),
                         "Cancel"
                     }
                     button {
                         r#type: "button",
-                        class: "px-3 py-1 text-xs rounded bg-[var(--operon-accent)] text-white",
+                        class: "operon-modal-button operon-modal-button-primary",
                         onclick: move |_| save(),
                         "Save"
                     }
