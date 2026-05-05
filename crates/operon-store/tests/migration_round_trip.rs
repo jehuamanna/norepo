@@ -17,6 +17,8 @@ const EXPECTED_TABLES: &[&str] = &[
     "local_user",
     "local_app_settings",
     "local_project",
+    "local_note",
+    "local_tree_state",
 ];
 
 fn list_tables(store: &operon_store::Store) -> Vec<String> {
