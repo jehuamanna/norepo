@@ -289,6 +289,10 @@ pub fn CommandPalette() -> Element {
                                 if let Some(c) = candidates_for_keydown.get(sel) {
                                     match c.kind {
                                         CandidateKind::Command => {
+                                            // Snapshot the mode so we can detect if the
+                                            // command re-opens the palette in another mode
+                                            // (e.g. workbench.action.selectTheme).
+                                            let mode_before = palette.read().mode;
                                             let context = CommandContext {
                                                 theme,
                                                 tabs,
@@ -300,7 +304,11 @@ pub fn CommandPalette() -> Element {
                                                 theme_registry: theme_reg_for_keydown.clone(),
                                             };
                                             let _ = cmd_reg_for_keydown.execute(&c.id, &context);
-                                            palette.write().open = false;
+                                            // Only auto-close if the command didn't switch
+                                            // the palette into a different mode.
+                                            if palette.read().mode == mode_before {
+                                                palette.write().open = false;
+                                            }
                                         }
                                         CandidateKind::Note => {
                                             tabs.write().open(
