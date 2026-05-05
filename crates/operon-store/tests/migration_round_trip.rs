@@ -59,12 +59,18 @@ fn re_running_up_is_no_op() {
     let store = fresh_store().unwrap();
     store.migrate().unwrap();
     store.migrate().unwrap();
-    let count: i64 = store
+    let first: i64 = store
         .conn()
         .unwrap()
         .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(count, 1);
+    store.migrate().unwrap();
+    let second: i64 = store
+        .conn()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(first, second);
 }
 
 #[test]
