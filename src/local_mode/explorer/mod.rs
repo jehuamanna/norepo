@@ -24,6 +24,7 @@ use dioxus::prelude::*;
 use operon_store::repos::{LocalNote, LocalProject};
 use uuid::Uuid;
 
+use crate::editor::EditorMode;
 use crate::local_mode::desktop::{LocalNoteRepo, LocalProjectRepo, LocalTreeStateRepo};
 use crate::local_mode::editor::{open_local_note_tab, LocalSaveAction};
 use crate::local_mode::ui::{
@@ -375,6 +376,38 @@ pub fn ExplorerPanel() -> Element {
         Err(e) => eprintln!("operon: move_down note failed: {e}"),
     });
 
+    // Right-click → View / Edit / Split-view: switch the editor mode of the
+    // note's tab, opening it first if it isn't already open.
+    let mut tabs_for_mode = tabs;
+    let scheduler_for_mode = save_scheduler.clone();
+    let on_set_note_mode = use_callback(move |(note_id, target): (Uuid, EditorMode)| {
+        let existing_tab_id = tabs_for_mode
+            .read()
+            .iter()
+            .find(|t| t.note_id == note_id.to_string())
+            .map(|t| t.id);
+        let tab_id = if let Some(id) = existing_tab_id {
+            id
+        } else {
+            let title = notes_by_project
+                .read()
+                .values()
+                .flat_map(|list| list.iter())
+                .find(|n| n.id == note_id)
+                .map(|n| n.title.clone())
+                .unwrap_or_else(|| note_id.to_string());
+            open_local_note_tab(
+                tabs_for_mode,
+                scheduler_for_mode.clone(),
+                note_id,
+                title,
+                String::new(),
+            )
+        };
+        tabs_for_mode.write().set_mode(tab_id, target);
+        selected_note.set(Some(note_id));
+    });
+
     // Clipboard helpers shared by row context-menu items.
     let mut clipboard_for_cut = clipboard;
     let on_cut_note = use_callback(move |id: Uuid| {
@@ -597,6 +630,14 @@ pub fn ExplorerPanel() -> Element {
 
     let project_repo_for_delete = project_repo.clone();
     let note_repo_for_delete = note_repo.clone();
+    // Snapshot the per-note current editor mode from the tab manager so each
+    // NoteRow can show the right context-menu items (View / Edit / Split).
+    let note_modes_snapshot: HashMap<Uuid, EditorMode> = {
+        let snap = tabs.read();
+        snap.iter()
+            .filter_map(|t| Uuid::parse_str(&t.note_id).ok().map(|u| (u, t.mode)))
+            .collect()
+    };
     let workspace_snap = workspace_open.read().clone();
     let project_note_open_snap = project_note_open.read().clone();
     let notes_snap = notes_by_project.read().clone();
@@ -759,6 +800,8 @@ pub fn ExplorerPanel() -> Element {
                             on_drop_project_on_project: on_drop_project_on_project,
                             on_drop_note_on_project: on_drop_note_on_project,
                             on_drop_note_on_note: on_drop_note_on_note,
+                            note_modes: note_modes_snapshot.clone(),
+                            on_set_note_mode: on_set_note_mode,
                         }
                     }
                 }
@@ -858,6 +901,8 @@ struct ProjectSubtreeProps {
     on_drop_project_on_project: Callback<(Uuid, Uuid, DropPosition)>,
     on_drop_note_on_project: Callback<(Uuid, Uuid, DropPosition)>,
     on_drop_note_on_note: Callback<(Uuid, Uuid, DropPosition)>,
+    note_modes: HashMap<Uuid, EditorMode>,
+    on_set_note_mode: Callback<(Uuid, EditorMode)>,
 }
 
 #[component]
@@ -965,6 +1010,8 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
                         on_copy: props.on_copy_note,
                         on_paste: props.on_paste_into_note,
                         on_drop_note_on_note: props.on_drop_note_on_note,
+                        current_mode: props.note_modes.get(&note.id).copied(),
+                        on_set_mode: props.on_set_note_mode,
                     }
                 }
             }

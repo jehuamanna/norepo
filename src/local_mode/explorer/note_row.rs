@@ -7,6 +7,7 @@ use keyboard_types::Modifiers;
 use operon_store::repos::LocalNote;
 use uuid::Uuid;
 
+use crate::editor::EditorMode;
 use crate::local_mode::ui::{
     classify_drop_position, ContextMenu, ContextMenuItem, DragKind, DragSession, DropPosition,
     InlineRename,
@@ -39,6 +40,11 @@ pub struct NoteRowProps {
     pub on_copy: Callback<Uuid>,
     pub on_paste: Callback<Uuid>,
     pub on_drop_note_on_note: Callback<(Uuid, Uuid, DropPosition)>,
+    /// Current editor mode for this note when it's open in a tab. None means
+    /// the note isn't open yet — picking any mode opens it.
+    pub current_mode: Option<EditorMode>,
+    /// Switch the note's editor mode (opens the tab if needed).
+    pub on_set_mode: Callback<(Uuid, EditorMode)>,
 }
 
 #[component]
@@ -78,6 +84,8 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let on_copy = props.on_copy;
     let on_paste = props.on_paste;
     let on_drop_note_on_note = props.on_drop_note_on_note;
+    let current_mode = props.current_mode;
+    let on_set_mode = props.on_set_mode;
 
     let mut row_class = if selected {
         String::from("notes-explorer-row notes-explorer-row-active group")
@@ -128,7 +136,37 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     );
     move_down_item.enabled = !is_last_sibling;
 
-    let menu_items: Vec<ContextMenuItem> = vec![
+    // Mode-switch items: render the modes the note is NOT currently in. If
+    // the note isn't open yet, all three are offered — picking one opens the
+    // note in that mode. Items live first in the menu so they're easy to hit.
+    let mut mode_items: Vec<ContextMenuItem> = Vec::new();
+    if current_mode != Some(EditorMode::Edit) {
+        mode_items.push(ContextMenuItem::new(
+            "Edit",
+            Callback::new(move |_| {
+                on_set_mode.call((id, EditorMode::Edit));
+            }),
+        ));
+    }
+    if current_mode != Some(EditorMode::View) {
+        mode_items.push(ContextMenuItem::new(
+            "View",
+            Callback::new(move |_| {
+                on_set_mode.call((id, EditorMode::View));
+            }),
+        ));
+    }
+    if current_mode != Some(EditorMode::Split) {
+        mode_items.push(ContextMenuItem::new(
+            "Split view",
+            Callback::new(move |_| {
+                on_set_mode.call((id, EditorMode::Split));
+            }),
+        ));
+    }
+
+    let mut menu_items: Vec<ContextMenuItem> = mode_items;
+    menu_items.extend([
         ContextMenuItem::new(
             "Rename",
             Callback::new(move |_| {
@@ -164,7 +202,7 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 on_request_delete.call(id);
             }),
         ),
-    ];
+    ]);
 
     let caret_glyph = if has_children {
         if is_open {

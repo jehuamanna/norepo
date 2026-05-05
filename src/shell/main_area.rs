@@ -7,6 +7,7 @@ use dioxus::prelude::*;
 
 use crate::editor::EditorMode;
 use crate::plugin::PluginRegistry;
+use crate::rbag::state::{AppState, Mode};
 use crate::shell::mode_toolbar::ModeToolbar;
 use crate::tabs::{SaveScheduler, TabId, TabManager, TabStrip};
 
@@ -15,6 +16,8 @@ pub fn MainArea() -> Element {
     let tabs: Signal<TabManager> = use_context();
     let registry: Rc<PluginRegistry> = use_context();
     let scheduler: SaveScheduler = use_context();
+    let app_state: Signal<AppState> = use_context();
+    let is_local = app_state.read().mode == Mode::Local;
 
     let active_info: Option<(TabId, String, String, String, EditorMode)> = {
         let snapshot = tabs.read();
@@ -88,7 +91,9 @@ pub fn MainArea() -> Element {
             "data-region": "main-area",
             class: "operon-region operon-main-area",
             TabStrip {}
-            ModeToolbar {}
+            // Local Mode hides the View/Edit/Live Preview/Split toolbar — mode
+            // switching happens via the note row's right-click context menu.
+            if !is_local { ModeToolbar {} }
             div { class: "operon-main-body", {body} }
         }
     }

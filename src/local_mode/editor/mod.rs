@@ -18,6 +18,7 @@ use dioxus::prelude::*;
 use operon_store::repos::LocalNoteRepository;
 use uuid::Uuid;
 
+use crate::editor::EditorMode;
 use crate::persistence::Persistence;
 use crate::tabs::{Tab, TabId, TabManager};
 
@@ -90,6 +91,9 @@ pub fn open_local_note_tab(
         initial_content,
     );
     save_scheduler.set_manual_save(id);
+    // Local Mode opens notes in Edit mode by default; the right-click menu
+    // on the note row offers View / Split-view as alternatives.
+    tabs.write().set_mode(id, EditorMode::Edit);
     id
 }
 
