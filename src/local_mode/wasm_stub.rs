@@ -11,15 +11,11 @@ use dioxus::prelude::*;
 use crate::rbag::state::Mode;
 
 #[component]
-pub fn LocalShell() -> Element {
-    rsx! {
-        div {
-            class: "flex items-center justify-center h-screen w-screen text-sm",
-            "data-testid": "local-shell",
-            "Local Mode is not available on the web build."
-        }
-    }
+pub fn LocalShellOverlay(children: Element) -> Element {
+    rsx! { {children} }
 }
+
+pub fn provide_local_app_signals() {}
 
 #[component]
 pub fn StartupChooser() -> Element {

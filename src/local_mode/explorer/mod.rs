@@ -670,11 +670,13 @@ pub fn ExplorerPanel() -> Element {
 
     rsx! {
         div {
-            class: "flex flex-col h-full w-full bg-[var(--operon-bg)] text-[var(--operon-fg)] border-r border-[var(--operon-border)]",
+            class: "notes-explorer-list",
             "data-testid": "explorer-panel",
+            style: "list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column;",
             // Header — search input + checkbox + "+" button
             div {
-                class: "flex items-center gap-2 px-2 py-2 border-b border-[var(--operon-border)]",
+                class: "flex items-center gap-2 py-2",
+                style: "border-bottom: 1px solid var(--vscode-panel-border); margin-bottom: 4px;",
                 div {
                     class: "flex-1",
                     ExplorerSearch {

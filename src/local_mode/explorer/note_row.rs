@@ -54,7 +54,6 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let id_str = id.to_string();
     let title = note.title.clone();
     let depth = props.depth.max(0);
-    let indent_px = depth * 16;
     let has_children = props.has_children;
     let is_open = props.is_open;
     let selected = props.selected;
@@ -81,18 +80,14 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let on_drop_note_on_note = props.on_drop_note_on_note;
 
     let mut row_class = if selected {
-        String::from(
-            "flex items-center gap-1 px-2 py-1 cursor-pointer text-sm bg-[var(--operon-hover)] relative",
-        )
+        String::from("notes-explorer-row notes-explorer-row-active group")
     } else {
-        String::from(
-            "flex items-center gap-1 px-2 py-1 cursor-pointer text-sm hover:bg-[var(--operon-hover)] group relative",
-        )
+        String::from("notes-explorer-row group")
     };
     if cut {
-        row_class.push_str(" opacity-50");
+        row_class.push_str(" notes-explorer-row-cut");
     }
-    let style = format!("padding-left: {}px;", 8 + indent_px);
+    let style = format!("--depth: {depth};");
 
     let initial_title = title.clone();
     let dismiss_menu = use_callback(move |_: ()| menu_pos_setter.set(None));

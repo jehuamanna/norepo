@@ -350,8 +350,33 @@ html, body {
   font-size: 13px;
 }
 
+/* Notes / Local explorer row styling. Cloud's NotesExplorerPanel and Local
+ * Mode's LocalProjectsExplorerPanel share these rules so the two panels look
+ * identical inside the shared Shell sidebar. The `--depth` CSS variable lets
+ * note rows visually nest without per-row inline padding. */
+.notes-explorer-panel {
+  padding: 6px 8px;
+}
+.notes-explorer-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  border-radius: 3px;
+  font-size: 13px;
+  padding: 4px 6px;
+  padding-left: calc(var(--depth, 0) * 12px + 6px);
+}
 .notes-explorer-row:hover {
-  background: var(--vscode-activitybar-activebackground);
+  background: var(--vscode-list-inactiveselectionbackground, var(--vscode-activitybar-activebackground));
+}
+.notes-explorer-row-active {
+  background: var(--vscode-list-activeselectionbackground);
+  color: var(--vscode-list-activeselectionforeground, currentColor);
+}
+.notes-explorer-row-cut {
+  opacity: 0.5;
 }
 
 .operon-main-area {

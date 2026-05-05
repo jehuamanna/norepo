@@ -69,17 +69,14 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     let on_drop_note_on_project = props.on_drop_note_on_project;
 
     let mut row_class = if selected {
-        String::from(
-            "flex items-center gap-1 px-2 py-1 cursor-pointer text-sm bg-[var(--operon-hover)] group relative",
-        )
+        String::from("notes-explorer-row notes-explorer-row-active group")
     } else {
-        String::from(
-            "flex items-center gap-1 px-2 py-1 cursor-pointer text-sm hover:bg-[var(--operon-hover)] group relative",
-        )
+        String::from("notes-explorer-row group")
     };
     if cut {
-        row_class.push_str(" opacity-50");
+        row_class.push_str(" notes-explorer-row-cut");
     }
+    let style = "--depth: 0;";
 
     let initial_name = name.clone();
     let dismiss_menu = use_callback(move |_: ()| menu_pos_setter.set(None));
@@ -133,6 +130,7 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     rsx! {
         div {
             class: "{row_class}",
+            style: "{style}",
             "data-testid": "project-row",
             "data-explorer": "true",
             "data-project-id": "{id_str}",
