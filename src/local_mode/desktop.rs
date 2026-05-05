@@ -4,16 +4,18 @@ use std::sync::Arc;
 
 use dioxus::prelude::*;
 use operon_store::repos::{
-    LocalNoteRepository, LocalProjectRepository, LocalSettingsRepository, LocalTreeStateRepository,
-    LocalUserRepository, SqliteLocalNoteRepository, SqliteLocalProjectRepository,
-    SqliteLocalSettingsRepository, SqliteLocalTreeStateRepository, SqliteLocalUserRepository,
+    LocalNoteRepository, LocalProjectRepository, LocalSearchRepository, LocalSettingsRepository,
+    LocalTreeStateRepository, LocalUserRepository, SqliteLocalNoteRepository,
+    SqliteLocalProjectRepository, SqliteLocalSearchRepository, SqliteLocalSettingsRepository,
+    SqliteLocalTreeStateRepository, SqliteLocalUserRepository,
 };
 use operon_store::{Store, StoreConfig};
 use uuid::Uuid;
 
 use super::editor::{install_save_action, LocalNoteEditor, LocalSaveAction};
 use super::explorer::{
-    ExplorerPanel, LocalNoteVersion, LocalProjectVersion, SelectedNote, SelectedProject,
+    ExplorerPanel, ExplorerSearchFocus, ExplorerSearchRepo, LocalNoteVersion, LocalProjectVersion,
+    SelectedNote, SelectedProject,
 };
 use super::ui::{ClipKind, ClipPayload, Clipboard, DragKind, DragSession, LocalClipboard};
 use super::{MODE_VALUE_CLOUD, MODE_VALUE_LOCAL, SETTINGS_KEY_MODE_REMEMBERED};
@@ -35,12 +37,15 @@ pub fn LocalStateProvider(children: Element) -> Element {
     let note_repo: Arc<dyn LocalNoteRepository> =
         Arc::new(SqliteLocalNoteRepository::new(store.clone()));
     let tree_repo: Arc<dyn LocalTreeStateRepository> =
-        Arc::new(SqliteLocalTreeStateRepository::new(store));
+        Arc::new(SqliteLocalTreeStateRepository::new(store.clone()));
+    let search_repo: Arc<dyn LocalSearchRepository> =
+        Arc::new(SqliteLocalSearchRepository::new(store));
     use_context_provider(|| LocalUserRepo(user_repo));
     use_context_provider(|| LocalSettingsRepo(settings_repo));
     use_context_provider(|| LocalProjectRepo(project_repo));
     use_context_provider(|| LocalNoteRepo(note_repo));
     use_context_provider(|| LocalTreeStateRepo(tree_repo));
+    use_context_provider(|| ExplorerSearchRepo(search_repo));
     rsx! { {children} }
 }
 
@@ -74,12 +79,15 @@ pub fn provide_local_state() {
     let note_repo: Arc<dyn LocalNoteRepository> =
         Arc::new(SqliteLocalNoteRepository::new(store.clone()));
     let tree_repo: Arc<dyn LocalTreeStateRepository> =
-        Arc::new(SqliteLocalTreeStateRepository::new(store));
+        Arc::new(SqliteLocalTreeStateRepository::new(store.clone()));
+    let search_repo: Arc<dyn LocalSearchRepository> =
+        Arc::new(SqliteLocalSearchRepository::new(store));
     use_context_provider(|| LocalUserRepo(user_repo));
     use_context_provider(|| LocalSettingsRepo(settings_repo));
     use_context_provider(|| LocalProjectRepo(project_repo));
     use_context_provider(|| LocalNoteRepo(note_repo));
     use_context_provider(|| LocalTreeStateRepo(tree_repo));
+    use_context_provider(|| ExplorerSearchRepo(search_repo));
 }
 
 fn open_local_store() -> Store {
@@ -152,6 +160,9 @@ pub fn LocalShell() -> Element {
     use_context_provider(|| DragSession(drag_session));
     let clipboard: Signal<Option<Clipboard>> = use_signal(|| None);
     use_context_provider(|| LocalClipboard(clipboard));
+    // Phase-5: bumped by Ctrl+Shift+F so the explorer search input refocuses.
+    let search_focus_tick: Signal<u64> = use_signal(|| 0);
+    use_context_provider(|| ExplorerSearchFocus(search_focus_tick));
 
     // Explicit-save action — the Save button + Ctrl+S call this.
     let save_callback =
@@ -173,6 +184,7 @@ pub fn LocalShell() -> Element {
     let mut selected_project_setter = selected_project;
     let mut note_version_setter = note_version;
     let project_repo_keys = project_repo_for_keys.clone();
+    let mut search_focus_tick_setter = search_focus_tick;
 
     rsx! {
         div {
@@ -189,6 +201,18 @@ pub fn LocalShell() -> Element {
                 {
                     evt.prevent_default();
                     save_action.callback.call(());
+                    return;
+                }
+                // Phase-5: Ctrl+Shift+F focuses the explorer search input. The
+                // existing Ctrl+P binding (cloud command palette) lives in the
+                // shell module and is left untouched.
+                if with_meta
+                    && mods.contains(Modifiers::SHIFT)
+                    && !mods.contains(Modifiers::ALT)
+                    && evt.key().to_string().eq_ignore_ascii_case("f")
+                {
+                    evt.prevent_default();
+                    search_focus_tick_setter.with_mut(|t| *t += 1);
                     return;
                 }
                 if with_meta && !mods.contains(Modifiers::ALT) {

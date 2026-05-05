@@ -4,15 +4,21 @@
 
 mod note_row;
 mod project_row;
+mod search;
 mod tree_node;
 mod tree_state;
 
 pub use note_row::NoteRow;
 pub use project_row::ProjectRow;
+pub use search::{
+    click_handler as search_click_handler, load_body_cache, BodyCache, ExplorerSearch,
+    ExplorerSearchFocus, ExplorerSearchRepo, ResultsList,
+};
 pub use tree_node::{flatten_visible, NoteForest};
 pub use tree_state::TreeStateQueue;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use dioxus::prelude::*;
 use operon_store::repos::{LocalNote, LocalProject};
@@ -24,6 +30,7 @@ use crate::local_mode::ui::{
     ClipKind, ClipPayload, Clipboard, ConfirmDialog, DragKind, DragSession, DropPosition,
     LocalClipboard,
 };
+use crate::persistence::Persistence;
 use crate::tabs::{SaveScheduler, TabManager};
 
 /// App-scope signal: bumped on every successful project mutation. The panel
@@ -57,13 +64,16 @@ pub fn ExplorerPanel() -> Element {
     let LocalTreeStateRepo(tree_repo) = use_context();
     let LocalProjectVersion(mut project_version) = use_context();
     let LocalNoteVersion(mut note_version) = use_context();
-    let SelectedProject(mut selected_project) = use_context();
+    let SelectedProject(selected_project) = use_context();
+    let mut selected_project = selected_project;
     let SelectedNote(mut selected_note) = use_context();
     let DragSession(drag_session) = use_context();
     let LocalClipboard(clipboard) = use_context();
     let tabs: Signal<TabManager> = use_context();
     let save_scheduler: SaveScheduler = use_context();
     let _save_action: LocalSaveAction = use_context();
+    let persistence: Arc<dyn Persistence> = use_context();
+    let ExplorerSearchFocus(focus_tick) = use_context();
 
     // Re-fetch project list when version bumps.
     let projects: Signal<Vec<LocalProject>> = use_signal(Vec::new);
@@ -121,6 +131,61 @@ pub fn ExplorerPanel() -> Element {
 
     // Tree-state debounce queue.
     let tree_queue: Signal<TreeStateQueue> = use_signal(|| TreeStateQueue::new(tree_repo.clone()));
+
+    // ===== Phase-5: search state =====
+    let search_query: Signal<String> = use_signal(String::new);
+    let search_in_content: Signal<bool> = use_signal(|| false);
+    // Debounced query — only flushed 150ms after the user stops typing.
+    let debounced_query: Signal<String> = use_signal(String::new);
+    let body_cache: Signal<BodyCache> = use_signal(BodyCache::default);
+    // Snapshot of the previously-selected note so Esc can restore focus.
+    let prev_selection: Signal<Option<Uuid>> = use_signal(|| None);
+
+    // Debounce: spawn a delay each time the query changes; only the last spawn
+    // wins by checking a generation counter.
+    {
+        let mut debounced_setter = debounced_query;
+        use_effect(move || {
+            let q = search_query.read().clone();
+            spawn(async move {
+                search::debounce_window().await;
+                debounced_setter.set(q);
+            });
+        });
+    }
+
+    // Body cache lifecycle: load when in_content flips on; clear when off.
+    {
+        let mut body_cache_setter = body_cache;
+        let p_repo = project_repo.clone();
+        let n_repo = note_repo.clone();
+        let persistence_for_cache = persistence.clone();
+        use_effect(move || {
+            let on = *search_in_content.read();
+            if !on {
+                body_cache_setter.set(BodyCache::default());
+                return;
+            }
+            let Ok(projects) = p_repo.list() else {
+                return;
+            };
+            let mut all_ids: Vec<Uuid> = Vec::new();
+            for p in projects {
+                if let Ok(rows) = n_repo.list_for_project(p.id) {
+                    all_ids.extend(rows.iter().map(|r| r.id));
+                }
+            }
+            let persistence = persistence_for_cache.clone();
+            spawn(async move {
+                let map = search::load_body_cache(all_ids, persistence).await;
+                body_cache_setter.set(BodyCache(Arc::new(map)));
+            });
+        });
+    }
+
+    // Track focus_tick → focus the input. The ExplorerSearch component reads
+    // the focus_tick signal in its onmounted.
+    let _ = focus_tick;
 
     let renaming_project: Signal<Option<Uuid>> = use_signal(|| None);
     let pending_delete_project: Signal<Option<Uuid>> = use_signal(|| None);
@@ -545,19 +610,79 @@ pub fn ExplorerPanel() -> Element {
         })
     );
 
+    // Phase-5: title lookup for the search-result click handler.
+    let note_titles_signal: Signal<HashMap<Uuid, String>> = use_signal(HashMap::new);
+    {
+        let mut titles_setter = note_titles_signal;
+        use_effect(move || {
+            let map = notes_by_project.read();
+            let mut out: HashMap<Uuid, String> = HashMap::new();
+            for list in map.values() {
+                for n in list {
+                    out.insert(n.id, n.title.clone());
+                }
+            }
+            titles_setter.set(out);
+        });
+    }
+    let on_search_pick = search_click_handler(
+        tabs,
+        save_scheduler.clone(),
+        selected_note,
+        selected_project,
+        workspace_open,
+        tree_queue,
+        note_titles_signal,
+        search_query,
+        search_in_content,
+    );
+
+    // Esc inside the search input clears query + restores focus to prev_selection.
+    let prev_selection_setter = prev_selection;
+    let mut search_query_setter = search_query;
+    let mut search_in_content_setter = search_in_content;
+    let mut selected_note_for_clear = selected_note;
+    let on_search_clear = use_callback(move |_| {
+        search_query_setter.set(String::new());
+        search_in_content_setter.set(false);
+        if let Some(prev) = *prev_selection_setter.read() {
+            selected_note_for_clear.set(Some(prev));
+        }
+    });
+
+    // Capture prev_selection on transition from empty -> non-empty query.
+    {
+        let mut prev_setter = prev_selection;
+        use_effect(move || {
+            let q = search_query.read().clone();
+            if !q.is_empty() && prev_setter.read().is_none() {
+                prev_setter.set(*selected_note.read());
+            } else if q.is_empty() {
+                prev_setter.set(None);
+            }
+        });
+    }
+
+    let debounced_now = debounced_query.read().clone();
+    let in_content_now = *search_in_content.read();
+    let body_cache_now = body_cache.read().clone();
+    let show_results = !debounced_now.trim().is_empty();
+
     rsx! {
         div {
             class: "flex flex-col h-full w-full bg-[var(--operon-bg)] text-[var(--operon-fg)] border-r border-[var(--operon-border)]",
             "data-testid": "explorer-panel",
-            // Header
+            // Header — search input + checkbox + "+" button
             div {
                 class: "flex items-center gap-2 px-2 py-2 border-b border-[var(--operon-border)]",
-                input {
-                    r#type: "search",
-                    class: "flex-1 px-2 py-1 text-xs bg-[var(--operon-input-bg)] border border-[var(--operon-border)] rounded",
-                    "data-testid": "explorer-search",
-                    placeholder: "Search projects",
-                    disabled: true,
+                div {
+                    class: "flex-1",
+                    ExplorerSearch {
+                        query: search_query,
+                        in_content: search_in_content,
+                        focus_tick: focus_tick,
+                        on_clear: on_search_clear,
+                    }
                 }
                 button {
                     r#type: "button",
@@ -568,7 +693,15 @@ pub fn ExplorerPanel() -> Element {
                     "+"
                 }
             }
-            // Rows
+            // Body — results when query is non-empty, otherwise the tree.
+            if show_results {
+                ResultsList {
+                    query: debounced_now.clone(),
+                    in_content: in_content_now,
+                    body_cache: body_cache_now.clone(),
+                    on_pick: on_search_pick,
+                }
+            } else {
             div {
                 class: "flex-1 overflow-y-auto",
                 if projects_snapshot.is_empty() {
@@ -627,6 +760,7 @@ pub fn ExplorerPanel() -> Element {
                         }
                     }
                 }
+            }
             }
         }
         if let Some(did) = pending_delete_project_id {
