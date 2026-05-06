@@ -14,6 +14,8 @@ pub mod explorer;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ui;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod images;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod vault;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod vault_picker;

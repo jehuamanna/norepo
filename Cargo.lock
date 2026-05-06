@@ -4977,6 +4977,7 @@ dependencies = [
  "rfd 0.14.1",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-util",
