@@ -8,6 +8,10 @@ use dioxus::prelude::*;
 use std::sync::Arc;
 
 use crate::commands::{register_builtin_commands, CommandRegistry, PaletteState};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::local_mode::vault::VaultRoot;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::local_mode::VaultDirPicker;
 use crate::local_mode::StartupChooser;
 use crate::log::LogBuffer;
 use crate::log_info;
@@ -81,6 +85,16 @@ pub fn App() -> Element {
     };
     #[cfg(target_arch = "wasm32")]
     let initial_mode_remembered: Option<Mode> = Some(Mode::NonLocal);
+
+    // Local Mode also requires a chosen notes vault directory. On first run
+    // (no `vault.root.path` setting) we render the `VaultDirPicker` modal in
+    // place of the workspace until the user picks one. The vault is held in
+    // App-scope state so the picker can update it without a reload.
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut vault_root: Signal<Option<VaultRoot>> = {
+        let crate::local_mode::LocalSettingsRepo(settings) = use_context();
+        use_signal(|| crate::local_mode::read_vault_root(&settings))
+    };
 
     use_hook(|| {
         if let Some(m) = initial_mode_remembered {
@@ -177,6 +191,10 @@ pub fn App() -> Element {
 
     let mode_known = initial_mode_remembered.is_some();
     let current_mode = app_state.read().mode;
+    #[cfg(not(target_arch = "wasm32"))]
+    let vault_set = vault_root.read().is_some();
+    #[cfg(target_arch = "wasm32")]
+    let vault_set = true; // wasm path skips the local-mode picker (Phase 2 work)
 
     rsx! {
         document::Link { rel: "icon", href: FAVICON }
@@ -196,7 +214,27 @@ pub fn App() -> Element {
             if !mode_known {
                 StartupChooser {}
             } else if current_mode == Mode::Local {
-                crate::local_mode::LocalShellOverlay { Shell {} }
+                {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        if !vault_set {
+                            rsx! {
+                                VaultDirPicker {
+                                    blocking: true,
+                                    on_chosen: move |root: VaultRoot| {
+                                        vault_root.set(Some(root));
+                                    },
+                                }
+                            }
+                        } else {
+                            rsx! {
+                                crate::local_mode::LocalShellOverlay { Shell {} }
+                            }
+                        }
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    rsx! { crate::local_mode::LocalShellOverlay { Shell {} } }
+                }
             } else {
                 Shell {}
             }

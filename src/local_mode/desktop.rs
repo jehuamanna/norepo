@@ -324,6 +324,15 @@ pub fn read_remembered_mode(settings: &Arc<dyn LocalSettingsRepository>) -> Opti
     }
 }
 
+/// Read the persisted vault root path. Used by `app.rs` in Local Mode to
+/// decide whether to render the [`VaultDirPicker`] or jump straight into the
+/// workspace. Returns `None` when no vault has been picked yet (first run).
+pub fn read_vault_root(
+    settings: &Arc<dyn LocalSettingsRepository>,
+) -> Option<crate::local_mode::vault::VaultRoot> {
+    crate::local_mode::vault::load(settings).ok().flatten()
+}
+
 /// Lift every Local-Mode app-scope signal to App scope so the Cloud `Shell`
 /// chrome (mode-aware StatusBar / ActivityBar / SideBar plugin contributions)
 /// can read them without prop-drilling. Call from `app.rs` only when
