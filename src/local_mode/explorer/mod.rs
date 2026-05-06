@@ -621,17 +621,20 @@ pub fn ExplorerPanel() -> Element {
     let expand_ancestors = move |project_id: Uuid, mut cursor: Option<Uuid>| {
         let scope = scope_for_project(project_id);
         let snap = notes_by_project_for_expand.read();
-        let list = match snap.get(&project_id) {
-            Some(l) => l,
-            None => return,
+        let Some(list) = snap.get(&project_id) else {
+            return;
         };
+        // Build a parent lookup once so the ancestor walk is O(depth)
+        // instead of O(depth × project size).
+        let parent_by_id: HashMap<Uuid, Option<Uuid>> =
+            list.iter().map(|n| (n.id, n.parent_id)).collect();
         while let Some(id) = cursor {
             let key = id.to_string();
             project_note_open_for_expand.with_mut(|map| {
                 map.entry(project_id).or_default().insert(key.clone(), true);
             });
             queue_for_expand.read().enqueue(scope.clone(), key, true);
-            cursor = list.iter().find(|n| n.id == id).and_then(|n| n.parent_id);
+            cursor = parent_by_id.get(&id).copied().flatten();
         }
     };
 
