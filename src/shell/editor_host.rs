@@ -103,6 +103,13 @@ pub fn MonacoEditorHost(
         let host_id = format!("operon-monaco-host-{note_id}");
         let initial_content = content.clone();
         let language_id = language.id.to_string();
+        // Plans-Phase-9-monaco-desktop (rev 3): visible mount status so
+        // we can debug "Monaco never appears" without having to open
+        // the webview's devtools. The recv loop flips this to "mounted"
+        // on success or "error: <msg>" on bridge / mount failure.
+        let mut mount_status: Signal<String> =
+            use_signal(|| "Loading Monaco…".to_string());
+        let mut mounted_flag: Signal<bool> = use_signal(|| false);
 
         // Build the bootstrap script once, capturing the per-host id +
         // initial content. Idempotent: re-renders don't re-run because
@@ -118,6 +125,7 @@ pub fn MonacoEditorHost(
             let script = format!(
                 r#"(async function() {{
                     try {{
+                        dioxus.send({{type:"diag", phase:"start", origin:String(window.location && window.location.origin)}});
                         if (!window.operonBridge) {{
                             // Plans-Phase-9-monaco-desktop (rev 2): the
                             // bridge dist is served via the custom
@@ -126,7 +134,13 @@ pub fn MonacoEditorHost(
                             // doesn't auto-serve `/assets/` for desktop
                             // the way `dx serve --target web` does, so
                             // the wasm-style URL would 404 here.
-                            await import('bridge://localhost/index.js');
+                            try {{
+                                await import('bridge://localhost/index.js');
+                                dioxus.send({{type:"diag", phase:"imported"}});
+                            }} catch (impErr) {{
+                                dioxus.send({{type:"error", message:"import failed: "+String(impErr && impErr.message || impErr)}});
+                                return;
+                            }}
                         }}
                         if (!window.operonBridge) {{
                             dioxus.send({{type:"error", message:"bridge not loaded"}});
@@ -273,10 +287,24 @@ pub fn MonacoEditorHost(
                             handler.call(action);
                         }
                     }
-                    Some("mounted") => {}
+                    Some("mounted") => {
+                        mounted_flag.set(true);
+                        mount_status.set("mounted".to_string());
+                    }
                     Some("error") => {
                         let m = msg.get("message").and_then(|v| v.as_str()).unwrap_or("");
                         eprintln!("operon: monaco bridge error: {m}");
+                        mount_status.set(format!("error: {m}"));
+                    }
+                    Some("diag") => {
+                        let phase = msg.get("phase").and_then(|v| v.as_str()).unwrap_or("");
+                        let origin = msg.get("origin").and_then(|v| v.as_str()).unwrap_or("");
+                        eprintln!("operon: monaco diag phase={phase} origin={origin}");
+                        if !origin.is_empty() {
+                            mount_status.set(format!("phase={phase} origin={origin}"));
+                        } else {
+                            mount_status.set(format!("phase={phase}"));
+                        }
                     }
                     _ => {}
                 }
@@ -292,12 +320,26 @@ pub fn MonacoEditorHost(
 
         return rsx! {
             div {
-                id: "{host_id}",
-                class: "operon-monaco-host",
-                "data-monaco-host": "{note_id_attr}",
-                "data-monaco-language": "{language_attr}",
-                "data-stub": "false",
-                style: "width: 100%; height: 100%; min-height: 300px;",
+                style: "position: relative; width: 100%; height: 100%; min-height: 300px;",
+                div {
+                    id: "{host_id}",
+                    class: "operon-monaco-host",
+                    "data-monaco-host": "{note_id_attr}",
+                    "data-monaco-language": "{language_attr}",
+                    "data-stub": "false",
+                    style: "position: absolute; inset: 0;",
+                }
+                if !*mounted_flag.read() {
+                    div {
+                        class: "operon-monaco-status",
+                        "data-testid": "monaco-mount-status",
+                        style: "position: absolute; top: 8px; left: 8px; padding: 6px 10px; \
+                                background: rgba(255, 235, 59, 0.85); color: #1a1a1a; \
+                                font-family: monospace; font-size: 12px; border-radius: 4px; \
+                                z-index: 10; max-width: 90%; white-space: pre-wrap;",
+                        "{mount_status.read()}"
+                    }
+                }
             }
         };
     }
