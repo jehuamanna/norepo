@@ -13,5 +13,7 @@ pub use clipboard::{
 };
 pub use confirm::ConfirmDialog;
 pub use context_menu::{ContextMenu, ContextMenuItem};
-pub use drag_drop::{classify_drop_position, DragKind, DragSession, DropPosition};
+pub use drag_drop::{
+    classify_drop_position, DragDescendants, DragKind, DragSession, DropPosition,
+};
 pub use inline_rename::InlineRename;

@@ -12,6 +12,8 @@
 //! middle 40% means drop into. Each row is responsible for snapping its own
 //! cursor math; this module just owns the type + signal vocabulary.
 
+use std::collections::BTreeSet;
+
 use dioxus::prelude::*;
 use uuid::Uuid;
 
@@ -36,6 +38,14 @@ pub enum DropPosition {
 /// `ondragend` and `ondrop` clear it.
 #[derive(Clone, Copy)]
 pub struct DragSession(pub Signal<Option<DragKind>>);
+
+/// Plans-Phase-3-explorer-drag-drop-feedback: while a note drag is active,
+/// the source's full descendant set (excluding the source itself) lives
+/// here so individual rows can answer "would dropping me on this target
+/// create a cycle?" without re-traversing the tree on every `ondragover`.
+/// `ondragstart` populates it; `ondragend`/`ondrop` clear it.
+#[derive(Clone, Copy)]
+pub struct DragDescendants(pub Signal<BTreeSet<Uuid>>);
 
 /// Compute where, relative to a row's bounding rect of height `h`, a cursor
 /// at offset y should drop. Top 30% → Before, bottom 30% → After, middle 40%

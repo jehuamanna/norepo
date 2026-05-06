@@ -81,6 +81,14 @@ pub struct LastClicked(pub Signal<Option<NodeKey>>);
 #[derive(Clone, Copy)]
 pub struct VisibleFlat(pub Signal<Vec<NodeKey>>);
 
+/// Plans-Phase-3-explorer-drag-drop-feedback: panel-scope mirror of the
+/// per-project notes list. NoteRow's ondragstart reads this snapshot to
+/// compute the descendant set of the dragged note in O(project size); the
+/// result populates `DragDescendants` so subsequent `ondragover` events
+/// can reject cycle-creating drops without retraversing.
+#[derive(Clone, Copy)]
+pub struct NotesByProjectCtx(pub Signal<HashMap<Uuid, Vec<LocalNote>>>);
+
 /// Bumped on every note mutation. The panel re-fetches notes for the
 /// affected project when this changes.
 #[derive(Clone, Copy)]
@@ -229,6 +237,10 @@ pub fn ExplorerPanel() -> Element {
 
     // Per-project note lists, keyed by project_id. Re-fetched on note_version bump.
     let notes_by_project: Signal<HashMap<Uuid, Vec<LocalNote>>> = use_signal(HashMap::new);
+    // Plans-Phase-3-explorer-drag-drop-feedback: expose the same signal as
+    // a context so descendant-aware DnD validation lives in NoteRow without
+    // having to thread the snapshot through twenty props.
+    use_context_provider(|| NotesByProjectCtx(notes_by_project));
     let mut notes_setter = notes_by_project;
     {
         let repo = note_repo.clone();

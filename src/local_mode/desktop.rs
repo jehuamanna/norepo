@@ -455,6 +455,13 @@ pub fn provide_local_app_signals() {
     use_context_provider(|| crate::local_mode::explorer::VisibleFlat(visible_flat));
     let drag_session: Signal<Option<DragKind>> = use_signal(|| None);
     use_context_provider(|| DragSession(drag_session));
+    // Plans-Phase-3-explorer-drag-drop-feedback: descendant set of the
+    // currently dragged note. Populated on dragstart, cleared on
+    // dragend/drop. Note rows read this to reject drops that would create
+    // a cycle (drop a note onto its own subtree).
+    let drag_descendants: Signal<std::collections::BTreeSet<uuid::Uuid>> =
+        use_signal(std::collections::BTreeSet::new);
+    use_context_provider(|| crate::local_mode::ui::DragDescendants(drag_descendants));
     let clipboard: Signal<Option<Clipboard>> = use_signal(|| None);
     use_context_provider(|| LocalClipboard(clipboard));
     let bulk_clipboard: Signal<Option<crate::local_mode::ui::BulkClipboard>> = use_signal(|| None);

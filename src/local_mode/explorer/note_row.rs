@@ -9,10 +9,12 @@ use operon_store::repos::{LocalNote, NoteKind};
 use uuid::Uuid;
 
 use crate::editor::EditorMode;
-use crate::local_mode::explorer::{LastClicked, MultiSelected, NodeKey, VisibleFlat};
+use crate::local_mode::explorer::{
+    LastClicked, MultiSelected, NodeKey, NotesByProjectCtx, VisibleFlat,
+};
 use crate::local_mode::ui::{
-    classify_drop_position, ContextMenu, ContextMenuItem, DragKind, DragSession, DropPosition,
-    InlineRename,
+    classify_drop_position, ContextMenu, ContextMenuItem, DragDescendants, DragKind, DragSession,
+    DropPosition, InlineRename,
 };
 
 #[derive(Props, Clone, PartialEq)]
@@ -66,9 +68,18 @@ pub struct NoteRowProps {
 pub fn NoteRow(props: NoteRowProps) -> Element {
     let menu_pos: Signal<Option<(i32, i32)>> = use_signal(|| None);
     let mut menu_pos_setter = menu_pos;
-    let drop_indicator: Signal<Option<DropPosition>> = use_signal(|| None);
+    // Plans-Phase-3-explorer-drag-drop-feedback: tri-state indicator —
+    // None = no drag over this row; Some(Ok(pos)) = a valid drop position;
+    // Some(Err(())) = a forbidden drop (would create a cycle, or the row
+    // is mid-rename). Forbidden renders a "no-drop" border.
+    let drop_indicator: Signal<Option<Result<DropPosition, ()>>> = use_signal(|| None);
     let mut drop_indicator_setter = drop_indicator;
     let DragSession(mut drag_session) = use_context();
+    // Plans-Phase-3-explorer-drag-drop-feedback: descendant set of the
+    // dragged note (populated below by ondragstart) and the panel-scope
+    // notes snapshot used to compute it.
+    let DragDescendants(mut drag_descendants) = use_context();
+    let NotesByProjectCtx(notes_by_project_ctx) = use_context();
     // Plans-Phase-4-multiselect-aria
     let MultiSelected(mut multi_selected) = use_context();
     let LastClicked(mut last_clicked) = use_context();
@@ -394,18 +405,54 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
             },
             ondragstart: move |_| {
                 drag_session.set(Some(DragKind::Note(id)));
+                // Plans-Phase-3-explorer-drag-drop-feedback: precompute the
+                // descendant set so dragover can reject cycle-creating drops.
+                let snap = notes_by_project_ctx.read();
+                let mut descendants: std::collections::BTreeSet<Uuid> =
+                    std::collections::BTreeSet::new();
+                if let Some((_, list)) = snap
+                    .iter()
+                    .find(|(_, list)| list.iter().any(|n| n.id == id))
+                {
+                    let mut frontier: Vec<Uuid> = vec![id];
+                    while let Some(parent) = frontier.pop() {
+                        for n in list.iter().filter(|n| n.parent_id == Some(parent)) {
+                            if descendants.insert(n.id) {
+                                frontier.push(n.id);
+                            }
+                        }
+                    }
+                }
+                drag_descendants.set(descendants);
             },
             ondragend: move |_| {
                 drag_session.set(None);
                 drop_indicator_setter.set(None);
+                drag_descendants.set(std::collections::BTreeSet::new());
             },
             ondragover: move |evt| {
                 evt.prevent_default();
                 let kind = *drag_session.read();
                 let coords = evt.element_coordinates();
                 let pos = classify_drop_position(coords.y, 28.0);
-                let allow = matches!(kind, Some(DragKind::Note(src)) if src != id);
-                drop_indicator_setter.set(if allow { Some(pos) } else { None });
+                // Plans-Phase-3: classify the drop as
+                //   - Some(Ok(pos))  → allowed; show coloured indicator
+                //   - Some(Err(()))  → forbidden; show no-drop indicator
+                //   - None           → not a note drag we care about
+                let next = match kind {
+                    Some(DragKind::Note(src)) => {
+                        if in_rename {
+                            // Don't disrupt a row mid-rename.
+                            None
+                        } else if src == id || drag_descendants.read().contains(&id) {
+                            Some(Err(()))
+                        } else {
+                            Some(Ok(pos))
+                        }
+                    }
+                    _ => None,
+                };
+                drop_indicator_setter.set(next);
             },
             ondragleave: move |_| {
                 drop_indicator_setter.set(None);
@@ -445,7 +492,18 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 let kind = *drag_session.read();
                 let coords = evt.element_coordinates();
                 let pos = classify_drop_position(coords.y, 28.0);
+                // Plans-Phase-3-explorer-drag-drop-feedback: refuse drops on
+                // a row mid-rename or when the target is a descendant of
+                // the source. The visual indicator already reflects this
+                // — here we just suppress the repo call.
+                let descendants_snap = drag_descendants.read().clone();
                 if let Some(DragKind::Note(src)) = kind {
+                    if in_rename || src == id || descendants_snap.contains(&id) {
+                        drag_session.set(None);
+                        drop_indicator_setter.set(None);
+                        drag_descendants.set(std::collections::BTreeSet::new());
+                        return;
+                    }
                     // Plans-Phase-4-multiselect-aria: if the drag source is
                     // a member of the multi-set, drop the whole set at the
                     // target. Otherwise just the source.
@@ -454,7 +512,7 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                     if multi_drop {
                         for k in set_snap.iter() {
                             if let NodeKey::Note(n_id) = k {
-                                if *n_id != id {
+                                if *n_id != id && !descendants_snap.contains(n_id) {
                                     on_drop_note_on_note.call((*n_id, id, pos));
                                 }
                             }
@@ -465,6 +523,7 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 }
                 drag_session.set(None);
                 drop_indicator_setter.set(None);
+                drag_descendants.set(std::collections::BTreeSet::new());
             },
             // Plans-Phase-3-note-id-create: leading grip glyph as a visible
             // indicator that the row is draggable. Drag itself is still
@@ -553,8 +612,10 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 }
             }
             if drag_active {
-                if let Some(p) = drop_pos_now {
-                    DropIndicator { position: p }
+                match drop_pos_now {
+                    Some(Ok(p)) => rsx! { DropIndicator { position: p } },
+                    Some(Err(())) => rsx! { ForbiddenIndicator {} },
+                    None => rsx! {},
                 }
             }
         }
@@ -589,6 +650,20 @@ fn DropIndicator(position: DropPosition) -> Element {
         span {
             class: "{class}",
             "data-testid": "{testid}",
+        }
+    }
+}
+
+/// Plans-Phase-3-explorer-drag-drop-feedback: shown when the dragged note
+/// would land on itself or one of its descendants. A red ring + "no-drop"
+/// cursor signal that the drop will be rejected; releasing here is a no-op.
+#[component]
+fn ForbiddenIndicator() -> Element {
+    rsx! {
+        span {
+            class: "absolute inset-0 ring-2 ring-rose-500 pointer-events-none",
+            style: "cursor: no-drop;",
+            "data-testid": "drop-indicator-forbidden",
         }
     }
 }
