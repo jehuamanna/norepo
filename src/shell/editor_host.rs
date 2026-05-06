@@ -146,7 +146,19 @@ pub fn MonacoEditorHost(
                             dioxus.send({{type:"error", message:"bridge not loaded"}});
                             return;
                         }}
-                        // Wait for the host element to flush into the DOM.
+                        // Plans-Phase-9-monaco-desktop (rev 10): wait
+                        // for the host element to (a) flush into the
+                        // DOM AND (b) get a non-zero clientWidth /
+                        // clientHeight before mounting Monaco. In
+                        // Split mode the parent flex chain takes
+                        // multiple animation frames to resolve, and
+                        // mounting against a 0x0 host leaves Monaco
+                        // technically present but visually empty
+                        // (its automaticLayout ResizeObserver
+                        // sometimes misses the 0 -> N transition).
+                        // We poll up to ~3 seconds; if we still don't
+                        // have size, mount anyway and log it so the
+                        // diag tells us a CSS regression survived.
                         let target = document.getElementById('{host_id}');
                         let attempts = 0;
                         while (!target && attempts < 60) {{
@@ -158,10 +170,15 @@ pub fn MonacoEditorHost(
                             dioxus.send({{type:"error", message:"host element not found"}});
                             return;
                         }}
+                        let sizeAttempts = 0;
+                        while ((target.clientWidth === 0 || target.clientHeight === 0) && sizeAttempts < 90) {{
+                            await new Promise(r => setTimeout(r, 33));
+                            sizeAttempts++;
+                        }}
                         dioxus.send({{
                             type:"diag",
                             phase:"target-found",
-                            origin: "w="+target.clientWidth+" h="+target.clientHeight,
+                            origin: "w="+target.clientWidth+" h="+target.clientHeight+" tries="+sizeAttempts,
                         }});
                         const handle = await window.operonBridge.mount(target, {{
                             kind: "monaco",
