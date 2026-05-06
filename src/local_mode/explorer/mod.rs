@@ -90,6 +90,16 @@ pub struct VisibleFlat(pub Signal<Vec<NodeKey>>);
 #[derive(Clone, Copy)]
 pub struct NotesByProjectCtx(pub Signal<HashMap<Uuid, Vec<LocalNote>>>);
 
+/// Plans-Phase-8-explorer-undo: panel-scope handle to the explorer's
+/// undo stack and the callback that pops + applies the latest inverse.
+/// Rows read `history.read().is_empty()` to gate the menu item and call
+/// `on_undo` to fire it.
+#[derive(Clone, Copy)]
+pub struct ExplorerUndoCtx {
+    pub history: Signal<history::ExplorerHistory>,
+    pub on_undo: Callback<()>,
+}
+
 /// Bumped on every note mutation. The panel re-fetches notes for the
 /// affected project when this changes.
 #[derive(Clone, Copy)]
@@ -955,6 +965,14 @@ pub fn ExplorerPanel() -> Element {
             }
         }
         note_version.with_mut(|v| *v += 1);
+    });
+
+    // Plans-Phase-8-explorer-undo: provide the history + on_undo as a
+    // single context so NoteRow / ProjectRow can render an "Undo last
+    // action" menu item without prop-drilling.
+    use_context_provider(|| ExplorerUndoCtx {
+        history,
+        on_undo,
     });
 
     // Plans-Phase-6-image-notes: external image-file drop on a note row.

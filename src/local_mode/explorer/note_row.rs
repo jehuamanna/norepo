@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::editor::EditorMode;
 use crate::local_mode::explorer::{
-    LastClicked, MultiSelected, NodeKey, NotesByProjectCtx, VisibleFlat,
+    ExplorerUndoCtx, LastClicked, MultiSelected, NodeKey, NotesByProjectCtx, VisibleFlat,
 };
 use crate::local_mode::ui::{
     classify_drop_position, ContextMenu, ContextMenuItem, DragDescendants, DragKind, DragSession,
@@ -86,6 +86,9 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     // notes snapshot used to compute it.
     let DragDescendants(mut drag_descendants) = use_context();
     let NotesByProjectCtx(notes_by_project_ctx) = use_context();
+    // Plans-Phase-8-explorer-undo: handle to the panel's undo stack +
+    // dispatch callback so we can render an "Undo last action" item.
+    let ExplorerUndoCtx { history, on_undo } = use_context::<ExplorerUndoCtx>();
     // Plans-Phase-4-multiselect-aria
     let MultiSelected(mut multi_selected) = use_context();
     let LastClicked(mut last_clicked) = use_context();
@@ -273,6 +276,18 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
         outdent_item,
         move_up_item,
         move_down_item,
+        // Plans-Phase-8-explorer-undo: surface the keybinding (Cmd+Z) for
+        // discovery. Disabled when the stack is empty.
+        {
+            let mut item = ContextMenuItem::new(
+                "Undo last action",
+                Callback::new(move |_| {
+                    on_undo.call(());
+                }),
+            );
+            item.enabled = !history.read().is_empty();
+            item
+        },
         ContextMenuItem::new(
             "Delete",
             Callback::new(move |_| {

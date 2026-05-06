@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use operon_store::repos::NoteKind;
 
+use crate::local_mode::explorer::ExplorerUndoCtx;
 use crate::local_mode::ui::{
     classify_drop_position, ContextMenu, ContextMenuItem, DragKind, DragSession, DropPosition,
     InlineRename,
@@ -58,6 +59,9 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     let drop_indicator: Signal<Option<Result<DropPosition, ()>>> = use_signal(|| None);
     let mut drop_indicator_setter = drop_indicator;
     let DragSession(mut drag_session) = use_context();
+    // Plans-Phase-8-explorer-undo: panel-scope undo handle for the
+    // "Undo last action" menu entry.
+    let ExplorerUndoCtx { history, on_undo } = use_context::<ExplorerUndoCtx>();
 
     let project = props.project.clone();
     let id = project.id;
@@ -143,6 +147,18 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
             }),
         ),
         paste_item,
+        // Plans-Phase-8-explorer-undo: surface the keybinding (Cmd+Z) for
+        // discovery. Disabled when the stack is empty.
+        {
+            let mut item = ContextMenuItem::new(
+                "Undo last action",
+                Callback::new(move |_| {
+                    on_undo.call(());
+                }),
+            );
+            item.enabled = !history.read().is_empty();
+            item
+        },
         ContextMenuItem::new(
             "Delete",
             Callback::new(move |_| {
