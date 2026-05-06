@@ -76,6 +76,39 @@ pub struct LocalNoteVersion(pub Signal<u64>);
 
 const SCOPE_WORKSPACE: &str = "workspace";
 
+/// Plans-Phase-4-multiselect-aria: replace OS-unsafe characters with `_` so
+/// titles can be used as filenames during bulk export.
+fn sanitize_filename(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    for c in title.chars() {
+        match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => out.push('_'),
+            c if c.is_control() => out.push('_'),
+            c => out.push(c),
+        }
+    }
+    if out.trim().is_empty() {
+        out = "Untitled".to_string();
+    }
+    out
+}
+
+/// Pick a unique path inside `dir` with `stem.ext`; appends ` (2)` etc on
+/// collision so a bulk export of repeat-titled notes doesn't overwrite.
+fn unique_path(dir: &std::path::Path, stem: &str, ext: &str) -> std::path::PathBuf {
+    let first = dir.join(format!("{stem}.{ext}"));
+    if !first.exists() {
+        return first;
+    }
+    for n in 2..1000 {
+        let candidate = dir.join(format!("{stem} ({n}).{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(format!("{stem}.{ext}"))
+}
+
 fn scope_for_project(project_id: Uuid) -> String {
     format!("project:{project_id}")
 }
@@ -569,6 +602,89 @@ pub fn ExplorerPanel() -> Element {
         pending_bulk_delete_setter.set(false);
     });
 
+    // Plans-Phase-4-multiselect-aria: bulk export. Opens a native folder
+    // picker, then writes each selected note's body as `<title>.md` in
+    // that directory. Image notes copy their blob next to the markdown
+    // file. Title collisions get a numeric suffix.
+    let project_repo_for_export = project_repo.clone();
+    let note_repo_for_export = note_repo.clone();
+    let persistence_for_export: Arc<dyn Persistence> = use_context();
+    let crate::local_mode::CurrentVaultRoot(vault_root_for_export) = use_context();
+    let on_bulk_export = use_callback(move |_: ()| {
+        let snapshot = multi_selected_for_render.read().clone();
+        if snapshot.is_empty() {
+            return;
+        }
+        let project_repo = project_repo_for_export.clone();
+        let note_repo = note_repo_for_export.clone();
+        let persistence = persistence_for_export.clone();
+        let vault = vault_root_for_export.read().clone();
+        spawn(async move {
+            let Some(handle) = rfd::AsyncFileDialog::new()
+                .set_title("Export selection to folder")
+                .pick_folder()
+                .await
+            else {
+                return;
+            };
+            let target = handle.path().to_path_buf();
+            let _ = std::fs::create_dir_all(&target);
+            let projects = project_repo.list().unwrap_or_default();
+            // Index notes by id for cheap lookup.
+            let mut by_id: std::collections::HashMap<Uuid, operon_store::repos::LocalNote> =
+                std::collections::HashMap::new();
+            for p in &projects {
+                if let Ok(notes) = note_repo.list_for_project(p.id) {
+                    for n in notes {
+                        by_id.insert(n.id, n);
+                    }
+                }
+            }
+            let mut written: usize = 0;
+            for key in snapshot.iter() {
+                let NodeKey::Note(id) = key else {
+                    continue;
+                };
+                let Some(note) = by_id.get(id).cloned() else {
+                    continue;
+                };
+                let safe_title = sanitize_filename(&note.title);
+                match note.kind {
+                    operon_store::repos::NoteKind::Markdown => {
+                        let body = match persistence.load(&id.to_string()).await {
+                            Ok(b) => b,
+                            Err(_) => Vec::new(),
+                        };
+                        let path = unique_path(&target, &safe_title, "md");
+                        if std::fs::write(&path, &body).is_ok() {
+                            written += 1;
+                        }
+                    }
+                    operon_store::repos::NoteKind::Image => {
+                        let Some(rel) = note.blob_path.clone() else { continue };
+                        let Some(vr) = vault.clone() else { continue };
+                        let bytes = match crate::local_mode::images::read_image(
+                            &vr,
+                            std::path::Path::new(&rel),
+                        ) {
+                            Ok(b) => b,
+                            Err(_) => continue,
+                        };
+                        let ext = std::path::Path::new(&rel)
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("png");
+                        let path = unique_path(&target, &safe_title, ext);
+                        if std::fs::write(&path, &bytes).is_ok() {
+                            written += 1;
+                        }
+                    }
+                }
+            }
+            eprintln!("operon: bulk export wrote {written} file(s) to {target:?}");
+        });
+    });
+
     // Right-click → View / Edit / Split-view: switch the editor mode of the
     // note's tab, opening it first if it isn't already open.
     let mut tabs_for_mode = tabs;
@@ -951,11 +1067,23 @@ pub fn ExplorerPanel() -> Element {
                 "aria-label": "Projects and notes",
                 tabindex: "-1",
                 onkeydown: move |evt| {
-                    if evt.key().to_string() == "Delete" || evt.key().to_string() == "Backspace" {
+                    let key = evt.key().to_string();
+                    let mods = evt.modifiers();
+                    let with_meta = mods.contains(keyboard_types::Modifiers::META)
+                        || mods.contains(keyboard_types::Modifiers::CONTROL);
+                    if key == "Delete" || key == "Backspace" {
                         let count = multi_selected_for_render.read().len();
                         if count >= 2 {
                             evt.prevent_default();
                             pending_bulk_delete_setter.set(true);
+                        }
+                    } else if with_meta && mods.contains(keyboard_types::Modifiers::SHIFT)
+                        && key.eq_ignore_ascii_case("e")
+                    {
+                        let count = multi_selected_for_render.read().len();
+                        if count >= 1 {
+                            evt.prevent_default();
+                            on_bulk_export.call(());
                         }
                     }
                 },
