@@ -149,6 +149,32 @@ pub trait LocalNoteRepository: Send + Sync {
     /// Swap `sibling_index` with the next sibling at the same level.
     /// No-op at the last sibling.
     fn move_down(&self, id: Uuid) -> Result<(), StoreError>;
+
+    /// Plans-Phase-8-explorer-undo: capture the full subtree rooted at `id`
+    /// into a snapshot suitable for `restore_subtree`. The snapshot lists
+    /// every note with its current parent_id / sibling_index / depth /
+    /// title / created_at_ms / kind / blob_path so a subsequent
+    /// `restore_subtree` reproduces exactly what was on disk before delete.
+    /// Returns `NotFound` if `id` doesn't exist.
+    fn snapshot_subtree(&self, id: Uuid) -> Result<SubtreeSnapshot, StoreError>;
+
+    /// Plans-Phase-8-explorer-undo: re-insert a snapshot previously captured
+    /// via `snapshot_subtree`. Walks the snapshot in BFS order so parents
+    /// land before their children, satisfying the FK on `parent_id`. Sibling
+    /// indices around the destination are densified the same way `move_to`
+    /// does. Returns `Conflict` if any of the snapshot's ids already exist.
+    fn restore_subtree(&self, snap: &SubtreeSnapshot) -> Result<(), StoreError>;
+}
+
+/// Plans-Phase-8-explorer-undo: stable, in-memory representation of a
+/// subtree captured by `snapshot_subtree`. Lives next to the trait so the
+/// type can be passed around without an explicit `LocalNote` Vec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtreeSnapshot {
+    pub root_id: Uuid,
+    /// Notes in BFS order — root first, then each level. `restore_subtree`
+    /// can walk this list once and INSERT in order; no re-sorting needed.
+    pub notes: Vec<LocalNote>,
 }
 
 pub struct SqliteLocalNoteRepository {
@@ -1032,6 +1058,100 @@ impl LocalNoteRepository for SqliteLocalNoteRepository {
     fn move_down(&self, id: Uuid) -> Result<(), StoreError> {
         swap_with_neighbour(&self.store, id, 1)
     }
+
+    fn snapshot_subtree(&self, id: Uuid) -> Result<SubtreeSnapshot, StoreError> {
+        let conn = self.store.conn()?;
+        // Confirm the root exists (returns NotFound otherwise — same shape
+        // as `rename` / `delete` for missing rows). `optional()` maps the
+        // "no rows" case to None on both desktop and wasm-sqlite backends.
+        let root_opt: Option<LocalNote> = conn
+            .query_row(
+                &format!("SELECT {SELECT_COLS} FROM local_note WHERE id = ?1"),
+                params![id.to_string()],
+                row_to_local_note,
+            )
+            .optional()?;
+        let Some(root) = root_opt else {
+            return Err(StoreError::NotFound);
+        };
+        let mut notes: Vec<LocalNote> = vec![root];
+        let mut frontier: Vec<Uuid> = vec![id];
+        // BFS — stable order so the snapshot is deterministic.
+        while let Some(parent) = frontier.pop() {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {SELECT_COLS} FROM local_note \
+                 WHERE parent_id = ?1 ORDER BY sibling_index ASC"
+            ))?;
+            let rows: Vec<LocalNote> = stmt
+                .query_map(params![parent.to_string()], row_to_local_note)?
+                .collect::<crate::sql::Result<Vec<_>>>()?;
+            for child in rows {
+                frontier.push(child.id);
+                notes.push(child);
+            }
+        }
+        Ok(SubtreeSnapshot { root_id: id, notes })
+    }
+
+    fn restore_subtree(&self, snap: &SubtreeSnapshot) -> Result<(), StoreError> {
+        if snap.notes.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.store.conn()?;
+        let tx = conn.transaction()?;
+        // Re-densify destination siblings: shift any siblings at the root's
+        // original (project, parent, sibling_index) up by 1 to make room.
+        // Same Some/None split as `move_to` for the parent_id IS NULL case.
+        let root = &snap.notes[0];
+        match root.parent_id {
+            Some(pid) => {
+                tx.execute(
+                    "UPDATE local_note \
+                     SET sibling_index = sibling_index + 1 \
+                     WHERE project_id = ?1 AND parent_id = ?2 \
+                       AND sibling_index >= ?3",
+                    params![
+                        root.project_id.to_string(),
+                        pid.to_string(),
+                        root.sibling_index,
+                    ],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "UPDATE local_note \
+                     SET sibling_index = sibling_index + 1 \
+                     WHERE project_id = ?1 AND parent_id IS NULL \
+                       AND sibling_index >= ?2",
+                    params![root.project_id.to_string(), root.sibling_index],
+                )?;
+            }
+        }
+        // BFS-ordered notes guarantee parents land before children, so the
+        // FK on parent_id (ON DELETE CASCADE) doesn't trip.
+        for n in &snap.notes {
+            tx.execute(
+                "INSERT INTO local_note \
+                 (id, project_id, parent_id, sibling_index, depth, title, \
+                  created_at_ms, updated_at_ms, kind, blob_path) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    n.id.to_string(),
+                    n.project_id.to_string(),
+                    n.parent_id.map(|p| p.to_string()),
+                    n.sibling_index,
+                    n.depth,
+                    n.title,
+                    n.created_at_ms,
+                    n.updated_at_ms,
+                    n.kind.as_str(),
+                    n.blob_path,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 fn swap_with_neighbour(store: &Store, id: Uuid, dir: i64) -> Result<(), StoreError> {
@@ -1507,5 +1627,88 @@ mod tests {
         n.move_down(b.id).unwrap();
         let b_now = fetch(&n, project_id, b.id);
         assert_eq!(b_now.sibling_index, 1);
+    }
+
+    // ===== Plans-Phase-8-explorer-undo: snapshot / restore round-trip =====
+
+    #[test]
+    fn snapshot_subtree_returns_root_and_descendants_in_bfs_order() {
+        let (_p, n, project_id) = make_pair();
+        let root = n.create(project_id, None, "root").unwrap();
+        let c1 = n.create(project_id, Some(root.id), "c1").unwrap();
+        let c2 = n.create(project_id, Some(root.id), "c2").unwrap();
+        let g = n.create(project_id, Some(c2.id), "g").unwrap();
+
+        let snap = n.snapshot_subtree(root.id).unwrap();
+        assert_eq!(snap.root_id, root.id);
+        // Root comes first, then children of root, then grandchildren.
+        assert_eq!(snap.notes[0].id, root.id);
+        let ids: Vec<Uuid> = snap.notes.iter().map(|n| n.id).collect();
+        assert!(ids.contains(&c1.id));
+        assert!(ids.contains(&c2.id));
+        assert!(ids.contains(&g.id));
+        assert_eq!(snap.notes.len(), 4);
+    }
+
+    #[test]
+    fn snapshot_subtree_then_delete_then_restore_reproduces_tree() {
+        let (_p, n, project_id) = make_pair();
+        let root = n.create(project_id, None, "root").unwrap();
+        let c1 = n.create(project_id, Some(root.id), "c1").unwrap();
+        let _c2 = n.create(project_id, Some(root.id), "c2").unwrap();
+        let _g = n.create(project_id, Some(c1.id), "g").unwrap();
+
+        let before: Vec<(Uuid, Option<Uuid>, i64, String)> = n
+            .list_for_project(project_id)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.id, r.parent_id, r.sibling_index, r.title))
+            .collect();
+
+        let snap = n.snapshot_subtree(root.id).unwrap();
+        n.delete(root.id).unwrap();
+        assert!(n.list_for_project(project_id).unwrap().is_empty());
+
+        n.restore_subtree(&snap).unwrap();
+        let after: Vec<(Uuid, Option<Uuid>, i64, String)> = n
+            .list_for_project(project_id)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.id, r.parent_id, r.sibling_index, r.title))
+            .collect();
+        assert_eq!(before, after, "restore must reproduce the pre-delete tree");
+    }
+
+    #[test]
+    fn snapshot_subtree_missing_root_returns_not_found() {
+        let (_p, n, _project_id) = make_pair();
+        let bogus = Uuid::new_v4();
+        match n.snapshot_subtree(bogus) {
+            Err(StoreError::NotFound) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_subtree_densifies_destination_siblings() {
+        // a, b, c at root. Snapshot b, delete it, then restore — siblings
+        // should bump back up to make room at b's original sibling_index.
+        let (_p, n, project_id) = make_pair();
+        let _a = n.create(project_id, None, "a").unwrap();
+        let b = n.create(project_id, None, "b").unwrap();
+        let c = n.create(project_id, None, "c").unwrap();
+
+        let snap = n.snapshot_subtree(b.id).unwrap();
+        n.delete(b.id).unwrap();
+        // After delete c stays at sibling_index=2 (no auto-densify on
+        // delete). Restore should still slot b back at index=1 and shift
+        // any siblings at >=1 up by 1 first.
+        n.restore_subtree(&snap).unwrap();
+
+        let listed = n.list_for_project(project_id).unwrap();
+        let by_id: std::collections::HashMap<Uuid, &LocalNote> =
+            listed.iter().map(|r| (r.id, r)).collect();
+        assert_eq!(by_id.get(&b.id).unwrap().sibling_index, 1);
+        assert_eq!(by_id.get(&c.id).unwrap().sibling_index, 3);
     }
 }
