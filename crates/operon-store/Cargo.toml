@@ -27,12 +27,19 @@ r2d2_sqlite = "0.25"
 # everyone yet.
 [features]
 default = []
-wasm-sqlite = ["dep:sqlite-wasm-rs"]
+wasm-sqlite = ["dep:sqlite-wasm-rs", "dep:sqlite-wasm-vfs"]
 
-# Wasm-only optional dep. Activates only when --features wasm-sqlite is
-# passed AND the target is wasm32. Desktop builds never see it.
+# Wasm-only optional deps. Activate only when --features wasm-sqlite is
+# passed AND the target is wasm32. Desktop builds never see them.
 [target.'cfg(target_arch = "wasm32")'.dependencies.sqlite-wasm-rs]
 version = "0.5"
+optional = true
+
+# `sqlite-wasm-vfs` ships the opfs-sahpool VFS we register before
+# Store::open. No native build script; no clang required for *this*
+# dep (clang is still needed for sqlite-wasm-rs).
+[target.'cfg(target_arch = "wasm32")'.dependencies.sqlite-wasm-vfs]
+version = "0.2"
 optional = true
 
 [dev-dependencies]

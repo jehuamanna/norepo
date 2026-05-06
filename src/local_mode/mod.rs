@@ -33,6 +33,13 @@ mod wasm_stub;
 #[cfg(target_arch = "wasm32")]
 pub use wasm_stub::*;
 
+// Plans-Phase-2-saving / Phase E: async boot helper for wasm Local Mode.
+// Activated only with `--features wasm-sqlite`. The shell calls
+// `wasm_init::init_wasm_local_mode(vault_handle).await` to get a
+// (Store, Persistence) pair, then stashes both in Dioxus context.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-sqlite"))]
+pub mod wasm_init;
+
 /// IndexedDB-backed persistence for the user's chosen OPFS handle (web only).
 /// Phase 2 wires this into the web boot flow; Phase 1 ships the helpers so
 /// they can be unit-tested ahead of the consumer landing.

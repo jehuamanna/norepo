@@ -49,6 +49,24 @@ pub struct Store {
 }
 
 impl Store {
+    /// Plans-Phase-2-saving: idempotently install the opfs-sahpool VFS so
+    /// `file:…?vfs=opfs-sahpool` URIs resolve. Call once before
+    /// `Store::open` with a persistent filename. The `sqlite-wasm-vfs`
+    /// crate guards itself against double-installation, so multiple
+    /// callers across app reloads are fine.
+    pub async fn install_opfs_vfs(directory: &str) -> Result<(), StoreError> {
+        sqlite_wasm_vfs::sahpool::install(
+            &sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfgBuilder::new()
+                .vfs_name("opfs-sahpool")
+                .directory(directory)
+                .build(),
+            true,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| StoreError::Open(format!("opfs-sahpool install: {e}")))
+    }
+
     /// Open a Store at `filename`. Pass `:memory:` for ephemeral storage,
     /// or `file:operon.sqlite?vfs=opfs-sahpool` once the OPFS VFS is
     /// registered. Applies the same pragmas as the desktop store
