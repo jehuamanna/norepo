@@ -473,6 +473,17 @@ html, body {
   opacity: 0.4;
   cursor: not-allowed;
 }
+/* Submenu inherits .operon-context-menu chrome and floats just to the
+ * right of its parent row. The chevron suffix on submenu anchors comes
+ * from the row's own text content (a trailing ▸). */
+.operon-context-submenu {
+  z-index: 61;
+}
+.operon-context-menu-row-submenu {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
 
 /* Modal scrim used by Local-Mode confirm + settings dialogs. Fills the
  * viewport so the wrapper still catches outside clicks, but is fully
