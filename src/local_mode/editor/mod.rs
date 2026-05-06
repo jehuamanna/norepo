@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use dioxus::html::HasFileData;
 use dioxus::prelude::*;
 use operon_store::repos::{
     LinkRow, LocalNoteLinkRepository, LocalNoteRepository, LocalProjectRepository,
@@ -596,6 +597,20 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
         note_repo_for_image.clone();
     let crate::local_mode::desktop::CurrentVaultRoot(vault_signal_for_paste) =
         vault_for_image.clone();
+
+    // Plans-Phase-6-image-notes (drop-to-note-area): capture handles for
+    // the textarea ondrop handler before the picker closure below moves
+    // its own copies. An image dropped onto the editor body becomes a
+    // child image-note under the active note (mirrors the explorer-row
+    // drop and the clipboard paste flow) and the body gets an
+    // Obsidian-style `![[…]]` embed at the caret.
+    let crate::local_mode::desktop::LocalNoteRepo(note_repo_for_drop) =
+        note_repo_for_image.clone();
+    let crate::local_mode::desktop::LocalProjectRepo(project_repo_for_drop) =
+        project_repo_for_image.clone();
+    let vault_signal_for_drop = vault_signal_for_paste;
+    let tabs_for_drop = tabs;
+
     let on_insert_image_via_picker = move || {
         let Ok(parent_uuid) = Uuid::parse_str(&tab.note_id) else {
             return;
@@ -735,6 +750,139 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
             autofocus: true,
             oninput: move |evt| {
                 tabs.write().set_content(tab_id, evt.value());
+            },
+            // Plans-Phase-6-image-notes (drop-to-note-area): preventing
+            // default on `ondragover` is what tells the browser this
+            // element is a valid drop target — without it, `ondrop`
+            // never fires.
+            ondragover: move |evt| evt.prevent_default(),
+            ondrop: {
+                let note_repo_outer = note_repo_for_drop.clone();
+                let project_repo_outer = project_repo_for_drop.clone();
+                move |evt: Event<DragData>| {
+                    evt.prevent_default();
+                    let files = evt.data().files();
+                    if files.is_empty() {
+                        return;
+                    }
+                    for f in files {
+                        let name = f.name();
+                        let lower = name.to_ascii_lowercase();
+                        let mime = if lower.ends_with(".png") {
+                            "image/png"
+                        } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+                            "image/jpeg"
+                        } else if lower.ends_with(".webp") {
+                            "image/webp"
+                        } else if lower.ends_with(".gif") {
+                            "image/gif"
+                        } else if lower.ends_with(".svg") {
+                            "image/svg+xml"
+                        } else if lower.ends_with(".avif") {
+                            "image/avif"
+                        } else {
+                            continue;
+                        };
+                        let note_repo = note_repo_outer.clone();
+                        let project_repo = project_repo_outer.clone();
+                        let vault_signal = vault_signal_for_drop;
+                        let mut tabs_sig = tabs_for_drop;
+                        let cur_tab_id = tab_id;
+                        spawn(async move {
+                            let bytes = match f.read_bytes().await {
+                                Ok(b) => b.to_vec(),
+                                Err(e) => {
+                                    eprintln!(
+                                        "operon: drop-image read_bytes failed: {e:?}"
+                                    );
+                                    return;
+                                }
+                            };
+                            let active = tabs_sig.read().get(cur_tab_id).cloned();
+                            let Some(tab) = active else {
+                                return;
+                            };
+                            let Ok(parent_uuid) = Uuid::parse_str(&tab.note_id) else {
+                                return;
+                            };
+                            let Some(vault) = vault_signal.read().clone() else {
+                                return;
+                            };
+                            let project_id_opt = {
+                                let projects = project_repo.list().unwrap_or_default();
+                                projects.into_iter().find_map(|p| {
+                                    note_repo
+                                        .list_for_project(p.id)
+                                        .ok()
+                                        .and_then(|notes| {
+                                            notes
+                                                .iter()
+                                                .find(|n| n.id == parent_uuid)
+                                                .map(|_| p.id)
+                                        })
+                                })
+                            };
+                            let Some(project_id) = project_id_opt else {
+                                return;
+                            };
+                            let written = match crate::local_mode::images::write_image(
+                                &vault, &bytes, mime,
+                            ) {
+                                Ok(w) => w,
+                                Err(e) => {
+                                    eprintln!("operon: drop-image write failed: {e}");
+                                    return;
+                                }
+                            };
+                            let stem = std::path::Path::new(&name)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("Image")
+                                .to_string();
+                            let new_note = match note_repo.create_with_kind(
+                                project_id,
+                                Some(parent_uuid),
+                                &stem,
+                                operon_store::repos::NoteKind::Image,
+                            ) {
+                                Ok(n) => n,
+                                Err(e) => {
+                                    eprintln!(
+                                        "operon: drop-image create_with_kind failed: {e}"
+                                    );
+                                    return;
+                                }
+                            };
+                            let rel = written.relative_path.to_string_lossy().to_string();
+                            if let Err(e) = note_repo.set_blob_path(new_note.id, Some(&rel))
+                            {
+                                eprintln!(
+                                    "operon: drop-image set_blob_path failed: {e}"
+                                );
+                            }
+                            let short = operon_store::vfs::short_id(new_note.id);
+                            let embed = format!("![[{stem}^{short}]]");
+                            let current = tabs_sig
+                                .read()
+                                .get(cur_tab_id)
+                                .map(|t| t.content.clone())
+                                .unwrap_or_default();
+                            let caret = read_caret_pos(cur_tab_id).await;
+                            let next = match caret {
+                                Some(pos) => splice_at_caret(&current, pos, &embed),
+                                None => {
+                                    if current.ends_with('\n') || current.is_empty() {
+                                        format!("{current}{embed}\n")
+                                    } else {
+                                        format!("{current}\n{embed}\n")
+                                    }
+                                }
+                            };
+                            tabs_sig.write().set_content(cur_tab_id, next);
+                            tabs_sig.write().set_dirty(cur_tab_id, true);
+                        });
+                    }
+                }
             },
             onkeydown: move |evt| {
                 let mods = evt.modifiers();

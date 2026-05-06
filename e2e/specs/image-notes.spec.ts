@@ -39,6 +39,21 @@ test.describe.skip('Phase 6 — image notes', () => {
     // page.locator(...).dispatchEvent('drop', {dataTransfer:...})
   });
 
+  // Bug-c236b2ed (Notes 2 / Image note): the user listed "drop an image
+  // to the note area" as one of the three image-note ingestion paths.
+  // The textarea now has ondragover/ondrop wired so a file dropped onto
+  // the editor body is written, child image-note minted, and `![[…]]`
+  // spliced at the caret — same end-state as Cmd/Ctrl+Shift+I.
+  test('Drop an image file onto the editor body creates a child image-note + splices ![[…]]', async ({ page }) => {
+    const editor = page.locator('[data-testid="local-note-textarea"]');
+    await editor.focus();
+    // Harness hook: dispatch a synthetic `drop` carrying a tiny PNG.
+    // Expected:
+    //   1. New row with data-note-kind="image" appears in the explorer.
+    //   2. Body contains `![[<stem>^<short>]]` at the caret.
+    //   3. Tab is dirty (manual-save indicator visible).
+  });
+
   test('Explorer rows show [md]/[im] indicator', async ({ page }) => {
     const md = page.locator('[data-testid="kind-badge"][data-note-kind="markdown"]').first();
     const im = page.locator('[data-testid="kind-badge"][data-note-kind="image"]').first();
