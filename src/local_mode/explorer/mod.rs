@@ -334,7 +334,33 @@ pub fn ExplorerPanel() -> Element {
         pending_delete_note_setter.set(Some(id));
     });
 
+    // Plans-Phase-3-note-id-create: auto-expand the parent (and any collapsed
+    // ancestors) so the new child/sibling rename input is visible without
+    // manual chevron clicks. Walks the parent_id chain in `notes_by_project`
+    // for the given project, marks each ancestor open in both the in-memory
+    // `project_note_open` map and the persisted `tree_state` queue.
+    let queue_for_expand = tree_queue;
+    let mut project_note_open_for_expand = project_note_open;
+    let notes_by_project_for_expand = notes_by_project;
+    let expand_ancestors = move |project_id: Uuid, mut cursor: Option<Uuid>| {
+        let scope = scope_for_project(project_id);
+        let snap = notes_by_project_for_expand.read();
+        let list = match snap.get(&project_id) {
+            Some(l) => l,
+            None => return,
+        };
+        while let Some(id) = cursor {
+            let key = id.to_string();
+            project_note_open_for_expand.with_mut(|map| {
+                map.entry(project_id).or_default().insert(key.clone(), true);
+            });
+            queue_for_expand.read().enqueue(scope.clone(), key, true);
+            cursor = list.iter().find(|n| n.id == id).and_then(|n| n.parent_id);
+        }
+    };
+
     let note_repo_for_add_child = note_repo.clone();
+    let mut expand_ancestors_for_child = expand_ancestors.clone();
     let on_add_child_note = use_callback(move |parent_id: Uuid| {
         // Find parent's project_id.
         let project_id = notes_by_project
@@ -345,12 +371,51 @@ pub fn ExplorerPanel() -> Element {
             eprintln!("operon: add child note: parent {parent_id} not found");
             return;
         };
+        // Expand the parent and any collapsed ancestors before the create so
+        // the inline rename input on the new row is visible.
+        expand_ancestors_for_child(project_id, Some(parent_id));
         match note_repo_for_add_child.create(project_id, Some(parent_id), "") {
             Ok(n) => {
                 note_version.with_mut(|v| *v += 1);
                 renaming_note_setter.set(Some(n.id));
             }
             Err(e) => eprintln!("operon: create child note failed: {e}"),
+        }
+    });
+
+    // Plans-Phase-3-note-id-create: insert a new sibling note immediately
+    // after the target. Creates with the same `parent_id` as the target,
+    // then `move_to` to land at `target.sibling_index + 1` (`move_to`
+    // shifts the dense ordering). Triggers inline rename on the new row
+    // and expands ancestors so the new row is visible.
+    let note_repo_for_add_sibling = note_repo.clone();
+    let mut expand_ancestors_for_sibling = expand_ancestors.clone();
+    let on_add_sibling_note = use_callback(move |target_id: Uuid| {
+        let snapshot = notes_by_project.read();
+        let mut found: Option<(Uuid, Option<Uuid>, i64)> = None;
+        for (pid, list) in snapshot.iter() {
+            if let Some(target) = list.iter().find(|n| n.id == target_id) {
+                found = Some((*pid, target.parent_id, target.sibling_index));
+                break;
+            }
+        }
+        drop(snapshot);
+        let Some((project_id, parent_id, target_idx)) = found else {
+            eprintln!("operon: add sibling: target {target_id} not found");
+            return;
+        };
+        expand_ancestors_for_sibling(project_id, parent_id);
+        match note_repo_for_add_sibling.create(project_id, parent_id, "") {
+            Ok(n) => {
+                if let Err(e) =
+                    note_repo_for_add_sibling.move_to(n.id, project_id, parent_id, target_idx + 1)
+                {
+                    eprintln!("operon: add sibling: move_to failed: {e}");
+                }
+                note_version.with_mut(|v| *v += 1);
+                renaming_note_setter.set(Some(n.id));
+            }
+            Err(e) => eprintln!("operon: create sibling note failed: {e}"),
         }
     });
 
@@ -787,6 +852,7 @@ pub fn ExplorerPanel() -> Element {
                             on_request_rename_note: on_request_rename_note,
                             on_request_delete_note: on_request_delete_note,
                             on_add_child_note: on_add_child_note,
+                            on_add_sibling_note: on_add_sibling_note,
                             on_indent_note: on_indent_note,
                             on_outdent_note: on_outdent_note,
                             on_move_up_note: on_move_up_note,
@@ -888,6 +954,7 @@ struct ProjectSubtreeProps {
     on_request_rename_note: Callback<Uuid>,
     on_request_delete_note: Callback<Uuid>,
     on_add_child_note: Callback<Uuid>,
+    on_add_sibling_note: Callback<Uuid>,
     on_indent_note: Callback<Uuid>,
     on_outdent_note: Callback<Uuid>,
     on_move_up_note: Callback<Uuid>,
@@ -1002,6 +1069,7 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
                         on_request_rename: props.on_request_rename_note,
                         on_request_delete: props.on_request_delete_note,
                         on_add_child: props.on_add_child_note,
+                        on_add_sibling: props.on_add_sibling_note,
                         on_indent: props.on_indent_note,
                         on_outdent: props.on_outdent_note,
                         on_move_up: props.on_move_up_note,

@@ -32,6 +32,12 @@ pub struct NoteRowProps {
     pub on_request_rename: Callback<Uuid>,
     pub on_request_delete: Callback<Uuid>,
     pub on_add_child: Callback<Uuid>,
+    /// Plans-Phase-3-note-id-create: insert a new sibling note immediately
+    /// after this one, at the same depth. The handler in `explorer/mod.rs`
+    /// finds the target's parent via `notes_by_project`, calls
+    /// `note_repo.create(.., parent_id, "")`, then `move_to` to land at
+    /// `target.sibling_index + 1` and triggers the inline rename.
+    pub on_add_sibling: Callback<Uuid>,
     pub on_indent: Callback<Uuid>,
     pub on_outdent: Callback<Uuid>,
     pub on_move_up: Callback<Uuid>,
@@ -76,6 +82,7 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let on_request_rename = props.on_request_rename;
     let on_request_delete = props.on_request_delete;
     let on_add_child = props.on_add_child;
+    let on_add_sibling = props.on_add_sibling;
     let on_indent = props.on_indent;
     let on_outdent = props.on_outdent;
     let on_move_up = props.on_move_up;
@@ -165,6 +172,7 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
         ));
     }
 
+    let id_for_copy = id_str.clone();
     let mut menu_items: Vec<ContextMenuItem> = mode_items;
     menu_items.extend([
         ContextMenuItem::new(
@@ -174,9 +182,21 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
             }),
         ),
         ContextMenuItem::new(
+            "Copy ID",
+            Callback::new(move |_| {
+                crate::util::clipboard::copy_text(&id_for_copy);
+            }),
+        ),
+        ContextMenuItem::new(
             "Add child note",
             Callback::new(move |_| {
                 on_add_child.call(id);
+            }),
+        ),
+        ContextMenuItem::new(
+            "Add sibling note",
+            Callback::new(move |_| {
+                on_add_sibling.call(id);
             }),
         ),
         ContextMenuItem::new(
@@ -245,25 +265,39 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 let coords = evt.client_coordinates();
                 menu_pos_setter.set(Some((coords.x as i32, coords.y as i32)));
             },
-            onkeydown: move |evt| {
-                let key = evt.key().to_string();
-                let mods = evt.modifiers();
-                if key == "Tab" {
-                    evt.prevent_default();
-                    evt.stop_propagation();
-                    if mods.contains(Modifiers::SHIFT) {
-                        on_outdent.call(id);
-                    } else {
-                        on_indent.call(id);
+            onkeydown: {
+                let id_for_keys = id_str.clone();
+                move |evt| {
+                    let key = evt.key().to_string();
+                    let mods = evt.modifiers();
+                    let with_meta = mods.contains(Modifiers::META) || mods.contains(Modifiers::CONTROL);
+                    if with_meta && mods.contains(Modifiers::SHIFT) && !mods.contains(Modifiers::ALT)
+                        && key.eq_ignore_ascii_case("c")
+                    {
+                        // Plans-Phase-3-note-id-create: Cmd/Ctrl+Shift+C copies the
+                        // focused row's note id to the clipboard.
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        crate::util::clipboard::copy_text(&id_for_keys);
+                        return;
                     }
-                } else if key == "ArrowUp" && mods.contains(Modifiers::ALT) {
-                    evt.prevent_default();
-                    evt.stop_propagation();
-                    on_move_up.call(id);
-                } else if key == "ArrowDown" && mods.contains(Modifiers::ALT) {
-                    evt.prevent_default();
-                    evt.stop_propagation();
-                    on_move_down.call(id);
+                    if key == "Tab" {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        if mods.contains(Modifiers::SHIFT) {
+                            on_outdent.call(id);
+                        } else {
+                            on_indent.call(id);
+                        }
+                    } else if key == "ArrowUp" && mods.contains(Modifiers::ALT) {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        on_move_up.call(id);
+                    } else if key == "ArrowDown" && mods.contains(Modifiers::ALT) {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        on_move_down.call(id);
+                    }
                 }
             },
             ondragstart: move |_| {
@@ -297,13 +331,27 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 drag_session.set(None);
                 drop_indicator_setter.set(None);
             },
-            // Disclosure caret + drag handle. Even when has_children is false
-            // we render the slot so labels align; data-testid="drag-handle"
-            // is on the whole row via the parent (see HTML5 draggable attr).
+            // Plans-Phase-3-note-id-create: leading grip glyph as a visible
+            // indicator that the row is draggable. Drag itself is still
+            // initiated on the row outer (HTML5 `draggable` attr) so that
+            // existing DnD muscle memory keeps working; the glyph is purely a
+            // visual affordance.
             span {
-                class: "inline-flex w-3 shrink-0 select-none text-xs opacity-70",
+                class: "inline-flex w-3 shrink-0 select-none text-xs opacity-0 group-hover:opacity-50",
                 "data-testid": "drag-handle",
+                "aria-hidden": "true",
+                "\u{2807}\u{2807}"
+            }
+            // Disclosure caret. ≥16x16 hit area (w-4 h-4) so it's reliably
+            // hittable; aria-expanded reflects the open/closed state for
+            // assistive tech.
+            span {
+                class: "inline-flex items-center justify-center w-4 h-4 shrink-0 select-none text-xs opacity-70",
+                "data-testid": "disclosure-caret",
                 "data-has-children": if has_children { "true" } else { "false" },
+                role: "button",
+                "aria-label": "Toggle children",
+                "aria-expanded": if has_children { if is_open { "true" } else { "false" } } else { "false" },
                 onclick: move |evt| {
                     evt.stop_propagation();
                     if has_children {
