@@ -77,6 +77,13 @@ pub struct SettingsOpen(pub Signal<bool>);
 #[derive(Clone, Copy)]
 pub struct LocalUsername(pub Signal<String>);
 
+/// App-scope signal: currently configured notes vault root. `None` means the
+/// user hasn't picked one yet (first run); `Some` is what App reads to decide
+/// between mounting [`crate::local_mode::VaultDirPicker`] and the workspace.
+/// SettingsPanel writes through it so a "Change…" picker hot-applies.
+#[derive(Clone, Copy)]
+pub struct CurrentVaultRoot(pub Signal<Option<crate::local_mode::vault::VaultRoot>>);
+
 /// Convenience used by `app.rs` and tests to install the repos. Equivalent to
 /// rendering [`LocalStateProvider`] but callable from a hook position.
 pub fn provide_local_state() {
@@ -127,8 +134,10 @@ fn default_store_path() -> std::path::PathBuf {
 #[component]
 pub fn SettingsPanel(open: Signal<bool>, username: Signal<String>) -> Element {
     let LocalUserRepo(user_repo) = use_context();
+    let CurrentVaultRoot(mut vault_root) = use_context();
     let mut draft: Signal<String> = use_signal(|| username.read().clone());
     let mut error: Signal<Option<String>> = use_signal(|| None);
+    let mut show_change_picker: Signal<bool> = use_signal(|| false);
 
     let mut close = move || {
         open.set(false);
@@ -146,6 +155,12 @@ pub fn SettingsPanel(open: Signal<bool>, username: Signal<String>) -> Element {
             Err(e) => error.set(Some(e.to_string())),
         }
     };
+
+    let vault_path_label = vault_root
+        .read()
+        .as_ref()
+        .map(|r| r.path.display().to_string())
+        .unwrap_or_else(|| "(not set)".to_string());
 
     rsx! {
         div {
@@ -174,6 +189,32 @@ pub fn SettingsPanel(open: Signal<bool>, username: Signal<String>) -> Element {
                 if let Some(msg) = error.read().clone() {
                     p { class: "operon-modal-error", "{msg}" }
                 }
+                h3 {
+                    class: "operon-modal-section",
+                    style: "margin-top: 1rem; font-weight: 600;",
+                    "Vault directory"
+                }
+                div {
+                    class: "operon-modal-vault-row",
+                    style: "display: flex; align-items: center; gap: 0.5rem;",
+                    code {
+                        "data-testid": "vault-path",
+                        style: "flex: 1; padding: 0.25rem 0.5rem; background: var(--operon-bg-2, #f5f5f5); border-radius: 0.25rem; font-size: 0.85em;",
+                        "{vault_path_label}"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "operon-modal-button",
+                        "data-testid": "vault-change-button",
+                        onclick: move |_| show_change_picker.set(true),
+                        "Change…"
+                    }
+                }
+                p {
+                    class: "operon-modal-help",
+                    style: "font-size: 0.8em; color: var(--operon-fg-muted, #666); margin-top: 0.25rem;",
+                    "Changing the vault re-points new writes; existing notes stay in their previous location."
+                }
                 div {
                     class: "operon-modal-actions",
                     button {
@@ -188,6 +229,15 @@ pub fn SettingsPanel(open: Signal<bool>, username: Signal<String>) -> Element {
                         onclick: move |_| save(),
                         "Save"
                     }
+                }
+            }
+            if *show_change_picker.read() {
+                crate::local_mode::VaultDirPicker {
+                    blocking: false,
+                    on_chosen: move |root: crate::local_mode::vault::VaultRoot| {
+                        vault_root.set(Some(root));
+                        show_change_picker.set(false);
+                    },
                 }
             }
         }

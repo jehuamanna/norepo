@@ -89,12 +89,15 @@ pub fn App() -> Element {
     // Local Mode also requires a chosen notes vault directory. On first run
     // (no `vault.root.path` setting) we render the `VaultDirPicker` modal in
     // place of the workspace until the user picks one. The vault is held in
-    // App-scope state so the picker can update it without a reload.
+    // App-scope state via `CurrentVaultRoot` so SettingsPanel "Change…" can
+    // hot-apply a re-pick without a reload.
     #[cfg(not(target_arch = "wasm32"))]
     let mut vault_root: Signal<Option<VaultRoot>> = {
         let crate::local_mode::LocalSettingsRepo(settings) = use_context();
         use_signal(|| crate::local_mode::read_vault_root(&settings))
     };
+    #[cfg(not(target_arch = "wasm32"))]
+    use_context_provider(|| crate::local_mode::CurrentVaultRoot(vault_root));
 
     use_hook(|| {
         if let Some(m) = initial_mode_remembered {
