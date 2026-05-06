@@ -897,18 +897,20 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
             class: "operon-local-editor-host",
             "data-testid": "local-note-editor-host",
             "data-tab-id": "{tab_id.0}",
-            // Plans-Phase-9-monaco-desktop (rev 4): flex-fill the
-            // available column-height. The parent layout
-            // (`.operon-main-area` / `.operon-local-split-edit`) is a
-            // `display: flex; flex-direction: column`; without `flex:
-            // 1` + `min-height: 0` this row collapses to 0 and Monaco
-            // mounts into a zero-height host. `min-height: 0` overrides
-            // the default `min-height: auto` flex-item rule which
-            // otherwise prevents children from shrinking below their
-            // content size.
-            style: "flex: 1 1 auto; min-height: 0; min-width: 0; \
-                    display: flex; flex-direction: column; \
-                    width: 100%; height: 100%;",
+            // Plans-Phase-9-monaco-desktop (rev 8): absolute-inset
+            // against the positioned ancestor (`.operon-main-body` in
+            // Edit mode, `.operon-local-split-edit` in Split mode).
+            // Earlier revisions used a triple-nested flex column
+            // chain (`flex: 1 1 auto; min-height: 0; flex-direction:
+            // column; height: 100%`) — Edit mode held up but Split
+            // mode's column-of-column-of-column resolved the host to
+            // 0x0 in the dx-desktop webview, leaving Monaco mounted
+            // against an invisible container. Absolute-inset breaks
+            // the dependency on flex-cascade resolution: every layer
+            // gets its size deterministically from the outermost
+            // positioned ancestor's dimensions.
+            style: "position: absolute; inset: 0; \
+                    display: flex; flex-direction: column;",
             // Plans-Phase-6-image-notes (drop-to-note-area): preventing
             // default on `ondragover` is what tells the browser this
             // element is a valid drop target — without it, `ondrop`

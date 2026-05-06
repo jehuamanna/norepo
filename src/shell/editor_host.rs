@@ -353,16 +353,14 @@ pub fn MonacoEditorHost(
 
         return rsx! {
             div {
-                // Plans-Phase-9-monaco-desktop (rev 4): take the full
-                // height the flex-column parent gives us. `position:
-                // relative` is the anchor for the absolute-positioned
-                // host + status overlay below; `flex: 1` + `min-height:
-                // 0` prevent the default `min-height: auto` flex rule
-                // from collapsing this row when Monaco hasn't filled
-                // it yet.
-                style: "position: relative; flex: 1 1 auto; \
-                        min-height: 0; min-width: 0; \
-                        width: 100%; height: 100%;",
+                // Plans-Phase-9-monaco-desktop (rev 8): absolute-inset
+                // against the positioned `LocalNoteEditor` wrapping
+                // div (which is itself absolute-inset against
+                // `.operon-main-body` / `.operon-local-split-edit`).
+                // Each layer fills its parent independent of any flex
+                // calc — Monaco's host always has deterministic
+                // dimensions equal to the outer positioned ancestor.
+                style: "position: absolute; inset: 0;",
                 div {
                     id: "{host_id}",
                     class: "operon-monaco-host",

@@ -650,9 +650,14 @@ html, body {
 .operon-local-split-view {
   flex: 1 1 50%;
   min-width: 0;
+  /* Plans-Phase-9-monaco-desktop (rev 8): make this the positioned
+   * ancestor for the absolute-inset Monaco host inside. Without it,
+   * Monaco's host element resolves against the next-positioned
+   * ancestor (often the document body) and ends up 0x0. */
+  position: relative;
   display: flex;
   flex-direction: column;
-  overflow: auto;
+  overflow: hidden;
 }
 .operon-local-split-edit {
   border-right: 1px solid var(--vscode-panel-border);
@@ -723,6 +728,10 @@ html, body {
   flex: 1 1 auto;
   overflow: auto;
   padding: 12px 16px;
+  /* Plans-Phase-9-monaco-desktop (rev 8): positioned ancestor for the
+   * Edit-mode `LocalNoteEditor` wrapping div (which is now
+   * absolute-inset). */
+  position: relative;
 }
 
 .operon-main-empty {
