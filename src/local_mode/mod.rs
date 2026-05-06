@@ -16,6 +16,10 @@ pub mod ui;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod vault;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod vault_picker;
+#[cfg(not(target_arch = "wasm32"))]
+pub use vault_picker::VaultDirPicker;
+#[cfg(not(target_arch = "wasm32"))]
 pub use desktop::*;
 #[cfg(not(target_arch = "wasm32"))]
 pub use editor::{LocalNoteEditor, LocalSaveAction, LocalSaveButton};
