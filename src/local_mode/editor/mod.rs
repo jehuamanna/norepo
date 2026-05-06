@@ -873,7 +873,18 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
             class: "operon-local-editor-host",
             "data-testid": "local-note-editor-host",
             "data-tab-id": "{tab_id.0}",
-            style: "width: 100%; height: 100%; min-height: 400px; display: flex;",
+            // Plans-Phase-9-monaco-desktop (rev 4): flex-fill the
+            // available column-height. The parent layout
+            // (`.operon-main-area` / `.operon-local-split-edit`) is a
+            // `display: flex; flex-direction: column`; without `flex:
+            // 1` + `min-height: 0` this row collapses to 0 and Monaco
+            // mounts into a zero-height host. `min-height: 0` overrides
+            // the default `min-height: auto` flex-item rule which
+            // otherwise prevents children from shrinking below their
+            // content size.
+            style: "flex: 1 1 auto; min-height: 0; min-width: 0; \
+                    display: flex; flex-direction: column; \
+                    width: 100%; height: 100%;",
             // Plans-Phase-6-image-notes (drop-to-note-area): preventing
             // default on `ondragover` is what tells the browser this
             // element is a valid drop target — without it, `ondrop`

@@ -158,6 +158,7 @@ pub fn MonacoEditorHost(
                             dioxus.send({{type:"error", message:"host element not found"}});
                             return;
                         }}
+                        dioxus.send({{type:"diag", phase:"target-found"}});
                         const handle = await window.operonBridge.mount(target, {{
                             kind: "monaco",
                             languageId: {language_id_json},
@@ -165,6 +166,7 @@ pub fn MonacoEditorHost(
                             theme: "vs",
                             readOnly: false,
                         }});
+                        dioxus.send({{type:"diag", phase:"mount-returned"}});
                         window.__operon_monaco_handles = window.__operon_monaco_handles || {{}};
                         window.__operon_monaco_handles['{host_id}'] = handle;
                         // Suppress change events fired by programmatic
@@ -288,6 +290,7 @@ pub fn MonacoEditorHost(
                         }
                     }
                     Some("mounted") => {
+                        eprintln!("operon: monaco mounted");
                         mounted_flag.set(true);
                         mount_status.set("mounted".to_string());
                     }
@@ -320,7 +323,16 @@ pub fn MonacoEditorHost(
 
         return rsx! {
             div {
-                style: "position: relative; width: 100%; height: 100%; min-height: 300px;",
+                // Plans-Phase-9-monaco-desktop (rev 4): take the full
+                // height the flex-column parent gives us. `position:
+                // relative` is the anchor for the absolute-positioned
+                // host + status overlay below; `flex: 1` + `min-height:
+                // 0` prevent the default `min-height: auto` flex rule
+                // from collapsing this row when Monaco hasn't filled
+                // it yet.
+                style: "position: relative; flex: 1 1 auto; \
+                        min-height: 0; min-width: 0; \
+                        width: 100%; height: 100%;",
                 div {
                     id: "{host_id}",
                     class: "operon-monaco-host",
