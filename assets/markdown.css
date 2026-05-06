@@ -88,3 +88,43 @@
   max-width: 100%;
   display: block;
 }
+
+/* Plans-Phase-9-wikilink-picker (rev 2): make wikilinks visibly
+ * clickable. Without these rules the renderer's <a> elements inherit
+ * the body color and look indistinguishable from raw text — the user
+ * couldn't tell `[[Note]]` was a link. */
+.markdown-prose .wikilink {
+  color: var(--vscode-textlink-foreground, #4daafc);
+  text-decoration: underline;
+  text-decoration-style: solid;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.markdown-prose .wikilink:hover {
+  text-decoration-thickness: 2px;
+}
+
+.markdown-prose .wikilink-broken {
+  color: var(--vscode-errorforeground, #f14c4c);
+  text-decoration-style: dashed;
+}
+
+/* Image embeds render as inline <img>; cap their width to the column
+ * and add a touch of vertical breathing room. */
+.markdown-prose .wikilink-embed-image {
+  display: block;
+  max-width: 100%;
+  margin: 0.4em 0;
+  border-radius: 4px;
+}
+
+/* When an embed wikilink can't resolve to an image (broken target,
+ * non-image kind, missing blob), the renderer degrades to a clickable
+ * `[[…]]` text link tagged `wikilink-embed-missing`. Style it
+ * italic/muted so the failed-embed origin is still visible. */
+.markdown-prose .wikilink-embed-missing {
+  font-style: italic;
+  opacity: 0.85;
+}

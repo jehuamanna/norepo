@@ -118,8 +118,15 @@ pub fn render_node(n: &MdNode) -> Element {
                 Some(WikiLinkChecker(cb)) => cb.call(target.clone()),
                 None => true,
             };
+            // Plans-Phase-9-wikilink-picker (rev 2): when an embed wikilink
+            // can't render as `<img>` (no resolver, broken target, or the
+            // target turned out to be a markdown note), DON'T show the
+            // literal `![[…]]` text — that's indistinguishable from raw
+            // source. Drop the leading `!` so the user sees a normal
+            // clickable link, and tag the anchor with
+            // `data-wikilink-embed="missing"` so themes can still style
+            // failed embeds distinctly.
             let display = format!("[[{}]]", target);
-            let display_embed = format!("![[{}]]", target);
             let target_owned = target.clone();
             let onclick = move |evt: Event<MouseData>| {
                 if let Some(WikiLinkResolver(cb)) = resolver {
@@ -129,44 +136,33 @@ pub fn render_node(n: &MdNode) -> Element {
             };
             let class = if *embed {
                 if live {
-                    "wikilink wikilink-embed"
+                    "wikilink wikilink-embed wikilink-embed-missing"
                 } else {
-                    "wikilink wikilink-embed wikilink-broken"
+                    "wikilink wikilink-embed wikilink-embed-missing wikilink-broken"
                 }
             } else if live {
                 "wikilink"
             } else {
                 "wikilink wikilink-broken"
             };
-            let title_attr = if live {
-                target.clone()
-            } else {
+            let title_attr = if !live {
                 format!("Broken link: {}", target)
-            };
-            if *embed {
-                rsx! {
-                    a {
-                        class,
-                        href: "#",
-                        "data-wikilink-target": "{target}",
-                        "data-wikilink-embed": "true",
-                        "data-wikilink-broken": if live { "false" } else { "true" },
-                        title: "{title_attr}",
-                        onclick,
-                        "{display_embed}"
-                    }
-                }
+            } else if *embed {
+                format!("Embed target is not an image: {}", target)
             } else {
-                rsx! {
-                    a {
-                        class,
-                        href: "#",
-                        "data-wikilink-target": "{target}",
-                        "data-wikilink-broken": if live { "false" } else { "true" },
-                        title: "{title_attr}",
-                        onclick,
-                        "{display}"
-                    }
+                target.clone()
+            };
+            let embed_attr = if *embed { "missing" } else { "false" };
+            rsx! {
+                a {
+                    class,
+                    href: "#",
+                    "data-wikilink-target": "{target}",
+                    "data-wikilink-embed": "{embed_attr}",
+                    "data-wikilink-broken": if live { "false" } else { "true" },
+                    title: "{title_attr}",
+                    onclick,
+                    "{display}"
                 }
             }
         }
