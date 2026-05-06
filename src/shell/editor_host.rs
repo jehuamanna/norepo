@@ -121,13 +121,6 @@ pub fn MonacoEditorHost(
         let host_id = format!("operon-monaco-host-{note_id}-{host_seq}");
         let initial_content = content.clone();
         let language_id = language.id.to_string();
-        // Plans-Phase-9-monaco-desktop (rev 3): visible mount status so
-        // we can debug "Monaco never appears" without having to open
-        // the webview's devtools. The recv loop flips this to "mounted"
-        // on success or "error: <msg>" on bridge / mount failure.
-        let mut mount_status: Signal<String> =
-            use_signal(|| "Loading Monaco…".to_string());
-        let mut mounted_flag: Signal<bool> = use_signal(|| false);
 
         // Build the bootstrap script once, capturing the per-host id +
         // initial content. Idempotent: re-renders don't re-run because
@@ -143,7 +136,6 @@ pub fn MonacoEditorHost(
             let script = format!(
                 r#"(async function() {{
                     try {{
-                        dioxus.send({{type:"diag", phase:"start", origin:String(window.location && window.location.origin)}});
                         if (!window.operonBridge) {{
                             // Plans-Phase-9-monaco-desktop (rev 2): the
                             // bridge dist is served via the custom
@@ -154,7 +146,6 @@ pub fn MonacoEditorHost(
                             // the wasm-style URL would 404 here.
                             try {{
                                 await import('bridge://localhost/index.js');
-                                dioxus.send({{type:"diag", phase:"imported"}});
                             }} catch (impErr) {{
                                 dioxus.send({{type:"error", message:"import failed: "+String(impErr && impErr.message || impErr)}});
                                 return;
@@ -164,19 +155,14 @@ pub fn MonacoEditorHost(
                             dioxus.send({{type:"error", message:"bridge not loaded"}});
                             return;
                         }}
-                        // Plans-Phase-9-monaco-desktop (rev 10): wait
-                        // for the host element to (a) flush into the
-                        // DOM AND (b) get a non-zero clientWidth /
-                        // clientHeight before mounting Monaco. In
-                        // Split mode the parent flex chain takes
-                        // multiple animation frames to resolve, and
-                        // mounting against a 0x0 host leaves Monaco
-                        // technically present but visually empty
-                        // (its automaticLayout ResizeObserver
-                        // sometimes misses the 0 -> N transition).
-                        // We poll up to ~3 seconds; if we still don't
-                        // have size, mount anyway and log it so the
-                        // diag tells us a CSS regression survived.
+                        // Plans-Phase-9-monaco-desktop (rev 14): the
+                        // unique-host-id fix landed in rev 13 means we
+                        // never collide with a sibling pane's host
+                        // element, so the size-gated polling and
+                        // multi-stage relayout retries from earlier
+                        // revs are no longer needed. Wait briefly for
+                        // the element to flush into the DOM, then
+                        // mount.
                         let target = document.getElementById('{host_id}');
                         let attempts = 0;
                         while (!target && attempts < 60) {{
@@ -188,16 +174,6 @@ pub fn MonacoEditorHost(
                             dioxus.send({{type:"error", message:"host element not found"}});
                             return;
                         }}
-                        let sizeAttempts = 0;
-                        while ((target.clientWidth === 0 || target.clientHeight === 0) && sizeAttempts < 90) {{
-                            await new Promise(r => setTimeout(r, 33));
-                            sizeAttempts++;
-                        }}
-                        dioxus.send({{
-                            type:"diag",
-                            phase:"target-found",
-                            origin: "w="+target.clientWidth+" h="+target.clientHeight+" tries="+sizeAttempts,
-                        }});
                         const handle = await window.operonBridge.mount(target, {{
                             kind: "monaco",
                             languageId: {language_id_json},
@@ -205,58 +181,8 @@ pub fn MonacoEditorHost(
                             theme: "vs",
                             readOnly: false,
                         }});
-                        dioxus.send({{type:"diag", phase:"mount-returned"}});
                         window.__operon_monaco_handles = window.__operon_monaco_handles || {{}};
                         window.__operon_monaco_handles['{host_id}'] = handle;
-                        // Plans-Phase-9-monaco-desktop (rev 7): force a
-                        // re-layout once the parent flex has settled.
-                        // Monaco's `automaticLayout: true` uses a
-                        // ResizeObserver that occasionally doesn't fire
-                        // when the host element gets its final size
-                        // *after* `editor.create()` ran (Split mode
-                        // hits this — host is 0x0 at mount, then
-                        // resolves to 50% of the column). Two
-                        // setTimeouts at increasing delays cover both
-                        // immediate (next-frame) and slightly-deferred
-                        // (post-flex-settle) cases.
-                        const relayout = (label) => {{
-                            try {{
-                                if (!handle || !handle.layout) return;
-                                handle.layout();
-                                // Plans-Phase-9-monaco-desktop (rev 12):
-                                // also report whether Monaco actually
-                                // created its DOM inside the host.
-                                // `.monaco-editor` is the root element
-                                // Monaco injects on `editor.create`. If
-                                // it's missing or empty, Monaco mounted
-                                // but didn't render — likely a CSS
-                                // injection problem.
-                                const me = target.querySelector(".monaco-editor");
-                                const childCount = target.childElementCount;
-                                const meRect = me ? me.getBoundingClientRect() : null;
-                                dioxus.send({{
-                                    type:"diag",
-                                    phase:"relayout-"+label,
-                                    origin: "host="+target.clientWidth+"x"+target.clientHeight
-                                          + " kids="+childCount
-                                          + " me="+(me ? "yes" : "no")
-                                          + (meRect ? " meRect="+Math.round(meRect.width)+"x"+Math.round(meRect.height) : ""),
-                                }});
-                            }} catch (e) {{}}
-                        }};
-                        // Plans-Phase-9-monaco-desktop (rev 12): drop
-                        // the 0ms retry (fires before Monaco finishes
-                        // its first render — re-entering layout()
-                        // mid-init confused the renderer in earlier
-                        // tests). Drop the ResizeObserver — the size-
-                        // gated mount in rev 10 already waits for
-                        // non-zero dimensions, and Monaco's own
-                        // automaticLayout catches subsequent changes.
-                        // The remaining 100/500/2000 ms calls are
-                        // mostly diagnostic at this point.
-                        setTimeout(() => relayout("100ms"), 100);
-                        setTimeout(() => relayout("500ms"), 500);
-                        setTimeout(() => relayout("2s"), 2000);
                         // Suppress change events fired by programmatic
                         // setContent so Rust doesn't see its own write
                         // bounce back as user input.
@@ -365,7 +291,6 @@ pub fn MonacoEditorHost(
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        eprintln!("operon: monaco change len={}", value.len());
                         on_change_for_loop.call(value);
                     }
                     Some("keyaction") => {
@@ -378,25 +303,9 @@ pub fn MonacoEditorHost(
                             handler.call(action);
                         }
                     }
-                    Some("mounted") => {
-                        eprintln!("operon: monaco mounted");
-                        mounted_flag.set(true);
-                        mount_status.set("mounted".to_string());
-                    }
                     Some("error") => {
                         let m = msg.get("message").and_then(|v| v.as_str()).unwrap_or("");
                         eprintln!("operon: monaco bridge error: {m}");
-                        mount_status.set(format!("error: {m}"));
-                    }
-                    Some("diag") => {
-                        let phase = msg.get("phase").and_then(|v| v.as_str()).unwrap_or("");
-                        let origin = msg.get("origin").and_then(|v| v.as_str()).unwrap_or("");
-                        eprintln!("operon: monaco diag phase={phase} origin={origin}");
-                        if !origin.is_empty() {
-                            mount_status.set(format!("phase={phase} origin={origin}"));
-                        } else {
-                            mount_status.set(format!("phase={phase}"));
-                        }
                     }
                     _ => {}
                 }
@@ -427,22 +336,6 @@ pub fn MonacoEditorHost(
                     "data-monaco-language": "{language_attr}",
                     "data-stub": "false",
                     style: "position: absolute; inset: 0;",
-                }
-                // Plans-Phase-9-monaco-desktop (rev 11): keep the
-                // status overlay visible even after mount so the
-                // user can see live diag info (the host size from
-                // each `relayout-*` step). Pointer-events: none so
-                // it never steals clicks from Monaco. Remove this
-                // override once Split-mode rendering is confirmed.
-                div {
-                    class: "operon-monaco-status",
-                    "data-testid": "monaco-mount-status",
-                    style: "position: absolute; top: 4px; left: 4px; padding: 3px 6px; \
-                            background: rgba(255, 235, 59, 0.85); color: #1a1a1a; \
-                            font-family: monospace; font-size: 10px; border-radius: 3px; \
-                            z-index: 10; max-width: 90%; white-space: pre-wrap; \
-                            pointer-events: none;",
-                    "{mount_status.read()}"
                 }
             }
         };

@@ -276,6 +276,19 @@ pub fn rebuild_link_graph_for_source(
 
 /// Open (or focus) a Local-Mode note tab for `note_uuid`. The tab uses the
 /// `manual_save = true` path so the debounced autosave never fires.
+///
+/// Plans-Phase-9-monaco-desktop (rev 14): "click on a note in the
+/// explorer" semantics:
+/// - If an Edit-mode tab for the note already exists, focus it.
+/// - If a non-Edit (View / Split / LivePreview) tab exists for the
+///   note, leave it alone and open a *new* Edit tab alongside.
+/// - If no tab exists, open a new Edit tab.
+///
+/// The intent: the user can keep a View / Split tab open as a
+/// reference and click the note again to get a fresh editable
+/// buffer in a new tab. Each tab carries its own buffer; saves go
+/// through the same `Persistence` row keyed by note id, so
+/// last-write-wins on the SQLite side.
 pub fn open_local_note_tab(
     mut tabs: Signal<TabManager>,
     save_scheduler: crate::tabs::SaveScheduler,
@@ -283,15 +296,29 @@ pub fn open_local_note_tab(
     title: String,
     initial_content: String,
 ) -> TabId {
-    let id = tabs.write().open_manual_save(
-        note_uuid.to_string(),
+    let note_id_str = note_uuid.to_string();
+    // Look for an existing Edit-mode tab to focus.
+    let existing_edit = {
+        let snap = tabs.read();
+        let id = snap
+            .iter()
+            .find(|t| t.note_id == note_id_str && matches!(t.mode, EditorMode::Edit))
+            .map(|t| t.id);
+        id
+    };
+    if let Some(tid) = existing_edit {
+        tabs.write().activate(tid);
+        return tid;
+    }
+    // No Edit-mode tab — force a new tab so View / Split tabs
+    // remain undisturbed.
+    let id = tabs.write().open_manual_save_new(
+        note_id_str,
         "markdown".into(),
         title,
         initial_content,
     );
     save_scheduler.set_manual_save(id);
-    // Local Mode opens notes in Edit mode by default; the right-click menu
-    // on the note row offers View / Split-view as alternatives.
     tabs.write().set_mode(id, EditorMode::Edit);
     id
 }
@@ -501,7 +528,6 @@ pub fn LocalSaveButton(action: LocalSaveAction, dirty: bool) -> Element {
 #[component]
 pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
     let tabs: Signal<TabManager> = use_context();
-    eprintln!("operon: LocalNoteEditor render tab_id={tab_id:?}");
     // Plans-Phase-6-image-notes: image-tab view dependencies. Hooks must
     // run unconditionally; the actual rendering is gated below.
     let note_repo_for_image: crate::local_mode::desktop::LocalNoteRepo = use_context();
@@ -867,10 +893,6 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
     // routes to the live target.
     let mut tabs_for_propagate = tabs;
     let propagate_content = use_callback(move |new_content: String| {
-        eprintln!(
-            "operon: local on_change \u{2192} tabs.set_content len={}",
-            new_content.len()
-        );
         tabs_for_propagate
             .write()
             .set_content(tab_id, new_content);

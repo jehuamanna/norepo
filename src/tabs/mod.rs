@@ -62,7 +62,7 @@ impl TabManager {
         title: String,
         content: String,
     ) -> TabId {
-        self.open_inner(note_id, format_id, title, content, false)
+        self.open_inner(note_id, format_id, title, content, false, false)
     }
 
     /// Open a tab whose saves are gated on the user pressing the Save button or
@@ -75,7 +75,22 @@ impl TabManager {
         title: String,
         content: String,
     ) -> TabId {
-        self.open_inner(note_id, format_id, title, content, true)
+        self.open_inner(note_id, format_id, title, content, true, false)
+    }
+
+    /// Plans-Phase-9-monaco-desktop (rev 14): always create a new tab,
+    /// even if another tab already references the same `note_id`.
+    /// Used by the Local-Mode click-on-explorer-row flow when the
+    /// existing tab is in View / Split mode and the user wants a
+    /// fresh Edit buffer alongside.
+    pub fn open_manual_save_new(
+        &mut self,
+        note_id: String,
+        format_id: String,
+        title: String,
+        content: String,
+    ) -> TabId {
+        self.open_inner(note_id, format_id, title, content, true, true)
     }
 
     fn open_inner(
@@ -85,15 +100,18 @@ impl TabManager {
         title: String,
         content: String,
         manual_save: bool,
+        force_new: bool,
     ) -> TabId {
-        if let Some(id) = self
-            .tabs
-            .iter()
-            .find(|t| t.note_id == note_id)
-            .map(|t| t.id)
-        {
-            self.active = Some(id);
-            return id;
+        if !force_new {
+            if let Some(id) = self
+                .tabs
+                .iter()
+                .find(|t| t.note_id == note_id)
+                .map(|t| t.id)
+            {
+                self.active = Some(id);
+                return id;
+            }
         }
         self.next_id += 1;
         let id = TabId(self.next_id);

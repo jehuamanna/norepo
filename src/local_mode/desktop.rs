@@ -17,7 +17,7 @@ use operon_store::vfs;
 use operon_store::{Store, StoreConfig};
 use uuid::Uuid;
 
-use super::editor::{install_save_action, LocalSaveAction, LocalSaveButton};
+use super::editor::{install_save_action, LocalSaveAction};
 use super::explorer::{
     ExplorerSearchFocus, ExplorerSearchRepo, LocalNoteVersion, LocalProjectVersion, SelectedNote,
     SelectedProject,
@@ -718,8 +718,14 @@ pub fn LocalShellOverlay(children: Element) -> Element {
     let ExplorerSearchFocus(search_focus_tick) = use_context();
     let SettingsOpen(settings_open) = use_context();
     let LocalUsername(username) = use_context();
-    let tabs: Signal<TabManager> = use_context();
-    let save_action: LocalSaveAction = use_context();
+    // Plans-Phase-9-monaco-desktop (rev 14): `tabs` and `save_action`
+    // are still consumed via context elsewhere (`LocalNoteEditor`,
+    // `MainArea`); we keep the `use_context()` calls so the providers
+    // upstream remain wired, even though `LocalShellOverlay` no
+    // longer references either after the floating Save button was
+    // removed.
+    let _tabs: Signal<TabManager> = use_context();
+    let _save_action: LocalSaveAction = use_context();
 
     let mut clipboard_setter = clipboard;
     let mut bulk_clipboard_setter = bulk_clipboard;
@@ -731,11 +737,6 @@ pub fn LocalShellOverlay(children: Element) -> Element {
     let _ = settings_open;
     let note_repo_for_keys = note_repo.clone();
     let project_repo_for_keys = project_repo.clone();
-
-    let active_tab_dirty_and_manual = {
-        let tm = tabs.read();
-        tm.active().map(|t| (t.id, t.dirty, t.manual_save))
-    };
 
     rsx! {
         div {
@@ -863,13 +864,13 @@ pub fn LocalShellOverlay(children: Element) -> Element {
                         border-radius: 0.25rem; box-shadow: 0 1px 4px rgba(0,0,0,0.08); z-index: 30;",
                 crate::local_mode::explorer::BacklinksPanel {}
             }
-            // Floating Save button: only for Local-Mode tabs (manual_save = true).
-            if let Some((_, dirty, true)) = active_tab_dirty_and_manual {
-                div {
-                    style: "position: fixed; top: 36px; right: 12px; z-index: 40;",
-                    LocalSaveButton { action: save_action.clone(), dirty }
-                }
-            }
+            // Plans-Phase-9-monaco-desktop (rev 14): the floating
+            // Save button is gone — Cmd/Ctrl+S routes through Monaco's
+            // window-capture keydown listener and dispatches a
+            // `save` keyaction back to `LocalNoteEditor::on_action`,
+            // which calls the same `LocalSaveAction.callback`. The
+            // tab's own dirty bullet remains as the visual save-state
+            // indicator.
             if *settings_open.read() {
                 SettingsPanel {
                     open: settings_open,
