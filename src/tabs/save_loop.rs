@@ -105,6 +105,30 @@ impl SaveScheduler {
         });
     }
 
+    /// Cancel any pending debounced save for `tab_id` and persist immediately.
+    ///
+    /// Plans-Phase-2-saving: this is the unified manual-save path for Local
+    /// Mode (Ctrl+S / File→Save / Save button). Bumping the generation counter
+    /// invalidates any in-flight debounce future for the same tab so the
+    /// content lands exactly once.
+    ///
+    /// Returns the result of `Persistence::save`. The caller flips the tab's
+    /// `dirty` flag and calls `LocalNoteRepository::touch_updated` on success.
+    pub async fn flush(
+        &self,
+        tab_id: TabId,
+        note_id: &str,
+        content: &str,
+    ) -> Result<(), crate::persistence::PersistError> {
+        // Bump the generation: any pending debounce future for this tab will
+        // wake up, observe the mismatch, and exit without saving.
+        if let Ok(mut gens) = self.generations.lock() {
+            let next = gens.get(&tab_id).copied().unwrap_or(0).saturating_add(1);
+            gens.insert(tab_id, next);
+        }
+        self.persistence.save(note_id, content.as_bytes()).await
+    }
+
     /// Test-only synchronous schedule that skips the debounce (and the spawn) and saves
     /// immediately. Used by unit tests so we don't need a Dioxus runtime in scope.
     #[cfg(test)]
@@ -146,6 +170,19 @@ mod tests {
         let s = SaveScheduler::new(p.clone());
         block_on(s.save_now("note-1", "hello")).unwrap();
         assert_eq!(block_on(p.load("note-1")).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn flush_writes_immediately_and_bumps_generation() {
+        let p: Arc<dyn Persistence> = Arc::new(MemoryPersistence::new());
+        let s = SaveScheduler::new(p.clone());
+        // Pretend a debounce was scheduled (gen = 7).
+        s.generations.lock().unwrap().insert(TabId(42), 7);
+        block_on(s.flush(TabId(42), "note-x", "fresh")).unwrap();
+        // Persistence wrote.
+        assert_eq!(block_on(p.load("note-x")).unwrap(), b"fresh");
+        // Generation bumped — any in-flight task with gen=7 will now bail.
+        assert_eq!(*s.generations.lock().unwrap().get(&TabId(42)).unwrap(), 8);
     }
 
     #[test]
