@@ -158,7 +158,11 @@ pub fn MonacoEditorHost(
                             dioxus.send({{type:"error", message:"host element not found"}});
                             return;
                         }}
-                        dioxus.send({{type:"diag", phase:"target-found"}});
+                        dioxus.send({{
+                            type:"diag",
+                            phase:"target-found",
+                            origin: "w="+target.clientWidth+" h="+target.clientHeight,
+                        }});
                         const handle = await window.operonBridge.mount(target, {{
                             kind: "monaco",
                             languageId: {language_id_json},
@@ -167,17 +171,33 @@ pub fn MonacoEditorHost(
                             readOnly: false,
                         }});
                         dioxus.send({{type:"diag", phase:"mount-returned"}});
-                        // Plans-Phase-9-monaco-desktop (rev 7): some
-                        // nested-flex layouts (Local Mode Split) leave
-                        // Monaco's ResizeObserver chain pointing at a
-                        // 0-by-0 host briefly. Dispatch a window resize
-                        // a tick later so Monaco's automaticLayout
-                        // re-measures against the now-laid-out host.
-                        setTimeout(() => {{
-                            try {{ window.dispatchEvent(new Event("resize")); }} catch (e) {{}}
-                        }}, 50);
                         window.__operon_monaco_handles = window.__operon_monaco_handles || {{}};
                         window.__operon_monaco_handles['{host_id}'] = handle;
+                        // Plans-Phase-9-monaco-desktop (rev 7): force a
+                        // re-layout once the parent flex has settled.
+                        // Monaco's `automaticLayout: true` uses a
+                        // ResizeObserver that occasionally doesn't fire
+                        // when the host element gets its final size
+                        // *after* `editor.create()` ran (Split mode
+                        // hits this — host is 0x0 at mount, then
+                        // resolves to 50% of the column). Two
+                        // setTimeouts at increasing delays cover both
+                        // immediate (next-frame) and slightly-deferred
+                        // (post-flex-settle) cases.
+                        const relayout = () => {{
+                            try {{
+                                if (!handle || !handle.layout) return;
+                                handle.layout();
+                                dioxus.send({{
+                                    type:"diag",
+                                    phase:"relayout",
+                                    origin: "w="+target.clientWidth+" h="+target.clientHeight,
+                                }});
+                            }} catch (e) {{}}
+                        }};
+                        setTimeout(relayout, 0);
+                        setTimeout(relayout, 100);
+                        setTimeout(relayout, 500);
                         // Suppress change events fired by programmatic
                         // setContent so Rust doesn't see its own write
                         // bounce back as user input.

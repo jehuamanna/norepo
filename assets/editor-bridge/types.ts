@@ -31,6 +31,12 @@ export interface Handle {
   setReadOnly(ro: boolean): void;
   setTheme(theme: unknown): void;
   dispatch(cmd: string): void;
+  /** Force the underlying editor to re-measure its container and lay out
+   * its DOM. Needed when the editor mounts inside a flex-nested host
+   * whose final size is resolved AFTER `editor.create(...)` returns —
+   * Monaco's automaticLayout ResizeObserver doesn't always fire in that
+   * sequence. Plans-Phase-9-monaco-desktop (rev 7). */
+  layout(): void;
   /** Tear down the editor and free every closure that crossed the wasm-bindgen
    * boundary. Once called, the handle is unusable. */
   dispose(): void;

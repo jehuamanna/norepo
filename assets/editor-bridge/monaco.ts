@@ -122,6 +122,14 @@ export function mountMonaco(target: HTMLElement, init: BackendInit): Handle {
         monaco.editor.setTheme(t.name);
       }
     },
+    layout() {
+      if (disposed) return;
+      // Plans-Phase-9-monaco-desktop (rev 7): re-measure the container
+      // and reflow Monaco's DOM. Useful when the host element gets its
+      // final flex size after `monaco.editor.create()` already ran with
+      // a 0x0 measurement.
+      editor.layout();
+    },
     dispatch(cmd: string) {
       if (disposed) return;
       switch (cmd) {
