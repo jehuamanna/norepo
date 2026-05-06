@@ -51,6 +51,14 @@ pub enum ExplorerAction {
     Paste {
         pasted_root_id: Uuid,
     },
+    /// Plans-Phase-10: a freshly created note. Undo deletes the row;
+    /// `blob_path` (when present, e.g. for image-picker creates) is the
+    /// vault-relative path so the on-disk blob can be GC'd in lockstep
+    /// with the row.
+    Create {
+        id: Uuid,
+        blob_path: Option<String>,
+    },
 }
 
 /// Bounded ring buffer of undo entries. The newest entry is at the back;

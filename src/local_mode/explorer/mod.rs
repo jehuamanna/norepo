@@ -479,6 +479,11 @@ pub fn ExplorerPanel() -> Element {
     let on_add_root_markdown_note = use_callback(move |project_id: Uuid| {
         match note_repo_for_add_root.create(project_id, None, "") {
             Ok(n) => {
+                // Plans-Phase-10: undoable create.
+                history.write().push(history::ExplorerAction::Create {
+                    id: n.id,
+                    blob_path: None,
+                });
                 note_version.with_mut(|v| *v += 1);
                 renaming_note_setter.set(Some(n.id));
             }
@@ -564,6 +569,12 @@ pub fn ExplorerPanel() -> Element {
                     if let Err(e) = note_repo.set_blob_path(row.id, Some(&rel)) {
                         eprintln!("operon: set_blob_path failed: {e}");
                     }
+                    // Plans-Phase-10: undoable create — pass the blob path
+                    // so undo can GC the orphaned file.
+                    history.write().push(history::ExplorerAction::Create {
+                        id: row.id,
+                        blob_path: Some(rel.clone()),
+                    });
                     note_version.with_mut(|v| *v += 1);
                     renaming_note_setter.set(Some(row.id));
                 }
@@ -649,7 +660,13 @@ pub fn ExplorerPanel() -> Element {
         match note_repo_for_rename.rename(id, &new_title) {
             Ok(()) => {
                 if let Some(prev) = prev_title_for_undo {
-                    if prev != new_title {
+                    // Plans-Phase-10: when prev_title was empty, this rename
+                    // is the user committing the title of a freshly-created
+                    // note. Skip pushing a Rename inverse — the Create
+                    // entry the create handler already pushed will undo
+                    // both the title and the row in one shot. Keeps the
+                    // stack tidy (one entry per user gesture).
+                    if !prev.is_empty() && prev != new_title {
                         history.write().push(history::ExplorerAction::Rename {
                             id,
                             prev_title: prev,
@@ -745,6 +762,11 @@ pub fn ExplorerPanel() -> Element {
         match kind {
             NoteKind::Markdown => match note_repo_for_add_child.create(project_id, Some(parent_id), "") {
                 Ok(n) => {
+                    // Plans-Phase-10: undoable create.
+                    history.write().push(history::ExplorerAction::Create {
+                        id: n.id,
+                        blob_path: None,
+                    });
                     note_version.with_mut(|v| *v += 1);
                     renaming_note_setter.set(Some(n.id));
                 }
@@ -793,6 +815,11 @@ pub fn ExplorerPanel() -> Element {
                     ) {
                         eprintln!("operon: add sibling: move_to failed: {e}");
                     }
+                    // Plans-Phase-10: undoable create.
+                    history.write().push(history::ExplorerAction::Create {
+                        id: n.id,
+                        blob_path: None,
+                    });
                     note_version.with_mut(|v| *v += 1);
                     renaming_note_setter.set(Some(n.id));
                 }
@@ -895,6 +922,8 @@ pub fn ExplorerPanel() -> Element {
     // Failures log + emit a toast; the entry is still consumed so the
     // user moves on.
     let note_repo_for_undo = note_repo.clone();
+    // Plans-Phase-10: cloned for the Create-undo arm's blob-GC walk.
+    let project_repo_for_undo = project_repo.clone();
     let crate::local_mode::desktop::LocalNoteLinkRepo(link_repo_for_undo) =
         use_context::<crate::local_mode::desktop::LocalNoteLinkRepo>();
     let persistence_for_undo: Arc<dyn Persistence> = use_context();
@@ -980,6 +1009,37 @@ pub fn ExplorerPanel() -> Element {
                         kind: crate::local_mode::ui::ToastKind::Error,
                     }));
                     return;
+                }
+            }
+            history::ExplorerAction::Create { id, blob_path } => {
+                // Plans-Phase-10: undo of create deletes the row (cascade
+                // kills any children the user has since added beneath it,
+                // but for a freshly-created note there usually aren't any)
+                // and removes the on-disk blob for image notes — only if
+                // no other note still references it.
+                if let Err(e) = note_repo_for_undo.delete(id) {
+                    eprintln!("operon: undo create failed: {e}");
+                    toast_slot.set(Some(crate::local_mode::ui::Toast {
+                        message: format!("Undo failed: {e}"),
+                        kind: crate::local_mode::ui::ToastKind::Error,
+                    }));
+                    return;
+                }
+                if let Some(rel) = blob_path {
+                    if let Some(vault) = vault_root_signal.read().clone() {
+                        let projects = project_repo_for_undo.list().unwrap_or_default();
+                        let still_referenced = projects.iter().any(|p| {
+                            note_repo_for_undo
+                                .list_for_project(p.id)
+                                .map(|notes| {
+                                    notes.iter().any(|n| n.blob_path.as_deref() == Some(rel.as_str()))
+                                })
+                                .unwrap_or(false)
+                        });
+                        if !still_referenced {
+                            let _ = std::fs::remove_file(vault.path().join(&rel));
+                        }
+                    }
                 }
             }
         }
@@ -1705,6 +1765,10 @@ pub fn ExplorerPanel() -> Element {
             // Scope check is implicit — the listener only fires for events
             // whose target is inside this div, so the editor's intrinsic
             // undo (Monaco) is left alone when focus is in the editor.
+            // Plans-Phase-10: also skip while the user is mid-rename so the
+            // input keeps its intrinsic text-undo. Otherwise pressing
+            // Cmd+Z while typing the title of a freshly-created note
+            // would yank the row out from under them.
             onkeydown: move |evt| {
                 let key = evt.key().to_string();
                 let mods = evt.modifiers();
@@ -1713,6 +1777,7 @@ pub fn ExplorerPanel() -> Element {
                 if with_meta
                     && !mods.contains(keyboard_types::Modifiers::SHIFT)
                     && key.eq_ignore_ascii_case("z")
+                    && renaming_note.read().is_none()
                 {
                     evt.prevent_default();
                     evt.stop_propagation();
