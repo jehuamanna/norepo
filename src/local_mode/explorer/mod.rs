@@ -501,6 +501,10 @@ pub fn ExplorerPanel() -> Element {
     // ===== Note handlers =====
     let mut tabs_for_select = tabs;
     let scheduler_for_select = save_scheduler.clone();
+    // Plans-Phase-2-editor-auto-focus: the editor host listens to this
+    // app-scope signal and grants focus when its note id matches. Gated on
+    // `renaming_note.is_none()` so the rename input keeps the caret.
+    let crate::editor::RequestEditorFocus(mut request_editor_focus) = use_context();
     let on_select_note = use_callback(move |note_id: Uuid| {
         selected_note.set(Some(note_id));
         // Find note metadata to get the title; fall back to the id.
@@ -519,6 +523,10 @@ pub fn ExplorerPanel() -> Element {
             String::new(),
         );
         let _ = tabs_for_select.write();
+        // Plans-Phase-2: grant focus only when no rename input is alive.
+        if renaming_note.read().is_none() {
+            request_editor_focus.set(Some(note_id.to_string()));
+        }
     });
 
     // Plans-Phase-5-vfs-wikilinks: rename propagation.

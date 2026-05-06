@@ -69,6 +69,13 @@ pub fn App() -> Element {
     let tabs: Signal<TabManager> = use_signal(TabManager::new);
     use_context_provider(|| tabs);
 
+    // Plans-Phase-2-editor-auto-focus: app-scope signal that asks the
+    // editor host to take keyboard focus after mount. Carries the note id
+    // (string) of the editor that should be focused; cleared by the host
+    // once it dispatches `EditorCommand::Focus`.
+    let request_editor_focus: Signal<Option<String>> = use_signal(|| None);
+    use_context_provider(|| crate::editor::RequestEditorFocus(request_editor_focus));
+
     // Local Mode wiring: install the LocalUserRepo / LocalSettingsRepo before any
     // component reads them. Then resolve the remembered mode from
     // `local_app_settings`; if absent, AppState defaults to NonLocal but we

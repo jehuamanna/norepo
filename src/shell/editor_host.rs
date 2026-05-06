@@ -52,13 +52,16 @@ pub fn MonacoEditorHost(
         use std::rc::Rc;
 
         use crate::editor::{
-            BackendInit, EditorBackend, MonacoBackend,
+            BackendInit, EditorBackend, EditorCommand, MonacoBackend, RequestEditorFocus,
         };
         use crate::theme::{editor_theme, Theme};
 
         let theme: Signal<Theme> = use_context();
         let backend: Signal<Rc<RefCell<MonacoBackend>>> =
             use_signal(|| Rc::new(RefCell::new(MonacoBackend::new())));
+        // Plans-Phase-2-editor-auto-focus: read the app-scope focus-request
+        // signal so we can grant focus when our note id matches.
+        let RequestEditorFocus(mut focus_request) = use_context();
 
         // Mount once on first render with the host element. Re-runs are safe — MonacoBackend
         // tracks `disposed` internally and stale calls are no-ops.
@@ -67,6 +70,7 @@ pub fn MonacoEditorHost(
         let initial_content = content.clone();
         let language_for_effect = language.clone();
         let theme_blob = editor_theme::monaco_blob(&theme.read());
+        let note_id_for_effect = note_id.clone();
 
         use_effect(move || {
             let host_id = host_id_for_effect.clone();
@@ -75,6 +79,7 @@ pub fn MonacoEditorHost(
             let theme_blob = theme_blob.clone();
             let backend = backend.clone();
             let on_change = on_change;
+            let note_id_capture = note_id_for_effect.clone();
             spawn(async move {
                 let Some(window) = web_sys::window() else { return };
                 let Some(doc) = window.document() else { return };
@@ -92,6 +97,17 @@ pub fn MonacoEditorHost(
                     bk.borrow().on_change(Box::new(move |new_content| {
                         on_change.call(new_content);
                     }));
+                    // Plans-Phase-2-editor-auto-focus: if our note is the one
+                    // requesting focus, dispatch and clear the signal.
+                    let wants_focus = focus_request
+                        .read()
+                        .as_deref()
+                        .map(|id| id == note_id_capture.as_str())
+                        .unwrap_or(false);
+                    if wants_focus {
+                        bk.borrow().dispatch(EditorCommand::Focus);
+                        focus_request.set(None);
+                    }
                 }
             });
         });

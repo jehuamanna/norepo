@@ -46,6 +46,14 @@ pub struct EditorState {
     pub scroll: u32,
 }
 
+/// Plans-Phase-2-editor-auto-focus: app-scope signal that requests
+/// keyboard focus for the editor mounted with the matching note id (string
+/// form of the note's UUID). The editor host consumes the value, calls
+/// `EditorCommand::Focus`, and clears the signal so it doesn't fire again
+/// on unrelated rerenders.
+#[derive(Clone, Copy)]
+pub struct RequestEditorFocus(pub dioxus::prelude::Signal<Option<String>>);
+
 /// Editor commands dispatched via [`EditorBackend::dispatch`]. Backends route these to their
 /// underlying library.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
