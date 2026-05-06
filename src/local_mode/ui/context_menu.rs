@@ -171,11 +171,35 @@ fn ContextMenuRow(props: ContextMenuRowProps) -> Element {
     }
 
     // Submenu open state + the anchor coordinates we'll position against.
+    // Plans-Phase-6 (follow-up F3): the anchor is now derived from the
+    // parent row's `getBoundingClientRect()` (captured in `onmounted`) so
+    // keyboard-only submenu reveal (`ArrowRight`) lands at the correct
+    // position instead of (0,0).
     let mut sub_open: Signal<bool> = use_signal(|| false);
     let mut sub_anchor: Signal<(i32, i32)> = use_signal(|| (0, 0));
 
     let testid_for_submenu = format!("{testid}-submenu");
     let chevron = if has_children { " \u{25B8}" } else { "" };
+
+    // Captures the row's right-edge / top once it mounts (and again every
+    // time it's re-rendered with new layout — Dioxus fires `onmounted` on
+    // each insertion). On desktop this is a no-op (try_as_web_event
+    // returns None) and we fall back to cursor coordinates supplied by
+    // the mouse/click handlers.
+    let capture_anchor = move |evt: Event<MountedData>| {
+        #[cfg(target_arch = "wasm32")]
+        {
+            use dioxus::web::WebEventExt;
+            if let Some(node) = evt.data().try_as_web_event() {
+                let rect = node.get_bounding_client_rect();
+                sub_anchor.set((rect.right() as i32, rect.top() as i32));
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = evt;
+        }
+    };
 
     rsx! {
         button {
@@ -185,10 +209,20 @@ fn ContextMenuRow(props: ContextMenuRowProps) -> Element {
             "aria-haspopup": if has_children { "menu" } else { "false" },
             "aria-expanded": if has_children { if *sub_open.read() { "true" } else { "false" } } else { "false" },
             disabled: !enabled,
+            onmounted: capture_anchor,
             onmouseenter: move |evt| {
                 if has_children && enabled {
-                    let coords = evt.client_coordinates();
-                    sub_anchor.set((coords.x as i32 + 140, coords.y as i32 - 4));
+                    // Web: rely on the cached anchor from onmounted. Desktop:
+                    // overwrite with cursor coords (no DOM rect available).
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let coords = evt.client_coordinates();
+                        sub_anchor.set((coords.x as i32 + 140, coords.y as i32 - 4));
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let _ = evt;
+                    }
                     sub_open.set(true);
                 }
             },
@@ -213,8 +247,15 @@ fn ContextMenuRow(props: ContextMenuRowProps) -> Element {
                 evt.stop_propagation();
                 if !enabled { return; }
                 if has_children {
-                    let coords = evt.client_coordinates();
-                    sub_anchor.set((coords.x as i32 + 140, coords.y as i32 - 4));
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let coords = evt.client_coordinates();
+                        sub_anchor.set((coords.x as i32 + 140, coords.y as i32 - 4));
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let _ = evt;
+                    }
                     let was_open = *sub_open.read();
                     sub_open.set(!was_open);
                 } else {
