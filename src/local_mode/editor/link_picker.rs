@@ -10,16 +10,30 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use dioxus::prelude::*;
-use operon_store::repos::SearchKind;
+use operon_store::repos::{NoteKind, SearchKind};
 
 use crate::local_mode::explorer::ExplorerSearchRepo;
 
+/// What the user picked from `LinkPicker`. The caller decides whether to
+/// insert the markdown link form `[[target]]` or the embed form
+/// `![[target]]` — the picker just reports the chosen target plus the
+/// kind hint so the caller can branch.
+///
+/// Plans-Phase-9-wikilink-picker (rev 1): `embed = true` when the picked
+/// hit is a `NoteKind::Image` row. Project hits and markdown notes are
+/// `embed = false`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PickedLink {
+    pub target: String,
+    pub embed: bool,
+}
+
 #[component]
-pub fn LinkPicker(open: Signal<bool>, on_pick: EventHandler<String>) -> Element {
+pub fn LinkPicker(open: Signal<bool>, on_pick: EventHandler<PickedLink>) -> Element {
     let search_repo: ExplorerSearchRepo = use_context();
     let mut query: Signal<String> = use_signal(String::new);
-    let mut results: Signal<Vec<(String, String)>> = use_signal(Vec::new);
-    // (target, breadcrumb-for-display)
+    // (target, breadcrumb-for-display, kind: None=project, Some(NoteKind)=note)
+    let mut results: Signal<Vec<(String, String, Option<NoteKind>)>> = use_signal(Vec::new);
 
     let mut close = move || {
         open.set(false);
@@ -41,15 +55,15 @@ pub fn LinkPicker(open: Signal<bool>, on_pick: EventHandler<String>) -> Element 
             let loader = |_id: uuid::Uuid| -> Option<String> { None };
             match search_repo.0.search(needle.trim(), false, 50, &loader) {
                 Ok(hits) => {
-                    let rows: Vec<(String, String)> = hits
+                    let rows: Vec<(String, String, Option<NoteKind>)> = hits
                         .into_iter()
                         .map(|h| match h.kind {
-                            SearchKind::Project => (h.title.clone(), h.breadcrumb),
+                            SearchKind::Project => (h.title.clone(), h.breadcrumb, None),
                             SearchKind::Note => {
                                 // Compose "Project/Title" so vfs::resolve_link
                                 // treats it as Absolute and resolves uniquely.
                                 let target = h.breadcrumb.replace(" / ", "/");
-                                (target, h.breadcrumb)
+                                (target, h.breadcrumb, h.note_kind)
                             }
                         })
                         .collect();
@@ -98,17 +112,48 @@ pub fn LinkPicker(open: Signal<bool>, on_pick: EventHandler<String>) -> Element 
                 ul {
                     class: "operon-modal-results",
                     style: "list-style: none; padding: 0; margin: 0.5rem 0; max-height: 16rem; overflow-y: auto;",
-                    for (i, (target, breadcrumb)) in results.read().iter().cloned().enumerate() {
+                    for (i, (target, breadcrumb, note_kind)) in results.read().iter().cloned().enumerate() {
                         li {
                             key: "{i}-{target}",
                             class: "operon-modal-result",
                             style: "padding: 0.25rem 0.5rem; cursor: pointer; border-radius: 0.25rem;",
                             "data-testid": "link-picker-result",
+                            "data-note-kind": match note_kind {
+                                Some(NoteKind::Markdown) => "markdown",
+                                Some(NoteKind::Image) => "image",
+                                None => "project",
+                            },
                             onclick: move |evt| {
                                 evt.stop_propagation();
-                                on_pick.call(target.clone());
+                                let embed = matches!(note_kind, Some(NoteKind::Image));
+                                on_pick.call(PickedLink { target: target.clone(), embed });
                                 close();
                             },
+                            // Plans-Phase-9-wikilink-picker (rev 1): kind
+                            // badge mirrors the explorer-row convention
+                            // (note_row.rs:651-663) so the user can see at a
+                            // glance whether picking will insert `[[…]]` or
+                            // `![[…]]`. Project hits get no badge — they
+                            // can't be embedded.
+                            if let Some(kind) = note_kind {
+                                {
+                                    let (label, css) = match kind {
+                                        NoteKind::Markdown => ("[md]", "kind-badge kind-md"),
+                                        NoteKind::Image => ("[im]", "kind-badge kind-im"),
+                                    };
+                                    rsx! {
+                                        span {
+                                            class: "{css} text-[0.65rem] mr-1 px-1 rounded select-none opacity-60",
+                                            "data-testid": "kind-badge",
+                                            "data-note-kind": match kind {
+                                                NoteKind::Markdown => "markdown",
+                                                NoteKind::Image => "image",
+                                            },
+                                            "{label}"
+                                        }
+                                    }
+                                }
+                            }
                             "{breadcrumb}"
                         }
                     }

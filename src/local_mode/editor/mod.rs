@@ -28,7 +28,7 @@ use crate::plugins::markdown::wikilink;
 use crate::tabs::{SaveScheduler, Tab, TabId, TabManager};
 
 mod link_picker;
-pub use link_picker::LinkPicker;
+pub use link_picker::{LinkPicker, PickedLink};
 
 /// Shared callback installed at LocalShell scope. The keyboard handler at the
 /// shell root (Ctrl+S) and the explicit Save button both invoke this. It looks
@@ -676,13 +676,21 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
     };
 
     let mut tabs_for_link = tabs;
-    let on_pick_link = move |target: String| {
+    let on_pick_link = move |picked: PickedLink| {
         let current = tabs_for_link
             .read()
             .get(tab_id)
             .map(|t| t.content.clone())
             .unwrap_or_default();
-        let inserted = format!("[[{target}]]");
+        // Plans-Phase-9-wikilink-picker (rev 1): image picks insert the
+        // embed form so MarkdownView's `WikiLinkImageResolver` renders an
+        // inline `<img>`; markdown / project picks stay on the clickable
+        // text-anchor `[[…]]` form.
+        let inserted = if picked.embed {
+            format!("![[{}]]", picked.target)
+        } else {
+            format!("[[{}]]", picked.target)
+        };
         spawn(async move {
             let caret = read_caret_pos(tab_id).await;
             let next = match caret {
