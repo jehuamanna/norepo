@@ -436,9 +436,16 @@ pub fn ExplorerPanel() -> Element {
     // Reads the chosen file, writes via images::write_image, mints an
     // image-note row, and attaches blob_path. Lives entirely on the
     // desktop side because rfd is desktop-only.
+    //
+    // Plans-Phase-6 (follow-up F1): generalised to accept a `parent_id` and
+    // optional `sibling_after_idx` so the same picker drives the project,
+    // child, and sibling Image submenu leaves. Newly-created rows enter
+    // inline rename (item 3 — auto-rename on Image create).
     let note_repo_for_add_image = note_repo.clone();
     let crate::local_mode::CurrentVaultRoot(vault_root_signal) = use_context();
-    let on_add_image_note = use_callback(move |project_id: Uuid| {
+    let on_pick_image_note = use_callback(move |
+        (project_id, parent_id, sibling_after_idx): (Uuid, Option<Uuid>, Option<i64>),
+    | {
         let Some(vault) = vault_root_signal.read().clone() else {
             eprintln!("operon: add image note: no vault");
             return;
@@ -491,13 +498,20 @@ pub fn ExplorerPanel() -> Element {
                 .and_then(|s| s.to_str())
                 .unwrap_or("Image")
                 .to_string();
-            match note_repo.create_with_kind(project_id, None, &stem, NoteKind::Image) {
+            match note_repo.create_with_kind(project_id, parent_id, &stem, NoteKind::Image) {
                 Ok(row) => {
+                    // Sibling case: relocate immediately after the anchor.
+                    if let Some(idx) = sibling_after_idx {
+                        if let Err(e) = note_repo.move_to(row.id, project_id, parent_id, idx) {
+                            eprintln!("operon: image sibling move_to failed: {e}");
+                        }
+                    }
                     let rel = written.relative_path.to_string_lossy().to_string();
                     if let Err(e) = note_repo.set_blob_path(row.id, Some(&rel)) {
                         eprintln!("operon: set_blob_path failed: {e}");
                     }
                     note_version.with_mut(|v| *v += 1);
+                    renaming_note_setter.set(Some(row.id));
                 }
                 Err(e) => eprintln!("operon: create image note failed: {e}"),
             }
@@ -506,13 +520,12 @@ pub fn ExplorerPanel() -> Element {
 
     // Plans-Phase-1-note-creation-context-menu: unified project-level Add
     // note dispatch. The submenu's Markdown leaf takes the existing fast
-    // path (auto-rename); Image leaf reuses the file-picker path. Both
-    // come through this single callback so the project_row prop is one
-    // signature instead of two.
+    // path (auto-rename); Image leaf reuses the generalised picker path
+    // with parent_id=None and no sibling anchor.
     let on_add_project_note =
         use_callback(move |(project_id, kind): (Uuid, NoteKind)| match kind {
             NoteKind::Markdown => on_add_root_markdown_note.call(project_id),
-            NoteKind::Image => on_add_image_note.call(project_id),
+            NoteKind::Image => on_pick_image_note.call((project_id, None, None)),
         });
 
     // ===== Note handlers =====
@@ -691,10 +704,8 @@ pub fn ExplorerPanel() -> Element {
     let note_repo_for_add_child = note_repo.clone();
     let mut expand_ancestors_for_child = expand_ancestors.clone();
     // Plans-Phase-1-note-creation-context-menu: kind-aware add-child dispatch.
-    // Markdown → existing fast path with auto-rename. Image → mints an
-    // empty Image row at the same parent; attaching the image bytes uses
-    // the existing image-paste / drop / picker flows on the new row
-    // (full child-level picker integration is a follow-up).
+    // Markdown → existing fast path with auto-rename. Image → drives the
+    // file picker via on_pick_image_note (item 2 — picker for child).
     let on_add_child_note = use_callback(move |(parent_id, kind): (Uuid, NoteKind)| {
         let project_id = notes_by_project
             .read()
@@ -705,21 +716,17 @@ pub fn ExplorerPanel() -> Element {
             return;
         };
         expand_ancestors_for_child(project_id, Some(parent_id));
-        let res = match kind {
-            NoteKind::Markdown => note_repo_for_add_child.create(project_id, Some(parent_id), ""),
-            NoteKind::Image => note_repo_for_add_child.create_with_kind(
-                project_id,
-                Some(parent_id),
-                "",
-                NoteKind::Image,
-            ),
-        };
-        match res {
-            Ok(n) => {
-                note_version.with_mut(|v| *v += 1);
-                renaming_note_setter.set(Some(n.id));
+        match kind {
+            NoteKind::Markdown => match note_repo_for_add_child.create(project_id, Some(parent_id), "") {
+                Ok(n) => {
+                    note_version.with_mut(|v| *v += 1);
+                    renaming_note_setter.set(Some(n.id));
+                }
+                Err(e) => eprintln!("operon: create child note failed: {e}"),
+            },
+            NoteKind::Image => {
+                on_pick_image_note.call((project_id, Some(parent_id), None));
             }
-            Err(e) => eprintln!("operon: create child note failed: {e}"),
         }
     });
 
@@ -731,8 +738,9 @@ pub fn ExplorerPanel() -> Element {
     let note_repo_for_add_sibling = note_repo.clone();
     let mut expand_ancestors_for_sibling = expand_ancestors.clone();
     // Plans-Phase-1-note-creation-context-menu: kind-aware add-sibling.
-    // Markdown branch unchanged. Image branch creates an empty Image row;
-    // bytes are attached via the existing image-paste / drop flow.
+    // Markdown branch creates + move_to(target_idx+1) + auto-rename.
+    // Image branch routes through on_pick_image_note with the target's
+    // sibling-index+1 as the anchor (item 2 — picker for sibling).
     let on_add_sibling_note = use_callback(move |(target_id, kind): (Uuid, NoteKind)| {
         let snapshot = notes_by_project.read();
         let mut found: Option<(Uuid, Option<Uuid>, i64)> = None;
@@ -748,26 +756,25 @@ pub fn ExplorerPanel() -> Element {
             return;
         };
         expand_ancestors_for_sibling(project_id, parent_id);
-        let create_res = match kind {
-            NoteKind::Markdown => note_repo_for_add_sibling.create(project_id, parent_id, ""),
-            NoteKind::Image => note_repo_for_add_sibling.create_with_kind(
-                project_id,
-                parent_id,
-                "",
-                NoteKind::Image,
-            ),
-        };
-        match create_res {
-            Ok(n) => {
-                if let Err(e) =
-                    note_repo_for_add_sibling.move_to(n.id, project_id, parent_id, target_idx + 1)
-                {
-                    eprintln!("operon: add sibling: move_to failed: {e}");
+        match kind {
+            NoteKind::Markdown => match note_repo_for_add_sibling.create(project_id, parent_id, "") {
+                Ok(n) => {
+                    if let Err(e) = note_repo_for_add_sibling.move_to(
+                        n.id,
+                        project_id,
+                        parent_id,
+                        target_idx + 1,
+                    ) {
+                        eprintln!("operon: add sibling: move_to failed: {e}");
+                    }
+                    note_version.with_mut(|v| *v += 1);
+                    renaming_note_setter.set(Some(n.id));
                 }
-                note_version.with_mut(|v| *v += 1);
-                renaming_note_setter.set(Some(n.id));
+                Err(e) => eprintln!("operon: create sibling note failed: {e}"),
+            },
+            NoteKind::Image => {
+                on_pick_image_note.call((project_id, parent_id, Some(target_idx + 1)));
             }
-            Err(e) => eprintln!("operon: create sibling note failed: {e}"),
         }
     });
 
