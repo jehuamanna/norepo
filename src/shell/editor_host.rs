@@ -205,25 +205,40 @@ pub fn MonacoEditorHost(
                             try {{
                                 if (!handle || !handle.layout) return;
                                 handle.layout();
+                                // Plans-Phase-9-monaco-desktop (rev 12):
+                                // also report whether Monaco actually
+                                // created its DOM inside the host.
+                                // `.monaco-editor` is the root element
+                                // Monaco injects on `editor.create`. If
+                                // it's missing or empty, Monaco mounted
+                                // but didn't render — likely a CSS
+                                // injection problem.
+                                const me = target.querySelector(".monaco-editor");
+                                const childCount = target.childElementCount;
+                                const meRect = me ? me.getBoundingClientRect() : null;
                                 dioxus.send({{
                                     type:"diag",
                                     phase:"relayout-"+label,
-                                    origin: "w="+target.clientWidth+" h="+target.clientHeight,
+                                    origin: "host="+target.clientWidth+"x"+target.clientHeight
+                                          + " kids="+childCount
+                                          + " me="+(me ? "yes" : "no")
+                                          + (meRect ? " meRect="+Math.round(meRect.width)+"x"+Math.round(meRect.height) : ""),
                                 }});
                             }} catch (e) {{}}
                         }};
-                        setTimeout(() => relayout("0ms"), 0);
+                        // Plans-Phase-9-monaco-desktop (rev 12): drop
+                        // the 0ms retry (fires before Monaco finishes
+                        // its first render — re-entering layout()
+                        // mid-init confused the renderer in earlier
+                        // tests). Drop the ResizeObserver — the size-
+                        // gated mount in rev 10 already waits for
+                        // non-zero dimensions, and Monaco's own
+                        // automaticLayout catches subsequent changes.
+                        // The remaining 100/500/2000 ms calls are
+                        // mostly diagnostic at this point.
                         setTimeout(() => relayout("100ms"), 100);
                         setTimeout(() => relayout("500ms"), 500);
                         setTimeout(() => relayout("2s"), 2000);
-                        // Also observe the host element directly so we
-                        // catch any later size change and re-layout.
-                        try {{
-                            const ro = new ResizeObserver(() => {{
-                                relayout("ro");
-                            }});
-                            ro.observe(target);
-                        }} catch (e) {{}}
                         // Suppress change events fired by programmatic
                         // setContent so Rust doesn't see its own write
                         // bounce back as user input.
