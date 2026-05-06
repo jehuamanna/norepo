@@ -927,11 +927,21 @@ pub fn ExplorerPanel() -> Element {
     let crate::local_mode::desktop::LocalNoteLinkRepo(link_repo_for_undo) =
         use_context::<crate::local_mode::desktop::LocalNoteLinkRepo>();
     let persistence_for_undo: Arc<dyn Persistence> = use_context();
+    // Plans-Phase-11: clones for the on_redo closure (which also touches
+    // the link repo + persistence to apply the forward-direction
+    // referrer-body rewrite during a Rename redo).
+    let link_repo_for_redo = link_repo_for_undo.clone();
+    let persistence_for_redo = persistence_for_undo.clone();
     // Plans-Phase-8: app-scope toast slot for surfacing undo failures.
     let crate::local_mode::ui::ToastSlot(mut toast_slot) = use_context();
     let on_undo = use_callback(move |_: ()| {
         let action = history.write().pop();
         let Some(action) = action else { return };
+        // Plans-Phase-11: clone the action up front so we can push it
+        // onto the redo deque after a successful apply, *if* the variant
+        // supports redo. Variants that don't (MoveWithin / Paste /
+        // Create) are simply dropped after applying.
+        let redo_clone = action.clone();
         match action {
             history::ExplorerAction::Rename {
                 id,
@@ -972,6 +982,9 @@ pub fn ExplorerPanel() -> Element {
                         });
                     }
                 }
+                // Plans-Phase-11: Rename is fully reversible (both titles
+                // stored in the variant), so push to redo.
+                history.write().push_redo(redo_clone);
             }
             history::ExplorerAction::MoveWithin {
                 id,
@@ -989,6 +1002,8 @@ pub fn ExplorerPanel() -> Element {
                     }));
                     return;
                 }
+                // Plans-Phase-11: MoveWithin not redoable — see the
+                // variant doc-comment for rationale.
             }
             history::ExplorerAction::Delete { snapshot } => {
                 if let Err(e) = note_repo_for_undo.restore_subtree(&snapshot) {
@@ -999,6 +1014,10 @@ pub fn ExplorerPanel() -> Element {
                     }));
                     return;
                 }
+                // Plans-Phase-11: Delete is redoable — the snapshot
+                // carries everything needed for the forward direction
+                // (re-delete root_id).
+                history.write().push_redo(redo_clone);
             }
             history::ExplorerAction::Paste { pasted_root_id } => {
                 // Cascade kills descendants automatically via the FK.
@@ -1010,6 +1029,9 @@ pub fn ExplorerPanel() -> Element {
                     }));
                     return;
                 }
+                // Plans-Phase-11: Paste forward direction would need the
+                // original clipboard payload, which we no longer have.
+                // Skip from redo.
             }
             history::ExplorerAction::Create { id, blob_path } => {
                 // Plans-Phase-10: undo of create deletes the row (cascade
@@ -1043,6 +1065,77 @@ pub fn ExplorerPanel() -> Element {
                 }
             }
         }
+        note_version.with_mut(|v| *v += 1);
+    });
+
+    // Plans-Phase-11-redo-stack: pop from the redo deque and apply the
+    // forward direction. Mirrors `on_undo` — same toast-on-failure
+    // pattern, same note_version bump on success. Only the variants
+    // that were re-pushed onto redo by `on_undo` (Rename, Delete) end
+    // up here; MoveWithin / Paste / Create are dropped during undo so
+    // pop_redo never sees them.
+    let note_repo_for_redo = note_repo.clone();
+    let on_redo = use_callback(move |_: ()| {
+        let action = history.write().pop_redo();
+        let Some(action) = action else { return };
+        let undo_clone = action.clone();
+        match action {
+            history::ExplorerAction::Rename {
+                id,
+                prev_title,
+                project_name,
+                new_title,
+            } => {
+                // Forward direction: rename (id, new_title) + rewrite in
+                // the forward direction (prev_title -> new_title).
+                if let Err(e) = note_repo_for_redo.rename(id, &new_title) {
+                    eprintln!("operon: redo rename failed: {e}");
+                    toast_slot.set(Some(crate::local_mode::ui::Toast {
+                        message: format!("Redo failed: {e}"),
+                        kind: crate::local_mode::ui::ToastKind::Error,
+                    }));
+                    return;
+                }
+                if let Some(proj_name) = project_name {
+                    if prev_title != new_title {
+                        let link_repo = link_repo_for_redo.clone();
+                        let persistence = persistence_for_redo.clone();
+                        let prev_title_owned = prev_title.clone();
+                        let new_title_owned = new_title.clone();
+                        spawn(async move {
+                            rewrite_referrer_bodies(
+                                id,
+                                &prev_title_owned,
+                                &new_title_owned,
+                                &proj_name,
+                                link_repo,
+                                persistence,
+                            )
+                            .await;
+                        });
+                    }
+                }
+            }
+            history::ExplorerAction::Delete { ref snapshot } => {
+                // Forward direction: re-delete the root id. Cascade kills
+                // descendants automatically via the FK.
+                if let Err(e) = note_repo_for_redo.delete(snapshot.root_id) {
+                    eprintln!("operon: redo delete failed: {e}");
+                    toast_slot.set(Some(crate::local_mode::ui::Toast {
+                        message: format!("Redo failed: {e}"),
+                        kind: crate::local_mode::ui::ToastKind::Error,
+                    }));
+                    return;
+                }
+            }
+            // Variants dropped during undo never reach pop_redo, but the
+            // exhaustive match keeps the compiler honest if a future
+            // variant lands.
+            history::ExplorerAction::MoveWithin { .. }
+            | history::ExplorerAction::Paste { .. }
+            | history::ExplorerAction::Create { .. } => return,
+        }
+        history.write().push_undo(undo_clone);
         note_version.with_mut(|v| *v += 1);
     });
 
@@ -1775,13 +1868,17 @@ pub fn ExplorerPanel() -> Element {
                 let with_meta = mods.contains(keyboard_types::Modifiers::META)
                     || mods.contains(keyboard_types::Modifiers::CONTROL);
                 if with_meta
-                    && !mods.contains(keyboard_types::Modifiers::SHIFT)
                     && key.eq_ignore_ascii_case("z")
                     && renaming_note.read().is_none()
                 {
                     evt.prevent_default();
                     evt.stop_propagation();
-                    on_undo.call(());
+                    if mods.contains(keyboard_types::Modifiers::SHIFT) {
+                        // Plans-Phase-11: Cmd/Ctrl+Shift+Z → redo.
+                        on_redo.call(());
+                    } else {
+                        on_undo.call(());
+                    }
                 }
             },
             style: "list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column;",
