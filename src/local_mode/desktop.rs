@@ -424,6 +424,12 @@ pub fn provide_local_app_signals() {
     use_context_provider(|| SelectedProject(selected_project));
     let selected_note: Signal<Option<Uuid>> = use_signal(|| None);
     use_context_provider(|| SelectedNote(selected_note));
+    // Plans-Phase-4-multiselect-aria: parallel multi-selection set.
+    let multi_selected: Signal<std::collections::BTreeSet<crate::local_mode::explorer::NodeKey>> =
+        use_signal(std::collections::BTreeSet::new);
+    use_context_provider(|| crate::local_mode::explorer::MultiSelected(multi_selected));
+    let last_clicked: Signal<Option<crate::local_mode::explorer::NodeKey>> = use_signal(|| None);
+    use_context_provider(|| crate::local_mode::explorer::LastClicked(last_clicked));
     let drag_session: Signal<Option<DragKind>> = use_signal(|| None);
     use_context_provider(|| DragSession(drag_session));
     let clipboard: Signal<Option<Clipboard>> = use_signal(|| None);

@@ -8,6 +8,7 @@ use operon_store::repos::{LocalNote, NoteKind};
 use uuid::Uuid;
 
 use crate::editor::EditorMode;
+use crate::local_mode::explorer::{LastClicked, MultiSelected, NodeKey};
 use crate::local_mode::ui::{
     classify_drop_position, ContextMenu, ContextMenuItem, DragKind, DragSession, DropPosition,
     InlineRename,
@@ -60,6 +61,9 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let drop_indicator: Signal<Option<DropPosition>> = use_signal(|| None);
     let mut drop_indicator_setter = drop_indicator;
     let DragSession(mut drag_session) = use_context();
+    // Plans-Phase-4-multiselect-aria
+    let MultiSelected(mut multi_selected) = use_context();
+    let LastClicked(mut last_clicked) = use_context();
 
     let note = props.note.clone();
     let id = note.id;
@@ -68,7 +72,11 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let depth = props.depth.max(0);
     let has_children = props.has_children;
     let is_open = props.is_open;
-    let selected = props.selected;
+    // Plans-Phase-4: a row is "selected" for visual + ARIA purposes if
+    // either the single-select prop is set OR the multi-selection set
+    // contains it.
+    let in_multi = multi_selected.read().contains(&NodeKey::Note(id));
+    let selected = props.selected || in_multi;
     let in_rename = props.in_rename;
     let is_first_sibling = props.is_first_sibling;
     let is_last_sibling = props.is_last_sibling;
@@ -257,6 +265,40 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
             draggable: "true",
             onclick: move |evt| {
                 evt.stop_propagation();
+                let mods = evt.modifiers();
+                let with_meta = mods.contains(Modifiers::META) || mods.contains(Modifiers::CONTROL);
+                let key = NodeKey::Note(id);
+                if with_meta && !mods.contains(Modifiers::SHIFT) {
+                    // Plans-Phase-4: Ctrl/Cmd+click toggles in the multi-set
+                    // without disturbing the single-select signal.
+                    multi_selected.with_mut(|set| {
+                        if !set.remove(&key) {
+                            set.insert(key);
+                        }
+                    });
+                    last_clicked.set(Some(key));
+                    return;
+                }
+                if mods.contains(Modifiers::SHIFT) {
+                    // Range selection: union with everything between
+                    // last_clicked and the current row in document order.
+                    // Without a global flat-tree memo we approximate by
+                    // adding both endpoints; a proper visible-flat memo is
+                    // a follow-up.
+                    let mut set: std::collections::BTreeSet<NodeKey> =
+                        multi_selected.read().clone();
+                    if let Some(prev) = *last_clicked.read() {
+                        set.insert(prev);
+                    }
+                    set.insert(key);
+                    multi_selected.set(set);
+                    return;
+                }
+                // Plain click: clear multi-set, fall through to single select.
+                if !multi_selected.read().is_empty() {
+                    multi_selected.set(std::collections::BTreeSet::new());
+                }
+                last_clicked.set(Some(key));
                 on_select.call(id);
             },
             ondoubleclick: move |evt| {

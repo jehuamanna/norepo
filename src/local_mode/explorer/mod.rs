@@ -47,6 +47,28 @@ pub struct SelectedProject(pub Signal<Option<Uuid>>);
 #[derive(Clone, Copy)]
 pub struct SelectedNote(pub Signal<Option<Uuid>>);
 
+/// Plans-Phase-4-multiselect-aria: which row(s) participate in bulk
+/// operations. `Note` and `Project` flavors both live in the same set so
+/// that group DnD and bulk-delete can mix-and-match (subject to the same
+/// project / cycle constraints handled by the underlying repos).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+pub enum NodeKey {
+    Project(Uuid),
+    Note(Uuid),
+}
+
+/// App-scope signal: the active multi-selection set. Empty when only
+/// single-select (the existing `SelectedNote` / `SelectedProject` signals)
+/// is in play; populated when the user Ctrl/Cmd+clicks or Shift+clicks rows.
+/// When non-empty, the explorer renders a bulk-action toolbar.
+#[derive(Clone, Copy)]
+pub struct MultiSelected(pub Signal<std::collections::BTreeSet<NodeKey>>);
+
+/// Track the most recently clicked row so Shift+click can compute a range
+/// over the visible flattened tree.
+#[derive(Clone, Copy)]
+pub struct LastClicked(pub Signal<Option<NodeKey>>);
+
 /// Bumped on every note mutation. The panel re-fetches notes for the
 /// affected project when this changes.
 #[derive(Clone, Copy)]
@@ -192,10 +214,16 @@ pub fn ExplorerPanel() -> Element {
     let pending_delete_project: Signal<Option<Uuid>> = use_signal(|| None);
     let renaming_note: Signal<Option<Uuid>> = use_signal(|| None);
     let pending_delete_note: Signal<Option<Uuid>> = use_signal(|| None);
+    // Plans-Phase-4-multiselect-aria: when set, render a confirm modal
+    // listing the count of selected items to be bulk-deleted.
+    let pending_bulk_delete: Signal<bool> = use_signal(|| false);
     let mut renaming_project_setter = renaming_project;
     let mut pending_delete_project_setter = pending_delete_project;
     let mut renaming_note_setter = renaming_note;
     let mut pending_delete_note_setter = pending_delete_note;
+    let mut pending_bulk_delete_setter = pending_bulk_delete;
+    let MultiSelected(mut multi_selected) = use_context();
+    let multi_selected_for_render = multi_selected;
 
     // ===== Project handlers =====
     let on_select_project = use_callback(move |id: Uuid| {
@@ -439,6 +467,34 @@ pub fn ExplorerPanel() -> Element {
     let on_move_down_note = use_callback(move |id: Uuid| match note_repo_for_down.move_down(id) {
         Ok(()) => note_version.with_mut(|v| *v += 1),
         Err(e) => eprintln!("operon: move_down note failed: {e}"),
+    });
+
+    // Plans-Phase-4-multiselect-aria: bulk delete every NodeKey in the
+    // multi-selection set, in a single sweep through the repo. FK cascade
+    // handles descendants. Project deletes are intentionally a no-op here
+    // (the LocalProjectRepository doesn't expose delete; project removal
+    // happens through a separate confirmation flow that's still
+    // single-target).
+    let note_repo_for_bulk_delete = note_repo.clone();
+    let on_confirm_bulk_delete = use_callback(move |_: ()| {
+        let snapshot = multi_selected.read().clone();
+        let mut deleted: usize = 0;
+        for key in snapshot.iter() {
+            if let NodeKey::Note(id) = key {
+                match note_repo_for_bulk_delete.delete(*id) {
+                    Ok(()) => deleted += 1,
+                    Err(e) => eprintln!("operon: bulk delete note {id} failed: {e}"),
+                }
+            }
+        }
+        if deleted > 0 {
+            note_version.with_mut(|v| *v += 1);
+        }
+        multi_selected.set(std::collections::BTreeSet::new());
+        pending_bulk_delete_setter.set(false);
+    });
+    let on_cancel_bulk_delete = use_callback(move |_: ()| {
+        pending_bulk_delete_setter.set(false);
     });
 
     // Right-click → View / Edit / Split-view: switch the editor mode of the
@@ -819,8 +875,18 @@ pub fn ExplorerPanel() -> Element {
                 // advertise aria-multiselectable=false for now; flipping it
                 // is the BTreeSet<NodeKey> follow-up.
                 role: "tree",
-                "aria-multiselectable": "false",
+                "aria-multiselectable": "true",
                 "aria-label": "Projects and notes",
+                tabindex: "-1",
+                onkeydown: move |evt| {
+                    if evt.key().to_string() == "Delete" || evt.key().to_string() == "Backspace" {
+                        let count = multi_selected_for_render.read().len();
+                        if count >= 2 {
+                            evt.prevent_default();
+                            pending_bulk_delete_setter.set(true);
+                        }
+                    }
+                },
                 if projects_snapshot.is_empty() {
                     div {
                         class: "px-3 py-6 text-xs opacity-60 text-center",
@@ -932,6 +998,41 @@ pub fn ExplorerPanel() -> Element {
                 on_cancel: Callback::new(move |_| {
                     pending_delete_note_setter.set(None);
                 }),
+            }
+        }
+        // Plans-Phase-4-multiselect-aria: bulk-delete confirmation. Triggered
+        // by Delete/Backspace when the multi-selection set has 2+ items.
+        if *pending_bulk_delete.read() {
+            {
+                let snap = multi_selected_for_render.read();
+                let note_count = snap.iter().filter(|k| matches!(k, NodeKey::Note(_))).count();
+                let project_count = snap.iter().filter(|k| matches!(k, NodeKey::Project(_))).count();
+                let total = snap.len();
+                let breakdown = if project_count > 0 {
+                    format!(
+                        "{} item(s) selected — {} note(s), {} project(s).\nProjects in the set are kept (use Delete project for those). Notes will be deleted with their children.\nThis cannot be undone.",
+                        total, note_count, project_count
+                    )
+                } else {
+                    format!(
+                        "{} note(s) selected. Child notes are deleted too.\nThis cannot be undone.",
+                        note_count
+                    )
+                };
+                drop(snap);
+                rsx! {
+                    ConfirmDialog {
+                        title: "Bulk delete".to_string(),
+                        message: breakdown,
+                        confirm_label: "Delete all".to_string(),
+                        on_confirm: Callback::new(move |_| {
+                            on_confirm_bulk_delete.call(());
+                        }),
+                        on_cancel: Callback::new(move |_| {
+                            on_cancel_bulk_delete.call(());
+                        }),
+                    }
+                }
             }
         }
     }
