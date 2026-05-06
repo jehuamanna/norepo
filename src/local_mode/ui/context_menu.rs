@@ -66,6 +66,12 @@ pub fn ContextMenu(props: ContextMenuProps) -> Element {
     let style = format!("position: fixed; left: {}px; top: {}px;", props.x, props.y);
     let items = props.items.clone();
     let on_dismiss = props.on_dismiss;
+    // Tracks which row index in this menu currently has its submenu open.
+    // Lifting this out of `ContextMenuRow` enforces mutual exclusion: hovering
+    // a sibling row writes a different index here, which auto-closes the
+    // previously open submenu. Without this, two submenus could be visible at
+    // once because each row owned a private `bool` that no one cleared.
+    let open_submenu: Signal<Option<usize>> = use_signal(|| None);
 
     rsx! {
         // Full-viewport scrim catches outside clicks.
@@ -96,8 +102,10 @@ pub fn ContextMenu(props: ContextMenuProps) -> Element {
                 for (idx, item) in items.into_iter().enumerate() {
                     ContextMenuRow {
                         key: "{idx}",
+                        idx: idx,
                         item: item,
                         on_dismiss: on_dismiss,
+                        open_submenu: open_submenu,
                     }
                 }
             }
@@ -125,6 +133,10 @@ fn SubMenu(props: SubMenuProps) -> Element {
     );
     let items = props.items.clone();
     let on_dismiss = props.on_dismiss;
+    // Each SubMenu owns its own active-child tracker so a deeper nested
+    // submenu (if a leaf were ever promoted to `submenu(...)`) wouldn't
+    // collide with the parent menu's tracker.
+    let open_submenu: Signal<Option<usize>> = use_signal(|| None);
     rsx! {
         div {
             class: "operon-context-menu operon-context-submenu",
@@ -135,8 +147,10 @@ fn SubMenu(props: SubMenuProps) -> Element {
             for (idx, item) in items.into_iter().enumerate() {
                 ContextMenuRow {
                     key: "{idx}",
+                    idx: idx,
                     item: item,
                     on_dismiss: on_dismiss,
+                    open_submenu: open_submenu,
                 }
             }
         }
@@ -145,8 +159,12 @@ fn SubMenu(props: SubMenuProps) -> Element {
 
 #[derive(Props, Clone, PartialEq)]
 struct ContextMenuRowProps {
+    idx: usize,
     item: ContextMenuItem,
     on_dismiss: Callback<()>,
+    /// Parent-owned signal: row index whose submenu is currently open within
+    /// this menu, or `None`. The row is "active" iff this matches `idx`.
+    open_submenu: Signal<Option<usize>>,
 }
 
 #[component]
@@ -161,6 +179,9 @@ fn ContextMenuRow(props: ContextMenuRowProps) -> Element {
     let on_dismiss = props.on_dismiss;
     let children = props.item.children.clone();
     let has_children = !children.is_empty();
+    let my_idx = props.idx;
+    let mut open_submenu = props.open_submenu;
+    let is_open = *open_submenu.read() == Some(my_idx);
 
     let mut class_attr = String::from("operon-context-menu-row");
     if !enabled {
@@ -170,22 +191,20 @@ fn ContextMenuRow(props: ContextMenuRowProps) -> Element {
         class_attr.push_str(" operon-context-menu-row-submenu");
     }
 
-    // Submenu open state + the anchor coordinates we'll position against.
-    // Plans-Phase-6 (follow-up F3): the anchor is now derived from the
-    // parent row's `getBoundingClientRect()` (captured in `onmounted`) so
-    // keyboard-only submenu reveal (`ArrowRight`) lands at the correct
-    // position instead of (0,0).
-    let mut sub_open: Signal<bool> = use_signal(|| false);
+    // Anchor coordinates the SubMenu positions against — the row's
+    // top-right corner (in viewport space). Captured in `onmounted` so
+    // keyboard-only submenu reveal (`ArrowRight`) lands correctly.
     let mut sub_anchor: Signal<(i32, i32)> = use_signal(|| (0, 0));
 
     let testid_for_submenu = format!("{testid}-submenu");
     let chevron = if has_children { " \u{25B8}" } else { "" };
 
-    // Captures the row's right-edge / top once it mounts (and again every
-    // time it's re-rendered with new layout — Dioxus fires `onmounted` on
-    // each insertion). On desktop this is a no-op (try_as_web_event
-    // returns None) and we fall back to cursor coordinates supplied by
-    // the mouse/click handlers.
+    // Capture the row's right-edge / top. On wasm we read the rect
+    // synchronously off the DOM node; on desktop we fall back to the
+    // async `get_client_rect()` so the anchor lands on the row regardless
+    // of where the cursor entered. Without this, the desktop path used
+    // raw cursor coords + 140px and the submenu drifted "far away" from
+    // its parent menu when the user hovered the row's left edge.
     let capture_anchor = move |evt: Event<MountedData>| {
         #[cfg(target_arch = "wasm32")]
         {
@@ -193,11 +212,17 @@ fn ContextMenuRow(props: ContextMenuRowProps) -> Element {
             if let Some(node) = evt.data().try_as_web_event() {
                 let rect = node.get_bounding_client_rect();
                 sub_anchor.set((rect.right() as i32, rect.top() as i32));
+                return;
             }
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = evt;
+            let mounted = evt.data();
+            spawn(async move {
+                if let Ok(rect) = mounted.get_client_rect().await {
+                    sub_anchor.set((rect.max_x() as i32, rect.min_y() as i32));
+                }
+            });
         }
     };
 
@@ -207,37 +232,30 @@ fn ContextMenuRow(props: ContextMenuRowProps) -> Element {
             class: "{class_attr}",
             "data-testid": if has_children { testid_for_submenu.clone() } else { testid.clone() },
             "aria-haspopup": if has_children { "menu" } else { "false" },
-            "aria-expanded": if has_children { if *sub_open.read() { "true" } else { "false" } } else { "false" },
+            "aria-expanded": if has_children { if is_open { "true" } else { "false" } } else { "false" },
             disabled: !enabled,
             onmounted: capture_anchor,
-            onmouseenter: move |evt| {
-                if has_children && enabled {
-                    // Web: rely on the cached anchor from onmounted. Desktop:
-                    // overwrite with cursor coords (no DOM rect available).
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        let coords = evt.client_coordinates();
-                        sub_anchor.set((coords.x as i32 + 140, coords.y as i32 - 4));
-                    }
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        let _ = evt;
-                    }
-                    sub_open.set(true);
+            onmouseenter: move |_| {
+                if !enabled { return; }
+                if has_children {
+                    open_submenu.set(Some(my_idx));
+                } else if open_submenu.read().is_some() {
+                    // Hovering a non-submenu sibling closes any open submenu.
+                    open_submenu.set(None);
                 }
             },
             onkeydown: move |evt| {
                 let key = evt.key().to_string();
                 if has_children && key == "ArrowRight" {
                     evt.prevent_default();
-                    sub_open.set(true);
-                } else if key == "ArrowLeft" && *sub_open.read() {
+                    open_submenu.set(Some(my_idx));
+                } else if key == "ArrowLeft" && is_open {
                     evt.prevent_default();
-                    sub_open.set(false);
+                    open_submenu.set(None);
                 } else if key == "Escape" {
                     evt.prevent_default();
-                    if *sub_open.read() {
-                        sub_open.set(false);
+                    if is_open {
+                        open_submenu.set(None);
                     } else {
                         on_dismiss.call(());
                     }
@@ -247,17 +265,11 @@ fn ContextMenuRow(props: ContextMenuRowProps) -> Element {
                 evt.stop_propagation();
                 if !enabled { return; }
                 if has_children {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        let coords = evt.client_coordinates();
-                        sub_anchor.set((coords.x as i32 + 140, coords.y as i32 - 4));
+                    if is_open {
+                        open_submenu.set(None);
+                    } else {
+                        open_submenu.set(Some(my_idx));
                     }
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        let _ = evt;
-                    }
-                    let was_open = *sub_open.read();
-                    sub_open.set(!was_open);
                 } else {
                     on_click.call(());
                     on_dismiss.call(());
@@ -265,7 +277,7 @@ fn ContextMenuRow(props: ContextMenuRowProps) -> Element {
             },
             "{label}{chevron}"
         }
-        if has_children && *sub_open.read() {
+        if has_children && is_open {
             SubMenu {
                 items: children,
                 anchor_x: sub_anchor.read().0,
