@@ -6,7 +6,7 @@
 use crate::sql::{params, OptionalExtension};
 
 use crate::error::StoreError;
-use crate::sqlite::Store;
+use crate::store::Store;
 
 pub trait LocalSettingsRepository: Send + Sync {
     fn get(&self, key: &str) -> Result<Option<String>, StoreError>;

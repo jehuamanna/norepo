@@ -8,7 +8,7 @@ use crate::sql::params;
 use uuid::Uuid;
 
 use crate::error::StoreError;
-use crate::sqlite::Store;
+use crate::store::Store;
 
 /// One row of the link graph.
 #[derive(Clone, Debug, PartialEq, Eq)]

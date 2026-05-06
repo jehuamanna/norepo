@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::StoreError;
-use crate::sqlite::Store;
+use crate::store::Store;
 use crate::time::now_ms;
 
 const DEFAULT_NOTE_TITLE: &str = "Untitled";

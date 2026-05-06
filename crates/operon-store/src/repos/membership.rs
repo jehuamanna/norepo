@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::StoreError;
 use crate::ids::{DepartmentId, MembershipId, OrgId, UserId};
-use crate::sqlite::Store;
+use crate::store::Store;
 use crate::time::now_ms;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

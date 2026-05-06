@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use crate::sql::params;
 
 use crate::error::StoreError;
-use crate::sqlite::Store;
+use crate::store::Store;
 
 pub trait LocalTreeStateRepository: Send + Sync {
     /// Returns `false` for nodes the user has never toggled.

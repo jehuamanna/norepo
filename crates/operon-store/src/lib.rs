@@ -6,34 +6,41 @@
 
 pub mod error;
 pub mod ids;
-pub mod migrations;
-pub mod repos;
-pub mod sqlite;
-pub mod test_support;
 pub mod time;
+
+// Plans-Phase-2-saving: SQL-using modules are present when either the
+// desktop rusqlite back-end or the wasm-sqlite shim is active. On wasm
+// without the feature, operon-store still compiles but only exposes
+// error/ids/time — useful as a typed surface for shared id helpers.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-sqlite"))]
+pub mod migrations;
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-sqlite"))]
+pub mod repos;
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-sqlite"))]
 pub mod vfs;
 
-// Plans-Phase-2-saving / Option 2: full SQLite-on-wasm.
-// Activated by `--features wasm-sqlite` on a wasm32 target.
-// Build prerequisite: `clang` on the host (sqlite-wasm-rs's build.rs
-// compiles libsqlite3 C source for wasm32-unknown-unknown).
+// Desktop-only (uses r2d2 + rusqlite directly).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod sqlite;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod test_support;
+
+// Plans-Phase-2-saving / Option 2: full SQLite-on-wasm. Activated by
+// `--features wasm-sqlite` on a wasm32 target. Build prerequisite:
+// `clang` on the host.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-sqlite"))]
 pub mod wasm;
 
-// Plans-Phase-2-saving / Option 2: cfg-gated re-export so repos can write
+// Plans-Phase-2-saving: cfg-gated re-export so repos can write
 // `use crate::sql::{Connection, OptionalExtension};` and have it resolve
-// to either rusqlite (desktop) or the wasm shim. The `params!` macro
-// goes through `crate::params!` which is `#[macro_export]`-ed at the
-// crate root by both rusqlite and the shim.
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm-sqlite")))]
+// to either rusqlite (desktop) or the wasm shim.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod sql {
     pub use rusqlite::ffi;
     pub use rusqlite::types;
     pub use rusqlite::{
         Connection, Error, OptionalExtension, Result, Row, Statement, Transaction,
     };
-    /// Re-export rusqlite's `params!` macro at `crate::sql::params!` so
-    /// repos have a single import path on both targets.
     pub use rusqlite::params;
 }
 
@@ -49,14 +56,22 @@ pub mod sql {
     pub use crate::params;
 }
 
+/// Plans-Phase-2-saving: `Store` proxy module. Repos `use crate::store::Store;`
+/// and get the right backend. Desktop = rusqlite-backed `sqlite::Store`
+/// with r2d2 pooling; wasm-sqlite = `wasm::Store` with a Mutex-shared
+/// connection.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-sqlite"))]
+pub mod store {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use crate::sqlite::Store;
+    #[cfg(all(target_arch = "wasm32", feature = "wasm-sqlite"))]
+    pub use crate::wasm::Store;
+}
+
 pub use error::StoreError;
 pub use ids::*;
 
-// Plans-Phase-2-saving: re-export `Store` from whichever backend is
-// active. Desktop builds expose `StoreConfig` + `StoreMode`; the wasm
-// path's open semantics are different (URI string + VFS) so it doesn't
-// surface those types.
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm-sqlite")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub use sqlite::{Store, StoreConfig, StoreMode};
 
 #[cfg(all(target_arch = "wasm32", feature = "wasm-sqlite"))]

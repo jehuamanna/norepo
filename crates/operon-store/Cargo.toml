@@ -4,15 +4,19 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rusqlite = { version = "0.32", features = ["bundled", "blob", "uuid"] }
-r2d2 = "0.8"
-r2d2_sqlite = "0.25"
 uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 tracing = "0.1"
 web-time = "1"
+
+# Desktop-only: bundled SQLite via rusqlite + r2d2 connection pool.
+# Wasm uses the wasm-sqlite feature path below.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite = { version = "0.32", features = ["bundled", "blob", "uuid"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
 
 # Plans-Phase-2-saving: opt-in wasm SQLite back-end. `cargo build` with
 # `--features wasm-sqlite --target wasm32-unknown-unknown` activates the
@@ -25,7 +29,9 @@ web-time = "1"
 default = []
 wasm-sqlite = ["dep:sqlite-wasm-rs"]
 
-[dependencies.sqlite-wasm-rs]
+# Wasm-only optional dep. Activates only when --features wasm-sqlite is
+# passed AND the target is wasm32. Desktop builds never see it.
+[target.'cfg(target_arch = "wasm32")'.dependencies.sqlite-wasm-rs]
 version = "0.5"
 optional = true
 

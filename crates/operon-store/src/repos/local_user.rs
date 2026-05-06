@@ -4,7 +4,7 @@ use crate::sql::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::StoreError;
-use crate::sqlite::Store;
+use crate::store::Store;
 use crate::time::now_ms;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

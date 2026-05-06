@@ -6,7 +6,7 @@ use crate::sql::params;
 use uuid::Uuid;
 
 use crate::error::StoreError;
-use crate::sqlite::Store;
+use crate::store::Store;
 
 /// Cap a single `search()` call to this many hits unless the caller passes a
 /// smaller `limit`. The UI shows `+ N more` if the cap is hit.

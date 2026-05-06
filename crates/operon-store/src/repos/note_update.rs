@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::error::StoreError;
 use crate::ids::NoteId;
-use crate::sqlite::Store;
+use crate::store::Store;
 use crate::time::now_ms;
 
 pub trait NoteUpdateRepository: Send + Sync {

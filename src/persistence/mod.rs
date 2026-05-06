@@ -19,11 +19,19 @@ pub mod memory;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 
+// Plans-Phase-2-saving / Option 2: OPFS-backed Persistence for the web
+// build's Local Mode. Activated together with the `wasm-sqlite` feature
+// since they're mounted as a pair (sqlite metadata + OPFS bodies).
+#[cfg(all(target_arch = "wasm32", feature = "wasm-sqlite"))]
+pub mod opfs;
+
 #[cfg(not(target_arch = "wasm32"))]
 pub use fs::FilesystemPersistence;
 pub use memory::MemoryPersistence;
 #[cfg(target_arch = "wasm32")]
 pub use web::WebPersistence;
+#[cfg(all(target_arch = "wasm32", feature = "wasm-sqlite"))]
+pub use opfs::OpfsPersistence;
 
 /// Lightweight reference returned by `list()`. The `format_id` is captured at write-time when
 /// the backend can determine it (e.g., from filename extension on disk).
