@@ -2,7 +2,7 @@
 //! (title; optionally body via a caller-provided closure). All comparisons are
 //! parameterised — no string concatenation of user input into SQL.
 
-use rusqlite::params;
+use crate::sql::params;
 use uuid::Uuid;
 
 use crate::error::StoreError;
@@ -55,10 +55,10 @@ impl SqliteLocalSearchRepository {
     }
 }
 
-fn invalid_uuid(s: String) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
+fn invalid_uuid(s: String) -> crate::sql::Error {
+    crate::sql::Error::FromSqlConversionFailure(
         0,
-        rusqlite::types::Type::Text,
+        crate::sql::types::Type::Text,
         Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("invalid uuid: {s}"),

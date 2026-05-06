@@ -4,7 +4,7 @@
 //! its body changes; rename / delete propagation walks `referrers_of` and
 //! rewrites raw text inside affected sources.
 
-use rusqlite::params;
+use crate::sql::params;
 use uuid::Uuid;
 
 use crate::error::StoreError;
@@ -134,9 +134,9 @@ impl LocalNoteLinkRepository for SqliteLocalNoteLinkRepository {
         for r in rows {
             let (src, target_text, target_id_opt, is_embed_int) = r?;
             let source_note_id = Uuid::parse_str(&src).map_err(|e| {
-                StoreError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+                StoreError::Sqlite(crate::sql::Error::FromSqlConversionFailure(
                     0,
-                    rusqlite::types::Type::Text,
+                    crate::sql::types::Type::Text,
                     Box::new(e),
                 ))
             })?;

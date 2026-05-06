@@ -1,7 +1,9 @@
 //! Key/value store for local-mode app settings. Used by the startup chooser
 //! to persist `mode_remembered` and similar lightweight preferences.
 
-use rusqlite::{params, OptionalExtension};
+// Plans-Phase-2-saving: imports go through `crate::sql` so the same code
+// builds on desktop (rusqlite) and wasm (the wasm-sqlite shim).
+use crate::sql::{params, OptionalExtension};
 
 use crate::error::StoreError;
 use crate::sqlite::Store;

@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use crate::sql::Connection;
 
 use crate::error::StoreError;
 

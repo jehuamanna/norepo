@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension};
+use crate::sql::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::StoreError;
@@ -46,10 +46,10 @@ impl SqliteTeamRepository {
     }
 }
 
-fn invalid(e: StoreError) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
+fn invalid(e: StoreError) -> crate::sql::Error {
+    crate::sql::Error::FromSqlConversionFailure(
         0,
-        rusqlite::types::Type::Text,
+        crate::sql::types::Type::Text,
         Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             e.to_string(),
@@ -57,7 +57,7 @@ fn invalid(e: StoreError) -> rusqlite::Error {
     )
 }
 
-fn row_to_team(row: &rusqlite::Row<'_>) -> rusqlite::Result<Team> {
+fn row_to_team(row: &crate::sql::Row<'_>) -> crate::sql::Result<Team> {
     let id = TeamId::from_str_strict(&row.get::<_, String>(0)?).map_err(invalid)?;
     let org_id = OrgId::from_str_strict(&row.get::<_, String>(1)?).map_err(invalid)?;
     Ok(Team {

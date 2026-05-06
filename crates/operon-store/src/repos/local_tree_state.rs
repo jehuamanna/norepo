@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use rusqlite::params;
+use crate::sql::params;
 
 use crate::error::StoreError;
 use crate::sqlite::Store;

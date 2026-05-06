@@ -19,7 +19,10 @@ pub enum StoreError {
     #[error("unknown applied migration version {0}")]
     UnknownAppliedVersion(i64),
     #[error(transparent)]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(#[from] crate::sql::Error),
+    /// Plans-Phase-2-saving: r2d2 connection-pool errors are desktop-only.
+    /// The wasm Store guards a single Connection behind a Mutex (no pool).
+    #[cfg(not(all(target_arch = "wasm32", feature = "wasm-sqlite")))]
     #[error(transparent)]
     Pool(#[from] r2d2::Error),
     #[error(transparent)]
@@ -30,9 +33,9 @@ impl StoreError {
     pub fn is_unique_violation(&self) -> bool {
         matches!(
             self,
-            StoreError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
-                if e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
-                || e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+            StoreError::Sqlite(crate::sql::Error::SqliteFailure(e, _))
+                if e.extended_code == crate::sql::ffi::SQLITE_CONSTRAINT_UNIQUE
+                || e.extended_code == crate::sql::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
         )
     }
 }

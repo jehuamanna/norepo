@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension};
+use crate::sql::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::StoreError;
@@ -36,10 +36,10 @@ impl SqliteSessionRepository {
     }
 }
 
-fn invalid(e: StoreError) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
+fn invalid(e: StoreError) -> crate::sql::Error {
+    crate::sql::Error::FromSqlConversionFailure(
         0,
-        rusqlite::types::Type::Text,
+        crate::sql::types::Type::Text,
         Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             e.to_string(),
@@ -47,7 +47,7 @@ fn invalid(e: StoreError) -> rusqlite::Error {
     )
 }
 
-fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
+fn row_to_session(row: &crate::sql::Row<'_>) -> crate::sql::Result<Session> {
     let active: Option<String> = row.get(2)?;
     let active_org_id = match active {
         Some(s) => Some(OrgId::from_str_strict(&s).map_err(invalid)?),

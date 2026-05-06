@@ -2,7 +2,7 @@
 //! kept dense — `reorder` shifts neighbours inside a single transaction so the
 //! list never has gaps.
 
-use rusqlite::{params, OptionalExtension};
+use crate::sql::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -39,10 +39,10 @@ impl SqliteLocalProjectRepository {
     }
 }
 
-fn invalid_uuid(s: String) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
+fn invalid_uuid(s: String) -> crate::sql::Error {
+    crate::sql::Error::FromSqlConversionFailure(
         0,
-        rusqlite::types::Type::Text,
+        crate::sql::types::Type::Text,
         Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("invalid uuid: {s}"),
@@ -50,7 +50,7 @@ fn invalid_uuid(s: String) -> rusqlite::Error {
     )
 }
 
-fn row_to_local_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalProject> {
+fn row_to_local_project(row: &crate::sql::Row<'_>) -> crate::sql::Result<LocalProject> {
     let id_text: String = row.get(0)?;
     let id = Uuid::parse_str(&id_text).map_err(|_| invalid_uuid(id_text))?;
     Ok(LocalProject {

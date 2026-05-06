@@ -1,6 +1,6 @@
 //! Local-mode single-row user identity. Backed by `local_user` (id always 1).
 
-use rusqlite::{params, OptionalExtension};
+use crate::sql::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::StoreError;
@@ -29,7 +29,7 @@ impl SqliteLocalUserRepository {
     }
 }
 
-fn row_to_local_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalUser> {
+fn row_to_local_user(row: &crate::sql::Row<'_>) -> crate::sql::Result<LocalUser> {
     Ok(LocalUser {
         username: row.get(0)?,
         created_at_ms: row.get(1)?,

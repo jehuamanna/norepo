@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension};
+use crate::sql::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::StoreError;
@@ -58,10 +58,10 @@ impl SqliteNoteRepository {
     }
 }
 
-fn invalid(e: StoreError) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
+fn invalid(e: StoreError) -> crate::sql::Error {
+    crate::sql::Error::FromSqlConversionFailure(
         0,
-        rusqlite::types::Type::Text,
+        crate::sql::types::Type::Text,
         Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             e.to_string(),
@@ -69,7 +69,7 @@ fn invalid(e: StoreError) -> rusqlite::Error {
     )
 }
 
-fn row_to_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
+fn row_to_note(row: &crate::sql::Row<'_>) -> crate::sql::Result<Note> {
     let id = NoteId::from_str_strict(&row.get::<_, String>(0)?).map_err(invalid)?;
     let project_id = ProjectId::from_str_strict(&row.get::<_, String>(1)?).map_err(invalid)?;
     let parent_id_opt: Option<String> = row.get(2)?;

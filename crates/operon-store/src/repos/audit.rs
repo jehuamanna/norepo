@@ -1,4 +1,4 @@
-use rusqlite::params;
+use crate::sql::params;
 use serde::{Deserialize, Serialize};
 
 use crate::error::StoreError;

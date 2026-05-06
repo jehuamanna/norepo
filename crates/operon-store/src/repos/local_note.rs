@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use rusqlite::{params, OptionalExtension};
+use crate::sql::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -161,10 +161,10 @@ impl SqliteLocalNoteRepository {
     }
 }
 
-fn invalid_uuid(s: String) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
+fn invalid_uuid(s: String) -> crate::sql::Error {
+    crate::sql::Error::FromSqlConversionFailure(
         0,
-        rusqlite::types::Type::Text,
+        crate::sql::types::Type::Text,
         Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("invalid uuid: {s}"),
@@ -172,7 +172,7 @@ fn invalid_uuid(s: String) -> rusqlite::Error {
     )
 }
 
-fn row_to_local_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalNote> {
+fn row_to_local_note(row: &crate::sql::Row<'_>) -> crate::sql::Result<LocalNote> {
     let id_text: String = row.get(0)?;
     let id = Uuid::parse_str(&id_text).map_err(|_| invalid_uuid(id_text))?;
     let project_text: String = row.get(1)?;

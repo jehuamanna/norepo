@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension};
+use crate::sql::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::StoreError;
@@ -75,12 +75,12 @@ impl SqliteOrgRepository {
     }
 }
 
-fn row_to_org(row: &rusqlite::Row<'_>) -> rusqlite::Result<Org> {
+fn row_to_org(row: &crate::sql::Row<'_>) -> crate::sql::Result<Org> {
     let id_str: String = row.get(0)?;
     let id = OrgId::from_str_strict(&id_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
+        crate::sql::Error::FromSqlConversionFailure(
             0,
-            rusqlite::types::Type::Text,
+            crate::sql::types::Type::Text,
             Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 e.to_string(),
@@ -89,9 +89,9 @@ fn row_to_org(row: &rusqlite::Row<'_>) -> rusqlite::Result<Org> {
     })?;
     let flavour_str: String = row.get(2)?;
     let flavour = OrgFlavour::from_str(&flavour_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
+        crate::sql::Error::FromSqlConversionFailure(
             2,
-            rusqlite::types::Type::Text,
+            crate::sql::types::Type::Text,
             Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 e.to_string(),
