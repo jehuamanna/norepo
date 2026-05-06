@@ -241,6 +241,32 @@ fn try_render_image_view(
     })
 }
 
+/// Tiny inline base64 decoder for the paste-image bridge. Standard
+/// alphabet, ignores whitespace, tolerates missing/extra padding.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for c in s.chars() {
+        let v: u32 = match c {
+            'A'..='Z' => (c as u32) - ('A' as u32),
+            'a'..='z' => (c as u32) - ('a' as u32) + 26,
+            '0'..='9' => (c as u32) - ('0' as u32) + 52,
+            '+' => 62,
+            '/' => 63,
+            '=' | ' ' | '\n' | '\r' | '\t' => continue,
+            _ => return None,
+        };
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Tiny inline base64 encoder so the image-tab view can render via a
 /// `data:` URL without pulling a base64 crate. Standard alphabet, padded.
 fn base64_encode(bytes: &[u8]) -> String {
@@ -306,6 +332,137 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
     // Plans-Phase-5-vfs-wikilinks: link-picker visibility signal. Cmd/Ctrl+K
     // toggles it open; <LinkPicker> closes itself on pick / Escape.
     let mut link_picker_open: Signal<bool> = use_signal(|| false);
+
+    // Plans-Phase-6-image-notes: install a JS paste listener that captures
+    // clipboard image bytes and posts them back via dioxus.send. We
+    // listen for messages in a use_future, write the blob, create a child
+    // image-note under the active markdown note, and append ![[…]] to
+    // the body.
+    {
+        let mut tabs_for_paste = tabs;
+        let crate::local_mode::desktop::LocalNoteRepo(note_repo_for_paste) =
+            note_repo_for_image.clone();
+        let crate::local_mode::desktop::LocalProjectRepo(project_repo_for_paste) =
+            project_repo_for_image.clone();
+        let crate::local_mode::desktop::CurrentVaultRoot(vault_for_paste) =
+            vault_for_image.clone();
+        use_future(move || {
+            let note_repo = note_repo_for_paste.clone();
+            let project_repo = project_repo_for_paste.clone();
+            let vault_signal = vault_for_paste;
+            async move {
+                // Bind the listener once. dioxus.send messages flow through
+                // this eval handle's recv() future.
+                let mut eval = document::eval(
+                    "document.addEventListener('paste', async function(e) { \
+                        if (!e.clipboardData) return; \
+                        for (const item of e.clipboardData.items) { \
+                            if (item.kind === 'file' && item.type && item.type.startsWith('image/')) { \
+                                const blob = item.getAsFile(); \
+                                if (!blob) continue; \
+                                const buf = await blob.arrayBuffer(); \
+                                const u8 = new Uint8Array(buf); \
+                                let bin = ''; \
+                                for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]); \
+                                const b64 = btoa(bin); \
+                                dioxus.send({ mime: item.type, name: blob.name || 'pasted.png', b64 }); \
+                            } \
+                        } \
+                    });",
+                );
+                loop {
+                    let msg: serde_json::Value = match eval.recv().await {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    let mime = msg.get("mime").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = msg
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("pasted")
+                        .to_string();
+                    let b64 = msg.get("b64").and_then(|v| v.as_str()).unwrap_or("");
+                    let bytes = match base64_decode(b64) {
+                        Some(b) => b,
+                        None => continue,
+                    };
+                    // Active tab + parse uuid.
+                    let active = tabs_for_paste.read().active().cloned();
+                    let Some(tab) = active else { continue };
+                    let Ok(parent_uuid) = Uuid::parse_str(&tab.note_id) else {
+                        continue;
+                    };
+                    let Some(vault) = vault_signal.read().clone() else {
+                        continue;
+                    };
+                    // Resolve project of the parent note.
+                    let project_id = {
+                        let projects = project_repo.list().unwrap_or_default();
+                        projects.into_iter().find_map(|p| {
+                            note_repo
+                                .list_for_project(p.id)
+                                .ok()
+                                .and_then(|notes| {
+                                    notes.iter().find(|n| n.id == parent_uuid).map(|_| p.id)
+                                })
+                        })
+                    };
+                    let Some(project_id) = project_id else { continue };
+                    let written =
+                        match crate::local_mode::images::write_image(&vault, &bytes, mime) {
+                            Ok(w) => w,
+                            Err(e) => {
+                                eprintln!("operon: paste-image write failed: {e}");
+                                continue;
+                            }
+                        };
+                    let stem = std::path::Path::new(&name)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| {
+                            format!(
+                                "Pasted-{}",
+                                web_time::SystemTime::now()
+                                    .duration_since(web_time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis())
+                                    .unwrap_or_default()
+                            )
+                        });
+                    let new_note = match note_repo.create_with_kind(
+                        project_id,
+                        Some(parent_uuid),
+                        &stem,
+                        operon_store::repos::NoteKind::Image,
+                    ) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            eprintln!("operon: paste-image create_with_kind failed: {e}");
+                            continue;
+                        }
+                    };
+                    let rel = written.relative_path.to_string_lossy().to_string();
+                    if let Err(e) = note_repo.set_blob_path(new_note.id, Some(&rel)) {
+                        eprintln!("operon: paste-image set_blob_path failed: {e}");
+                    }
+                    let short = operon_store::vfs::short_id(new_note.id);
+                    let embed = format!("![[{stem}^{short}]]");
+                    let current = tabs_for_paste
+                        .read()
+                        .get(tab.id)
+                        .map(|t| t.content.clone())
+                        .unwrap_or_default();
+                    let next = if current.ends_with('\n') || current.is_empty() {
+                        format!("{current}{embed}\n")
+                    } else {
+                        format!("{current}\n{embed}\n")
+                    };
+                    tabs_for_paste.write().set_content(tab.id, next);
+                    tabs_for_paste.write().set_dirty(tab.id, true);
+                }
+            }
+        });
+    }
 
     let snapshot = tabs.read().get(tab_id).cloned();
     let Some(tab) = snapshot else {
