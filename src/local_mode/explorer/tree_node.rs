@@ -82,6 +82,7 @@ mod tests {
             title: title.into(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            kind: operon_store::repos::NoteKind::Markdown,
         }
     }
 

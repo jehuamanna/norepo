@@ -4,7 +4,7 @@
 
 use dioxus::prelude::*;
 use keyboard_types::Modifiers;
-use operon_store::repos::LocalNote;
+use operon_store::repos::{LocalNote, NoteKind};
 use uuid::Uuid;
 
 use crate::editor::EditorMode;
@@ -384,6 +384,24 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                     }),
                 }
             } else {
+                // Plans-Phase-6-image-notes: kind indicator. `[md]` for
+                // markdown, `[im]` for image. Drives off `note.kind` so it
+                // updates as soon as the row is rendered with a refreshed
+                // record.
+                {
+                    let (label, css) = match note.kind {
+                        NoteKind::Markdown => ("[md]", "kind-badge kind-md"),
+                        NoteKind::Image => ("[im]", "kind-badge kind-im"),
+                    };
+                    rsx! {
+                        span {
+                            class: "{css} text-[0.65rem] mr-1 px-1 rounded select-none opacity-60 shrink-0",
+                            "data-testid": "kind-badge",
+                            "data-note-kind": "{note.kind.as_str()}",
+                            "{label}"
+                        }
+                    }
+                }
                 span {
                     class: "truncate flex-1",
                     "data-testid": "note-row-name",

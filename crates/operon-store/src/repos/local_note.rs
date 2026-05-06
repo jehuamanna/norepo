@@ -14,6 +14,36 @@ use crate::time::now_ms;
 
 const DEFAULT_NOTE_TITLE: &str = "Untitled";
 
+/// Plans-Phase-6-image-notes: the note's content kind. Backed by the
+/// `local_note.kind` column added in migration 008.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum NoteKind {
+    Markdown,
+    Image,
+}
+
+impl NoteKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Markdown => "markdown",
+            Self::Image => "image",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "image" => Self::Image,
+            _ => Self::Markdown,
+        }
+    }
+}
+
+impl Default for NoteKind {
+    fn default() -> Self {
+        Self::Markdown
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalNote {
     pub id: Uuid,
@@ -24,6 +54,10 @@ pub struct LocalNote {
     pub title: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Plans-Phase-6-image-notes: defaults to `Markdown` for rows written
+    /// before migration 008 (the column gets `'markdown'` via SQL default).
+    #[serde(default)]
+    pub kind: NoteKind,
 }
 
 pub trait LocalNoteRepository: Send + Sync {
@@ -113,6 +147,15 @@ fn row_to_local_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalNote> {
         Some(s) => Some(Uuid::parse_str(&s).map_err(|_| invalid_uuid(s))?),
         None => None,
     };
+    // Plans-Phase-6-image-notes: column 8 is `kind`; rows from before
+    // migration 008 don't have it, but the migration adds the column with
+    // `DEFAULT 'markdown'` so every row reads as a string post-migrate. We
+    // tolerate older queries that might not select the column by treating
+    // a missing column as Markdown.
+    let kind: NoteKind = row
+        .get::<_, String>(8)
+        .map(|s| NoteKind::from_str(&s))
+        .unwrap_or_default();
     Ok(LocalNote {
         id,
         project_id,
@@ -122,11 +165,12 @@ fn row_to_local_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalNote> {
         title: row.get(5)?,
         created_at_ms: row.get(6)?,
         updated_at_ms: row.get(7)?,
+        kind,
     })
 }
 
 const SELECT_COLS: &str =
-    "id, project_id, parent_id, sibling_index, depth, title, created_at_ms, updated_at_ms";
+    "id, project_id, parent_id, sibling_index, depth, title, created_at_ms, updated_at_ms, kind";
 
 impl LocalNoteRepository for SqliteLocalNoteRepository {
     fn list_for_project(&self, project_id: Uuid) -> Result<Vec<LocalNote>, StoreError> {
@@ -229,6 +273,7 @@ impl LocalNoteRepository for SqliteLocalNoteRepository {
             title: resolved_title.to_string(),
             created_at_ms: now,
             updated_at_ms: now,
+            kind: NoteKind::Markdown,
         })
     }
 

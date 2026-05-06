@@ -25,7 +25,7 @@ pub use attachment::{Attachment, AttachmentRepository, SqliteAttachmentRepositor
 pub use audit::{AuditEntry, AuditLogRepository, AuditOutcome, SqliteAuditLogRepository};
 pub use department::{Department, DepartmentRepository, SqliteDepartmentRepository};
 pub use invite::{Invite, InviteRepository, SqliteInviteRepository};
-pub use local_note::{LocalNote, LocalNoteRepository, SqliteLocalNoteRepository};
+pub use local_note::{LocalNote, LocalNoteRepository, NoteKind, SqliteLocalNoteRepository};
 pub use local_project::{LocalProject, LocalProjectRepository, SqliteLocalProjectRepository};
 pub use local_search::{
     LocalSearchRepository, SearchHit, SearchKind, SqliteLocalSearchRepository, DEFAULT_SEARCH_LIMIT,
