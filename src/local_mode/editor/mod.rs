@@ -241,6 +241,79 @@ fn try_render_image_view(
     })
 }
 
+/// Plans-Phase-6/5: read the active tab's textarea selectionStart via a
+/// `document::eval` round-trip. Returns `None` when the textarea isn't
+/// mounted or the value is out of bounds, in which case callers fall
+/// back to appending at the end of the body.
+async fn read_caret_pos(tab_id: TabId) -> Option<usize> {
+    let script = format!(
+        "(function() {{ const t = document.querySelector('[data-tab-id=\"{}\"]'); \
+         dioxus.send(t ? t.selectionStart : -1); }})();",
+        tab_id.0
+    );
+    let mut eval = document::eval(&script);
+    let n: i64 = eval.recv().await.ok()?;
+    if n < 0 {
+        None
+    } else {
+        Some(n as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::splice_at_caret;
+
+    #[test]
+    fn splice_empty_body() {
+        assert_eq!(splice_at_caret("", 0, "hello"), "hello");
+        assert_eq!(splice_at_caret("", 999, "hello"), "hello");
+    }
+
+    #[test]
+    fn splice_at_zero() {
+        assert_eq!(splice_at_caret("world", 0, "hello "), "hello world");
+    }
+
+    #[test]
+    fn splice_in_middle() {
+        assert_eq!(splice_at_caret("hello world", 5, " there,"), "hello there, world");
+    }
+
+    #[test]
+    fn splice_past_end_appends() {
+        assert_eq!(splice_at_caret("ab", 100, "c"), "abc");
+    }
+
+    #[test]
+    fn splice_snaps_to_char_boundary() {
+        // Multibyte char (é = 2 bytes); pos in the middle should snap left.
+        let s = "café";
+        // 'é' starts at byte 3, ends at byte 5. pos=4 is mid-char.
+        let out = splice_at_caret(s, 4, "X");
+        // Expect insertion at the char boundary at position 3 (before é).
+        assert_eq!(out, "cafXé");
+    }
+}
+
+/// Splice `insert` into `body` at character offset `pos` (snapped to the
+/// nearest char boundary). Falls back to appending when `pos` is past
+/// the body's end or no boundary fits.
+fn splice_at_caret(body: &str, pos: usize, insert: &str) -> String {
+    if body.is_empty() {
+        return insert.to_string();
+    }
+    if pos >= body.len() {
+        return format!("{body}{insert}");
+    }
+    let mut adj = pos;
+    while adj > 0 && !body.is_char_boundary(adj) {
+        adj -= 1;
+    }
+    let (before, after) = body.split_at(adj);
+    format!("{before}{insert}{after}")
+}
+
 /// Tiny inline base64 decoder for the paste-image bridge. Standard
 /// alphabet, ignores whitespace, tolerates missing/extra padding.
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
@@ -452,10 +525,16 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
                         .get(tab.id)
                         .map(|t| t.content.clone())
                         .unwrap_or_default();
-                    let next = if current.ends_with('\n') || current.is_empty() {
-                        format!("{current}{embed}\n")
-                    } else {
-                        format!("{current}\n{embed}\n")
+                    let caret = read_caret_pos(tab.id).await;
+                    let next = match caret {
+                        Some(pos) => splice_at_caret(&current, pos, &embed),
+                        None => {
+                            if current.ends_with('\n') || current.is_empty() {
+                                format!("{current}{embed}\n")
+                            } else {
+                                format!("{current}\n{embed}\n")
+                            }
+                        }
                     };
                     tabs_for_paste.write().set_content(tab.id, next);
                     tabs_for_paste.write().set_dirty(tab.id, true);
@@ -581,17 +660,21 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
             }
             let short = operon_store::vfs::short_id(new_note.id);
             let embed = format!("![[{}^{}]]", stem, short);
-            // Append the embed to the current body. Caret-position insertion
-            // is a follow-up.
             let current = tabs_for_image
                 .read()
                 .get(tab_id)
                 .map(|t| t.content.clone())
                 .unwrap_or_default();
-            let next = if current.ends_with('\n') || current.is_empty() {
-                format!("{current}{embed}\n")
-            } else {
-                format!("{current}\n{embed}\n")
+            let caret = read_caret_pos(tab_id).await;
+            let next = match caret {
+                Some(pos) => splice_at_caret(&current, pos, &embed),
+                None => {
+                    if current.ends_with('\n') || current.is_empty() {
+                        format!("{current}{embed}\n")
+                    } else {
+                        format!("{current}\n{embed}\n")
+                    }
+                }
             };
             tabs_for_image.write().set_content(tab_id, next);
             tabs_for_image.write().set_dirty(tab_id, true);
@@ -606,13 +689,21 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
             .map(|t| t.content.clone())
             .unwrap_or_default();
         let inserted = format!("[[{target}]]");
-        let next = if current.ends_with('\n') || current.is_empty() {
-            format!("{current}{inserted}\n")
-        } else {
-            format!("{current}\n{inserted}\n")
-        };
-        tabs_for_link.write().set_content(tab_id, next);
-        tabs_for_link.write().set_dirty(tab_id, true);
+        spawn(async move {
+            let caret = read_caret_pos(tab_id).await;
+            let next = match caret {
+                Some(pos) => splice_at_caret(&current, pos, &inserted),
+                None => {
+                    if current.ends_with('\n') || current.is_empty() {
+                        format!("{current}{inserted}\n")
+                    } else {
+                        format!("{current}\n{inserted}\n")
+                    }
+                }
+            };
+            tabs_for_link.write().set_content(tab_id, next);
+            tabs_for_link.write().set_dirty(tab_id, true);
+        });
     };
 
     rsx! {
