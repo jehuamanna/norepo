@@ -5,6 +5,8 @@ use dioxus::html::HasFileData;
 use operon_store::repos::LocalProject;
 use uuid::Uuid;
 
+use operon_store::repos::NoteKind;
+
 use crate::local_mode::ui::{
     classify_drop_position, ContextMenu, ContextMenuItem, DragKind, DragSession, DropPosition,
     InlineRename,
@@ -28,12 +30,12 @@ pub struct ProjectRowProps {
     pub on_request_rename: Callback<Uuid>,
     pub on_request_delete: Callback<Uuid>,
     pub on_toggle: Callback<Uuid>,
-    pub on_add_note: Callback<Uuid>,
-    /// Plans-Phase-6-image-notes: "Add image note" entry. The handler in
-    /// `explorer/mod.rs` opens a native file picker, writes the chosen
-    /// image via `images::write_image`, then mints a `NoteKind::Image`
-    /// row + an `attachments` entry.
-    pub on_add_image_note: Callback<Uuid>,
+    /// Plans-Phase-1-note-creation-context-menu: project-level Add note is
+    /// now kind-aware. The submenu's Markdown leaf goes through the existing
+    /// `note_repo.create` path (auto-rename triggered on the new row); the
+    /// Image leaf opens the same native file picker that the old standalone
+    /// `Add image note…` item used.
+    pub on_add_note: Callback<(Uuid, NoteKind)>,
     /// Plans-Phase-6-image-notes: external image-file drops onto this
     /// project row land as top-level image-notes in the project. Tuple is
     /// (project_id, bytes, suggested filename).
@@ -72,7 +74,6 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     let on_request_delete = props.on_request_delete;
     let on_toggle = props.on_toggle;
     let on_add_note = props.on_add_note;
-    let on_add_image_note = props.on_add_image_note;
     let on_drop_image_file = props.on_drop_image_file;
     let on_cut = props.on_cut;
     let on_copy = props.on_copy;
@@ -108,17 +109,22 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
                 on_request_rename.call(id);
             }),
         ),
-        ContextMenuItem::new(
+        ContextMenuItem::submenu(
             "Add note",
-            Callback::new(move |_| {
-                on_add_note.call(id);
-            }),
-        ),
-        ContextMenuItem::new(
-            "Add image note…",
-            Callback::new(move |_| {
-                on_add_image_note.call(id);
-            }),
+            vec![
+                ContextMenuItem::new(
+                    "Markdown",
+                    Callback::new(move |_| {
+                        on_add_note.call((id, NoteKind::Markdown));
+                    }),
+                ),
+                ContextMenuItem::new(
+                    "Image",
+                    Callback::new(move |_| {
+                        on_add_note.call((id, NoteKind::Image));
+                    }),
+                ),
+            ],
         ),
         ContextMenuItem::new(
             "Cut",
@@ -286,7 +292,8 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
                     "aria-label": "Add note",
                     onclick: move |evt| {
                         evt.stop_propagation();
-                        on_add_note.call(id);
+                        // Plans-Phase-1: quick-button defaults to Markdown.
+                        on_add_note.call((id, NoteKind::Markdown));
                     },
                     "+"
                 }

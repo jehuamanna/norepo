@@ -33,13 +33,16 @@ pub struct NoteRowProps {
     pub on_rename: Callback<(Uuid, String)>,
     pub on_request_rename: Callback<Uuid>,
     pub on_request_delete: Callback<Uuid>,
-    pub on_add_child: Callback<Uuid>,
-    /// Plans-Phase-3-note-id-create: insert a new sibling note immediately
-    /// after this one, at the same depth. The handler in `explorer/mod.rs`
-    /// finds the target's parent via `notes_by_project`, calls
-    /// `note_repo.create(.., parent_id, "")`, then `move_to` to land at
-    /// `target.sibling_index + 1` and triggers the inline rename.
-    pub on_add_sibling: Callback<Uuid>,
+    /// Plans-Phase-1-note-creation-context-menu: kind-aware add-child. The
+    /// submenu's Markdown / Image leaves dispatch with the chosen NoteKind;
+    /// the handler in `explorer/mod.rs` branches on kind (Markdown takes
+    /// the existing fast path, Image opens a file picker before creation).
+    pub on_add_child: Callback<(Uuid, NoteKind)>,
+    /// Plans-Phase-1-note-creation-context-menu: kind-aware add-sibling.
+    /// Same dispatch contract as `on_add_child`. The Markdown branch creates
+    /// then `move_to(.., target.sibling_index + 1)`; Image goes via the
+    /// project-scoped picker plumbing with the target's `parent_id`.
+    pub on_add_sibling: Callback<(Uuid, NoteKind)>,
     pub on_indent: Callback<Uuid>,
     pub on_outdent: Callback<Uuid>,
     pub on_move_up: Callback<Uuid>,
@@ -202,17 +205,39 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 crate::util::clipboard::copy_text(&id_for_copy);
             }),
         ),
-        ContextMenuItem::new(
+        ContextMenuItem::submenu(
             "Add child note",
-            Callback::new(move |_| {
-                on_add_child.call(id);
-            }),
+            vec![
+                ContextMenuItem::new(
+                    "Markdown",
+                    Callback::new(move |_| {
+                        on_add_child.call((id, NoteKind::Markdown));
+                    }),
+                ),
+                ContextMenuItem::new(
+                    "Image",
+                    Callback::new(move |_| {
+                        on_add_child.call((id, NoteKind::Image));
+                    }),
+                ),
+            ],
         ),
-        ContextMenuItem::new(
+        ContextMenuItem::submenu(
             "Add sibling note",
-            Callback::new(move |_| {
-                on_add_sibling.call(id);
-            }),
+            vec![
+                ContextMenuItem::new(
+                    "Markdown",
+                    Callback::new(move |_| {
+                        on_add_sibling.call((id, NoteKind::Markdown));
+                    }),
+                ),
+                ContextMenuItem::new(
+                    "Image",
+                    Callback::new(move |_| {
+                        on_add_sibling.call((id, NoteKind::Image));
+                    }),
+                ),
+            ],
         ),
         ContextMenuItem::new(
             "Cut",
@@ -519,7 +544,10 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                     "aria-label": "Add child note",
                     onclick: move |evt| {
                         evt.stop_propagation();
-                        on_add_child.call(id);
+                        // Plans-Phase-1: quick-button defaults to Markdown.
+                        // Image notes go through the context-menu submenu so
+                        // the file picker UX is reachable.
+                        on_add_child.call((id, NoteKind::Markdown));
                     },
                     "+"
                 }

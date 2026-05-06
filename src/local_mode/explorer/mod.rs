@@ -405,7 +405,7 @@ pub fn ExplorerPanel() -> Element {
     });
 
     let note_repo_for_add_root = note_repo.clone();
-    let on_add_root_note = use_callback(move |project_id: Uuid| {
+    let on_add_root_markdown_note = use_callback(move |project_id: Uuid| {
         match note_repo_for_add_root.create(project_id, None, "") {
             Ok(n) => {
                 note_version.with_mut(|v| *v += 1);
@@ -486,6 +486,17 @@ pub fn ExplorerPanel() -> Element {
             }
         });
     });
+
+    // Plans-Phase-1-note-creation-context-menu: unified project-level Add
+    // note dispatch. The submenu's Markdown leaf takes the existing fast
+    // path (auto-rename); Image leaf reuses the file-picker path. Both
+    // come through this single callback so the project_row prop is one
+    // signature instead of two.
+    let on_add_project_note =
+        use_callback(move |(project_id, kind): (Uuid, NoteKind)| match kind {
+            NoteKind::Markdown => on_add_root_markdown_note.call(project_id),
+            NoteKind::Image => on_add_image_note.call(project_id),
+        });
 
     // ===== Note handlers =====
     let mut tabs_for_select = tabs;
@@ -642,8 +653,12 @@ pub fn ExplorerPanel() -> Element {
 
     let note_repo_for_add_child = note_repo.clone();
     let mut expand_ancestors_for_child = expand_ancestors.clone();
-    let on_add_child_note = use_callback(move |parent_id: Uuid| {
-        // Find parent's project_id.
+    // Plans-Phase-1-note-creation-context-menu: kind-aware add-child dispatch.
+    // Markdown → existing fast path with auto-rename. Image → mints an
+    // empty Image row at the same parent; attaching the image bytes uses
+    // the existing image-paste / drop / picker flows on the new row
+    // (full child-level picker integration is a follow-up).
+    let on_add_child_note = use_callback(move |(parent_id, kind): (Uuid, NoteKind)| {
         let project_id = notes_by_project
             .read()
             .iter()
@@ -652,10 +667,17 @@ pub fn ExplorerPanel() -> Element {
             eprintln!("operon: add child note: parent {parent_id} not found");
             return;
         };
-        // Expand the parent and any collapsed ancestors before the create so
-        // the inline rename input on the new row is visible.
         expand_ancestors_for_child(project_id, Some(parent_id));
-        match note_repo_for_add_child.create(project_id, Some(parent_id), "") {
+        let res = match kind {
+            NoteKind::Markdown => note_repo_for_add_child.create(project_id, Some(parent_id), ""),
+            NoteKind::Image => note_repo_for_add_child.create_with_kind(
+                project_id,
+                Some(parent_id),
+                "",
+                NoteKind::Image,
+            ),
+        };
+        match res {
             Ok(n) => {
                 note_version.with_mut(|v| *v += 1);
                 renaming_note_setter.set(Some(n.id));
@@ -671,7 +693,10 @@ pub fn ExplorerPanel() -> Element {
     // and expands ancestors so the new row is visible.
     let note_repo_for_add_sibling = note_repo.clone();
     let mut expand_ancestors_for_sibling = expand_ancestors.clone();
-    let on_add_sibling_note = use_callback(move |target_id: Uuid| {
+    // Plans-Phase-1-note-creation-context-menu: kind-aware add-sibling.
+    // Markdown branch unchanged. Image branch creates an empty Image row;
+    // bytes are attached via the existing image-paste / drop flow.
+    let on_add_sibling_note = use_callback(move |(target_id, kind): (Uuid, NoteKind)| {
         let snapshot = notes_by_project.read();
         let mut found: Option<(Uuid, Option<Uuid>, i64)> = None;
         for (pid, list) in snapshot.iter() {
@@ -686,7 +711,16 @@ pub fn ExplorerPanel() -> Element {
             return;
         };
         expand_ancestors_for_sibling(project_id, parent_id);
-        match note_repo_for_add_sibling.create(project_id, parent_id, "") {
+        let create_res = match kind {
+            NoteKind::Markdown => note_repo_for_add_sibling.create(project_id, parent_id, ""),
+            NoteKind::Image => note_repo_for_add_sibling.create_with_kind(
+                project_id,
+                parent_id,
+                "",
+                NoteKind::Image,
+            ),
+        };
+        match create_res {
             Ok(n) => {
                 if let Err(e) =
                     note_repo_for_add_sibling.move_to(n.id, project_id, parent_id, target_idx + 1)
@@ -1422,8 +1456,7 @@ pub fn ExplorerPanel() -> Element {
                             on_request_rename_project: on_request_rename_project,
                             on_request_delete_project: on_request_delete_project,
                             on_toggle_project: on_toggle_project,
-                            on_add_root_note: on_add_root_note,
-                            on_add_image_note: on_add_image_note,
+                            on_add_project_note: on_add_project_note,
                             on_drop_image_into_note: on_drop_image_into_note,
                             on_drop_image_into_project: on_drop_image_into_project,
                             on_select_note: on_select_note,
@@ -1626,8 +1659,7 @@ struct ProjectSubtreeProps {
     on_request_rename_project: Callback<Uuid>,
     on_request_delete_project: Callback<Uuid>,
     on_toggle_project: Callback<Uuid>,
-    on_add_root_note: Callback<Uuid>,
-    on_add_image_note: Callback<Uuid>,
+    on_add_project_note: Callback<(Uuid, NoteKind)>,
     on_drop_image_into_note: Callback<(Uuid, Vec<u8>, String)>,
     on_drop_image_into_project: Callback<(Uuid, Vec<u8>, String)>,
     on_select_note: Callback<Uuid>,
@@ -1635,8 +1667,8 @@ struct ProjectSubtreeProps {
     on_rename_note: Callback<(Uuid, String)>,
     on_request_rename_note: Callback<Uuid>,
     on_request_delete_note: Callback<Uuid>,
-    on_add_child_note: Callback<Uuid>,
-    on_add_sibling_note: Callback<Uuid>,
+    on_add_child_note: Callback<(Uuid, NoteKind)>,
+    on_add_sibling_note: Callback<(Uuid, NoteKind)>,
     on_indent_note: Callback<Uuid>,
     on_outdent_note: Callback<Uuid>,
     on_move_up_note: Callback<Uuid>,
@@ -1707,8 +1739,7 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
             on_request_rename: props.on_request_rename_project,
             on_request_delete: props.on_request_delete_project,
             on_toggle: props.on_toggle_project,
-            on_add_note: props.on_add_root_note,
-            on_add_image_note: props.on_add_image_note,
+            on_add_note: props.on_add_project_note,
             on_drop_image_file: props.on_drop_image_into_project,
             on_cut: props.on_cut_project,
             on_copy: props.on_copy_project,
