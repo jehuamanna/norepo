@@ -15,11 +15,15 @@
 use std::sync::Arc;
 
 use dioxus::prelude::*;
-use operon_store::repos::LocalNoteRepository;
+use operon_store::repos::{
+    LinkRow, LocalNoteLinkRepository, LocalNoteRepository, LocalProjectRepository,
+};
+use operon_store::vfs;
 use uuid::Uuid;
 
 use crate::editor::EditorMode;
 use crate::persistence::Persistence;
+use crate::plugins::markdown::wikilink;
 use crate::tabs::{SaveScheduler, Tab, TabId, TabManager};
 
 mod link_picker;
@@ -41,10 +45,17 @@ pub struct LocalSaveAction {
 /// manual save and the 150 ms debounced autosave converge on a single
 /// `Persistence::save` call site. Calling `flush` first cancels any
 /// in-flight debounce future for the tab so we never double-write.
+///
+/// Plans-Phase-5-vfs-wikilinks: after a successful save, parses the body
+/// via `wikilink::extract_links`, resolves each target via
+/// `vfs::resolve_link`, and rebuilds the `local_note_link` rows for this
+/// source via `LocalNoteLinkRepository::replace_for`.
 pub fn install_save_action(
     mut tabs: Signal<TabManager>,
     _persistence: Arc<dyn Persistence>,
     note_repo: Arc<dyn LocalNoteRepository>,
+    project_repo: Arc<dyn LocalProjectRepository>,
+    link_repo: Arc<dyn LocalNoteLinkRepository>,
     scheduler: SaveScheduler,
 ) -> Callback<()> {
     Callback::new(move |_| {
@@ -66,6 +77,8 @@ pub fn install_save_action(
         let note_id = tab.note_id.clone();
         let content = tab.content.clone();
         let repo = note_repo.clone();
+        let project_repo = project_repo.clone();
+        let link_repo = link_repo.clone();
         let scheduler = scheduler.clone();
 
         spawn(async move {
@@ -74,6 +87,13 @@ pub fn install_save_action(
                     if let Err(e) = repo.touch_updated(note_uuid) {
                         eprintln!("operon: touch_updated failed for {note_uuid}: {e}");
                     }
+                    rebuild_link_graph_for_source(
+                        note_uuid,
+                        &content,
+                        &project_repo,
+                        &repo,
+                        &link_repo,
+                    );
                     tabs.write().set_dirty(tab_id, false);
                 }
                 Err(e) => {
@@ -82,6 +102,59 @@ pub fn install_save_action(
             }
         });
     })
+}
+
+/// Plans-Phase-5-vfs-wikilinks: extract every wikilink in `body`, resolve
+/// each against the source-note's project (best-effort), and replace the
+/// `local_note_link` rows for the source. Resolution failures are kept as
+/// rows with `target_note_id = NULL` so the renderer still surfaces them
+/// as broken.
+pub fn rebuild_link_graph_for_source(
+    source_id: Uuid,
+    body: &str,
+    project_repo: &Arc<dyn LocalProjectRepository>,
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    link_repo: &Arc<dyn LocalNoteLinkRepository>,
+) {
+    let extracted = wikilink::extract_links(body);
+    if extracted.is_empty() {
+        if let Err(e) = link_repo.replace_for(source_id, &[]) {
+            eprintln!("operon: rebuild_link_graph clear failed: {e}");
+        }
+        return;
+    }
+    // Resolve the source's project so relative `[[Note]]` forms can be
+    // scoped correctly.
+    let projects = project_repo.list().unwrap_or_default();
+    let source_project_id = projects.iter().find_map(|p| {
+        note_repo
+            .list_for_project(p.id)
+            .ok()
+            .and_then(|notes| notes.iter().find(|n| n.id == source_id).map(|_| p.id))
+    });
+    let mut rows: Vec<LinkRow> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for link in extracted {
+        if !seen.insert(link.target.clone()) {
+            // (source, target) is the PK; keep the first occurrence's
+            // is_embed flag and skip duplicates.
+            continue;
+        }
+        let target_note_id = source_project_id.and_then(|pid| {
+            vfs::parse_link(&link.target).and_then(|form| {
+                vfs::resolve_link(project_repo.as_ref(), note_repo.as_ref(), pid, &form).ok()
+            })
+        });
+        rows.push(LinkRow {
+            source_note_id: source_id,
+            target_text: link.target,
+            target_note_id,
+            is_embed: link.embed,
+        });
+    }
+    if let Err(e) = link_repo.replace_for(source_id, &rows) {
+        eprintln!("operon: rebuild_link_graph replace_for failed: {e}");
+    }
 }
 
 /// Open (or focus) a Local-Mode note tab for `note_uuid`. The tab uses the

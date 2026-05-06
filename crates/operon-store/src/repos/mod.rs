@@ -5,6 +5,7 @@ pub mod audit;
 pub mod department;
 pub mod invite;
 pub mod local_note;
+pub mod local_note_link;
 pub mod local_project;
 pub mod local_search;
 pub mod local_settings;
@@ -26,6 +27,9 @@ pub use audit::{AuditEntry, AuditLogRepository, AuditOutcome, SqliteAuditLogRepo
 pub use department::{Department, DepartmentRepository, SqliteDepartmentRepository};
 pub use invite::{Invite, InviteRepository, SqliteInviteRepository};
 pub use local_note::{LocalNote, LocalNoteRepository, NoteKind, SqliteLocalNoteRepository};
+pub use local_note_link::{
+    LinkRow, LocalNoteLinkRepository, SqliteLocalNoteLinkRepository,
+};
 pub use local_project::{LocalProject, LocalProjectRepository, SqliteLocalProjectRepository};
 pub use local_search::{
     LocalSearchRepository, SearchHit, SearchKind, SqliteLocalSearchRepository, DEFAULT_SEARCH_LIMIT,

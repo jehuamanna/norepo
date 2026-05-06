@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use dioxus::prelude::*;
 use operon_store::repos::{
-    LocalNoteRepository, LocalProjectRepository, LocalSearchRepository, LocalSettingsRepository,
-    LocalTreeStateRepository, LocalUserRepository, SqliteLocalNoteRepository,
-    SqliteLocalProjectRepository, SqliteLocalSearchRepository, SqliteLocalSettingsRepository,
-    SqliteLocalTreeStateRepository, SqliteLocalUserRepository,
+    LocalNoteLinkRepository, LocalNoteRepository, LocalProjectRepository, LocalSearchRepository,
+    LocalSettingsRepository, LocalTreeStateRepository, LocalUserRepository,
+    SqliteLocalNoteLinkRepository, SqliteLocalNoteRepository, SqliteLocalProjectRepository,
+    SqliteLocalSearchRepository, SqliteLocalSettingsRepository, SqliteLocalTreeStateRepository,
+    SqliteLocalUserRepository,
 };
 use operon_store::vfs;
 use operon_store::{Store, StoreConfig};
@@ -39,6 +40,8 @@ pub fn LocalStateProvider(children: Element) -> Element {
         Arc::new(SqliteLocalNoteRepository::new(store.clone()));
     let tree_repo: Arc<dyn LocalTreeStateRepository> =
         Arc::new(SqliteLocalTreeStateRepository::new(store.clone()));
+    let link_repo: Arc<dyn LocalNoteLinkRepository> =
+        Arc::new(SqliteLocalNoteLinkRepository::new(store.clone()));
     let search_repo: Arc<dyn LocalSearchRepository> =
         Arc::new(SqliteLocalSearchRepository::new(store));
     use_context_provider(|| LocalUserRepo(user_repo));
@@ -46,6 +49,7 @@ pub fn LocalStateProvider(children: Element) -> Element {
     use_context_provider(|| LocalProjectRepo(project_repo));
     use_context_provider(|| LocalNoteRepo(note_repo));
     use_context_provider(|| LocalTreeStateRepo(tree_repo));
+    use_context_provider(|| LocalNoteLinkRepo(link_repo));
     use_context_provider(|| ExplorerSearchRepo(search_repo));
     rsx! { {children} }
 }
@@ -66,6 +70,11 @@ pub struct LocalNoteRepo(pub Arc<dyn LocalNoteRepository>);
 
 #[derive(Clone)]
 pub struct LocalTreeStateRepo(pub Arc<dyn LocalTreeStateRepository>);
+
+/// Plans-Phase-5-vfs-wikilinks: wikilink graph repo. Save-time graph
+/// rebuild and rename propagation read/write through this.
+#[derive(Clone)]
+pub struct LocalNoteLinkRepo(pub Arc<dyn LocalNoteLinkRepository>);
 
 /// App-scope signal: gear → settings panel toggle. Lives at App scope so the
 /// ActivityBar gear (rendered inside Cloud `Shell`) and the overlay can share it.
@@ -99,6 +108,8 @@ pub fn provide_local_state() {
         Arc::new(SqliteLocalNoteRepository::new(store.clone()));
     let tree_repo: Arc<dyn LocalTreeStateRepository> =
         Arc::new(SqliteLocalTreeStateRepository::new(store.clone()));
+    let link_repo: Arc<dyn LocalNoteLinkRepository> =
+        Arc::new(SqliteLocalNoteLinkRepository::new(store.clone()));
     let search_repo: Arc<dyn LocalSearchRepository> =
         Arc::new(SqliteLocalSearchRepository::new(store));
     use_context_provider(|| LocalUserRepo(user_repo));
@@ -106,6 +117,7 @@ pub fn provide_local_state() {
     use_context_provider(|| LocalProjectRepo(project_repo));
     use_context_provider(|| LocalNoteRepo(note_repo));
     use_context_provider(|| LocalTreeStateRepo(tree_repo));
+    use_context_provider(|| LocalNoteLinkRepo(link_repo));
     use_context_provider(|| ExplorerSearchRepo(search_repo));
 }
 
@@ -441,8 +453,17 @@ pub fn provide_local_app_signals() {
     use_context_provider(|| ExplorerSearchFocus(search_focus_tick));
 
     let scheduler: crate::tabs::SaveScheduler = use_context();
+    let LocalNoteLinkRepo(link_repo) = use_context::<LocalNoteLinkRepo>();
+    let LocalProjectRepo(project_repo_for_save) = use_context::<LocalProjectRepo>();
     let save_callback = use_hook(|| {
-        install_save_action(tabs, persistence.clone(), note_repo.clone(), scheduler.clone())
+        install_save_action(
+            tabs,
+            persistence.clone(),
+            note_repo.clone(),
+            project_repo_for_save.clone(),
+            link_repo.clone(),
+            scheduler.clone(),
+        )
     });
     use_context_provider(|| LocalSaveAction {
         callback: save_callback,

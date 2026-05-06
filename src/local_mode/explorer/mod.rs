@@ -442,16 +442,93 @@ pub fn ExplorerPanel() -> Element {
         let _ = tabs_for_select.write();
     });
 
+    // Plans-Phase-5-vfs-wikilinks: rename propagation.
     let note_repo_for_rename = note_repo.clone();
+    let project_repo_for_rename = project_repo.clone();
+    let crate::local_mode::desktop::LocalNoteLinkRepo(link_repo_for_rename) = use_context();
+    let persistence_for_rename: Arc<dyn Persistence> = use_context();
     let on_rename_note = use_callback(move |(id, new_title): (Uuid, String)| {
         if new_title.trim().is_empty() {
             renaming_note_setter.set(None);
             return;
         }
+        // Capture the prior title (and the prior project name, for the
+        // absolute-form rewrite) before the rename lands.
+        let snap = notes_by_project.read();
+        let mut old_title: Option<String> = None;
+        let mut project_id_opt: Option<Uuid> = None;
+        for (pid, list) in snap.iter() {
+            if let Some(n) = list.iter().find(|n| n.id == id) {
+                old_title = Some(n.title.clone());
+                project_id_opt = Some(*pid);
+                break;
+            }
+        }
+        drop(snap);
+        let project_name = project_id_opt
+            .and_then(|pid| project_repo_for_rename.list().ok().and_then(|ps| {
+                ps.into_iter().find(|p| p.id == pid).map(|p| p.name)
+            }));
+
         match note_repo_for_rename.rename(id, &new_title) {
             Ok(()) => {
                 note_version.with_mut(|v| *v += 1);
                 renaming_note_setter.set(None);
+
+                // Walk every referrer and rewrite `[[OldTitle]]` /
+                // `[[Project/OldTitle]]` to the new equivalents in the
+                // body, then patch local_note_link.target_text. Async via
+                // `spawn` so the rename callback returns immediately.
+                if let (Some(old), Some(proj_name)) = (old_title, project_name.clone()) {
+                    if old != new_title {
+                        let link_repo = link_repo_for_rename.clone();
+                        let persistence = persistence_for_rename.clone();
+                        let new_title_owned = new_title.clone();
+                        spawn(async move {
+                            let referrers = link_repo.referrers_of(id).unwrap_or_default();
+                            for source in referrers {
+                                let source_str = source.to_string();
+                                let body_bytes = match persistence.load(&source_str).await {
+                                    Ok(b) => b,
+                                    Err(_) => continue,
+                                };
+                                let Ok(body) = String::from_utf8(body_bytes) else { continue };
+                                let mut next = body.clone();
+                                next = next.replace(
+                                    &format!("[[{old}]]"),
+                                    &format!("[[{new_title_owned}]]"),
+                                );
+                                next = next.replace(
+                                    &format!("![[{old}]]"),
+                                    &format!("![[{new_title_owned}]]"),
+                                );
+                                let old_abs = format!("[[{proj_name}/{old}]]");
+                                let new_abs =
+                                    format!("[[{proj_name}/{new_title_owned}]]");
+                                next = next.replace(&old_abs, &new_abs);
+                                let old_abs_embed = format!("![[{proj_name}/{old}]]");
+                                let new_abs_embed =
+                                    format!("![[{proj_name}/{new_title_owned}]]");
+                                next = next.replace(&old_abs_embed, &new_abs_embed);
+                                if next != body {
+                                    let _ = persistence
+                                        .save(&source_str, next.as_bytes())
+                                        .await;
+                                    let _ = link_repo.rewrite_target_text(
+                                        id,
+                                        &old,
+                                        &new_title_owned,
+                                    );
+                                    let _ = link_repo.rewrite_target_text(
+                                        id,
+                                        &format!("{proj_name}/{old}"),
+                                        &format!("{proj_name}/{new_title_owned}"),
+                                    );
+                                }
+                            }
+                        });
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("operon: rename local_note failed: {e}");
