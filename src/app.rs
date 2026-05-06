@@ -139,6 +139,15 @@ pub fn App() -> Element {
     use_context_provider(|| log_buffer);
 
     let resolved_mode = app_state.read().mode;
+    #[cfg(not(target_arch = "wasm32"))]
+    let persistence = {
+        // Plans-Phase-2-saving: route Local-Mode FS persistence through the
+        // user-chosen vault. Cloud mode stays on the legacy default dir until
+        // we finish migrating cloud-mode notes too.
+        let vault_now = vault_root.read().clone();
+        provide_persistence_with_vault(resolved_mode, vault_now.as_ref())
+    };
+    #[cfg(target_arch = "wasm32")]
     let persistence = provide_persistence(resolved_mode);
     let scheduler = SaveScheduler::new(persistence.clone());
     use_context_provider(|| persistence);
@@ -245,34 +254,40 @@ pub fn App() -> Element {
     }
 }
 
-/// Construct the per-platform `Persistence` for the running app. On desktop, attempts to use
-/// `~/.local/share/operon/notes` (or the OS-equivalent) and falls back to `MemoryPersistence`
-/// if directory creation fails. Local Mode roots persistence under a `local/` subdir so it
-/// stays separate from cloud-mode synced state. On wasm, returns `MemoryPersistence` until
-/// Phase 3 lands the real `WebPersistence` (OPFS first, IndexedDB fallback).
+/// Wasm `Persistence` provider: returns `MemoryPersistence` until
+/// `Plans-Phase-2-saving` lands the OPFS-backed implementation. Desktop
+/// goes through [`provide_persistence_with_vault`] so the user's chosen
+/// vault is honored.
+#[cfg(target_arch = "wasm32")]
 fn provide_persistence(mode: Mode) -> Arc<dyn Persistence> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use crate::persistence::FilesystemPersistence;
-        let dir = match mode {
-            Mode::Local => default_notes_dir().join("local"),
-            Mode::NonLocal => default_notes_dir(),
-        };
-        match FilesystemPersistence::new(&dir) {
-            Ok(p) => Arc::new(p),
-            Err(e) => {
-                eprintln!(
-                    "operon: filesystem persistence init failed for {dir:?} ({e}); \
-                     falling back to in-memory storage"
-                );
-                Arc::new(MemoryPersistence::new())
-            }
+    let _ = mode;
+    Arc::new(MemoryPersistence::new())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn provide_persistence_with_vault(
+    mode: Mode,
+    vault_root: Option<&VaultRoot>,
+) -> Arc<dyn Persistence> {
+    use crate::persistence::FilesystemPersistence;
+    let dir = match mode {
+        Mode::Local => match vault_root {
+            // Plans-Phase-2-saving: vault-rooted Local Mode persistence.
+            // Markdown bodies live at <vault>/notes/<id>.md.
+            Some(root) => root.notes_dir(),
+            None => default_notes_dir().join("local"),
+        },
+        Mode::NonLocal => default_notes_dir(),
+    };
+    match FilesystemPersistence::new(&dir) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            eprintln!(
+                "operon: filesystem persistence init failed for {dir:?} ({e}); \
+                 falling back to in-memory storage"
+            );
+            Arc::new(MemoryPersistence::new())
         }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = mode;
-        Arc::new(MemoryPersistence::new())
     }
 }
 
