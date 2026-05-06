@@ -167,6 +167,15 @@ pub fn MonacoEditorHost(
                             readOnly: false,
                         }});
                         dioxus.send({{type:"diag", phase:"mount-returned"}});
+                        // Plans-Phase-9-monaco-desktop (rev 7): some
+                        // nested-flex layouts (Local Mode Split) leave
+                        // Monaco's ResizeObserver chain pointing at a
+                        // 0-by-0 host briefly. Dispatch a window resize
+                        // a tick later so Monaco's automaticLayout
+                        // re-measures against the now-laid-out host.
+                        setTimeout(() => {{
+                            try {{ window.dispatchEvent(new Event("resize")); }} catch (e) {{}}
+                        }}, 50);
                         window.__operon_monaco_handles = window.__operon_monaco_handles || {{}};
                         window.__operon_monaco_handles['{host_id}'] = handle;
                         // Suppress change events fired by programmatic

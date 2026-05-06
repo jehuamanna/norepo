@@ -501,6 +501,7 @@ pub fn LocalSaveButton(action: LocalSaveAction, dirty: bool) -> Element {
 #[component]
 pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
     let tabs: Signal<TabManager> = use_context();
+    eprintln!("operon: LocalNoteEditor render tab_id={tab_id:?}");
     // Plans-Phase-6-image-notes: image-tab view dependencies. Hooks must
     // run unconditionally; the actual rendering is gated below.
     let note_repo_for_image: crate::local_mode::desktop::LocalNoteRepo = use_context();
