@@ -25,23 +25,148 @@ pub fn MonacoEditorHost(
     let note_id_attr = note_id.clone();
     let language_attr = language.id;
 
-    // Native build: Dioxus desktop runs Rust natively; DOM is reachable inside the webview
-    // via Dioxus's own JS layer rather than via wasm-bindgen + web_sys::Element. Mounting a
-    // real Monaco editor on desktop requires the Phase-2 follow-up of routing through
-    // `dioxus::eval`; for now the desktop build renders a clear placeholder so the surface
-    // is visible during dev.
+    // Plans-Phase-9-monaco-desktop (rev 1): Dioxus desktop runs Rust
+    // natively, but the webview hosting our DOM can run JavaScript via
+    // `document::eval`. We spawn ONE long-lived eval per host instance
+    // that dynamic-imports the existing editor-bridge JS (the same one
+    // the wasm path uses), mounts Monaco against the host `<div>`, and
+    // enters a bidirectional message loop:
+    //   - Monaco's `onChange` posts back via `dioxus.send({type:"change"})`.
+    //   - `eval.send({type:"setContent" | "focus" | "dispose"})` pushes
+    //     commands the other way (used by the picker / paste / drop /
+    //     unmount paths).
+    // The wasm path is unchanged.
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let _ = (&content, &on_change, &language); // silence unused
+        let host_id = format!("operon-monaco-host-{note_id}");
+        let initial_content = content.clone();
+        let language_id = language.id.to_string();
+
+        // Build the bootstrap script once, capturing the per-host id +
+        // initial content. Idempotent: re-renders don't re-run because
+        // we stash the resulting Eval in `use_hook`.
+        let host_id_for_script = host_id.clone();
+        let initial_content_json = serde_json::to_string(&initial_content)
+            .unwrap_or_else(|_| String::from("\"\""));
+        let language_id_json = serde_json::to_string(&language_id)
+            .unwrap_or_else(|_| String::from("\"plaintext\""));
+
+        let eval_handle: document::Eval = use_hook(move || {
+            let host_id = host_id_for_script;
+            let script = format!(
+                r#"(async function() {{
+                    try {{
+                        if (!window.operonBridge) {{
+                            await import('/assets/editor-bridge/dist/index.js');
+                        }}
+                        if (!window.operonBridge) {{
+                            dioxus.send({{type:"error", message:"bridge not loaded"}});
+                            return;
+                        }}
+                        // Wait for the host element to flush into the DOM.
+                        let target = document.getElementById('{host_id}');
+                        let attempts = 0;
+                        while (!target && attempts < 60) {{
+                            await new Promise(r => setTimeout(r, 33));
+                            target = document.getElementById('{host_id}');
+                            attempts++;
+                        }}
+                        if (!target) {{
+                            dioxus.send({{type:"error", message:"host element not found"}});
+                            return;
+                        }}
+                        const handle = await window.operonBridge.mount(target, {{
+                            kind: "monaco",
+                            languageId: {language_id_json},
+                            content: {initial_content_json},
+                            theme: "vs",
+                            readOnly: false,
+                        }});
+                        window.__operon_monaco_handles = window.__operon_monaco_handles || {{}};
+                        window.__operon_monaco_handles['{host_id}'] = handle;
+                        // Suppress change events fired by programmatic
+                        // setContent so Rust doesn't see its own write
+                        // bounce back as user input.
+                        let suppress = false;
+                        handle.onChange((c) => {{
+                            if (suppress) return;
+                            dioxus.send({{type:"change", value:c}});
+                        }});
+                        dioxus.send({{type:"mounted"}});
+                        while (true) {{
+                            const msg = await dioxus.recv();
+                            if (!msg || typeof msg !== "object") continue;
+                            switch (msg.type) {{
+                                case "setContent":
+                                    suppress = true;
+                                    try {{ handle.setContent(typeof msg.value === "string" ? msg.value : ""); }}
+                                    finally {{ suppress = false; }}
+                                    break;
+                                case "focus":
+                                    handle.dispatch("Focus");
+                                    break;
+                                case "dispose":
+                                    handle.dispose();
+                                    delete window.__operon_monaco_handles['{host_id}'];
+                                    return;
+                            }}
+                        }}
+                    }} catch (e) {{
+                        dioxus.send({{type:"error", message:String(e && e.message || e)}});
+                    }}
+                }})();"#,
+                host_id = host_id,
+                language_id_json = language_id_json,
+                initial_content_json = initial_content_json,
+            );
+            document::eval(&script)
+        });
+
+        // Drive the JS → Rust channel. Each `change` becomes an
+        // `on_change` invocation matching the wasm path's contract.
+        let on_change_for_loop = on_change;
+        let mut eval_for_loop = eval_handle;
+        use_future(move || async move {
+            loop {
+                let msg: serde_json::Value = match eval_for_loop.recv().await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let kind = msg.get("type").and_then(|v| v.as_str());
+                match kind {
+                    Some("change") => {
+                        let value = msg
+                            .get("value")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        on_change_for_loop.call(value);
+                    }
+                    Some("mounted") => {}
+                    Some("error") => {
+                        let m = msg.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                        eprintln!("operon: monaco bridge error: {m}");
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // Tear down Monaco on unmount. Eval is Copy, so capturing it in
+        // the drop closure is fine.
+        let eval_for_dispose = eval_handle;
+        use_drop(move || {
+            let _ = eval_for_dispose.send(serde_json::json!({"type":"dispose"}));
+        });
+
         return rsx! {
             div {
-                class: "operon-monaco-host operon-monaco-host-stub",
+                id: "{host_id}",
+                class: "operon-monaco-host",
                 "data-monaco-host": "{note_id_attr}",
                 "data-monaco-language": "{language_attr}",
-                "data-stub": "true",
-                div { class: "operon-monaco-host-placeholder",
-                    "Monaco editor mounts in the web build (desktop wiring lands in a follow-up). Active language: {language_attr}"
-                }
+                "data-stub": "false",
+                style: "width: 100%; height: 100%; min-height: 300px;",
             }
         };
     }
