@@ -100,7 +100,25 @@ pub fn MonacoEditorHost(
     // The wasm path is unchanged.
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let host_id = format!("operon-monaco-host-{note_id}");
+        // Plans-Phase-9-monaco-desktop (rev 13): unique host id per
+        // mount instance. Earlier revs used `operon-monaco-host-
+        // {note_id}` which made every Local-Mode editor for the same
+        // note share an id. During an Edit↔Split mode transition,
+        // Dioxus briefly keeps both panes' DOM in the document while
+        // diffing — `document.getElementById` then returned the OLD
+        // pane's host, the bootstrap mounted Monaco against it, and
+        // a tick later Dioxus removed that OLD pane (and the editor
+        // with it) leaving the NEW pane's host empty. View↔Edit /
+        // View↔Split worked because View mode doesn't render
+        // `LocalNoteEditor` so there's no second host to confuse
+        // the lookup. Unique counter via `use_hook` survives
+        // re-renders and never collides across remounts.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let host_seq: u64 = use_hook(|| {
+            static MONACO_HOST_SEQ: AtomicU64 = AtomicU64::new(0);
+            MONACO_HOST_SEQ.fetch_add(1, Ordering::Relaxed)
+        });
+        let host_id = format!("operon-monaco-host-{note_id}-{host_seq}");
         let initial_content = content.clone();
         let language_id = language.id.to_string();
         // Plans-Phase-9-monaco-desktop (rev 3): visible mount status so
