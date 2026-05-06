@@ -20,6 +20,15 @@ pub struct WikiLinkResolver(pub Callback<String>);
 #[derive(Clone, Copy)]
 pub struct WikiLinkChecker(pub Callback<String, bool>);
 
+/// Plans-Phase-6-image-notes (inline-embed): when an `![[Title^short]]`
+/// embed wikilink resolves to a `NoteKind::Image` row, the Local-Mode
+/// shell installs this resolver to return a `data:<mime>;base64,…` URL
+/// for the blob. Renderer uses it to emit `<img src="…">` instead of the
+/// text-anchor fallback. `None` means "not an image embed" (falls
+/// through to text rendering).
+#[derive(Clone, Copy)]
+pub struct WikiLinkImageResolver(pub Callback<String, Option<String>>);
+
 #[component]
 pub fn MarkdownView(content: String) -> Element {
     // Plans-Phase-5-vfs-wikilinks: post-process the AST to lift `[[…]]` and
@@ -84,6 +93,27 @@ pub fn render_node(n: &MdNode) -> Element {
             // renderer mark broken targets with a distinct class.
             let resolver = try_consume_context::<WikiLinkResolver>();
             let checker = try_consume_context::<WikiLinkChecker>();
+            // Plans-Phase-6-image-notes (inline-embed): if the embed target
+            // resolves to an image-note blob, render an `<img>` with the
+            // data URL the resolver returns. Falls through to the text
+            // anchor when no resolver is installed (e.g. cloud Shell) or
+            // the target isn't an image.
+            if *embed {
+                let img_resolver = try_consume_context::<WikiLinkImageResolver>();
+                if let Some(WikiLinkImageResolver(cb)) = img_resolver {
+                    if let Some(src) = cb.call(target.clone()) {
+                        return rsx! {
+                            img {
+                                class: "wikilink wikilink-embed wikilink-embed-image",
+                                src: "{src}",
+                                alt: "{target}",
+                                "data-wikilink-target": "{target}",
+                                "data-wikilink-embed": "image",
+                            }
+                        };
+                    }
+                }
+            }
             let live = match checker {
                 Some(WikiLinkChecker(cb)) => cb.call(target.clone()),
                 None => true,

@@ -125,6 +125,55 @@ pub fn read_image(vault: &VaultRoot, relative: &Path) -> Result<Vec<u8>, ImageEr
     })
 }
 
+/// Read the blob at `relative` and return a `data:<mime>;base64,...` URL
+/// suitable for inline `<img src="…">` rendering. Used by both the
+/// image-note tab viewer and the wikilink-embed image resolver. Returns
+/// `None` when the blob is missing or its extension isn't a recognised
+/// image type — callers fall back to text rendering in that case.
+pub fn data_url_for_blob(vault: &VaultRoot, relative: &Path) -> Option<String> {
+    let mime = match relative.extension().and_then(|s| s.to_str()) {
+        Some(e) => match e.to_ascii_lowercase().as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            "svg" => "image/svg+xml",
+            "avif" => "image/avif",
+            _ => return None,
+        },
+        None => return None,
+    };
+    let bytes = read_image(vault, relative).ok()?;
+    Some(format!("data:{mime};base64,{}", base64_encode(&bytes)))
+}
+
+/// Standard-alphabet base64 encoder, padded. Tiny enough to avoid a crate
+/// dependency for the `data:` URL use case.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHA: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+        let triple = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        out.push(ALPHA[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHA[((triple >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHA[((triple >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHA[(triple & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut s = String::with_capacity(64);
@@ -203,5 +252,25 @@ mod tests {
         let (_tmp, vault) = fixture_vault();
         let err = read_image(&vault, Path::new(".operon/images/missing.png")).unwrap_err();
         assert!(matches!(err, ImageErr::NotFound(_)));
+    }
+
+    #[test]
+    fn data_url_round_trips_png_bytes() {
+        let (_tmp, vault) = fixture_vault();
+        let bytes = b"\x89PNG\r\n\x1a\n";
+        let w = write_image(&vault, bytes, "image/png").unwrap();
+        let url = data_url_for_blob(&vault, &w.relative_path).expect("data url");
+        assert!(url.starts_with("data:image/png;base64,"));
+        // Round-trip the base64 portion via a known byte: 0x89 0x50 0x4e ...
+        // -> "iVBORw0KGgo=" (canonical PNG header b64).
+        assert!(url.ends_with("iVBORw0KGgo="));
+    }
+
+    #[test]
+    fn data_url_returns_none_for_unknown_extension() {
+        let (_tmp, vault) = fixture_vault();
+        // Synthesise a path with a non-image extension to skip the
+        // mime branch — the function returns None before touching disk.
+        assert!(data_url_for_blob(&vault, Path::new(".operon/images/x.bin")).is_none());
     }
 }

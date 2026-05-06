@@ -212,20 +212,7 @@ fn try_render_image_view(
     }
     let rel = row.blob_path.clone()?;
     let rel_path = std::path::Path::new(&rel).to_path_buf();
-    let bytes = crate::local_mode::images::read_image(&vault, &rel_path).ok()?;
-
-    // Compose a data: URL for inline rendering. base64 inline encoder
-    // (we don't pull a base64 crate just for this).
-    let mime = match rel_path.extension().and_then(|s| s.to_str()).unwrap_or("") {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        "svg" => "image/svg+xml",
-        "avif" => "image/avif",
-        _ => "application/octet-stream",
-    };
-    let data_url = format!("data:{mime};base64,{}", base64_encode(&bytes));
+    let data_url = crate::local_mode::images::data_url_for_blob(&vault, &rel_path)?;
 
     // Plans-Phase-2-editor-auto-focus: image-note tab needs to be focusable
     // so arrow keys / page-up/down can scroll the viewer when the note has
@@ -358,33 +345,6 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
-}
-
-/// Tiny inline base64 encoder so the image-tab view can render via a
-/// `data:` URL without pulling a base64 crate. Standard alphabet, padded.
-fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
-        let triple = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
-        out.push(ALPHA[((triple >> 18) & 0x3f) as usize] as char);
-        out.push(ALPHA[((triple >> 12) & 0x3f) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHA[((triple >> 6) & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHA[(triple & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 /// Save button rendered inside the editor toolbar. Calls the installed

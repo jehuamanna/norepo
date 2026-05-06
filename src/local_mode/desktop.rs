@@ -5,7 +5,7 @@ use std::sync::Arc;
 use dioxus::prelude::*;
 use operon_store::repos::{
     LocalNoteLinkRepository, LocalNoteRepository, LocalProjectRepository, LocalSearchRepository,
-    LocalSettingsRepository, LocalTreeStateRepository, LocalUserRepository,
+    LocalSettingsRepository, LocalTreeStateRepository, LocalUserRepository, NoteKind,
     SqliteLocalNoteLinkRepository, SqliteLocalNoteRepository, SqliteLocalProjectRepository,
     SqliteLocalSearchRepository, SqliteLocalSettingsRepository, SqliteLocalTreeStateRepository,
     SqliteLocalUserRepository,
@@ -583,6 +583,55 @@ pub fn provide_local_app_signals() {
         })
     });
     use_context_provider(|| crate::plugins::markdown::render::WikiLinkChecker(wikilink_checker));
+
+    // Plans-Phase-6-image-notes (inline-embed): resolver that turns an
+    // `![[Title^short]]` embed target into a `data:` URL when it points
+    // to an image-note blob. The MarkdownView renderer consumes this
+    // context to emit `<img>` instead of the text-anchor fallback.
+    let project_repo_for_img = project_repo.clone();
+    let note_repo_for_img = note_repo_for_links.clone();
+    let selected_note_for_img = selected_note_for_links;
+    let CurrentVaultRoot(vault_for_img) = use_context::<CurrentVaultRoot>();
+    let wikilink_image_resolver = use_hook(move || {
+        Callback::new(move |target: String| -> Option<String> {
+            let snap_projects = project_repo_for_img.list().ok()?;
+            let source_project_id = (*selected_note_for_img.read())
+                .and_then(|nid| {
+                    snap_projects.iter().find_map(|p| {
+                        note_repo_for_img
+                            .list_for_project(p.id)
+                            .ok()
+                            .and_then(|notes| notes.iter().find(|n| n.id == nid).map(|_| p.id))
+                    })
+                })
+                .or_else(|| snap_projects.first().map(|p| p.id))?;
+            let form = vfs::parse_link(&target)?;
+            let note_id = vfs::resolve_link(
+                project_repo_for_img.as_ref(),
+                note_repo_for_img.as_ref(),
+                source_project_id,
+                &form,
+            )
+            .ok()?;
+            let row = note_repo_for_img
+                .list_for_project(source_project_id)
+                .ok()?
+                .into_iter()
+                .find(|n| n.id == note_id)?;
+            if !matches!(row.kind, NoteKind::Image) {
+                return None;
+            }
+            let blob_path = row.blob_path.clone()?;
+            let vault = vault_for_img.read().clone()?;
+            crate::local_mode::images::data_url_for_blob(
+                &vault,
+                std::path::Path::new(&blob_path),
+            )
+        })
+    });
+    use_context_provider(|| {
+        crate::plugins::markdown::render::WikiLinkImageResolver(wikilink_image_resolver)
+    });
 }
 
 /// Wraps the Cloud `Shell` for Local Mode. Owns the Local-only keyboard

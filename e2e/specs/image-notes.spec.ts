@@ -34,6 +34,23 @@ test.describe.skip('Phase 6 — image notes', () => {
     // Embed expected: `![[<title>^<short-id>]]` appears at caret.
   });
 
+  // Bug-c236b2ed (Image note, follow-up): when a pasted image's
+  // `![[Title^short]]` reference is rendered in View / Split mode, the
+  // MarkdownView consults `WikiLinkImageResolver` (Local-Mode shell) and
+  // emits an `<img data-wikilink-embed="image">` instead of the text
+  // anchor — so the image displays inline in the rendered markdown.
+  test('Inline image embed renders as <img> in View mode (data:image base64)', async ({ page }) => {
+    // Open a note that has been authored with `![[…^…]]` referencing
+    // an existing image-note in the same project.
+    const row = page.locator('[data-testid="note-row"]').first();
+    await row.click();
+    // Switch the open tab to View mode so MarkdownView mounts.
+    await page.locator('[data-testid="mode-toolbar-view"]').click();
+    const inline = page.locator('[data-wikilink-embed="image"]');
+    await expect(inline).toBeVisible();
+    await expect(inline).toHaveAttribute('src', /^data:image\/(png|jpe?g|webp|gif|svg\+xml|avif);base64,/);
+  });
+
   test('Drop an image file onto a note row creates a child image-note', async ({ page }) => {
     const row = page.locator('[data-testid="note-row"]').first();
     // page.locator(...).dispatchEvent('drop', {dataTransfer:...})
