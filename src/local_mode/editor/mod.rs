@@ -897,20 +897,16 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
             class: "operon-local-editor-host",
             "data-testid": "local-note-editor-host",
             "data-tab-id": "{tab_id.0}",
-            // Plans-Phase-9-monaco-desktop (rev 8): absolute-inset
-            // against the positioned ancestor (`.operon-main-body` in
-            // Edit mode, `.operon-local-split-edit` in Split mode).
-            // Earlier revisions used a triple-nested flex column
-            // chain (`flex: 1 1 auto; min-height: 0; flex-direction:
-            // column; height: 100%`) — Edit mode held up but Split
-            // mode's column-of-column-of-column resolved the host to
-            // 0x0 in the dx-desktop webview, leaving Monaco mounted
-            // against an invisible container. Absolute-inset breaks
-            // the dependency on flex-cascade resolution: every layer
-            // gets its size deterministically from the outermost
-            // positioned ancestor's dimensions.
-            style: "position: absolute; inset: 0; \
-                    display: flex; flex-direction: column;",
+            // Plans-Phase-9-monaco-desktop (rev 11): absolute-inset
+            // against the positioned ancestor (`.operon-main-body` /
+            // `.operon-local-split-edit`). Children (MonacoEditorHost
+            // wrapping div, optional ContextMenu, LinkPicker) are all
+            // either absolute-positioned or fixed — no flex needed
+            // here. Removing `display: flex; flex-direction: column;`
+            // simplifies the layout chain and rules out a flex-with-
+            // no-in-flow-children edge case as the cause of the
+            // 0×0 host the user saw in Split mode.
+            style: "position: absolute; inset: 0;",
             // Plans-Phase-6-image-notes (drop-to-note-area): preventing
             // default on `ondragover` is what tells the browser this
             // element is a valid drop target — without it, `ondrop`

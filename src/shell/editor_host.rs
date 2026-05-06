@@ -201,20 +201,29 @@ pub fn MonacoEditorHost(
                         // setTimeouts at increasing delays cover both
                         // immediate (next-frame) and slightly-deferred
                         // (post-flex-settle) cases.
-                        const relayout = () => {{
+                        const relayout = (label) => {{
                             try {{
                                 if (!handle || !handle.layout) return;
                                 handle.layout();
                                 dioxus.send({{
                                     type:"diag",
-                                    phase:"relayout",
+                                    phase:"relayout-"+label,
                                     origin: "w="+target.clientWidth+" h="+target.clientHeight,
                                 }});
                             }} catch (e) {{}}
                         }};
-                        setTimeout(relayout, 0);
-                        setTimeout(relayout, 100);
-                        setTimeout(relayout, 500);
+                        setTimeout(() => relayout("0ms"), 0);
+                        setTimeout(() => relayout("100ms"), 100);
+                        setTimeout(() => relayout("500ms"), 500);
+                        setTimeout(() => relayout("2s"), 2000);
+                        // Also observe the host element directly so we
+                        // catch any later size change and re-layout.
+                        try {{
+                            const ro = new ResizeObserver(() => {{
+                                relayout("ro");
+                            }});
+                            ro.observe(target);
+                        }} catch (e) {{}}
                         // Suppress change events fired by programmatic
                         // setContent so Rust doesn't see its own write
                         // bounce back as user input.
@@ -386,16 +395,21 @@ pub fn MonacoEditorHost(
                     "data-stub": "false",
                     style: "position: absolute; inset: 0;",
                 }
-                if !*mounted_flag.read() {
-                    div {
-                        class: "operon-monaco-status",
-                        "data-testid": "monaco-mount-status",
-                        style: "position: absolute; top: 8px; left: 8px; padding: 6px 10px; \
-                                background: rgba(255, 235, 59, 0.85); color: #1a1a1a; \
-                                font-family: monospace; font-size: 12px; border-radius: 4px; \
-                                z-index: 10; max-width: 90%; white-space: pre-wrap;",
-                        "{mount_status.read()}"
-                    }
+                // Plans-Phase-9-monaco-desktop (rev 11): keep the
+                // status overlay visible even after mount so the
+                // user can see live diag info (the host size from
+                // each `relayout-*` step). Pointer-events: none so
+                // it never steals clicks from Monaco. Remove this
+                // override once Split-mode rendering is confirmed.
+                div {
+                    class: "operon-monaco-status",
+                    "data-testid": "monaco-mount-status",
+                    style: "position: absolute; top: 4px; left: 4px; padding: 3px 6px; \
+                            background: rgba(255, 235, 59, 0.85); color: #1a1a1a; \
+                            font-family: monospace; font-size: 10px; border-radius: 3px; \
+                            z-index: 10; max-width: 90%; white-space: pre-wrap; \
+                            pointer-events: none;",
+                    "{mount_status.read()}"
                 }
             }
         };
