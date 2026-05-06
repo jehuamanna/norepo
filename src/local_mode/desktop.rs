@@ -435,6 +435,8 @@ pub fn provide_local_app_signals() {
     use_context_provider(|| DragSession(drag_session));
     let clipboard: Signal<Option<Clipboard>> = use_signal(|| None);
     use_context_provider(|| LocalClipboard(clipboard));
+    let bulk_clipboard: Signal<Option<crate::local_mode::ui::BulkClipboard>> = use_signal(|| None);
+    use_context_provider(|| crate::local_mode::ui::LocalBulkClipboard(bulk_clipboard));
     let search_focus_tick: Signal<u64> = use_signal(|| 0);
     use_context_provider(|| ExplorerSearchFocus(search_focus_tick));
 
@@ -554,6 +556,8 @@ pub fn LocalShellOverlay(children: Element) -> Element {
     let LocalNoteRepo(note_repo) = use_context();
     let LocalProjectRepo(project_repo) = use_context();
     let LocalClipboard(clipboard) = use_context();
+    let crate::local_mode::ui::LocalBulkClipboard(bulk_clipboard) = use_context();
+    let crate::local_mode::explorer::MultiSelected(multi_selected) = use_context();
     let SelectedProject(selected_project) = use_context();
     let SelectedNote(selected_note) = use_context();
     let LocalNoteVersion(note_version) = use_context();
@@ -564,6 +568,8 @@ pub fn LocalShellOverlay(children: Element) -> Element {
     let save_action: LocalSaveAction = use_context();
 
     let mut clipboard_setter = clipboard;
+    let mut bulk_clipboard_setter = bulk_clipboard;
+    let mut multi_selected_setter = multi_selected;
     let mut selected_project_setter = selected_project;
     let mut note_version_setter = note_version;
     let mut search_focus_tick_setter = search_focus_tick;
@@ -597,23 +603,70 @@ pub fn LocalShellOverlay(children: Element) -> Element {
                 }
                 if with_meta && !mods.contains(Modifiers::ALT) && !mods.contains(Modifiers::SHIFT) {
                     if key.eq_ignore_ascii_case("x") || key.eq_ignore_ascii_case("c") {
+                        let kind = if key.eq_ignore_ascii_case("x") {
+                            ClipKind::Cut
+                        } else {
+                            ClipKind::Copy
+                        };
+                        // Plans-Phase-4-multiselect-aria: multi-set takes
+                        // precedence when 2+ items are selected.
+                        let multi: Vec<ClipPayload> = multi_selected
+                            .read()
+                            .iter()
+                            .map(|k| match k {
+                                crate::local_mode::explorer::NodeKey::Note(id) => {
+                                    ClipPayload::Note(*id)
+                                }
+                                crate::local_mode::explorer::NodeKey::Project(id) => {
+                                    ClipPayload::Project(*id)
+                                }
+                            })
+                            .collect();
+                        if multi.len() >= 2 {
+                            bulk_clipboard_setter.set(Some(crate::local_mode::ui::BulkClipboard {
+                                kind,
+                                items: multi,
+                            }));
+                            clipboard_setter.set(None);
+                            evt.prevent_default();
+                            return;
+                        }
                         let payload = if let Some(nid) = *selected_note.read() {
                             Some(ClipPayload::Note(nid))
                         } else {
                             (*selected_project.read()).map(ClipPayload::Project)
                         };
                         if let Some(payload) = payload {
-                            let kind = if key.eq_ignore_ascii_case("x") {
-                                ClipKind::Cut
-                            } else {
-                                ClipKind::Copy
-                            };
                             clipboard_setter.set(Some(Clipboard { kind, payload }));
+                            bulk_clipboard_setter.set(None);
                             evt.prevent_default();
                             return;
                         }
                     }
                     if key.eq_ignore_ascii_case("v") {
+                        let bulk = bulk_clipboard.read().clone();
+                        if let Some(bulk) = bulk {
+                            for payload in bulk.items.iter() {
+                                paste_clipboard(
+                                    Clipboard {
+                                        kind: bulk.kind,
+                                        payload: *payload,
+                                    },
+                                    *selected_note.read(),
+                                    *selected_project.read(),
+                                    &note_repo_for_keys,
+                                    &project_repo_for_keys,
+                                );
+                            }
+                            note_version_setter.with_mut(|v| *v += 1);
+                            if matches!(bulk.kind, ClipKind::Cut) {
+                                bulk_clipboard_setter.set(None);
+                                multi_selected_setter
+                                    .set(std::collections::BTreeSet::new());
+                            }
+                            evt.prevent_default();
+                            return;
+                        }
                         let clip = *clipboard.read();
                         if let Some(clip) = clip {
                             paste_clipboard(
@@ -632,10 +685,17 @@ pub fn LocalShellOverlay(children: Element) -> Element {
                         }
                     }
                 }
-                if key == "Escape" && clipboard.read().is_some() {
-                    clipboard_setter.set(None);
-                    evt.prevent_default();
-                    return;
+                if key == "Escape" {
+                    if clipboard.read().is_some() {
+                        clipboard_setter.set(None);
+                        evt.prevent_default();
+                        return;
+                    }
+                    if bulk_clipboard.read().is_some() {
+                        bulk_clipboard_setter.set(None);
+                        evt.prevent_default();
+                        return;
+                    }
                 }
                 let _ = &mut selected_project_setter;
             },

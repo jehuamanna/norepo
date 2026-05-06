@@ -8,7 +8,9 @@ pub mod context_menu;
 pub mod drag_drop;
 pub mod inline_rename;
 
-pub use clipboard::{ClipKind, ClipPayload, Clipboard, LocalClipboard};
+pub use clipboard::{
+    BulkClipboard, ClipKind, ClipPayload, Clipboard, LocalBulkClipboard, LocalClipboard,
+};
 pub use confirm::ConfirmDialog;
 pub use context_menu::{ContextMenu, ContextMenuItem};
 pub use drag_drop::{classify_drop_position, DragKind, DragSession, DropPosition};

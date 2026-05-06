@@ -68,3 +68,17 @@ impl Clipboard {
 /// App-scope signal: the current clipboard, if any.
 #[derive(Clone, Copy)]
 pub struct LocalClipboard(pub Signal<Option<Clipboard>>);
+
+/// Plans-Phase-4-multiselect-aria: bulk clipboard. Populated when the user
+/// runs Cut/Copy with the multi-selection set holding 2+ items. Coexists
+/// with [`LocalClipboard`]: the keyboard handler clears the single-item
+/// clipboard when it writes a multi clipboard, and Paste prefers the multi
+/// when present.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BulkClipboard {
+    pub kind: ClipKind,
+    pub items: Vec<ClipPayload>,
+}
+
+#[derive(Clone, Copy)]
+pub struct LocalBulkClipboard(pub Signal<Option<BulkClipboard>>);
