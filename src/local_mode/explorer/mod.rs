@@ -608,6 +608,8 @@ pub fn ExplorerPanel() -> Element {
     // file. Title collisions get a numeric suffix.
     let project_repo_for_export = project_repo.clone();
     let note_repo_for_export = note_repo.clone();
+    let project_repo_for_gc = project_repo.clone();
+    let note_repo_for_gc = note_repo.clone();
     let persistence_for_export: Arc<dyn Persistence> = use_context();
     let crate::local_mode::CurrentVaultRoot(vault_root_for_export) = use_context();
     let on_bulk_export = use_callback(move |_: ()| {
@@ -1185,11 +1187,64 @@ pub fn ExplorerPanel() -> Element {
                 ),
                 confirm_label: "Delete".to_string(),
                 on_confirm: Callback::new(move |_| {
+                    // Plans-Phase-6-image-notes: snapshot the note's blob_path
+                    // (and the blob_paths of any descendants) BEFORE delete,
+                    // since the FK cascade will lose them.
+                    let mut blobs_to_check: Vec<String> = Vec::new();
+                    let snap = notes_by_project.read();
+                    for list in snap.values() {
+                        // Collect the target plus all descendants whose
+                        // ancestor chain includes `did`.
+                        for n in list.iter() {
+                            if n.id == did {
+                                if let Some(ref p) = n.blob_path {
+                                    blobs_to_check.push(p.clone());
+                                }
+                            }
+                            // Walk ancestors of n; if any ancestor is `did`,
+                            // n is being deleted too.
+                            let mut cur = n.parent_id;
+                            while let Some(pid) = cur {
+                                if pid == did {
+                                    if let Some(ref p) = n.blob_path {
+                                        blobs_to_check.push(p.clone());
+                                    }
+                                    break;
+                                }
+                                cur = list.iter().find(|x| x.id == pid).and_then(|x| x.parent_id);
+                            }
+                        }
+                    }
+                    drop(snap);
                     match note_repo_for_delete.delete(did) {
                         Ok(()) => {
                             note_version.with_mut(|v| *v += 1);
                             if selected_note_now == Some(did) {
                                 selected_note.set(None);
+                            }
+                            // Refcount each blob: if no remaining note
+                            // references it, delete the on-disk file.
+                            if let Some(vault) = vault_root_for_export.read().clone() {
+                                let project_repo = project_repo_for_gc.clone();
+                                let note_repo = note_repo_for_gc.clone();
+                                let projects = project_repo.list().unwrap_or_default();
+                                for blob in blobs_to_check {
+                                    let mut still_referenced = false;
+                                    'outer: for p in &projects {
+                                        if let Ok(notes) = note_repo.list_for_project(p.id) {
+                                            for n in notes {
+                                                if n.blob_path.as_deref() == Some(blob.as_str()) {
+                                                    still_referenced = true;
+                                                    break 'outer;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if !still_referenced {
+                                        let abs = vault.path().join(&blob);
+                                        let _ = std::fs::remove_file(&abs);
+                                    }
+                                }
                             }
                         }
                         Err(e) => eprintln!("operon: delete local_note failed: {e}"),
