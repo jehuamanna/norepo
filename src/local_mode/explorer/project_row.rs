@@ -51,7 +51,11 @@ pub struct ProjectRowProps {
 pub fn ProjectRow(props: ProjectRowProps) -> Element {
     let menu_pos: Signal<Option<(i32, i32)>> = use_signal(|| None);
     let mut menu_pos_setter = menu_pos;
-    let drop_indicator: Signal<Option<DropPosition>> = use_signal(|| None);
+    // Plans-Phase-7-projectrow-forbidden: tri-state indicator mirroring
+    // NoteRow. Some(Ok(pos)) → allowed; Some(Err(())) → forbidden
+    // (self-drop, or a position not allowed for the dragged kind);
+    // None → no drag over this row.
+    let drop_indicator: Signal<Option<Result<DropPosition, ()>>> = use_signal(|| None);
     let mut drop_indicator_setter = drop_indicator;
     let DragSession(mut drag_session) = use_context();
 
@@ -196,12 +200,30 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
                 // Element coordinates are relative to the row's top-left corner.
                 // Estimate row height from py-1 + line height — fall back to 28px.
                 let pos = classify_drop_position(coords.y, 28.0);
-                let allow = match kind {
-                    Some(DragKind::Project(src)) => src != id && !matches!(pos, DropPosition::Into),
-                    Some(DragKind::Note(_)) => matches!(pos, DropPosition::Into),
-                    None => false,
+                // Plans-Phase-7-projectrow-forbidden: classify the drop:
+                //   - allowed → Some(Ok(pos))
+                //   - forbidden (self-drop or wrong position) → Some(Err(()))
+                //   - no relevant drag → None
+                let next: Option<Result<DropPosition, ()>> = match kind {
+                    Some(DragKind::Project(src)) => {
+                        if src == id {
+                            Some(Err(()))
+                        } else if matches!(pos, DropPosition::Into) {
+                            Some(Err(()))
+                        } else {
+                            Some(Ok(pos))
+                        }
+                    }
+                    Some(DragKind::Note(_)) => {
+                        if matches!(pos, DropPosition::Into) {
+                            Some(Ok(pos))
+                        } else {
+                            Some(Err(()))
+                        }
+                    }
+                    None => None,
                 };
-                drop_indicator_setter.set(if allow { Some(pos) } else { None });
+                drop_indicator_setter.set(next);
             },
             ondragleave: move |_| {
                 drop_indicator_setter.set(None);
@@ -299,8 +321,10 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
                 }
             }
             if drag_active {
-                if let Some(p) = drop_pos_now {
-                    DropIndicator { position: p }
+                match drop_pos_now {
+                    Some(Ok(p)) => rsx! { DropIndicator { position: p } },
+                    Some(Err(())) => rsx! { ForbiddenIndicator {} },
+                    None => rsx! {},
                 }
             }
         }
@@ -335,6 +359,21 @@ fn DropIndicator(position: DropPosition) -> Element {
         span {
             class: "{class}",
             "data-testid": "{testid}",
+        }
+    }
+}
+
+/// Plans-Phase-7-projectrow-forbidden: shown when a drop on this project
+/// row would not be valid (project drop on self, project drop into
+/// another project's body, or note drop in a Before/After zone of a
+/// project). Same red-ring + no-drop-cursor as the NoteRow variant.
+#[component]
+fn ForbiddenIndicator() -> Element {
+    rsx! {
+        span {
+            class: "absolute inset-0 ring-2 ring-rose-500 pointer-events-none",
+            style: "cursor: no-drop;",
+            "data-testid": "drop-indicator-forbidden",
         }
     }
 }
