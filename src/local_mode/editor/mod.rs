@@ -252,6 +252,116 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
 
     let content = tab.content.clone();
 
+    // Plans-Phase-6-image-notes: Cmd/Ctrl+Shift+I opens an image picker,
+    // writes the chosen file, mints a child image-note under the current
+    // note, and appends an Obsidian-style `![[…]]` reference to the
+    // current body. Caret-position insertion would require a JS bridge
+    // (textarea selectionStart) — acceptable follow-up.
+    let mut tabs_for_image = tabs;
+    let crate::local_mode::desktop::LocalNoteRepo(note_repo_for_paste) =
+        note_repo_for_image.clone();
+    let crate::local_mode::desktop::CurrentVaultRoot(vault_signal_for_paste) =
+        vault_for_image.clone();
+    let on_insert_image_via_picker = move || {
+        let Ok(parent_uuid) = Uuid::parse_str(&tab.note_id) else {
+            return;
+        };
+        let Some(vault) = vault_signal_for_paste.read().clone() else {
+            return;
+        };
+        let project_id_opt = {
+            let crate::local_mode::desktop::LocalProjectRepo(prepo) =
+                project_repo_for_image.clone();
+            let projects = prepo.list().unwrap_or_default();
+            projects.iter().find_map(|p| {
+                note_repo_for_paste
+                    .list_for_project(p.id)
+                    .ok()
+                    .and_then(|notes| notes.iter().find(|n| n.id == parent_uuid).map(|_| p.id))
+            })
+        };
+        let Some(project_id) = project_id_opt else {
+            return;
+        };
+        let note_repo = note_repo_for_paste.clone();
+        spawn(async move {
+            let Some(handle) = rfd::AsyncFileDialog::new()
+                .set_title("Insert image")
+                .add_filter("Image", &["png", "jpg", "jpeg", "webp", "gif", "svg", "avif"])
+                .pick_file()
+                .await
+            else {
+                return;
+            };
+            let path = handle.path().to_path_buf();
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("operon: insert image read failed: {e}");
+                    return;
+                }
+            };
+            let mime = match path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("png") => "image/png",
+                Some("jpg") | Some("jpeg") => "image/jpeg",
+                Some("webp") => "image/webp",
+                Some("gif") => "image/gif",
+                Some("svg") => "image/svg+xml",
+                Some("avif") => "image/avif",
+                _ => return,
+            };
+            let written = match crate::local_mode::images::write_image(&vault, &bytes, mime) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("operon: insert image write failed: {e}");
+                    return;
+                }
+            };
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Image")
+                .to_string();
+            let new_note = match note_repo.create_with_kind(
+                project_id,
+                Some(parent_uuid),
+                &stem,
+                operon_store::repos::NoteKind::Image,
+            ) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("operon: insert image create_with_kind failed: {e}");
+                    return;
+                }
+            };
+            let rel = written.relative_path.to_string_lossy().to_string();
+            if let Err(e) = note_repo.set_blob_path(new_note.id, Some(&rel)) {
+                eprintln!("operon: insert image set_blob_path failed: {e}");
+            }
+            let short = operon_store::vfs::short_id(new_note.id);
+            let embed = format!("![[{}^{}]]", stem, short);
+            // Append the embed to the current body. Caret-position insertion
+            // is a follow-up.
+            let current = tabs_for_image
+                .read()
+                .get(tab_id)
+                .map(|t| t.content.clone())
+                .unwrap_or_default();
+            let next = if current.ends_with('\n') || current.is_empty() {
+                format!("{current}{embed}\n")
+            } else {
+                format!("{current}\n{embed}\n")
+            };
+            tabs_for_image.write().set_content(tab_id, next);
+            tabs_for_image.write().set_dirty(tab_id, true);
+        });
+    };
+
     rsx! {
         textarea {
             class: "operon-local-editor",
@@ -266,6 +376,16 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
             onkeydown: move |evt| {
                 let mods = evt.modifiers();
                 let with_meta = mods.contains(Modifiers::META) || mods.contains(Modifiers::CONTROL);
+                if with_meta
+                    && mods.contains(Modifiers::SHIFT)
+                    && !mods.contains(Modifiers::ALT)
+                    && evt.key().to_string().eq_ignore_ascii_case("i")
+                {
+                    // Plans-Phase-6-image-notes: insert image via picker.
+                    evt.prevent_default();
+                    on_insert_image_via_picker();
+                    return;
+                }
                 if with_meta
                     && !mods.contains(Modifiers::SHIFT)
                     && !mods.contains(Modifiers::ALT)
