@@ -58,6 +58,10 @@ pub struct LocalNote {
     /// before migration 008 (the column gets `'markdown'` via SQL default).
     #[serde(default)]
     pub kind: NoteKind,
+    /// Plans-Phase-6-image-notes: vault-relative path to this note's image
+    /// blob. `None` for markdown notes.
+    #[serde(default)]
+    pub blob_path: Option<String>,
 }
 
 pub trait LocalNoteRepository: Send + Sync {
@@ -68,6 +72,37 @@ pub trait LocalNoteRepository: Send + Sync {
         parent_id: Option<Uuid>,
         title: &str,
     ) -> Result<LocalNote, StoreError>;
+
+    /// Plans-Phase-6-image-notes: create a note with an explicit
+    /// [`NoteKind`]. Default impl writes via `create` with `'markdown'`
+    /// then patches the row's `kind` for `Image`. Sqlite impls override
+    /// this for atomicity — the default just keeps every existing trait
+    /// implementor working.
+    fn create_with_kind(
+        &self,
+        project_id: Uuid,
+        parent_id: Option<Uuid>,
+        title: &str,
+        kind: NoteKind,
+    ) -> Result<LocalNote, StoreError> {
+        let mut row = self.create(project_id, parent_id, title)?;
+        if !matches!(kind, NoteKind::Markdown) {
+            // The default body via `create` always lands as 'markdown'.
+            // Implementors that override this method can write the
+            // correct value in a single INSERT.
+            self.set_kind(row.id, kind)?;
+            row.kind = kind;
+        }
+        Ok(row)
+    }
+
+    /// Patch an existing note's [`NoteKind`].
+    fn set_kind(&self, id: Uuid, kind: NoteKind) -> Result<(), StoreError>;
+
+    /// Plans-Phase-6-image-notes: store the vault-relative path to the
+    /// note's image blob. Pass `None` to clear.
+    fn set_blob_path(&self, id: Uuid, path: Option<&str>) -> Result<(), StoreError>;
+
     fn rename(&self, id: Uuid, title: &str) -> Result<(), StoreError>;
     fn delete(&self, id: Uuid) -> Result<(), StoreError>;
     fn touch_updated(&self, id: Uuid) -> Result<(), StoreError>;
@@ -156,6 +191,7 @@ fn row_to_local_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalNote> {
         .get::<_, String>(8)
         .map(|s| NoteKind::from_str(&s))
         .unwrap_or_default();
+    let blob_path: Option<String> = row.get(9).unwrap_or(None);
     Ok(LocalNote {
         id,
         project_id,
@@ -166,11 +202,12 @@ fn row_to_local_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalNote> {
         created_at_ms: row.get(6)?,
         updated_at_ms: row.get(7)?,
         kind,
+        blob_path,
     })
 }
 
 const SELECT_COLS: &str =
-    "id, project_id, parent_id, sibling_index, depth, title, created_at_ms, updated_at_ms, kind";
+    "id, project_id, parent_id, sibling_index, depth, title, created_at_ms, updated_at_ms, kind, blob_path";
 
 impl LocalNoteRepository for SqliteLocalNoteRepository {
     fn list_for_project(&self, project_id: Uuid) -> Result<Vec<LocalNote>, StoreError> {
@@ -274,6 +311,7 @@ impl LocalNoteRepository for SqliteLocalNoteRepository {
             created_at_ms: now,
             updated_at_ms: now,
             kind: NoteKind::Markdown,
+            blob_path: None,
         })
     }
 
@@ -289,6 +327,30 @@ impl LocalNoteRepository for SqliteLocalNoteRepository {
         let n = conn.execute(
             "UPDATE local_note SET title = ?2, updated_at_ms = ?3 WHERE id = ?1",
             params![id.to_string(), trimmed, now],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn set_kind(&self, id: Uuid, kind: NoteKind) -> Result<(), StoreError> {
+        let conn = self.store.conn()?;
+        let n = conn.execute(
+            "UPDATE local_note SET kind = ?2 WHERE id = ?1",
+            params![id.to_string(), kind.as_str()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn set_blob_path(&self, id: Uuid, path: Option<&str>) -> Result<(), StoreError> {
+        let conn = self.store.conn()?;
+        let n = conn.execute(
+            "UPDATE local_note SET blob_path = ?2 WHERE id = ?1",
+            params![id.to_string(), path],
         )?;
         if n == 0 {
             return Err(StoreError::NotFound);

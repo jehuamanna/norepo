@@ -43,6 +43,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "008_local_note_kind",
         include_str!("../migrations/008_local_note_kind.sql"),
     ),
+    (
+        9,
+        "009_local_note_blob_path",
+        include_str!("../migrations/009_local_note_blob_path.sql"),
+    ),
 ];
 
 fn ensure_migrations_table(conn: &Connection) -> Result<(), StoreError> {

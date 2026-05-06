@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dioxus::prelude::*;
-use operon_store::repos::{LocalNote, LocalProject};
+use operon_store::repos::{LocalNote, LocalProject, NoteKind};
 use uuid::Uuid;
 
 use crate::editor::EditorMode;
@@ -312,6 +312,78 @@ pub fn ExplorerPanel() -> Element {
             }
             Err(e) => eprintln!("operon: create local_note failed: {e}"),
         }
+    });
+
+    // Plans-Phase-6-image-notes: Add image note via native file picker.
+    // Reads the chosen file, writes via images::write_image, mints an
+    // image-note row, and attaches blob_path. Lives entirely on the
+    // desktop side because rfd is desktop-only.
+    let note_repo_for_add_image = note_repo.clone();
+    let crate::local_mode::CurrentVaultRoot(vault_root_signal) = use_context();
+    let on_add_image_note = use_callback(move |project_id: Uuid| {
+        let Some(vault) = vault_root_signal.read().clone() else {
+            eprintln!("operon: add image note: no vault");
+            return;
+        };
+        let note_repo = note_repo_for_add_image.clone();
+        spawn(async move {
+            let Some(handle) = rfd::AsyncFileDialog::new()
+                .set_title("Choose an image")
+                .add_filter("Image", &["png", "jpg", "jpeg", "webp", "gif", "svg", "avif"])
+                .pick_file()
+                .await
+            else {
+                return;
+            };
+            let path = handle.path().to_path_buf();
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("operon: read image file {path:?} failed: {e}");
+                    return;
+                }
+            };
+            // Cheap MIME inference from the chosen extension.
+            let ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
+            let mime = match ext.as_str() {
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "webp" => "image/webp",
+                "gif" => "image/gif",
+                "svg" => "image/svg+xml",
+                "avif" => "image/avif",
+                _ => {
+                    eprintln!("operon: add image note: unsupported extension {ext}");
+                    return;
+                }
+            };
+            let written = match crate::local_mode::images::write_image(&vault, &bytes, mime) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("operon: write_image failed: {e}");
+                    return;
+                }
+            };
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Image")
+                .to_string();
+            match note_repo.create_with_kind(project_id, None, &stem, NoteKind::Image) {
+                Ok(row) => {
+                    let rel = written.relative_path.to_string_lossy().to_string();
+                    if let Err(e) = note_repo.set_blob_path(row.id, Some(&rel)) {
+                        eprintln!("operon: set_blob_path failed: {e}");
+                    }
+                    note_version.with_mut(|v| *v += 1);
+                }
+                Err(e) => eprintln!("operon: create image note failed: {e}"),
+            }
+        });
     });
 
     // ===== Note handlers =====
@@ -921,6 +993,7 @@ pub fn ExplorerPanel() -> Element {
                             on_request_delete_project: on_request_delete_project,
                             on_toggle_project: on_toggle_project,
                             on_add_root_note: on_add_root_note,
+                            on_add_image_note: on_add_image_note,
                             on_select_note: on_select_note,
                             on_toggle_note: on_toggle_note,
                             on_rename_note: on_rename_note,
@@ -1058,6 +1131,7 @@ struct ProjectSubtreeProps {
     on_request_delete_project: Callback<Uuid>,
     on_toggle_project: Callback<Uuid>,
     on_add_root_note: Callback<Uuid>,
+    on_add_image_note: Callback<Uuid>,
     on_select_note: Callback<Uuid>,
     on_toggle_note: Callback<(Uuid, Uuid)>,
     on_rename_note: Callback<(Uuid, String)>,
@@ -1136,6 +1210,7 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
             on_request_delete: props.on_request_delete_project,
             on_toggle: props.on_toggle_project,
             on_add_note: props.on_add_root_note,
+            on_add_image_note: props.on_add_image_note,
             on_cut: props.on_cut_project,
             on_copy: props.on_copy_project,
             on_paste: props.on_paste_into_project,

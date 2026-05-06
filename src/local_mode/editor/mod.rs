@@ -103,6 +103,95 @@ pub fn open_local_note_tab(
     id
 }
 
+/// Plans-Phase-6-image-notes: if the given note id is an image, return an
+/// inline image viewer. Reads the LocalNote row + the vault root from
+/// already-resolved context handles, then base64-encodes the image bytes
+/// for an inline `<img>` src. Returns `None` when the note isn't an image,
+/// the row can't be found, or the blob is missing.
+fn try_render_image_view(
+    note_id: Uuid,
+    note_repo_handle: &crate::local_mode::desktop::LocalNoteRepo,
+    project_repo_handle: &crate::local_mode::desktop::LocalProjectRepo,
+    vault_handle: &crate::local_mode::desktop::CurrentVaultRoot,
+) -> Option<Element> {
+    use operon_store::repos::NoteKind;
+
+    let crate::local_mode::desktop::LocalNoteRepo(note_repo) = note_repo_handle;
+    let crate::local_mode::desktop::LocalProjectRepo(project_repo) = project_repo_handle;
+    let crate::local_mode::desktop::CurrentVaultRoot(vault_signal) = vault_handle;
+    let vault = vault_signal.read().clone()?;
+
+    let projects = project_repo.list().ok()?;
+    let row = projects.into_iter().find_map(|p| {
+        note_repo
+            .list_for_project(p.id)
+            .ok()?
+            .into_iter()
+            .find(|n| n.id == note_id)
+    })?;
+
+    if !matches!(row.kind, NoteKind::Image) {
+        return None;
+    }
+    let rel = row.blob_path.clone()?;
+    let rel_path = std::path::Path::new(&rel).to_path_buf();
+    let bytes = crate::local_mode::images::read_image(&vault, &rel_path).ok()?;
+
+    // Compose a data: URL for inline rendering. base64 inline encoder
+    // (we don't pull a base64 crate just for this).
+    let mime = match rel_path.extension().and_then(|s| s.to_str()).unwrap_or("") {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "avif" => "image/avif",
+        _ => "application/octet-stream",
+    };
+    let data_url = format!("data:{mime};base64,{}", base64_encode(&bytes));
+
+    Some(rsx! {
+        div {
+            class: "operon-local-image-view",
+            "data-testid": "image-note-view",
+            "data-note-id": "{note_id}",
+            style: "display: flex; align-items: center; justify-content: center; height: 100%; overflow: auto; padding: 1rem; background: var(--operon-bg, #111);",
+            img {
+                src: "{data_url}",
+                alt: "{row.title}",
+                style: "max-width: 100%; max-height: 100%; object-fit: contain;",
+            }
+        }
+    })
+}
+
+/// Tiny inline base64 encoder so the image-tab view can render via a
+/// `data:` URL without pulling a base64 crate. Standard alphabet, padded.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHA: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+        let triple = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        out.push(ALPHA[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHA[((triple >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHA[((triple >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHA[(triple & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// Save button rendered inside the editor toolbar. Calls the installed
 /// `LocalSaveAction` on click.
 #[component]
@@ -120,7 +209,8 @@ pub fn LocalSaveButton(action: LocalSaveAction, dirty: bool) -> Element {
     }
 }
 
-/// Local-Mode editor body: a plain textarea bound to `Tab.content`.
+/// Local-Mode editor body: a plain textarea bound to `Tab.content`, or
+/// an image viewer when the active note is `NoteKind::Image`.
 ///
 /// The shared cloud `MarkdownFormatPlugin::render_edit` mounts Monaco, which
 /// today only initializes on `target_arch = "wasm32"` — the desktop build
@@ -132,6 +222,12 @@ pub fn LocalSaveButton(action: LocalSaveAction, dirty: bool) -> Element {
 #[component]
 pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
     let mut tabs: Signal<TabManager> = use_context();
+    // Plans-Phase-6-image-notes: image-tab view dependencies. Hooks must
+    // run unconditionally; the actual rendering is gated below.
+    let note_repo_for_image: crate::local_mode::desktop::LocalNoteRepo = use_context();
+    let project_repo_for_image: crate::local_mode::desktop::LocalProjectRepo = use_context();
+    let vault_for_image: crate::local_mode::desktop::CurrentVaultRoot = use_context();
+
     let snapshot = tabs.read().get(tab_id).cloned();
     let Some(tab) = snapshot else {
         return rsx! {
@@ -142,6 +238,18 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
             }
         };
     };
+
+    if let Ok(uuid) = Uuid::parse_str(&tab.note_id) {
+        if let Some(view) = try_render_image_view(
+            uuid,
+            &note_repo_for_image,
+            &project_repo_for_image,
+            &vault_for_image,
+        ) {
+            return view;
+        }
+    }
+
     let content = tab.content.clone();
 
     rsx! {
