@@ -1212,18 +1212,51 @@ pub fn ExplorerPanel() -> Element {
             .list_for_project(project_id)
             .map(|rows| rows.iter().filter(|r| r.parent_id == Some(target)).count() as i64)
             .unwrap_or(0);
-        let outcome = match (clip.kind, clip.payload) {
+        // Plans-Phase-8-explorer-undo: capture the inverse before the
+        // mutation. Cut + Note → MoveWithin (restore the source row's
+        // pre-paste position); Copy + Note → Paste (delete the new root).
+        let cut_inverse: Option<history::ExplorerAction> = match (clip.kind, clip.payload) {
             (ClipKind::Cut, ClipPayload::Note(nid)) => {
-                note_repo_for_paste.move_to(nid, project_id, Some(target), last_index)
+                let snap = notes_by_project.read();
+                let mut found: Option<(Uuid, Option<Uuid>, i64)> = None;
+                for (pid, list) in snap.iter() {
+                    if let Some(n) = list.iter().find(|n| n.id == nid) {
+                        found = Some((*pid, n.parent_id, n.sibling_index));
+                        break;
+                    }
+                }
+                found.map(|(pp, pparent, pidx)| history::ExplorerAction::MoveWithin {
+                    id: nid,
+                    project_id: pp,
+                    prev_parent: pparent,
+                    prev_index: pidx,
+                })
             }
+            _ => None,
+        };
+        let outcome: Result<Option<Uuid>, _> = match (clip.kind, clip.payload) {
+            (ClipKind::Cut, ClipPayload::Note(nid)) => note_repo_for_paste
+                .move_to(nid, project_id, Some(target), last_index)
+                .map(|_| None),
             (ClipKind::Copy, ClipPayload::Note(nid)) => note_repo_for_paste
                 .duplicate_subtree(nid, project_id, Some(target), last_index)
-                .map(|_| ()),
-            (_, ClipPayload::Project(_)) => Ok(()),
+                .map(Some),
+            (_, ClipPayload::Project(_)) => Ok(None),
         };
-        if let Err(e) = outcome {
-            eprintln!("operon: paste-into-note failed: {e}");
-            return;
+        match outcome {
+            Ok(new_root) => {
+                if let Some(inverse) = cut_inverse {
+                    history.write().push(inverse);
+                } else if let Some(rid) = new_root {
+                    history
+                        .write()
+                        .push(history::ExplorerAction::Paste { pasted_root_id: rid });
+                }
+            }
+            Err(e) => {
+                eprintln!("operon: paste-into-note failed: {e}");
+                return;
+            }
         }
         note_version.with_mut(|v| *v += 1);
         if matches!(clip.kind, ClipKind::Cut) {
@@ -1241,18 +1274,50 @@ pub fn ExplorerPanel() -> Element {
             .list_for_project(target_project)
             .map(|rows| rows.iter().filter(|r| r.parent_id.is_none()).count() as i64)
             .unwrap_or(0);
-        let outcome = match (clip.kind, clip.payload) {
+        // Plans-Phase-8-explorer-undo: same shape as on_paste_into_note —
+        // Cut → MoveWithin inverse; Copy → Paste inverse.
+        let cut_inverse: Option<history::ExplorerAction> = match (clip.kind, clip.payload) {
             (ClipKind::Cut, ClipPayload::Note(nid)) => {
-                note_repo_for_paste_proj.move_to(nid, target_project, None, last_index)
+                let snap = notes_by_project.read();
+                let mut found: Option<(Uuid, Option<Uuid>, i64)> = None;
+                for (pid, list) in snap.iter() {
+                    if let Some(n) = list.iter().find(|n| n.id == nid) {
+                        found = Some((*pid, n.parent_id, n.sibling_index));
+                        break;
+                    }
+                }
+                found.map(|(pp, pparent, pidx)| history::ExplorerAction::MoveWithin {
+                    id: nid,
+                    project_id: pp,
+                    prev_parent: pparent,
+                    prev_index: pidx,
+                })
             }
+            _ => None,
+        };
+        let outcome: Result<Option<Uuid>, _> = match (clip.kind, clip.payload) {
+            (ClipKind::Cut, ClipPayload::Note(nid)) => note_repo_for_paste_proj
+                .move_to(nid, target_project, None, last_index)
+                .map(|_| None),
             (ClipKind::Copy, ClipPayload::Note(nid)) => note_repo_for_paste_proj
                 .duplicate_subtree(nid, target_project, None, last_index)
-                .map(|_| ()),
-            (_, ClipPayload::Project(_)) => Ok(()),
+                .map(Some),
+            (_, ClipPayload::Project(_)) => Ok(None),
         };
-        if let Err(e) = outcome {
-            eprintln!("operon: paste-into-project failed: {e}");
-            return;
+        match outcome {
+            Ok(new_root) => {
+                if let Some(inverse) = cut_inverse {
+                    history.write().push(inverse);
+                } else if let Some(rid) = new_root {
+                    history
+                        .write()
+                        .push(history::ExplorerAction::Paste { pasted_root_id: rid });
+                }
+            }
+            Err(e) => {
+                eprintln!("operon: paste-into-project failed: {e}");
+                return;
+            }
         }
         note_version.with_mut(|v| *v += 1);
         if matches!(clip.kind, ClipKind::Cut) {
