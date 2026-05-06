@@ -2,11 +2,14 @@
 //! a "+" button to create a new (default-named) project. Phase 3 nests notes
 //! under each project, persisted via `local_note` + `local_tree_state`.
 
+mod bulk_rename;
 mod note_row;
 mod project_row;
 mod search;
 mod tree_node;
 mod tree_state;
+
+pub use bulk_rename::BulkRenameModal;
 
 pub use note_row::NoteRow;
 pub use project_row::ProjectRow;
@@ -257,6 +260,8 @@ pub fn ExplorerPanel() -> Element {
     // Plans-Phase-4-multiselect-aria: when set, render a confirm modal
     // listing the count of selected items to be bulk-deleted.
     let pending_bulk_delete: Signal<bool> = use_signal(|| false);
+    // Plans-Phase-4-multiselect-aria: bulk rename modal visibility.
+    let mut pending_bulk_rename: Signal<bool> = use_signal(|| false);
     let mut renaming_project_setter = renaming_project;
     let mut pending_delete_project_setter = pending_delete_project;
     let mut renaming_note_setter = renaming_note;
@@ -1263,6 +1268,14 @@ pub fn ExplorerPanel() -> Element {
                             evt.prevent_default();
                             on_bulk_export.call(());
                         }
+                    } else if with_meta && mods.contains(keyboard_types::Modifiers::SHIFT)
+                        && key.eq_ignore_ascii_case("r")
+                    {
+                        let count = multi_selected_for_render.read().len();
+                        if count >= 1 {
+                            evt.prevent_default();
+                            pending_bulk_rename.set(true);
+                        }
                     }
                 },
                 if projects_snapshot.is_empty() {
@@ -1430,6 +1443,17 @@ pub fn ExplorerPanel() -> Element {
                 on_cancel: Callback::new(move |_| {
                     pending_delete_note_setter.set(None);
                 }),
+            }
+        }
+        // Plans-Phase-4-multiselect-aria: bulk rename modal. Cmd/Ctrl+Shift+R
+        // when the multi-selection set has 1+ items. Apply re-bumps
+        // note_version so the explorer refreshes.
+        if *pending_bulk_rename.read() {
+            BulkRenameModal {
+                open: pending_bulk_rename,
+                on_applied: move |_count: usize| {
+                    note_version.with_mut(|v| *v += 1);
+                },
             }
         }
         // Plans-Phase-4-multiselect-aria: bulk-delete confirmation. Triggered

@@ -4974,6 +4974,7 @@ dependencies = [
  "operon-store",
  "pretty_assertions",
  "pulldown-cmark",
+ "regex",
  "rfd 0.14.1",
  "serde",
  "serde_json",
