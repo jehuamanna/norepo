@@ -210,6 +210,10 @@ mod imp {
                 EditorCommand::FormatDocument => "FormatDocument",
                 EditorCommand::FindReplace => "FindReplace",
                 EditorCommand::ToggleComment => "ToggleComment",
+                // Plans-Phase-2-editor-auto-focus: route to the JS shim's
+                // dispatch handler, which calls `editor.focus()` on the
+                // underlying Monaco instance.
+                EditorCommand::Focus => "Focus",
             };
             self.invoke("dispatch", &[s.into()]);
         }

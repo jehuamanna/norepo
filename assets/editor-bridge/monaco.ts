@@ -112,6 +112,12 @@ export function mountMonaco(target: HTMLElement, init: BackendInit): Handle {
         case "ToggleComment":
           editor.trigger("bridge", "editor.action.commentLine", null);
           break;
+        case "Focus":
+          // Plans-Phase-2-editor-auto-focus: route to Monaco's native focus
+          // call so the keyboard caret moves into the editor body without
+          // requiring an additional user click.
+          editor.focus();
+          break;
         default:
           // Unknown command — log to ease debugging without throwing across the
           // wasm-bindgen boundary.

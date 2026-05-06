@@ -55,6 +55,10 @@ pub enum EditorCommand {
     FormatDocument,
     FindReplace,
     ToggleComment,
+    /// Plans-Phase-2-editor-auto-focus: ask the backend to take keyboard
+    /// focus. Each backend maps this to its own focus call (Monaco's
+    /// `editor.focus()`, CM6's `view.focus()`, etc.).
+    Focus,
 }
 
 /// Static descriptor a format plugin hands the editor backend at mount time. `monaco_language`
