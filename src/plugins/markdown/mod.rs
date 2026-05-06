@@ -12,6 +12,7 @@ use crate::plugin::{FormatCaps, FormatPlugin, PluginManifest, PluginSurface};
 pub mod nodes;
 pub mod parser;
 pub mod render;
+pub mod wikilink;
 
 pub use nodes::MdNode;
 pub use render::MarkdownView;
