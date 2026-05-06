@@ -9,6 +9,7 @@ use operon_store::repos::{
     SqliteLocalProjectRepository, SqliteLocalSearchRepository, SqliteLocalSettingsRepository,
     SqliteLocalTreeStateRepository, SqliteLocalUserRepository,
 };
+use operon_store::vfs;
 use operon_store::{Store, StoreConfig};
 use uuid::Uuid;
 
@@ -444,6 +445,66 @@ pub fn provide_local_app_signals() {
     use_context_provider(|| LocalSaveAction {
         callback: save_callback,
     });
+
+    // Plans-Phase-5-vfs-wikilinks: install a click resolver so wikilink
+    // anchors rendered inside MarkdownView open the linked note in a tab.
+    let LocalProjectRepo(project_repo) = use_context::<LocalProjectRepo>();
+    let LocalNoteRepo(note_repo_for_links) = use_context::<LocalNoteRepo>();
+    let SelectedNote(selected_note_for_links) = use_context::<SelectedNote>();
+    let project_repo_for_links = project_repo.clone();
+    let tabs_for_links = tabs;
+    let scheduler_for_links = scheduler.clone();
+    let mut selected_note_for_links_setter = selected_note_for_links;
+    let wikilink_resolver = use_hook(move || {
+        Callback::new(move |target: String| {
+            // Heuristic source project: the currently selected note's
+            // project, otherwise the first project. Fine for first cut.
+            let snap_projects = project_repo_for_links.list().unwrap_or_default();
+            let source_project_id = (*selected_note_for_links_setter.read())
+                .and_then(|nid| {
+                    snap_projects.iter().find_map(|p| {
+                        note_repo_for_links
+                            .list_for_project(p.id)
+                            .ok()
+                            .and_then(|notes| notes.iter().find(|n| n.id == nid).map(|_| p.id))
+                    })
+                })
+                .or_else(|| snap_projects.first().map(|p| p.id));
+            let Some(source_project_id) = source_project_id else {
+                eprintln!("operon: wikilink click — no project context");
+                return;
+            };
+            let Some(form) = vfs::parse_link(&target) else {
+                return;
+            };
+            match vfs::resolve_link(
+                project_repo_for_links.as_ref(),
+                note_repo_for_links.as_ref(),
+                source_project_id,
+                &form,
+            ) {
+                Ok(note_id) => {
+                    let title = note_repo_for_links
+                        .list_for_project(source_project_id)
+                        .ok()
+                        .and_then(|notes| {
+                            notes.into_iter().find(|n| n.id == note_id).map(|n| n.title)
+                        })
+                        .unwrap_or_else(|| target.clone());
+                    super::editor::open_local_note_tab(
+                        tabs_for_links,
+                        scheduler_for_links.clone(),
+                        note_id,
+                        title,
+                        String::new(),
+                    );
+                    selected_note_for_links_setter.set(Some(note_id));
+                }
+                Err(e) => eprintln!("operon: wikilink resolve failed for {target:?}: {e}"),
+            }
+        })
+    });
+    use_context_provider(|| crate::plugins::markdown::render::WikiLinkResolver(wikilink_resolver));
 }
 
 /// Wraps the Cloud `Shell` for Local Mode. Owns the Local-only keyboard

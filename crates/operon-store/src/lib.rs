@@ -11,6 +11,7 @@ pub mod repos;
 pub mod sqlite;
 pub mod test_support;
 pub mod time;
+pub mod vfs;
 
 pub use error::StoreError;
 pub use ids::*;

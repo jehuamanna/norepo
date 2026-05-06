@@ -5,6 +5,14 @@ use dioxus::prelude::*;
 use super::nodes::MdNode;
 use super::parser;
 
+/// Plans-Phase-5-vfs-wikilinks: optional click resolver for `[[…]]` links.
+/// When a Local-Mode shell is mounted it installs this context with a
+/// callback that resolves the target text → opens the linked note. Any
+/// other surface (cloud Shell, sandboxed preview) leaves the context
+/// unset and clicks fall through to the default `href="#"` no-op.
+#[derive(Clone, Copy)]
+pub struct WikiLinkResolver(pub Callback<String>);
+
 #[component]
 pub fn MarkdownView(content: String) -> Element {
     // Plans-Phase-5-vfs-wikilinks: post-process the AST to lift `[[…]]` and
@@ -63,13 +71,20 @@ pub fn render_node(n: &MdNode) -> Element {
         }
         MdNode::Rule => rsx! { hr {} },
         MdNode::WikiLink { target, embed } => {
-            // Plans-Phase-5: target resolution via vfs::resolve_link is a
-            // follow-up; for now we render the wikilink as a styled anchor
-            // exposing `data-wikilink-target` so the (future) in-app router
-            // can intercept clicks. Embed renders as an <img> placeholder
-            // until Plans-Phase-6 wires attachment lookup.
+            // Plans-Phase-5-vfs-wikilinks: when a `WikiLinkResolver` is
+            // installed in context (Local-Mode shell), clicking the anchor
+            // resolves and routes the target. Otherwise it's a styled
+            // anchor with `data-wikilink-target` for future intercept.
+            let resolver = try_consume_context::<WikiLinkResolver>();
             let display = format!("[[{}]]", target);
             let display_embed = format!("![[{}]]", target);
+            let target_owned = target.clone();
+            let onclick = move |evt: Event<MouseData>| {
+                if let Some(WikiLinkResolver(cb)) = resolver {
+                    evt.prevent_default();
+                    cb.call(target_owned.clone());
+                }
+            };
             if *embed {
                 rsx! {
                     a {
@@ -78,6 +93,7 @@ pub fn render_node(n: &MdNode) -> Element {
                         "data-wikilink-target": "{target}",
                         "data-wikilink-embed": "true",
                         title: "{target}",
+                        onclick,
                         "{display_embed}"
                     }
                 }
@@ -88,6 +104,7 @@ pub fn render_node(n: &MdNode) -> Element {
                         href: "#",
                         "data-wikilink-target": "{target}",
                         title: "{target}",
+                        onclick,
                         "{display}"
                     }
                 }
