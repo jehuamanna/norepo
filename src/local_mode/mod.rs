@@ -11,7 +11,9 @@ pub mod desktop;
 pub mod editor;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod explorer;
-#[cfg(not(target_arch = "wasm32"))]
+// Plans-Phase-2-saving / Phase E: ui/ is pure Dioxus + uuid, no
+// platform-specific deps, so it compiles wherever we need it.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-sqlite"))]
 pub mod ui;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod images;
