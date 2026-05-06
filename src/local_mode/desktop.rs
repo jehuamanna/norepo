@@ -452,6 +452,7 @@ pub fn provide_local_app_signals() {
     let LocalNoteRepo(note_repo_for_links) = use_context::<LocalNoteRepo>();
     let SelectedNote(selected_note_for_links) = use_context::<SelectedNote>();
     let project_repo_for_links = project_repo.clone();
+    let note_repo_for_links_resolver = note_repo_for_links.clone();
     let tabs_for_links = tabs;
     let scheduler_for_links = scheduler.clone();
     let mut selected_note_for_links_setter = selected_note_for_links;
@@ -463,7 +464,7 @@ pub fn provide_local_app_signals() {
             let source_project_id = (*selected_note_for_links_setter.read())
                 .and_then(|nid| {
                     snap_projects.iter().find_map(|p| {
-                        note_repo_for_links
+                        note_repo_for_links_resolver
                             .list_for_project(p.id)
                             .ok()
                             .and_then(|notes| notes.iter().find(|n| n.id == nid).map(|_| p.id))
@@ -479,12 +480,12 @@ pub fn provide_local_app_signals() {
             };
             match vfs::resolve_link(
                 project_repo_for_links.as_ref(),
-                note_repo_for_links.as_ref(),
+                note_repo_for_links_resolver.as_ref(),
                 source_project_id,
                 &form,
             ) {
                 Ok(note_id) => {
-                    let title = note_repo_for_links
+                    let title = note_repo_for_links_resolver
                         .list_for_project(source_project_id)
                         .ok()
                         .and_then(|notes| {
@@ -505,6 +506,43 @@ pub fn provide_local_app_signals() {
         })
     });
     use_context_provider(|| crate::plugins::markdown::render::WikiLinkResolver(wikilink_resolver));
+
+    // Plans-Phase-5-vfs-wikilinks: sync checker the renderer calls during
+    // render to flag broken `[[…]]` links. Returns true on a unique resolve.
+    let project_repo_for_check = project_repo.clone();
+    let note_repo_for_check = note_repo_for_links.clone();
+    let selected_note_for_check = selected_note_for_links;
+    let wikilink_checker = use_hook(move || {
+        Callback::new(move |target: String| -> bool {
+            let snap_projects = project_repo_for_check.list().unwrap_or_default();
+            let source_project_id = (*selected_note_for_check.read())
+                .and_then(|nid| {
+                    snap_projects.iter().find_map(|p| {
+                        note_repo_for_check
+                            .list_for_project(p.id)
+                            .ok()
+                            .and_then(|notes| notes.iter().find(|n| n.id == nid).map(|_| p.id))
+                    })
+                })
+                .or_else(|| snap_projects.first().map(|p| p.id));
+            let Some(source_project_id) = source_project_id else {
+                return false;
+            };
+            let Some(form) = vfs::parse_link(&target) else {
+                return false;
+            };
+            matches!(
+                vfs::resolve_link(
+                    project_repo_for_check.as_ref(),
+                    note_repo_for_check.as_ref(),
+                    source_project_id,
+                    &form,
+                ),
+                Ok(_)
+            )
+        })
+    });
+    use_context_provider(|| crate::plugins::markdown::render::WikiLinkChecker(wikilink_checker));
 }
 
 /// Wraps the Cloud `Shell` for Local Mode. Owns the Local-only keyboard

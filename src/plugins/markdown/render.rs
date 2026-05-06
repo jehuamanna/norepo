@@ -13,6 +13,13 @@ use super::parser;
 #[derive(Clone, Copy)]
 pub struct WikiLinkResolver(pub Callback<String>);
 
+/// Plans-Phase-5-vfs-wikilinks: optional sync checker for "is this wikilink
+/// target live?". Returns `true` when the target resolves to a unique note;
+/// `false` for not-found or ambiguous. Renderer applies a `wikilink-broken`
+/// class when the checker returns `false`.
+#[derive(Clone, Copy)]
+pub struct WikiLinkChecker(pub Callback<String, bool>);
+
 #[component]
 pub fn MarkdownView(content: String) -> Element {
     // Plans-Phase-5-vfs-wikilinks: post-process the AST to lift `[[…]]` and
@@ -73,9 +80,14 @@ pub fn render_node(n: &MdNode) -> Element {
         MdNode::WikiLink { target, embed } => {
             // Plans-Phase-5-vfs-wikilinks: when a `WikiLinkResolver` is
             // installed in context (Local-Mode shell), clicking the anchor
-            // resolves and routes the target. Otherwise it's a styled
-            // anchor with `data-wikilink-target` for future intercept.
+            // resolves and routes the target. A `WikiLinkChecker` lets the
+            // renderer mark broken targets with a distinct class.
             let resolver = try_consume_context::<WikiLinkResolver>();
+            let checker = try_consume_context::<WikiLinkChecker>();
+            let live = match checker {
+                Some(WikiLinkChecker(cb)) => cb.call(target.clone()),
+                None => true,
+            };
             let display = format!("[[{}]]", target);
             let display_embed = format!("![[{}]]", target);
             let target_owned = target.clone();
@@ -85,14 +97,31 @@ pub fn render_node(n: &MdNode) -> Element {
                     cb.call(target_owned.clone());
                 }
             };
+            let class = if *embed {
+                if live {
+                    "wikilink wikilink-embed"
+                } else {
+                    "wikilink wikilink-embed wikilink-broken"
+                }
+            } else if live {
+                "wikilink"
+            } else {
+                "wikilink wikilink-broken"
+            };
+            let title_attr = if live {
+                target.clone()
+            } else {
+                format!("Broken link: {}", target)
+            };
             if *embed {
                 rsx! {
                     a {
-                        class: "wikilink wikilink-embed",
+                        class,
                         href: "#",
                         "data-wikilink-target": "{target}",
                         "data-wikilink-embed": "true",
-                        title: "{target}",
+                        "data-wikilink-broken": if live { "false" } else { "true" },
+                        title: "{title_attr}",
                         onclick,
                         "{display_embed}"
                     }
@@ -100,10 +129,11 @@ pub fn render_node(n: &MdNode) -> Element {
             } else {
                 rsx! {
                     a {
-                        class: "wikilink",
+                        class,
                         href: "#",
                         "data-wikilink-target": "{target}",
-                        title: "{target}",
+                        "data-wikilink-broken": if live { "false" } else { "true" },
+                        title: "{title_attr}",
                         onclick,
                         "{display}"
                     }
