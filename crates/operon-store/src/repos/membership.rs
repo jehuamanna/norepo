@@ -221,7 +221,7 @@ impl MembershipRepository for SqliteMembershipRepository {
         let conn = self.store.conn()?;
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM memberships WHERE role = 'master_admin'",
-            [],
+            params![],
             |row| row.get(0),
         )?;
         Ok(count as u32)

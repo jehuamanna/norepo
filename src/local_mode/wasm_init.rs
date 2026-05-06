@@ -66,10 +66,11 @@ pub async fn init_wasm_local_mode(
     // Step 3: open the SQLite metadata DB on OPFS.
     let store = Store::open("file:operon.sqlite?vfs=opfs-sahpool")?;
 
-    // Step 4: run migrations.
-    store.with_conn_mut(|conn| {
-        operon_store::migrations::migrate_up(conn)
-    })?;
+    // Step 4: run migrations through the wasm Store's MutexGuard handle.
+    {
+        let mut conn = store.conn()?;
+        operon_store::migrations::migrate_up(&mut conn)?;
+    }
 
     let persistence: Arc<dyn Persistence> = Arc::new(OpfsPersistence::new(notes_dir));
     Ok(WasmLocalInit { store, persistence })

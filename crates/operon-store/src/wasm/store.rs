@@ -55,7 +55,7 @@ impl Store {
     /// crate guards itself against double-installation, so multiple
     /// callers across app reloads are fine.
     pub async fn install_opfs_vfs(directory: &str) -> Result<(), StoreError> {
-        sqlite_wasm_vfs::sahpool::install(
+        sqlite_wasm_vfs::sahpool::install::<sqlite_wasm_rs::WasmOsCallback>(
             &sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfgBuilder::new()
                 .vfs_name("opfs-sahpool")
                 .directory(directory)
@@ -83,7 +83,7 @@ impl Store {
         };
         if rc != ffi_consts::SQLITE_OK as c_int {
             let msg = errmsg(db);
-            unsafe { ffi::sqlite3_close_v2(db) };
+            unsafe { ffi::sqlite3_close(db) };
             return Err(StoreError::Open(format!("sqlite3_open_v2 rc={rc}: {msg}")));
         }
         let conn = Connection::from_raw(db);

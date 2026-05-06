@@ -136,7 +136,7 @@ impl Connection {
         };
         if rc != ffi_consts::SQLITE_OK as c_int {
             let err = last_error(db, rc);
-            unsafe { ffi::sqlite3_close_v2(db) };
+            unsafe { ffi::sqlite3_close(db) };
             return Err(err);
         }
         Ok(Self { db })
@@ -200,7 +200,7 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         if !self.db.is_null() {
-            unsafe { ffi::sqlite3_close_v2(self.db) };
+            unsafe { ffi::sqlite3_close(self.db) };
         }
     }
 }
@@ -267,30 +267,24 @@ impl<'conn> Statement<'conn> {
         Ok(Rows { stmt: self })
     }
 
-    pub fn query_map<T, F>(&mut self, params: &[&dyn ToSql], mut f: F) -> Result<Vec<Result<T>>>
+    /// Returns a real `Iterator<Item = Result<T>>` matching rusqlite's
+    /// `MappedRows` shape. Repos can use either
+    /// `for r in rows { out.push(r?); }` or
+    /// `rows.collect::<Result<Vec<_>, _>>()?`.
+    pub fn query_map<'s, T, F>(
+        &'s mut self,
+        params: &[&dyn ToSql],
+        f: F,
+    ) -> Result<MappedRows<'s, 'conn, F, T>>
     where
         F: FnMut(&Row<'_>) -> Result<T>,
     {
-        // rusqlite returns an iterator; we materialize the Vec eagerly to
-        // keep lifetimes simple. Repos that needed streaming behaviour
-        // (none today) would need a refactor.
         self.bind_all(params)?;
-        let mut out = Vec::new();
-        loop {
-            let rc = unsafe { ffi::sqlite3_step(self.stmt) };
-            if rc == ffi_consts::SQLITE_DONE as c_int {
-                break;
-            }
-            if rc != ffi_consts::SQLITE_ROW as c_int {
-                return Err(last_error(self.db, rc));
-            }
-            let row = Row {
-                stmt: self.stmt,
-                _phantom: PhantomData,
-            };
-            out.push(f(&row));
-        }
-        Ok(out)
+        Ok(MappedRows {
+            stmt: self,
+            f,
+            _phantom: PhantomData,
+        })
     }
 
     pub fn query_row<T, F>(&mut self, params: &[&dyn ToSql], f: F) -> Result<T>
@@ -345,6 +339,36 @@ impl<'s, 'conn> Rows<'s, 'conn> {
     }
 }
 
+/// Mirrors `rusqlite::MappedRows`: a real `Iterator<Item = Result<T>>`
+/// where each item comes from running the user's row-mapper closure on a
+/// `Row` borrowed from the shared statement.
+pub struct MappedRows<'s, 'conn: 's, F, T> {
+    stmt: &'s mut Statement<'conn>,
+    f: F,
+    _phantom: PhantomData<T>,
+}
+
+impl<'s, 'conn, F, T> Iterator for MappedRows<'s, 'conn, F, T>
+where
+    F: FnMut(&Row<'_>) -> Result<T>,
+{
+    type Item = Result<T>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let rc = unsafe { ffi::sqlite3_step(self.stmt.stmt) };
+        if rc == ffi_consts::SQLITE_DONE as c_int {
+            None
+        } else if rc == ffi_consts::SQLITE_ROW as c_int {
+            let row = Row {
+                stmt: self.stmt.stmt,
+                _phantom: PhantomData,
+            };
+            Some((self.f)(&row))
+        } else {
+            Some(Err(last_error(self.stmt.db, rc)))
+        }
+    }
+}
+
 // ============================================================================
 // Row + FromSql
 // ============================================================================
@@ -354,9 +378,31 @@ pub struct Row<'a> {
     _phantom: PhantomData<&'a ()>,
 }
 
+/// Mirrors `rusqlite::RowIndex` — accept either a `usize` column index or
+/// (TODO) a column-name `&str`. For now operon-store only uses indexed
+/// access, so the str impl returns an error to keep the shim small.
+pub trait RowIndex {
+    fn idx(self) -> c_int;
+}
+
+impl RowIndex for usize {
+    fn idx(self) -> c_int {
+        self as c_int
+    }
+}
+
+impl RowIndex for c_int {
+    fn idx(self) -> c_int {
+        self
+    }
+}
+
 impl<'a> Row<'a> {
-    pub fn get<T: FromSql>(&self, idx: usize) -> Result<T> {
-        T::from_column(self.stmt, idx as c_int)
+    /// Two-generic shape matching rusqlite's `Row::get<I: RowIndex, T: FromSql>`.
+    /// Lets repos write `row.get::<_, String>(0)` and have the underscore
+    /// resolve to the index type.
+    pub fn get<I: RowIndex, T: FromSql>(&self, idx: I) -> Result<T> {
+        T::from_column(self.stmt, idx.idx())
     }
 }
 
@@ -474,9 +520,13 @@ pub trait ToSql {
         -> core::result::Result<(), String>;
 }
 
-const SQLITE_TRANSIENT: ffi::sqlite3_destructor_type = unsafe {
-    core::mem::transmute::<isize, ffi::sqlite3_destructor_type>(-1)
-};
+/// `SQLITE_TRANSIENT` is the magic value `-1` cast to a function pointer
+/// (telling SQLite to take an internal copy of the bind value). Rust's
+/// const evaluator rejects the transmute as UB, so we resolve it at
+/// runtime instead.
+fn sqlite_transient() -> ffi::sqlite3_destructor_type {
+    unsafe { core::mem::transmute::<isize, ffi::sqlite3_destructor_type>(-1) }
+}
 
 fn check_bind(rc: c_int) -> core::result::Result<(), String> {
     if rc == ffi_consts::SQLITE_OK as c_int {
@@ -497,21 +547,13 @@ impl ToSql for &str {
                 idx,
                 bytes.as_ptr() as *const c_char,
                 bytes.len() as c_int,
-                SQLITE_TRANSIENT,
+                sqlite_transient(),
             )
         })
     }
 }
 
 impl ToSql for String {
-    fn bind(&self, stmt: *mut ffi::sqlite3_stmt, idx: c_int)
-        -> core::result::Result<(), String>
-    {
-        self.as_str().bind(stmt, idx)
-    }
-}
-
-impl ToSql for &String {
     fn bind(&self, stmt: *mut ffi::sqlite3_stmt, idx: c_int)
         -> core::result::Result<(), String>
     {
@@ -561,7 +603,7 @@ impl ToSql for &[u8] {
                 idx,
                 self.as_ptr() as *const c_void,
                 self.len() as c_int,
-                SQLITE_TRANSIENT,
+                sqlite_transient(),
             )
         })
     }

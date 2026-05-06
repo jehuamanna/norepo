@@ -67,7 +67,7 @@ fn ensure_migrations_table(conn: &Connection) -> Result<(), StoreError> {
 
 fn applied_versions(conn: &Connection) -> Result<Vec<i64>, StoreError> {
     let mut stmt = conn.prepare("SELECT version FROM _schema_migrations ORDER BY version")?;
-    let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+    let rows = stmt.query_map(crate::sql::params![], |row| row.get::<_, i64>(0))?;
     let mut out = Vec::new();
     for r in rows {
         out.push(r?);
