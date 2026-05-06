@@ -46,10 +46,12 @@ js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
+    "Blob",
     "Document",
     "DomException",
     "DomStringList",
     "Element",
+    "File",
     "FileSystemDirectoryHandle",
     "FileSystemFileHandle",
     "FileSystemGetFileOptions",
@@ -83,6 +85,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 # Plans-Phase-1: Local Mode wires the SQLite-backed local_user / local_app_settings
 # repos into the desktop app. rusqlite is bundled and gated on non-wasm targets.
 operon-store = { path = "crates/operon-store" }
+
 # Vault directory picker (seed `Notes`, Plans-Phase-1-vault-dir). Desktop-only;
 # web uses `Window::show_directory_picker()` via web-sys.
 rfd = { version = "0.14", default-features = false, features = ["xdg-portal", "tokio"] }

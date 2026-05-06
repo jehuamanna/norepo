@@ -13,6 +13,13 @@ pub mod test_support;
 pub mod time;
 pub mod vfs;
 
+// Plans-Phase-2-saving / Option 2: full SQLite-on-wasm.
+// Activated by `--features wasm-sqlite` on a wasm32 target.
+// Build prerequisite: `clang` on the host (sqlite-wasm-rs's build.rs
+// compiles libsqlite3 C source for wasm32-unknown-unknown).
+#[cfg(all(target_arch = "wasm32", feature = "wasm-sqlite"))]
+pub mod wasm;
+
 pub use error::StoreError;
 pub use ids::*;
 pub use sqlite::{Store, StoreConfig, StoreMode};
