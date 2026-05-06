@@ -581,8 +581,46 @@ pub fn ExplorerPanel() -> Element {
     // happens through a separate confirmation flow that's still
     // single-target).
     let note_repo_for_bulk_delete = note_repo.clone();
+    let project_repo_for_bulk_gc = project_repo.clone();
+    let note_repo_for_bulk_gc = note_repo.clone();
+    let crate::local_mode::CurrentVaultRoot(vault_root_for_bulk_gc) = use_context();
     let on_confirm_bulk_delete = use_callback(move |_: ()| {
         let snapshot = multi_selected.read().clone();
+        // Plans-Phase-6-image-notes: snapshot blob_paths to potentially
+        // GC. We collect every blob_path of the targets + any descendants
+        // before the delete tx fires (FK cascade loses them after).
+        let mut blobs: Vec<String> = Vec::new();
+        let snap = notes_by_project.read();
+        let target_ids: std::collections::HashSet<Uuid> = snapshot
+            .iter()
+            .filter_map(|k| match k {
+                NodeKey::Note(id) => Some(*id),
+                NodeKey::Project(_) => None,
+            })
+            .collect();
+        for list in snap.values() {
+            for n in list.iter() {
+                let touched = target_ids.contains(&n.id) || {
+                    let mut cur = n.parent_id;
+                    let mut hit = false;
+                    while let Some(pid) = cur {
+                        if target_ids.contains(&pid) {
+                            hit = true;
+                            break;
+                        }
+                        cur = list.iter().find(|x| x.id == pid).and_then(|x| x.parent_id);
+                    }
+                    hit
+                };
+                if touched {
+                    if let Some(p) = n.blob_path.clone() {
+                        blobs.push(p);
+                    }
+                }
+            }
+        }
+        drop(snap);
+
         let mut deleted: usize = 0;
         for key in snapshot.iter() {
             if let NodeKey::Note(id) = key {
@@ -594,6 +632,25 @@ pub fn ExplorerPanel() -> Element {
         }
         if deleted > 0 {
             note_version.with_mut(|v| *v += 1);
+            if let Some(vault) = vault_root_for_bulk_gc.read().clone() {
+                let projects = project_repo_for_bulk_gc.list().unwrap_or_default();
+                for blob in blobs {
+                    let mut still_referenced = false;
+                    'outer: for p in &projects {
+                        if let Ok(notes) = note_repo_for_bulk_gc.list_for_project(p.id) {
+                            for n in notes {
+                                if n.blob_path.as_deref() == Some(blob.as_str()) {
+                                    still_referenced = true;
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                    if !still_referenced {
+                        let _ = std::fs::remove_file(vault.path().join(&blob));
+                    }
+                }
+            }
         }
         multi_selected.set(std::collections::BTreeSet::new());
         pending_bulk_delete_setter.set(false);
