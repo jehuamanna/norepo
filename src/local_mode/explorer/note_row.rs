@@ -74,6 +74,12 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     // is mid-rename). Forbidden renders a "no-drop" border.
     let drop_indicator: Signal<Option<Result<DropPosition, ()>>> = use_signal(|| None);
     let mut drop_indicator_setter = drop_indicator;
+    // Plans-Phase-7-snap: when the (target, position) pair is stable for
+    // 80 ms the indicator emphasises (thicker line / saturated ring). The
+    // generation counter guards against races where the cursor moved away
+    // before the timer fired.
+    let mut snapped: Signal<bool> = use_signal(|| false);
+    let mut hover_generation: Signal<u64> = use_signal(|| 0);
     let DragSession(mut drag_session) = use_context();
     // Plans-Phase-3-explorer-drag-drop-feedback: descendant set of the
     // dragged note (populated below by ondragstart) and the panel-scope
@@ -429,6 +435,8 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 drag_session.set(None);
                 drop_indicator_setter.set(None);
                 drag_descendants.set(std::collections::BTreeSet::new());
+                snapped.set(false);
+                hover_generation.with_mut(|g| *g = g.wrapping_add(1));
             },
             ondragover: move |evt| {
                 evt.prevent_default();
@@ -452,10 +460,38 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                     }
                     _ => None,
                 };
-                drop_indicator_setter.set(next);
+                let prev = *drop_indicator.read();
+                if prev != next {
+                    drop_indicator_setter.set(next);
+                    // Plans-Phase-7-snap: bumping the generation invalidates
+                    // any in-flight snap timer for the prior (target, pos).
+                    snapped.set(false);
+                    let gen = hover_generation.with_mut(|g| {
+                        *g = g.wrapping_add(1);
+                        *g
+                    });
+                    // Only arm a snap timer for *valid* drop positions.
+                    if matches!(next, Some(Ok(_))) {
+                        let captured_gen = gen;
+                        let captured_next = next;
+                        spawn(async move {
+                            futures_timer::Delay::new(
+                                std::time::Duration::from_millis(80),
+                            )
+                            .await;
+                            let still_current = *hover_generation.read() == captured_gen
+                                && *drop_indicator.read() == captured_next;
+                            if still_current {
+                                snapped.set(true);
+                            }
+                        });
+                    }
+                }
             },
             ondragleave: move |_| {
                 drop_indicator_setter.set(None);
+                snapped.set(false);
+                hover_generation.with_mut(|g| *g = g.wrapping_add(1));
             },
             ondrop: move |evt| {
                 evt.prevent_default();
@@ -524,6 +560,8 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 drag_session.set(None);
                 drop_indicator_setter.set(None);
                 drag_descendants.set(std::collections::BTreeSet::new());
+                snapped.set(false);
+                hover_generation.with_mut(|g| *g = g.wrapping_add(1));
             },
             // Plans-Phase-3-note-id-create: leading grip glyph as a visible
             // indicator that the row is draggable. Drag itself is still
@@ -612,10 +650,13 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 }
             }
             if drag_active {
-                match drop_pos_now {
-                    Some(Ok(p)) => rsx! { DropIndicator { position: p } },
-                    Some(Err(())) => rsx! { ForbiddenIndicator {} },
-                    None => rsx! {},
+                {
+                    let snap_now = *snapped.read();
+                    match drop_pos_now {
+                        Some(Ok(p)) => rsx! { DropIndicator { position: p, snapped: snap_now } },
+                        Some(Err(())) => rsx! { ForbiddenIndicator {} },
+                        None => rsx! {},
+                    }
                 }
             }
         }
@@ -631,19 +672,35 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
 }
 
 #[component]
-fn DropIndicator(position: DropPosition) -> Element {
-    let (testid, class) = match position {
-        DropPosition::Before => (
+fn DropIndicator(position: DropPosition, snapped: bool) -> Element {
+    // Plans-Phase-7-snap: when `snapped` is true (cursor stable for ≥80 ms),
+    // emphasise the indicator — thicker line for Before/After, ring-4 for
+    // Into. The data-testid suffixes `-snap` so e2e specs can assert the
+    // transition.
+    let (testid, class) = match (position, snapped) {
+        (DropPosition::Before, false) => (
             "drop-indicator-before",
             "absolute left-0 right-0 top-0 h-0.5 bg-[var(--operon-accent)]",
         ),
-        DropPosition::Into => (
+        (DropPosition::Before, true) => (
+            "drop-indicator-before-snap",
+            "absolute left-0 right-0 top-0 h-1 bg-[var(--operon-accent)]",
+        ),
+        (DropPosition::Into, false) => (
             "drop-indicator-into",
             "absolute inset-0 ring-2 ring-[var(--operon-accent)] pointer-events-none",
         ),
-        DropPosition::After => (
+        (DropPosition::Into, true) => (
+            "drop-indicator-into-snap",
+            "absolute inset-0 ring-4 ring-[var(--operon-accent)] pointer-events-none",
+        ),
+        (DropPosition::After, false) => (
             "drop-indicator-after",
             "absolute left-0 right-0 bottom-0 h-0.5 bg-[var(--operon-accent)]",
+        ),
+        (DropPosition::After, true) => (
+            "drop-indicator-after-snap",
+            "absolute left-0 right-0 bottom-0 h-1 bg-[var(--operon-accent)]",
         ),
     };
     rsx! {
