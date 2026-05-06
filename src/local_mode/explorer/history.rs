@@ -25,6 +25,14 @@ pub enum ExplorerAction {
     Rename {
         id: Uuid,
         prev_title: String,
+        /// Plans-Phase-8: needed by undo to run wikilink rewrite in the
+        /// reverse direction (`new_title` → `prev_title`) across every
+        /// referrer body. None when no project context was available
+        /// (rare — usually means the note was orphaned mid-rename).
+        project_name: Option<String>,
+        /// The title we renamed *to*. Together with `prev_title` this is
+        /// the substitution pair the undo path applies to every referrer.
+        new_title: String,
     },
     /// Indent / outdent / move-up / move-down all collapse to the same
     /// shape: restore (parent, sibling_index) for `id` in `project_id`.
@@ -95,6 +103,8 @@ mod tests {
         ExplorerAction::Rename {
             id: Uuid::from_u128(id),
             prev_title: title.into(),
+            project_name: None,
+            new_title: String::new(),
         }
     }
 

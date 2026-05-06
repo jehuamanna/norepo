@@ -168,6 +168,50 @@ fn handle_image_drop(
     }
 }
 
+/// Plans-Phase-8-explorer-undo: rewrite `[[old]]` / `![[old]]` /
+/// `[[project/old]]` / `![[project/old]]` references in every referrer
+/// of `target_id` to point at `new_title` instead. Used by both the
+/// rename callback (forward direction) and the undo-rename path
+/// (inverse direction). Runs inside an existing spawn — no spawn here.
+async fn rewrite_referrer_bodies(
+    target_id: Uuid,
+    old: &str,
+    new_title: &str,
+    project_name: &str,
+    link_repo: Arc<dyn operon_store::repos::LocalNoteLinkRepository>,
+    persistence: Arc<dyn Persistence>,
+) {
+    let referrers = link_repo.referrers_of(target_id).unwrap_or_default();
+    for source in referrers {
+        let source_str = source.to_string();
+        let body_bytes = match persistence.load(&source_str).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let Ok(body) = String::from_utf8(body_bytes) else {
+            continue;
+        };
+        let mut next = body.clone();
+        next = next.replace(&format!("[[{old}]]"), &format!("[[{new_title}]]"));
+        next = next.replace(&format!("![[{old}]]"), &format!("![[{new_title}]]"));
+        let old_abs = format!("[[{project_name}/{old}]]");
+        let new_abs = format!("[[{project_name}/{new_title}]]");
+        next = next.replace(&old_abs, &new_abs);
+        let old_abs_embed = format!("![[{project_name}/{old}]]");
+        let new_abs_embed = format!("![[{project_name}/{new_title}]]");
+        next = next.replace(&old_abs_embed, &new_abs_embed);
+        if next != body {
+            let _ = persistence.save(&source_str, next.as_bytes()).await;
+            let _ = link_repo.rewrite_target_text(target_id, old, new_title);
+            let _ = link_repo.rewrite_target_text(
+                target_id,
+                &format!("{project_name}/{old}"),
+                &format!("{project_name}/{new_title}"),
+            );
+        }
+    }
+}
+
 /// Pick a unique path inside `dir` with `stem.ext`; appends ` (2)` etc on
 /// collision so a bulk export of repeat-titled notes doesn't overwrite.
 fn unique_path(dir: &std::path::Path, stem: &str, ext: &str) -> std::path::PathBuf {
@@ -587,10 +631,11 @@ pub fn ExplorerPanel() -> Element {
                 ps.into_iter().find(|p| p.id == pid).map(|p| p.name)
             }));
 
-        // Plans-Phase-4-explorer-undo-stack: capture prev title BEFORE the
-        // repo write, push only after success so a failed rename doesn't
-        // pollute the stack.
+        // Plans-Phase-4 / Plans-Phase-8: capture prev title + project name
+        // BEFORE the repo write so undo can run rewrite_referrer_bodies in
+        // the reverse direction. Push only after success.
         let prev_title_for_undo = old_title.clone();
+        let project_name_for_undo = project_name.clone();
         match note_repo_for_rename.rename(id, &new_title) {
             Ok(()) => {
                 if let Some(prev) = prev_title_for_undo {
@@ -598,63 +643,34 @@ pub fn ExplorerPanel() -> Element {
                         history.write().push(history::ExplorerAction::Rename {
                             id,
                             prev_title: prev,
+                            project_name: project_name_for_undo,
+                            new_title: new_title.clone(),
                         });
                     }
                 }
                 note_version.with_mut(|v| *v += 1);
                 renaming_note_setter.set(None);
 
-                // Walk every referrer and rewrite `[[OldTitle]]` /
-                // `[[Project/OldTitle]]` to the new equivalents in the
-                // body, then patch local_note_link.target_text. Async via
-                // `spawn` so the rename callback returns immediately.
+                // Walk every referrer and rewrite `[[OldTitle]]` / etc to
+                // the new equivalents. Async via `spawn` so the rename
+                // callback returns immediately. Plans-Phase-8 factored the
+                // body of this loop into `rewrite_referrer_bodies` so the
+                // undo path can run it in reverse.
                 if let (Some(old), Some(proj_name)) = (old_title, project_name.clone()) {
                     if old != new_title {
                         let link_repo = link_repo_for_rename.clone();
                         let persistence = persistence_for_rename.clone();
                         let new_title_owned = new_title.clone();
                         spawn(async move {
-                            let referrers = link_repo.referrers_of(id).unwrap_or_default();
-                            for source in referrers {
-                                let source_str = source.to_string();
-                                let body_bytes = match persistence.load(&source_str).await {
-                                    Ok(b) => b,
-                                    Err(_) => continue,
-                                };
-                                let Ok(body) = String::from_utf8(body_bytes) else { continue };
-                                let mut next = body.clone();
-                                next = next.replace(
-                                    &format!("[[{old}]]"),
-                                    &format!("[[{new_title_owned}]]"),
-                                );
-                                next = next.replace(
-                                    &format!("![[{old}]]"),
-                                    &format!("![[{new_title_owned}]]"),
-                                );
-                                let old_abs = format!("[[{proj_name}/{old}]]");
-                                let new_abs =
-                                    format!("[[{proj_name}/{new_title_owned}]]");
-                                next = next.replace(&old_abs, &new_abs);
-                                let old_abs_embed = format!("![[{proj_name}/{old}]]");
-                                let new_abs_embed =
-                                    format!("![[{proj_name}/{new_title_owned}]]");
-                                next = next.replace(&old_abs_embed, &new_abs_embed);
-                                if next != body {
-                                    let _ = persistence
-                                        .save(&source_str, next.as_bytes())
-                                        .await;
-                                    let _ = link_repo.rewrite_target_text(
-                                        id,
-                                        &old,
-                                        &new_title_owned,
-                                    );
-                                    let _ = link_repo.rewrite_target_text(
-                                        id,
-                                        &format!("{proj_name}/{old}"),
-                                        &format!("{proj_name}/{new_title_owned}"),
-                                    );
-                                }
-                            }
+                            rewrite_referrer_bodies(
+                                id,
+                                &old,
+                                &new_title_owned,
+                                &proj_name,
+                                link_repo,
+                                persistence,
+                            )
+                            .await;
                         });
                     }
                 }
@@ -868,14 +884,47 @@ pub fn ExplorerPanel() -> Element {
     // Plans-Phase-4-explorer-undo-stack: pop the latest inverse and apply.
     // Failures log; the entry is still consumed so the user moves on.
     let note_repo_for_undo = note_repo.clone();
+    let crate::local_mode::desktop::LocalNoteLinkRepo(link_repo_for_undo) =
+        use_context::<crate::local_mode::desktop::LocalNoteLinkRepo>();
+    let persistence_for_undo: Arc<dyn Persistence> = use_context();
     let on_undo = use_callback(move |_: ()| {
         let action = history.write().pop();
         let Some(action) = action else { return };
         match action {
-            history::ExplorerAction::Rename { id, prev_title } => {
+            history::ExplorerAction::Rename {
+                id,
+                prev_title,
+                project_name,
+                new_title,
+            } => {
+                // Restore the title first; same call shape as the forward path.
                 if let Err(e) = note_repo_for_undo.rename(id, &prev_title) {
                     eprintln!("operon: undo rename failed: {e}");
                     return;
+                }
+                // Plans-Phase-8: rewrite referrer bodies back —
+                // `new_title` was the substring the forward rename
+                // injected; replacing it with `prev_title` is the
+                // inverse. Async; same fire-and-forget semantics as
+                // the forward rewrite.
+                if let Some(proj_name) = project_name {
+                    if prev_title != new_title {
+                        let link_repo = link_repo_for_undo.clone();
+                        let persistence = persistence_for_undo.clone();
+                        let prev_title_owned = prev_title.clone();
+                        let new_title_owned = new_title.clone();
+                        spawn(async move {
+                            rewrite_referrer_bodies(
+                                id,
+                                &new_title_owned,
+                                &prev_title_owned,
+                                &proj_name,
+                                link_repo,
+                                persistence,
+                            )
+                            .await;
+                        });
+                    }
                 }
             }
             history::ExplorerAction::MoveWithin {
