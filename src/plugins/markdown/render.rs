@@ -35,9 +35,25 @@ pub fn MarkdownView(content: String) -> Element {
     // `![[…]]` patterns out of plain Text nodes into typed `WikiLink` nodes.
     let nodes = super::wikilink::expand_wiki(parser::parse(&content));
 
+    // Plans-Phase-9-monaco-desktop (rev 6): empty-state hint so the
+    // preview pane in Split / View mode is recognisably "preview, no
+    // content yet" rather than "broken / not mounted". Only fires for
+    // a body that's both whitespace-only AND parses to zero nodes —
+    // anything the parser produces (paragraphs, code blocks, etc.)
+    // suppresses the hint immediately.
+    let show_empty_hint = nodes.is_empty() && content.trim().is_empty();
+
     rsx! {
         article {
             class: "markdown-prose",
+            "data-testid": "markdown-view",
+            if show_empty_hint {
+                p {
+                    class: "markdown-empty-hint",
+                    "data-testid": "markdown-empty-hint",
+                    "Type something in the editor to see the preview\u{2026}"
+                }
+            }
             for node in nodes.iter() {
                 {render_node(node)}
             }

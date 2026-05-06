@@ -89,6 +89,17 @@
   display: block;
 }
 
+/* Plans-Phase-9-monaco-desktop (rev 6): empty-state hint shown by
+ * MarkdownView when the parser produces zero nodes for a whitespace-only
+ * body. Italic/muted so it reads as a placeholder, not a paragraph. */
+.markdown-prose .markdown-empty-hint {
+  color: var(--vscode-descriptionforeground, var(--vscode-tab-inactiveforeground, #888));
+  font-style: italic;
+  opacity: 0.7;
+  padding: 8px 0;
+  margin: 0;
+}
+
 /* Plans-Phase-9-wikilink-picker (rev 2): make wikilinks visibly
  * clickable. Without these rules the renderer's <a> elements inherit
  * the body color and look indistinguishable from raw text — the user

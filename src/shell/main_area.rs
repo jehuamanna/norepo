@@ -39,6 +39,10 @@ pub fn MainArea() -> Element {
             }
         },
         Some((tab_id, format_id, note_id, content, mode)) => {
+            eprintln!(
+                "operon: main_area mode={mode:?} content_len={}",
+                content.len()
+            );
             match registry.format_plugin_for(&format_id) {
                 Some(plugin) => {
                     // on_change writes the new content back through the TabManager and

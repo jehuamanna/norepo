@@ -277,6 +277,7 @@ pub fn MonacoEditorHost(
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
+                        eprintln!("operon: monaco change len={}", value.len());
                         on_change_for_loop.call(value);
                     }
                     Some("keyaction") => {

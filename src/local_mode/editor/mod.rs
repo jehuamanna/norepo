@@ -500,7 +500,7 @@ pub fn LocalSaveButton(action: LocalSaveAction, dirty: bool) -> Element {
 /// from the existing `TabStrip` above this body.
 #[component]
 pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
-    let mut tabs: Signal<TabManager> = use_context();
+    let tabs: Signal<TabManager> = use_context();
     // Plans-Phase-6-image-notes: image-tab view dependencies. Hooks must
     // run unconditionally; the actual rendering is gated below.
     let note_repo_for_image: crate::local_mode::desktop::LocalNoteRepo = use_context();
@@ -853,6 +853,29 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
         }
     };
 
+    // Plans-Phase-9-monaco-desktop (rev 6): the on_change handle Monaco
+    // calls into needs to outlive `LocalNoteEditor` re-renders. The
+    // recv loop inside `MonacoEditorHost` captures `on_change` once
+    // when its `use_future` first runs, so a fresh `EventHandler::new`
+    // built every render would leave the loop pointing at a stale
+    // closure (and the user's keystrokes would never reach
+    // `Tab.content`, breaking the Split / View preview). `use_callback`
+    // returns a `Copy` `Callback<String>` whose underlying closure is
+    // pinned for the component's lifetime — wrap it once in the prop's
+    // `EventHandler::new` and the recv loop's old reference still
+    // routes to the live target.
+    let mut tabs_for_propagate = tabs;
+    let propagate_content = use_callback(move |new_content: String| {
+        eprintln!(
+            "operon: local on_change \u{2192} tabs.set_content len={}",
+            new_content.len()
+        );
+        tabs_for_propagate
+            .write()
+            .set_content(tab_id, new_content);
+        tabs_for_propagate.write().set_dirty(tab_id, true);
+    });
+
     // Plans-Phase-9-monaco-desktop (rev 1): wrap MonacoEditorHost in a
     // sizing div whose handlers catch drag/drop, right-click, and the
     // capture-phase keybindings Monaco swallows. Monaco itself is
@@ -1033,9 +1056,11 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
                 note_id: tab_note_id_for_host.clone(),
                 content: content.clone(),
                 language: LanguageDescriptor::markdown(),
+                // Plans-Phase-9-monaco-desktop (rev 6): forward to the
+                // stable `Callback` declared above so the propagation
+                // chain survives Monaco's first-render capture.
                 on_change: EventHandler::new(move |new_content: String| {
-                    tabs.write().set_content(tab_id, new_content);
-                    tabs.write().set_dirty(tab_id, true);
+                    propagate_content.call(new_content);
                 }),
                 channel_sink: monaco_channel,
                 on_action: on_action,
