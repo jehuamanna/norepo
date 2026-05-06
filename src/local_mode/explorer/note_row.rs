@@ -236,6 +236,7 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
 
     let drop_pos_now = *drop_indicator.read();
 
+    let aria_level = (depth + 2).max(2); // projects are level 1; root notes level 2
     rsx! {
         div {
             class: "{row_class}",
@@ -247,6 +248,11 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
             "data-selected": if selected { "true" } else { "false" },
             "data-open": if is_open { "true" } else { "false" },
             "data-cut": if cut { "true" } else { "false" },
+            // Plans-Phase-4-multiselect-aria: WAI-ARIA tree pattern.
+            role: "treeitem",
+            "aria-level": "{aria_level}",
+            "aria-selected": if selected { "true" } else { "false" },
+            "aria-expanded": if has_children { if is_open { "true" } else { "false" } } else { "" },
             tabindex: "0",
             draggable: "true",
             onclick: move |evt| {

@@ -137,6 +137,12 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
             "data-selected": if selected { "true" } else { "false" },
             "data-open": if is_open { "true" } else { "false" },
             "data-cut": if cut { "true" } else { "false" },
+            // Plans-Phase-4-multiselect-aria: WAI-ARIA tree pattern. Projects
+            // are level 1; notes inside are level 2+.
+            role: "treeitem",
+            "aria-level": "1",
+            "aria-selected": if selected { "true" } else { "false" },
+            "aria-expanded": if is_open { "true" } else { "false" },
             draggable: "true",
             onclick: move |evt| {
                 evt.stop_propagation();

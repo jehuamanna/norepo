@@ -797,8 +797,10 @@ pub fn ExplorerPanel() -> Element {
                     class: "notes-explorer-toolbar-add",
                     "data-testid": "explorer-add-project",
                     "aria-label": "New project",
+                    title: "New project",
                     onclick: on_add_project,
-                    "+"
+                    span { "aria-hidden": "true", "+" }
+                    span { class: "sr-only", "New project" }
                 }
             }
             // Body — results when query is non-empty, otherwise the tree.
@@ -812,6 +814,13 @@ pub fn ExplorerPanel() -> Element {
             } else {
             div {
                 class: "flex-1 overflow-y-auto",
+                // Plans-Phase-4: WAI-ARIA tree pattern. Multi-select isn't
+                // wired yet (single-selection signals still in place) so we
+                // advertise aria-multiselectable=false for now; flipping it
+                // is the BTreeSet<NodeKey> follow-up.
+                role: "tree",
+                "aria-multiselectable": "false",
+                "aria-label": "Projects and notes",
                 if projects_snapshot.is_empty() {
                     div {
                         class: "px-3 py-6 text-xs opacity-60 text-center",
