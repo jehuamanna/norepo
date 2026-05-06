@@ -135,9 +135,23 @@ pub fn MonacoEditorHost(
             focus_request.set(None);
         });
 
+        // Plans-Phase-7-clear-focus-on-dispose: when this editor host
+        // unmounts (tab close, route change), clear the focus request if
+        // it still points at our note id so the next mount can't pick up
+        // a stale request.
+        let note_id_for_dispose = note_id.clone();
+        let mut focus_request_for_dispose = focus_request;
         let _drop_guard = use_drop(move || {
             let bk = backend.read().clone();
             bk.borrow_mut().dispose();
+            let stale = focus_request_for_dispose
+                .read()
+                .as_deref()
+                .map(|id| id == note_id_for_dispose.as_str())
+                .unwrap_or(false);
+            if stale {
+                focus_request_for_dispose.set(None);
+            }
         });
 
         return rsx! {
