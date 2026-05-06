@@ -226,11 +226,30 @@ fn try_render_image_view(
     };
     let data_url = format!("data:{mime};base64,{}", base64_encode(&bytes));
 
+    // Plans-Phase-2-editor-auto-focus: image-note tab needs to be focusable
+    // so arrow keys / page-up/down can scroll the viewer when the note has
+    // just been opened from the explorer. Programmatic focus only — the
+    // tabindex=-1 keeps the container out of the natural tab cycle.
+    let crate::editor::RequestEditorFocus(mut focus_request) = use_context();
+    let note_id_for_focus = note_id.to_string();
+
     Some(rsx! {
         div {
             class: "operon-local-image-view",
             "data-testid": "image-note-view",
             "data-note-id": "{note_id}",
+            tabindex: "-1",
+            onmounted: move |evt| {
+                let wants_focus = focus_request
+                    .read()
+                    .as_deref()
+                    .map(|id| id == note_id_for_focus.as_str())
+                    .unwrap_or(false);
+                if wants_focus {
+                    drop(evt.set_focus(true));
+                    focus_request.set(None);
+                }
+            },
             style: "display: flex; align-items: center; justify-content: center; height: 100%; overflow: auto; padding: 1rem; background: var(--operon-bg, #111);",
             img {
                 src: "{data_url}",
