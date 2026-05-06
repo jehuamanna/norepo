@@ -24,71 +24,32 @@ use crate::theme::persistence::{self as theme_persistence, WebLocalStorage};
 use crate::theme::{Theme, ThemeRegistry};
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
-const MAIN_CSS: Asset = asset!("/assets/main.css");
-const TAILWIND_CSS: Asset = asset!("/assets/tailwind.css");
-const THEME_CSS: Asset = asset!("/assets/theme.css");
-const SHELL_CSS: Asset = asset!("/assets/shell.css");
-const MARKDOWN_CSS: Asset = asset!("/assets/markdown.css");
-
-/// Critical chrome rules emitted inline so the first paint after WASM mount
-/// has the Shell grid laid out without waiting on the hashed shell.css fetch.
-/// Keep this in sync with the corresponding rules at the top of
-/// assets/shell.css.
-const CRITICAL_SHELL_CSS: &str = r#"
-html, body {
-    margin: 0;
-    padding: 0;
-    height: 100%;
-    width: 100%;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-}
-#main, #operon-root {
-    height: 100vh;
-    width: 100vw;
-    display: block;
-}
-.operon-shell-grid {
-    display: grid;
-    grid-template-columns: 56px var(--operon-side-bar-width, 280px) 1fr var(--operon-companion-width, 320px);
-    grid-template-rows: 28px 1fr var(--operon-panel-height, 240px) 24px;
-    grid-template-areas:
-        "menu     menu     menu     menu"
-        "activity side     main     companion"
-        "activity side     panel    companion"
-        "status   status   status   status";
-    height: 100vh;
-    width: 100vw;
-    overflow: hidden;
-    position: relative;
-}
-.operon-shell-grid[data-sidebar-collapsed="true"] {
-    --operon-side-bar-width: 0px;
-}
-.operon-menubar  { grid-area: menu;      display: flex; align-items: center; font-size: 12px; }
-.operon-activity-bar {
-    grid-area: activity;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-}
-.operon-side-bar {
-    grid-area: side;
-    padding: 8px 12px;
-    font-size: 13px;
-    overflow-y: auto;
-}
-.operon-main-area     { grid-area: main;      display: flex; flex-direction: column; }
-.operon-panel         { grid-area: panel;     display: flex; flex-direction: column; font-size: 12px; }
-.operon-companion-area{ grid-area: companion; padding: 8px 12px; }
-.operon-status-bar {
-    grid-area: status;
-    display: flex;
-    align-items: center;
-    padding: 0 12px;
-    font-size: 12px;
-    gap: 12px;
-}
-"#;
+// `with_static_head(true)` makes dx-cli emit `<link rel="stylesheet">` into
+// the served HTML head at template-build time, with the correct hashed path,
+// so the browser fetches the CSS in parallel with WASM and chrome rules are
+// applied as soon as Dioxus mounts. Without it, the link tag would only be
+// added during App's first VDOM render — i.e. *after* WASM finished loading
+// and rendered the chrome divs, producing a flash of unstyled content.
+const MAIN_CSS: Asset = asset!(
+    "/assets/main.css",
+    AssetOptions::css().with_static_head(true)
+);
+const TAILWIND_CSS: Asset = asset!(
+    "/assets/tailwind.css",
+    AssetOptions::css().with_static_head(true)
+);
+const THEME_CSS: Asset = asset!(
+    "/assets/theme.css",
+    AssetOptions::css().with_static_head(true)
+);
+const SHELL_CSS: Asset = asset!(
+    "/assets/shell.css",
+    AssetOptions::css().with_static_head(true)
+);
+const MARKDOWN_CSS: Asset = asset!(
+    "/assets/markdown.css",
+    AssetOptions::css().with_static_head(true)
+);
 
 #[component]
 pub fn App() -> Element {
@@ -219,12 +180,12 @@ pub fn App() -> Element {
 
     rsx! {
         document::Link { rel: "icon", href: FAVICON }
-        // Inline critical chrome rules so the very first paint after WASM
-        // mount has the VS-Code Shell grid laid out — no second flash while
-        // shell.css is fetched. The full assets/shell.css below overrides
-        // these once it loads, but the inline copy keeps layout intact for
-        // every subsequent render in between.
-        document::Style { {CRITICAL_SHELL_CSS} }
+        // Stylesheets are emitted in <head> at template-build time via
+        // manganis static_head (see asset!() options at the top of this
+        // file). The runtime document::Stylesheet entries below ensure
+        // hot-reload still re-applies CSS after a non-hot-reloadable
+        // change; Dioxus dedupes them against the static-head links by
+        // href so there is no duplicate fetch.
         document::Stylesheet { href: MAIN_CSS }
         document::Stylesheet { href: TAILWIND_CSS }
         document::Stylesheet { href: THEME_CSS }
