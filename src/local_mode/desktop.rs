@@ -431,8 +431,10 @@ pub fn provide_local_app_signals() {
     let search_focus_tick: Signal<u64> = use_signal(|| 0);
     use_context_provider(|| ExplorerSearchFocus(search_focus_tick));
 
-    let save_callback =
-        use_hook(|| install_save_action(tabs, persistence.clone(), note_repo.clone()));
+    let scheduler: crate::tabs::SaveScheduler = use_context();
+    let save_callback = use_hook(|| {
+        install_save_action(tabs, persistence.clone(), note_repo.clone(), scheduler.clone())
+    });
     use_context_provider(|| LocalSaveAction {
         callback: save_callback,
     });

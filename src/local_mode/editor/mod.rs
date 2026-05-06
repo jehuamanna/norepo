@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::editor::EditorMode;
 use crate::persistence::Persistence;
-use crate::tabs::{Tab, TabId, TabManager};
+use crate::tabs::{SaveScheduler, Tab, TabId, TabManager};
 
 /// Shared callback installed at LocalShell scope. The keyboard handler at the
 /// shell root (Ctrl+S) and the explicit Save button both invoke this. It looks
@@ -33,10 +33,16 @@ pub struct LocalSaveAction {
 
 /// Mount the explicit-save action at LocalShell scope. The returned callback
 /// is what `Ctrl+S` and the Save button invoke.
+///
+/// Plans-Phase-2-saving: routes through [`SaveScheduler::flush`] so the
+/// manual save and the 150 ms debounced autosave converge on a single
+/// `Persistence::save` call site. Calling `flush` first cancels any
+/// in-flight debounce future for the tab so we never double-write.
 pub fn install_save_action(
     mut tabs: Signal<TabManager>,
-    persistence: Arc<dyn Persistence>,
+    _persistence: Arc<dyn Persistence>,
     note_repo: Arc<dyn LocalNoteRepository>,
+    scheduler: SaveScheduler,
 ) -> Callback<()> {
     Callback::new(move |_| {
         let active: Option<Tab> = tabs.read().active().cloned();
@@ -56,11 +62,11 @@ pub fn install_save_action(
         let tab_id = tab.id;
         let note_id = tab.note_id.clone();
         let content = tab.content.clone();
-        let persistence = persistence.clone();
         let repo = note_repo.clone();
+        let scheduler = scheduler.clone();
 
         spawn(async move {
-            match persistence.save(&note_id, content.as_bytes()).await {
+            match scheduler.flush(tab_id, &note_id, &content).await {
                 Ok(()) => {
                     if let Err(e) = repo.touch_updated(note_uuid) {
                         eprintln!("operon: touch_updated failed for {note_uuid}: {e}");
