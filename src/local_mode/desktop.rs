@@ -1,5 +1,8 @@
 //! Desktop (non-wasm) implementation of Local Mode UI + repo wiring.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use dioxus::prelude::*;
@@ -547,13 +550,54 @@ pub fn provide_local_app_signals() {
     });
     use_context_provider(|| crate::plugins::markdown::render::WikiLinkResolver(wikilink_resolver));
 
+    // Plans-Phase-9-wikilink-picker (rev 3): shared per-shell cache for
+    // the WikiLinkChecker + WikiLinkImageResolver. Both run on every
+    // MarkdownView render; in Split mode that's once per keystroke. The
+    // image resolver's read_image + base64_encode dominates wall-time
+    // (each call did multi-MB disk I/O + string alloc), and a body with
+    // even one embed could lock the UI on every keystroke — exactly the
+    // "paste freezes the app" symptom. Cache by target string;
+    // invalidate by tracking `note_version` + `project_version`. Both
+    // bump on rename / move / create / delete, so a stale entry never
+    // outlives the underlying file.
+    #[derive(Default)]
+    struct WikilinkCache {
+        observed_note_version: u64,
+        observed_project_version: u64,
+        check: HashMap<String, bool>,
+        image: HashMap<String, Option<String>>,
+    }
+
+    let cache: Rc<RefCell<WikilinkCache>> = use_hook(|| Rc::new(RefCell::new(WikilinkCache::default())));
+    let LocalNoteVersion(note_version_for_cache) = use_context::<LocalNoteVersion>();
+    let LocalProjectVersion(project_version_for_cache) = use_context::<LocalProjectVersion>();
+
     // Plans-Phase-5-vfs-wikilinks: sync checker the renderer calls during
     // render to flag broken `[[…]]` links. Returns true on a unique resolve.
     let project_repo_for_check = project_repo.clone();
     let note_repo_for_check = note_repo_for_links.clone();
     let selected_note_for_check = selected_note_for_links;
+    let cache_for_check = cache.clone();
     let wikilink_checker = use_hook(move || {
         Callback::new(move |target: String| -> bool {
+            // peek() reads the current version without subscribing the
+            // callback to it — the version change invalidates the cache
+            // lazily on the next call instead of triggering a re-render
+            // loop here.
+            let nv = *note_version_for_cache.peek();
+            let pv = *project_version_for_cache.peek();
+            {
+                let mut state = cache_for_check.borrow_mut();
+                if state.observed_note_version != nv || state.observed_project_version != pv {
+                    state.observed_note_version = nv;
+                    state.observed_project_version = pv;
+                    state.check.clear();
+                    state.image.clear();
+                }
+                if let Some(hit) = state.check.get(&target).copied() {
+                    return hit;
+                }
+            }
             let snap_projects = project_repo_for_check.list().unwrap_or_default();
             let source_project_id = (*selected_note_for_check.read())
                 .and_then(|nid| {
@@ -565,21 +609,23 @@ pub fn provide_local_app_signals() {
                     })
                 })
                 .or_else(|| snap_projects.first().map(|p| p.id));
-            let Some(source_project_id) = source_project_id else {
-                return false;
+            let result = match source_project_id {
+                None => false,
+                Some(spid) => match vfs::parse_link(&target) {
+                    None => false,
+                    Some(form) => matches!(
+                        vfs::resolve_link(
+                            project_repo_for_check.as_ref(),
+                            note_repo_for_check.as_ref(),
+                            spid,
+                            &form,
+                        ),
+                        Ok(_)
+                    ),
+                },
             };
-            let Some(form) = vfs::parse_link(&target) else {
-                return false;
-            };
-            matches!(
-                vfs::resolve_link(
-                    project_repo_for_check.as_ref(),
-                    note_repo_for_check.as_ref(),
-                    source_project_id,
-                    &form,
-                ),
-                Ok(_)
-            )
+            cache_for_check.borrow_mut().check.insert(target, result);
+            result
         })
     });
     use_context_provider(|| crate::plugins::markdown::render::WikiLinkChecker(wikilink_checker));
@@ -587,46 +633,67 @@ pub fn provide_local_app_signals() {
     // Plans-Phase-6-image-notes (inline-embed): resolver that turns an
     // `![[Title^short]]` embed target into a `data:` URL when it points
     // to an image-note blob. The MarkdownView renderer consumes this
-    // context to emit `<img>` instead of the text-anchor fallback.
+    // context to emit `<img>` instead of the text-anchor fallback. Reads
+    // are cached above on first hit so subsequent renders skip
+    // `read_image` + base64 entirely.
     let project_repo_for_img = project_repo.clone();
     let note_repo_for_img = note_repo_for_links.clone();
     let selected_note_for_img = selected_note_for_links;
     let CurrentVaultRoot(vault_for_img) = use_context::<CurrentVaultRoot>();
+    let cache_for_image = cache;
     let wikilink_image_resolver = use_hook(move || {
         Callback::new(move |target: String| -> Option<String> {
-            let snap_projects = project_repo_for_img.list().ok()?;
-            let source_project_id = (*selected_note_for_img.read())
-                .and_then(|nid| {
-                    snap_projects.iter().find_map(|p| {
-                        note_repo_for_img
-                            .list_for_project(p.id)
-                            .ok()
-                            .and_then(|notes| notes.iter().find(|n| n.id == nid).map(|_| p.id))
-                    })
-                })
-                .or_else(|| snap_projects.first().map(|p| p.id))?;
-            let form = vfs::parse_link(&target)?;
-            let note_id = vfs::resolve_link(
-                project_repo_for_img.as_ref(),
-                note_repo_for_img.as_ref(),
-                source_project_id,
-                &form,
-            )
-            .ok()?;
-            let row = note_repo_for_img
-                .list_for_project(source_project_id)
-                .ok()?
-                .into_iter()
-                .find(|n| n.id == note_id)?;
-            if !matches!(row.kind, NoteKind::Image) {
-                return None;
+            let nv = *note_version_for_cache.peek();
+            let pv = *project_version_for_cache.peek();
+            {
+                let mut state = cache_for_image.borrow_mut();
+                if state.observed_note_version != nv || state.observed_project_version != pv {
+                    state.observed_note_version = nv;
+                    state.observed_project_version = pv;
+                    state.check.clear();
+                    state.image.clear();
+                }
+                if let Some(hit) = state.image.get(&target).cloned() {
+                    return hit;
+                }
             }
-            let blob_path = row.blob_path.clone()?;
-            let vault = vault_for_img.read().clone()?;
-            crate::local_mode::images::data_url_for_blob(
-                &vault,
-                std::path::Path::new(&blob_path),
-            )
+            let computed = (|| -> Option<String> {
+                let snap_projects = project_repo_for_img.list().ok()?;
+                let source_project_id = (*selected_note_for_img.read())
+                    .and_then(|nid| {
+                        snap_projects.iter().find_map(|p| {
+                            note_repo_for_img
+                                .list_for_project(p.id)
+                                .ok()
+                                .and_then(|notes| notes.iter().find(|n| n.id == nid).map(|_| p.id))
+                        })
+                    })
+                    .or_else(|| snap_projects.first().map(|p| p.id))?;
+                let form = vfs::parse_link(&target)?;
+                let note_id = vfs::resolve_link(
+                    project_repo_for_img.as_ref(),
+                    note_repo_for_img.as_ref(),
+                    source_project_id,
+                    &form,
+                )
+                .ok()?;
+                let row = note_repo_for_img
+                    .list_for_project(source_project_id)
+                    .ok()?
+                    .into_iter()
+                    .find(|n| n.id == note_id)?;
+                if !matches!(row.kind, NoteKind::Image) {
+                    return None;
+                }
+                let blob_path = row.blob_path.clone()?;
+                let vault = vault_for_img.read().clone()?;
+                crate::local_mode::images::data_url_for_blob(
+                    &vault,
+                    std::path::Path::new(&blob_path),
+                )
+            })();
+            cache_for_image.borrow_mut().image.insert(target, computed.clone());
+            computed
         })
     });
     use_context_provider(|| {

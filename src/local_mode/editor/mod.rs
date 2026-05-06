@@ -124,15 +124,134 @@ pub fn rebuild_link_graph_for_source(
         }
         return;
     }
-    // Resolve the source's project so relative `[[Note]]` forms can be
-    // scoped correctly.
+    // Plans-Phase-9-wikilink-picker (rev 3): snapshot projects + every
+    // project's notes ONCE up front, then resolve all extracted links
+    // against the in-memory snapshot. Calling `vfs::resolve_link` per
+    // link issued one `list()` and at least one `list_for_project()`
+    // for every wikilink — for a body with N links and P projects that
+    // was N*(1 + P) DB queries on the main thread, plenty enough to
+    // freeze the UI on a paste of a moderately-linked note.
     let projects = project_repo.list().unwrap_or_default();
-    let source_project_id = projects.iter().find_map(|p| {
-        note_repo
-            .list_for_project(p.id)
-            .ok()
-            .and_then(|notes| notes.iter().find(|n| n.id == source_id).map(|_| p.id))
-    });
+    let mut notes_by_project: std::collections::HashMap<Uuid, Vec<operon_store::repos::LocalNote>> =
+        std::collections::HashMap::new();
+    for p in &projects {
+        if let Ok(rows) = note_repo.list_for_project(p.id) {
+            notes_by_project.insert(p.id, rows);
+        }
+    }
+    let source_project_id = notes_by_project
+        .iter()
+        .find_map(|(pid, notes)| notes.iter().find(|n| n.id == source_id).map(|_| *pid));
+    let resolve = |form: &vfs::LinkForm| -> Option<Uuid> {
+        match form {
+            vfs::LinkForm::Relative { title } => {
+                let spid = source_project_id?;
+                let notes = notes_by_project.get(&spid)?;
+                let matches: Vec<Uuid> = notes
+                    .iter()
+                    .filter(|n| n.title.eq_ignore_ascii_case(title))
+                    .map(|n| n.id)
+                    .collect();
+                if matches.len() == 1 {
+                    Some(matches[0])
+                } else {
+                    None
+                }
+            }
+            vfs::LinkForm::Absolute { project, title } => {
+                let pid = projects
+                    .iter()
+                    .find(|p| p.name.eq_ignore_ascii_case(project))?
+                    .id;
+                let notes = notes_by_project.get(&pid)?;
+                let matches: Vec<Uuid> = notes
+                    .iter()
+                    .filter(|n| n.title.eq_ignore_ascii_case(title))
+                    .map(|n| n.id)
+                    .collect();
+                if matches.len() == 1 {
+                    Some(matches[0])
+                } else {
+                    None
+                }
+            }
+            vfs::LinkForm::Nested {
+                project,
+                parent_path,
+                title,
+                short_id,
+            } => {
+                let pid = projects
+                    .iter()
+                    .find(|p| p.name.eq_ignore_ascii_case(project))?
+                    .id;
+                let notes = notes_by_project.get(&pid)?;
+                let mut frontier: Vec<Uuid> = notes
+                    .iter()
+                    .filter(|n| n.parent_id.is_none())
+                    .map(|n| n.id)
+                    .collect();
+                for segment in parent_path {
+                    let next: Vec<Uuid> = notes
+                        .iter()
+                        .filter(|n| {
+                            n.parent_id
+                                .map(|p| frontier.contains(&p))
+                                .unwrap_or(false)
+                                && n.title.eq_ignore_ascii_case(segment)
+                        })
+                        .map(|n| n.id)
+                        .collect();
+                    if next.is_empty() {
+                        return None;
+                    }
+                    frontier = next;
+                }
+                let matches: Vec<Uuid> = notes
+                    .iter()
+                    .filter(|n| {
+                        let parent_ok = if parent_path.is_empty() {
+                            n.parent_id.is_none()
+                        } else {
+                            n.parent_id
+                                .map(|p| frontier.contains(&p))
+                                .unwrap_or(false)
+                        };
+                        let title_ok = n.title.eq_ignore_ascii_case(title);
+                        let short_ok = match short_id {
+                            Some(s) => n.id.simple().to_string().starts_with(s),
+                            None => true,
+                        };
+                        parent_ok && title_ok && short_ok
+                    })
+                    .map(|n| n.id)
+                    .collect();
+                if matches.len() == 1 {
+                    Some(matches[0])
+                } else {
+                    None
+                }
+            }
+            vfs::LinkForm::Disambiguated { title, short_id } => {
+                let mut matches: Vec<Uuid> = Vec::new();
+                for notes in notes_by_project.values() {
+                    for n in notes {
+                        if n.title.eq_ignore_ascii_case(title)
+                            && n.id.simple().to_string().starts_with(short_id)
+                        {
+                            matches.push(n.id);
+                        }
+                    }
+                }
+                if matches.len() == 1 {
+                    Some(matches[0])
+                } else {
+                    None
+                }
+            }
+        }
+    };
+
     let mut rows: Vec<LinkRow> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for link in extracted {
@@ -141,11 +260,7 @@ pub fn rebuild_link_graph_for_source(
             // is_embed flag and skip duplicates.
             continue;
         }
-        let target_note_id = source_project_id.and_then(|pid| {
-            vfs::parse_link(&link.target).and_then(|form| {
-                vfs::resolve_link(project_repo.as_ref(), note_repo.as_ref(), pid, &form).ok()
-            })
-        });
+        let target_note_id = vfs::parse_link(&link.target).and_then(|form| resolve(&form));
         rows.push(LinkRow {
             source_note_id: source_id,
             target_text: link.target,
