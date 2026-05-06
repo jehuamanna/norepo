@@ -605,6 +605,17 @@ html, body {
   margin: 0 0 6px 0;
 }
 
+/* Plans-Phase-9-wikilink-picker (rev 2): visible row highlight for the
+ * keyboard-driven LinkPicker. Mirrors the selected-row treatment from
+ * the explorer rows so the user can tell which row Enter will pick. */
+.operon-modal-result {
+  transition: background 80ms var(--ease-in-out, cubic-bezier(0.4, 0, 0.2, 1));
+}
+.operon-modal-result-selected {
+  background: var(--vscode-listactiveselectionbackground, rgba(77, 170, 252, 0.18));
+  color: var(--vscode-listactiveselectionforeground, inherit);
+}
+
 /* Local-Mode editor textarea — used in Edit mode (and the edit pane of
  * Split mode) because the cloud Monaco backend doesn't mount on desktop. */
 .operon-local-editor {

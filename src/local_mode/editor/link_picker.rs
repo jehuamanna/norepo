@@ -11,6 +11,7 @@
 
 use dioxus::prelude::*;
 use operon_store::repos::{NoteKind, SearchKind};
+use operon_store::vfs;
 
 use crate::local_mode::explorer::ExplorerSearchRepo;
 
@@ -34,20 +35,42 @@ pub fn LinkPicker(open: Signal<bool>, on_pick: EventHandler<PickedLink>) -> Elem
     let mut query: Signal<String> = use_signal(String::new);
     // (target, breadcrumb-for-display, kind: None=project, Some(NoteKind)=note)
     let mut results: Signal<Vec<(String, String, Option<NoteKind>)>> = use_signal(Vec::new);
+    // Plans-Phase-9-wikilink-picker (rev 2): keyboard-driven highlight
+    // index. Arrow up/down moves; Enter picks the highlighted row. Reset
+    // to 0 every time the result list changes so a stale index can never
+    // outlive its row.
+    let mut highlight: Signal<usize> = use_signal(|| 0);
 
-    let mut close = move || {
+    let close = use_callback(move |_: ()| {
         open.set(false);
         query.set(String::new());
         results.set(Vec::new());
-    };
+        highlight.set(0);
+    });
+
+    // Helper invoked by Enter / row-click. `idx` is the row index in
+    // `results.read()`. Builds the PickedLink and closes.
+    let pick_at = use_callback(move |idx: usize| {
+        let snap = results.read().clone();
+        if let Some((target, _, note_kind)) = snap.get(idx).cloned() {
+            let embed = matches!(note_kind, Some(NoteKind::Image));
+            on_pick.call(PickedLink { target, embed });
+            close.call(());
+        }
+    });
 
     // Recompute results on every query change. Title-only search (in_content=false)
     // is enough for the picker — we just need to find candidates by name.
     {
         let search_repo = search_repo.clone();
         let mut results_setter = results;
+        let mut highlight_setter = highlight;
         use_effect(move || {
             let needle = query.read().clone();
+            // Reset the keyboard-highlight to the first row of every new
+            // result list. Without this the index could outlive its row
+            // and Enter would either pick nothing or the wrong note.
+            highlight_setter.set(0);
             if needle.trim().is_empty() {
                 results_setter.set(Vec::new());
                 return;
@@ -60,9 +83,16 @@ pub fn LinkPicker(open: Signal<bool>, on_pick: EventHandler<PickedLink>) -> Elem
                         .map(|h| match h.kind {
                             SearchKind::Project => (h.title.clone(), h.breadcrumb, None),
                             SearchKind::Note => {
-                                // Compose "Project/Title" so vfs::resolve_link
-                                // treats it as Absolute and resolves uniquely.
-                                let target = h.breadcrumb.replace(" / ", "/");
+                                // Plans-Phase-9-wikilink-picker (rev 2):
+                                // emit the FULL parent-path target (the
+                                // search-repo breadcrumb walks parent_id
+                                // and produces "Project / Folder / .../
+                                // Title") AND append `^short` so duplicate
+                                // titles still resolve uniquely. The vfs
+                                // Nested form parses both the path and
+                                // the short id.
+                                let path = h.breadcrumb.replace(" / ", "/");
+                                let target = format!("{}^{}", path, vfs::short_id(h.id));
                                 (target, h.breadcrumb, h.note_kind)
                             }
                         })
@@ -84,11 +114,35 @@ pub fn LinkPicker(open: Signal<bool>, on_pick: EventHandler<PickedLink>) -> Elem
             role: "dialog",
             "aria-modal": "true",
             "aria-labelledby": "link-picker-title",
-            onclick: move |_| close(),
+            onclick: move |_| close.call(()),
+            // Plans-Phase-9-wikilink-picker (rev 2): keyboard nav.
+            // Arrow up/down moves the highlight; Enter picks; Escape
+            // closes. Native textarea-style key repeat works because
+            // Dioxus delivers each repeat as a separate event.
             onkeydown: move |evt| {
-                if evt.key().to_string() == "Escape" {
-                    evt.prevent_default();
-                    close();
+                let key = evt.key().to_string();
+                let len = results.read().len();
+                match key.as_str() {
+                    "Escape" => {
+                        evt.prevent_default();
+                        close.call(());
+                    }
+                    "ArrowDown" if len > 0 => {
+                        evt.prevent_default();
+                        let cur = *highlight.read();
+                        highlight.set((cur + 1).min(len - 1));
+                    }
+                    "ArrowUp" if len > 0 => {
+                        evt.prevent_default();
+                        let cur = *highlight.read();
+                        highlight.set(cur.saturating_sub(1));
+                    }
+                    "Enter" if len > 0 => {
+                        evt.prevent_default();
+                        let idx = (*highlight.read()).min(len - 1);
+                        pick_at.call(idx);
+                    }
+                    _ => {}
                 }
             },
             div {
@@ -111,23 +165,35 @@ pub fn LinkPicker(open: Signal<bool>, on_pick: EventHandler<PickedLink>) -> Elem
                 }
                 ul {
                     class: "operon-modal-results",
+                    role: "listbox",
                     style: "list-style: none; padding: 0; margin: 0.5rem 0; max-height: 16rem; overflow-y: auto;",
                     for (i, (target, breadcrumb, note_kind)) in results.read().iter().cloned().enumerate() {
                         li {
                             key: "{i}-{target}",
-                            class: "operon-modal-result",
+                            // Plans-Phase-9-wikilink-picker (rev 2):
+                            // visual highlight tracks the keyboard
+                            // selection. `aria-selected` exposes it to
+                            // assistive tech; the data-testid attr is
+                            // keyed for the e2e selector.
+                            class: if i == *highlight.read() {
+                                "operon-modal-result operon-modal-result-selected"
+                            } else {
+                                "operon-modal-result"
+                            },
+                            role: "option",
+                            "aria-selected": if i == *highlight.read() { "true" } else { "false" },
                             style: "padding: 0.25rem 0.5rem; cursor: pointer; border-radius: 0.25rem;",
                             "data-testid": "link-picker-result",
+                            "data-highlighted": if i == *highlight.read() { "true" } else { "false" },
                             "data-note-kind": match note_kind {
                                 Some(NoteKind::Markdown) => "markdown",
                                 Some(NoteKind::Image) => "image",
                                 None => "project",
                             },
+                            onmouseenter: move |_| highlight.set(i),
                             onclick: move |evt| {
                                 evt.stop_propagation();
-                                let embed = matches!(note_kind, Some(NoteKind::Image));
-                                on_pick.call(PickedLink { target: target.clone(), embed });
-                                close();
+                                pick_at.call(i);
                             },
                             // Plans-Phase-9-wikilink-picker (rev 1): kind
                             // badge mirrors the explorer-row convention
@@ -170,7 +236,7 @@ pub fn LinkPicker(open: Signal<bool>, on_pick: EventHandler<PickedLink>) -> Elem
                     button {
                         r#type: "button",
                         class: "operon-modal-button",
-                        onclick: move |_| close(),
+                        onclick: move |_| close.call(()),
                         "Cancel"
                     }
                 }
