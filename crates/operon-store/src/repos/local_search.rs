@@ -71,6 +71,54 @@ fn invalid_uuid(s: String) -> crate::sql::Error {
     )
 }
 
+/// Plans-Phase-9-wikilink-picker (rev 2): walk the parent chain for a
+/// note id so the link-picker breadcrumb can show the full path
+/// (`Project / Parent / Sub / Title`) instead of just `Project / Title`.
+/// Returns parent titles in root-to-leaf order, *excluding* the leaf
+/// itself. A 64-step depth cap defends against cyclic parent pointers
+/// (move-to rejects cycles, but don't loop the search if the DB ever
+/// holds bad data).
+fn parent_chain_titles(conn: &crate::sql::Connection, leaf_id: Uuid) -> Vec<String> {
+    let sql = "WITH RECURSIVE chain(id, parent_id, title, depth) AS (
+            SELECT id, parent_id, title, 0 FROM local_note WHERE id = ?1
+            UNION ALL
+            SELECT n.id, n.parent_id, n.title, c.depth + 1
+            FROM local_note n JOIN chain c ON n.id = c.parent_id
+            WHERE c.depth < 64
+        )
+        SELECT title FROM chain WHERE depth > 0 ORDER BY depth DESC";
+    let mut titles: Vec<String> = Vec::new();
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return titles;
+    };
+    let rows = stmt.query_map(params![leaf_id.to_string()], |row| row.get::<_, String>(0));
+    if let Ok(iter) = rows {
+        for r in iter.flatten() {
+            titles.push(r);
+        }
+    }
+    titles
+}
+
+/// Compose a breadcrumb from the project name, walked parent titles,
+/// and the leaf title — `Project / Parent / Sub / Title` (or
+/// `Project / Title` for top-level notes).
+fn compose_breadcrumb(project_name: &str, parent_titles: &[String], leaf_title: &str) -> String {
+    let cap = project_name.len()
+        + leaf_title.len()
+        + 6
+        + parent_titles.iter().map(|s| s.len() + 3).sum::<usize>();
+    let mut s = String::with_capacity(cap);
+    s.push_str(project_name);
+    for t in parent_titles {
+        s.push_str(" / ");
+        s.push_str(t);
+    }
+    s.push_str(" / ");
+    s.push_str(leaf_title);
+    s
+}
+
 /// Build a snippet around the first match. Takes up to 60 chars before and 60
 /// chars after the match offset, then trims/normalises run of whitespace and
 /// newlines into single spaces.
@@ -181,12 +229,15 @@ impl LocalSearchRepository for SqliteLocalSearchRepository {
         for r in title_rows {
             let (id, project_id, project_name, title, kind_str) = r?;
             note_hit_ids.insert(id);
+            // Plans-Phase-9-wikilink-picker (rev 2): walk parent chain so
+            // the breadcrumb shows `Project / Parent / Sub / Title`.
+            let parents = parent_chain_titles(&conn, id);
             note_hits.push(SearchHit {
                 kind: SearchKind::Note,
                 id,
                 project_id: Some(project_id),
                 title: title.clone(),
-                breadcrumb: format!("{project_name} / {title}"),
+                breadcrumb: compose_breadcrumb(&project_name, &parents, &title),
                 snippet: None,
                 note_kind: Some(NoteKind::from_str(&kind_str)),
             });
@@ -228,12 +279,13 @@ impl LocalSearchRepository for SqliteLocalSearchRepository {
                 let body_lower = body.to_lowercase();
                 if let Some(byte_off) = body_lower.find(&needle_lower) {
                     let snippet = build_snippet(&body, byte_off);
+                    let parents = parent_chain_titles(&conn, id);
                     note_hits.push(SearchHit {
                         kind: SearchKind::Note,
                         id,
                         project_id: Some(project_id),
                         title: title.clone(),
-                        breadcrumb: format!("{project_name} / {title}"),
+                        breadcrumb: compose_breadcrumb(&project_name, &parents, &title),
                         snippet: Some(snippet),
                         note_kind: Some(NoteKind::from_str(&kind_str)),
                     });
@@ -325,6 +377,34 @@ mod tests {
         // surface as `Markdown` so the picker can render `[md]` and
         // emit `[[…]]` syntax.
         assert_eq!(note_hit.note_kind, Some(NoteKind::Markdown));
+    }
+
+    #[test]
+    fn local_search_breadcrumb_walks_parent_chain() {
+        let (p, n, s) = make_search();
+        let project = p.create("Jehu").unwrap();
+        // Build a 3-level tree: Folder → Sub → Untitledkkk.
+        let folder = n.create(project.id, None, "Folder").unwrap();
+        let sub = n.create(project.id, Some(folder.id), "Sub").unwrap();
+        let _leaf = n.create(project.id, Some(sub.id), "Untitledkkk").unwrap();
+        // Also create a separate top-level note with the same title to
+        // confirm the path discriminates between them.
+        let _other = n.create(project.id, None, "Untitledkkk").unwrap();
+        let loader = empty_loader();
+        let hits = s
+            .search("Untitledkkk", false, DEFAULT_SEARCH_LIMIT, &*loader)
+            .unwrap();
+        let nested = hits
+            .iter()
+            .find(|h| h.breadcrumb == "Jehu / Folder / Sub / Untitledkkk")
+            .expect("nested breadcrumb");
+        assert_eq!(nested.title, "Untitledkkk");
+        let top = hits
+            .iter()
+            .find(|h| h.breadcrumb == "Jehu / Untitledkkk")
+            .expect("top-level breadcrumb");
+        assert_eq!(top.title, "Untitledkkk");
+        assert_ne!(nested.id, top.id, "two distinct notes must surface");
     }
 
     #[test]
