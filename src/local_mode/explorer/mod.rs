@@ -675,7 +675,7 @@ pub fn ExplorerPanel() -> Element {
             return;
         };
         // Build a parent lookup once so the ancestor walk is O(depth)
-        // instead of O(depth × project size).
+        // instead of O(depth * project size).
         let parent_by_id: HashMap<Uuid, Option<Uuid>> =
             list.iter().map(|n| (n.id, n.parent_id)).collect();
         while let Some(id) = cursor {
