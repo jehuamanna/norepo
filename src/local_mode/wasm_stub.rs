@@ -9,10 +9,44 @@
 use dioxus::prelude::*;
 
 use crate::rbag::state::Mode;
+use crate::tabs::TabId;
+
+/// Stub of the desktop-only LocalSaveAction. The web build never reaches a
+/// Local-Mode tab (rusqlite isn't linked), so the callback is a no-op kept
+/// only so that try_consume_context::<LocalSaveAction>() in shell code can
+/// still type-check on wasm.
+#[derive(Clone, PartialEq)]
+pub struct LocalSaveAction {
+    pub callback: Callback<()>,
+}
+
+/// Stub: gear → settings panel signal.
+#[derive(Clone, Copy)]
+pub struct SettingsOpen(pub Signal<bool>);
+
+/// Stub: latest Local username.
+#[derive(Clone, Copy)]
+pub struct LocalUsername(pub Signal<String>);
 
 #[component]
 pub fn LocalShellOverlay(children: Element) -> Element {
     rsx! { {children} }
+}
+
+#[component]
+pub fn ExplorerPanel() -> Element {
+    rsx! {
+        div {
+            class: "operon-local-editor-empty",
+            "Local Mode unavailable on the web build."
+        }
+    }
+}
+
+#[component]
+pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
+    let _ = (tab_id, action);
+    rsx! { div { "Local Mode unavailable on the web build." } }
 }
 
 pub fn provide_local_app_signals() {}
