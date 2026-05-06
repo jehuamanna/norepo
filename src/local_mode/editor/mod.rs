@@ -22,6 +22,9 @@ use crate::editor::EditorMode;
 use crate::persistence::Persistence;
 use crate::tabs::{SaveScheduler, Tab, TabId, TabManager};
 
+mod link_picker;
+pub use link_picker::LinkPicker;
+
 /// Shared callback installed at LocalShell scope. The keyboard handler at the
 /// shell root (Ctrl+S) and the explicit Save button both invoke this. It looks
 /// up the active tab, snapshots its content, persists it, and bumps the
@@ -227,6 +230,9 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
     let note_repo_for_image: crate::local_mode::desktop::LocalNoteRepo = use_context();
     let project_repo_for_image: crate::local_mode::desktop::LocalProjectRepo = use_context();
     let vault_for_image: crate::local_mode::desktop::CurrentVaultRoot = use_context();
+    // Plans-Phase-5-vfs-wikilinks: link-picker visibility signal. Cmd/Ctrl+K
+    // toggles it open; <LinkPicker> closes itself on pick / Escape.
+    let mut link_picker_open: Signal<bool> = use_signal(|| false);
 
     let snapshot = tabs.read().get(tab_id).cloned();
     let Some(tab) = snapshot else {
@@ -362,6 +368,23 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
         });
     };
 
+    let mut tabs_for_link = tabs;
+    let on_pick_link = move |target: String| {
+        let current = tabs_for_link
+            .read()
+            .get(tab_id)
+            .map(|t| t.content.clone())
+            .unwrap_or_default();
+        let inserted = format!("[[{target}]]");
+        let next = if current.ends_with('\n') || current.is_empty() {
+            format!("{current}{inserted}\n")
+        } else {
+            format!("{current}\n{inserted}\n")
+        };
+        tabs_for_link.write().set_content(tab_id, next);
+        tabs_for_link.write().set_dirty(tab_id, true);
+    };
+
     rsx! {
         textarea {
             class: "operon-local-editor",
@@ -389,12 +412,28 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
                 if with_meta
                     && !mods.contains(Modifiers::SHIFT)
                     && !mods.contains(Modifiers::ALT)
+                    && evt.key().to_string().eq_ignore_ascii_case("k")
+                {
+                    // Plans-Phase-5-vfs-wikilinks: open link picker.
+                    evt.prevent_default();
+                    link_picker_open.set(true);
+                    return;
+                }
+                if with_meta
+                    && !mods.contains(Modifiers::SHIFT)
+                    && !mods.contains(Modifiers::ALT)
                     && evt.key().to_string().eq_ignore_ascii_case("s")
                 {
                     evt.prevent_default();
                     action.callback.call(());
                 }
             },
+        }
+        if *link_picker_open.read() {
+            LinkPicker {
+                open: link_picker_open,
+                on_pick: on_pick_link,
+            }
         }
     }
 }
