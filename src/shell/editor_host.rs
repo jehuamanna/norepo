@@ -119,7 +119,14 @@ pub fn MonacoEditorHost(
                 r#"(async function() {{
                     try {{
                         if (!window.operonBridge) {{
-                            await import('/assets/editor-bridge/dist/index.js');
+                            // Plans-Phase-9-monaco-desktop (rev 2): the
+                            // bridge dist is served via the custom
+                            // `bridge://` Wry protocol registered in
+                            // `main::bridge_protocol_handler`. Wry
+                            // doesn't auto-serve `/assets/` for desktop
+                            // the way `dx serve --target web` does, so
+                            // the wasm-style URL would 404 here.
+                            await import('bridge://localhost/index.js');
                         }}
                         if (!window.operonBridge) {{
                             dioxus.send({{type:"error", message:"bridge not loaded"}});
