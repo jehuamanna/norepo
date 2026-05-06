@@ -6,6 +6,7 @@ use crate::sql::params;
 use uuid::Uuid;
 
 use crate::error::StoreError;
+use crate::repos::local_note::NoteKind;
 use crate::store::Store;
 
 /// Cap a single `search()` call to this many hits unless the caller passes a
@@ -30,6 +31,10 @@ pub struct SearchHit {
     pub breadcrumb: String,
     /// Populated only when the match came from the note body.
     pub snippet: Option<String>,
+    /// `None` for project hits, `Some(NoteKind)` for note hits. Lets the
+    /// link-picker render a `[md]` / `[im]` badge per row and choose
+    /// between `[[…]]` and `![[…]]` syntax when inserting the reference.
+    pub note_kind: Option<NoteKind>,
 }
 
 pub trait LocalSearchRepository: Send + Sync {
@@ -141,6 +146,7 @@ impl LocalSearchRepository for SqliteLocalSearchRepository {
                 title: name.clone(),
                 breadcrumb: name,
                 snippet: None,
+                note_kind: None,
             });
         }
 
@@ -150,7 +156,7 @@ impl LocalSearchRepository for SqliteLocalSearchRepository {
         // here. For body matching below we additionally walk every note in the
         // store via the loader.
         let mut title_stmt = conn.prepare(
-            "SELECT n.id, n.project_id, p.name, n.title
+            "SELECT n.id, n.project_id, p.name, n.title, n.kind
              FROM local_note n
              JOIN local_project p ON p.id = n.project_id
              WHERE n.title LIKE '%' || ?1 || '%' COLLATE NOCASE
@@ -167,12 +173,13 @@ impl LocalSearchRepository for SqliteLocalSearchRepository {
                 project_id,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?;
         let mut note_hits: Vec<SearchHit> = Vec::new();
         let mut note_hit_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
         for r in title_rows {
-            let (id, project_id, project_name, title) = r?;
+            let (id, project_id, project_name, title, kind_str) = r?;
             note_hit_ids.insert(id);
             note_hits.push(SearchHit {
                 kind: SearchKind::Note,
@@ -181,6 +188,7 @@ impl LocalSearchRepository for SqliteLocalSearchRepository {
                 title: title.clone(),
                 breadcrumb: format!("{project_name} / {title}"),
                 snippet: None,
+                note_kind: Some(NoteKind::from_str(&kind_str)),
             });
         }
 
@@ -190,7 +198,7 @@ impl LocalSearchRepository for SqliteLocalSearchRepository {
         if in_content {
             let needle_lower = trimmed.to_lowercase();
             let mut all_stmt = conn.prepare(
-                "SELECT n.id, n.project_id, p.name, n.title
+                "SELECT n.id, n.project_id, p.name, n.title, n.kind
                  FROM local_note n
                  JOIN local_project p ON p.id = n.project_id
                  ORDER BY n.title COLLATE NOCASE ASC",
@@ -206,10 +214,11 @@ impl LocalSearchRepository for SqliteLocalSearchRepository {
                     project_id,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })?;
             for r in all_rows {
-                let (id, project_id, project_name, title) = r?;
+                let (id, project_id, project_name, title, kind_str) = r?;
                 if note_hit_ids.contains(&id) {
                     continue;
                 }
@@ -226,6 +235,7 @@ impl LocalSearchRepository for SqliteLocalSearchRepository {
                         title: title.clone(),
                         breadcrumb: format!("{project_name} / {title}"),
                         snippet: Some(snippet),
+                        note_kind: Some(NoteKind::from_str(&kind_str)),
                     });
                     note_hit_ids.insert(id);
                 }
@@ -311,6 +321,31 @@ mod tests {
             .expect("note hit");
         assert_eq!(note_hit.breadcrumb, "Project1 / Alpha");
         assert_eq!(note_hit.project_id, Some(project.id));
+        // Plans-Phase-9-wikilink-picker (rev 1): default-kind notes
+        // surface as `Markdown` so the picker can render `[md]` and
+        // emit `[[…]]` syntax.
+        assert_eq!(note_hit.note_kind, Some(NoteKind::Markdown));
+    }
+
+    #[test]
+    fn local_search_emits_image_kind_for_image_notes() {
+        let (p, n, s) = make_search();
+        let project = p.create("Snapshots").unwrap();
+        // Mint via create_with_kind so the row's kind column is `'image'`.
+        n.create_with_kind(project.id, None, "Pic", NoteKind::Image)
+            .unwrap();
+        let loader = empty_loader();
+        let hits = s.search("Pic", false, DEFAULT_SEARCH_LIMIT, &*loader).unwrap();
+        let note_hit = hits
+            .iter()
+            .find(|h| h.kind == SearchKind::Note && h.title == "Pic")
+            .expect("image note hit");
+        assert_eq!(note_hit.note_kind, Some(NoteKind::Image));
+        // Project hits never carry a NoteKind.
+        let project_hits: Vec<_> = hits.iter().filter(|h| h.kind == SearchKind::Project).collect();
+        for h in project_hits {
+            assert!(h.note_kind.is_none(), "project hit must not carry a NoteKind");
+        }
     }
 
     #[test]
