@@ -31,6 +31,12 @@ mod wasm_stub;
 #[cfg(target_arch = "wasm32")]
 pub use wasm_stub::*;
 
+/// IndexedDB-backed persistence for the user's chosen OPFS handle (web only).
+/// Phase 2 wires this into the web boot flow; Phase 1 ships the helpers so
+/// they can be unit-tested ahead of the consumer landing.
+#[cfg(target_arch = "wasm32")]
+pub mod web_vault_handle;
+
 /// Settings key used by [`StartupChooser`] to remember the last picked mode.
 pub const SETTINGS_KEY_MODE_REMEMBERED: &str = "mode_remembered";
 pub const MODE_VALUE_LOCAL: &str = "Local";
