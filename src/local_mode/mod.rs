@@ -30,17 +30,21 @@ pub use editor::{LocalNoteEditor, LocalSaveAction, LocalSaveButton};
 #[cfg(not(target_arch = "wasm32"))]
 pub use explorer::{ExplorerPanel, LocalProjectVersion, SelectedNote, SelectedProject};
 
-#[cfg(target_arch = "wasm32")]
+// Wasm without wasm-sqlite: stub Local Mode (renders "unavailable" placeholders).
+#[cfg(all(target_arch = "wasm32", not(feature = "wasm-sqlite")))]
 mod wasm_stub;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(feature = "wasm-sqlite")))]
 pub use wasm_stub::*;
 
-// Plans-Phase-2-saving / Phase E: async boot helper for wasm Local Mode.
-// Activated only with `--features wasm-sqlite`. The shell calls
-// `wasm_init::init_wasm_local_mode(vault_handle).await` to get a
-// (Store, Persistence) pair, then stashes both in Dioxus context.
+// Plans-Phase-2-saving / Phase E: real wasm Local Mode shell, backed by
+// the wasm Store + OpfsPersistence stack. Mounted only when the
+// `wasm-sqlite` feature is on.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-sqlite"))]
 pub mod wasm_init;
+#[cfg(all(target_arch = "wasm32", feature = "wasm-sqlite"))]
+pub mod wasm_shell;
+#[cfg(all(target_arch = "wasm32", feature = "wasm-sqlite"))]
+pub use wasm_shell::*;
 
 /// IndexedDB-backed persistence for the user's chosen OPFS handle (web only).
 /// Phase 2 wires this into the web boot flow; Phase 1 ships the helpers so

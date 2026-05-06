@@ -83,7 +83,12 @@ pub fn App() -> Element {
         let crate::local_mode::LocalSettingsRepo(settings) = use_context();
         use_hook(|| crate::local_mode::read_remembered_mode(&settings))
     };
-    #[cfg(target_arch = "wasm32")]
+    // Plans-Phase-2-saving / Phase E: with `wasm-sqlite` on, wasm boots
+    // straight into Local Mode (no Cloud RBAG path on web). Without the
+    // feature, the wasm_stub shell is mounted under NonLocal as before.
+    #[cfg(all(target_arch = "wasm32", feature = "wasm-sqlite"))]
+    let initial_mode_remembered: Option<Mode> = Some(Mode::Local);
+    #[cfg(all(target_arch = "wasm32", not(feature = "wasm-sqlite")))]
     let initial_mode_remembered: Option<Mode> = Some(Mode::NonLocal);
 
     // Local Mode also requires a chosen notes vault directory. On first run
