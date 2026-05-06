@@ -12,6 +12,11 @@ pub struct ContextMenuItem {
     pub label: String,
     pub on_click: Callback<()>,
     pub enabled: bool,
+    /// When non-empty, this item is a submenu anchor: hovering or activating it
+    /// reveals a nested [`ContextMenu`] containing these children. The item's
+    /// own `on_click` is ignored while `children` is populated; activation goes
+    /// through the leaf rows of the nested menu.
+    pub children: Vec<ContextMenuItem>,
 }
 
 impl ContextMenuItem {
@@ -20,6 +25,7 @@ impl ContextMenuItem {
             label: label.into(),
             on_click,
             enabled: true,
+            children: Vec::new(),
         }
     }
 
@@ -28,6 +34,19 @@ impl ContextMenuItem {
             label: label.into(),
             on_click: Callback::new(|_| {}),
             enabled: false,
+            children: Vec::new(),
+        }
+    }
+
+    /// Build a submenu anchor — its own `on_click` is a no-op; activation
+    /// flows through the supplied `children` leaves. Caller passes a label
+    /// (e.g. `"Add child note"`) and the leaves (e.g. `Markdown`, `Image`).
+    pub fn submenu(label: impl Into<String>, children: Vec<ContextMenuItem>) -> Self {
+        Self {
+            label: label.into(),
+            on_click: Callback::new(|_| {}),
+            enabled: true,
+            children,
         }
     }
 }
