@@ -8,7 +8,35 @@ import * as monaco from "monaco-editor";
 
 import type { BackendInit, EditorState, Handle } from "./types.js";
 
+// Plans-Phase-9-monaco-desktop (rev 5): Monaco's ESM build imports its
+// own CSS via plain `import './foo.css'` statements. Our esbuild build
+// uses `--loader:.css=text` which returns the CSS as a string but
+// doesn't auto-inject it — so the editor mounts but renders without
+// styles (no gutter, no proper scrollbars, content positioned wrong).
+// Force-import the pre-bundled `min/vs/editor/editor.main.css` (one
+// file, ~128KB, covers every Monaco feature) and inject once before
+// the first `editor.create()` call. Idempotent so second-and-later
+// editor instances skip re-injection.
+//
+// `@ts-expect-error` — esbuild text loader returns a string but
+// TypeScript doesn't know that without a declaration.
+// @ts-expect-error
+import editorMainCss from "monaco-editor/min/vs/editor/editor.main.css";
+
+let monacoCssInjected = false;
+function ensureMonacoCss(): void {
+  if (monacoCssInjected) return;
+  if (typeof document === "undefined") return;
+  const style = document.createElement("style");
+  style.id = "operon-monaco-injected-css";
+  style.setAttribute("data-source", "monaco-editor/min/vs/editor/editor.main.css");
+  style.textContent = editorMainCss as string;
+  document.head.appendChild(style);
+  monacoCssInjected = true;
+}
+
 export function mountMonaco(target: HTMLElement, init: BackendInit): Handle {
+  ensureMonacoCss();
   const editor = monaco.editor.create(target, {
     value: init.content,
     language: init.languageId,
