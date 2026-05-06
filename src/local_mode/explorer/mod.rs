@@ -69,6 +69,13 @@ pub struct MultiSelected(pub Signal<std::collections::BTreeSet<NodeKey>>);
 #[derive(Clone, Copy)]
 pub struct LastClicked(pub Signal<Option<NodeKey>>);
 
+/// Plans-Phase-4-multiselect-aria: visible flattened tree across all
+/// projects, in document order, respecting open/closed state. Updated by
+/// ExplorerPanel whenever its inputs change; NoteRow / ProjectRow consume
+/// it during Shift+click to compute proper ranges.
+#[derive(Clone, Copy)]
+pub struct VisibleFlat(pub Signal<Vec<NodeKey>>);
+
 /// Bumped on every note mutation. The panel re-fetches notes for the
 /// affected project when this changes.
 #[derive(Clone, Copy)]
@@ -1047,6 +1054,41 @@ pub fn ExplorerPanel() -> Element {
         queue_for_note_toggle
             .read()
             .enqueue(scope, note_id.to_string(), next);
+    });
+
+    // Plans-Phase-4-multiselect-aria: maintain a global visible-flat tree
+    // signal so Shift+click can compute true ranges. Recomputed on every
+    // ExplorerPanel render — Dioxus signals are cheap and the inputs
+    // already drive a re-render of the tree.
+    let visible_flat: Signal<Vec<NodeKey>> = use_context::<VisibleFlat>().0;
+    let mut visible_flat_setter = visible_flat;
+    use_effect(move || {
+        let projects_snap = projects.read().clone();
+        let workspace_snap = workspace_open.read().clone();
+        let notes_snap = notes_by_project.read().clone();
+        let open_snap = project_note_open.read().clone();
+        let mut out = Vec::with_capacity(64);
+        for p in &projects_snap {
+            out.push(NodeKey::Project(p.id));
+            let project_open =
+                workspace_snap.get(&p.id.to_string()).copied().unwrap_or(false);
+            if !project_open {
+                continue;
+            }
+            let project_open_map = open_snap.get(&p.id).cloned().unwrap_or_default();
+            let notes = notes_snap.get(&p.id).cloned().unwrap_or_default();
+            let forest = NoteForest::from_flat(notes);
+            let visible = flatten_visible(&forest, &|id: &Uuid| {
+                project_open_map
+                    .get(&id.to_string())
+                    .copied()
+                    .unwrap_or(false)
+            });
+            for n in visible {
+                out.push(NodeKey::Note(n.id));
+            }
+        }
+        visible_flat_setter.set(out);
     });
 
     // ===== Render =====

@@ -8,7 +8,7 @@ use operon_store::repos::{LocalNote, NoteKind};
 use uuid::Uuid;
 
 use crate::editor::EditorMode;
-use crate::local_mode::explorer::{LastClicked, MultiSelected, NodeKey};
+use crate::local_mode::explorer::{LastClicked, MultiSelected, NodeKey, VisibleFlat};
 use crate::local_mode::ui::{
     classify_drop_position, ContextMenu, ContextMenuItem, DragKind, DragSession, DropPosition,
     InlineRename,
@@ -64,6 +64,7 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     // Plans-Phase-4-multiselect-aria
     let MultiSelected(mut multi_selected) = use_context();
     let LastClicked(mut last_clicked) = use_context();
+    let VisibleFlat(visible_flat) = use_context();
 
     let note = props.note.clone();
     let id = note.id;
@@ -280,17 +281,29 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                     return;
                 }
                 if mods.contains(Modifiers::SHIFT) {
-                    // Range selection: union with everything between
-                    // last_clicked and the current row in document order.
-                    // Without a global flat-tree memo we approximate by
-                    // adding both endpoints; a proper visible-flat memo is
-                    // a follow-up.
+                    // Plans-Phase-4: full range over the visible flat tree.
                     let mut set: std::collections::BTreeSet<NodeKey> =
                         multi_selected.read().clone();
-                    if let Some(prev) = *last_clicked.read() {
-                        set.insert(prev);
+                    let flat = visible_flat.read().clone();
+                    let prev_opt = *last_clicked.read();
+                    if let Some(prev) = prev_opt {
+                        let a = flat.iter().position(|k| k == &prev);
+                        let b = flat.iter().position(|k| k == &key);
+                        if let (Some(a), Some(b)) = (a, b) {
+                            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                            for k in &flat[lo..=hi] {
+                                set.insert(*k);
+                            }
+                        } else {
+                            // Either endpoint isn't in the visible flat
+                            // (e.g. it just collapsed); fall back to the
+                            // endpoint union.
+                            set.insert(prev);
+                            set.insert(key);
+                        }
+                    } else {
+                        set.insert(key);
                     }
-                    set.insert(key);
                     multi_selected.set(set);
                     return;
                 }
@@ -372,7 +385,20 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 let coords = evt.element_coordinates();
                 let pos = classify_drop_position(coords.y, 28.0);
                 if let Some(DragKind::Note(src)) = kind {
-                    if src != id {
+                    // Plans-Phase-4-multiselect-aria: if the drag source is
+                    // a member of the multi-set, drop the whole set at the
+                    // target. Otherwise just the source.
+                    let set_snap = multi_selected.read().clone();
+                    let multi_drop = set_snap.contains(&NodeKey::Note(src));
+                    if multi_drop {
+                        for k in set_snap.iter() {
+                            if let NodeKey::Note(n_id) = k {
+                                if *n_id != id {
+                                    on_drop_note_on_note.call((*n_id, id, pos));
+                                }
+                            }
+                        }
+                    } else if src != id {
                         on_drop_note_on_note.call((src, id, pos));
                     }
                 }

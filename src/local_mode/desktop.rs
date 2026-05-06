@@ -443,6 +443,9 @@ pub fn provide_local_app_signals() {
     use_context_provider(|| crate::local_mode::explorer::MultiSelected(multi_selected));
     let last_clicked: Signal<Option<crate::local_mode::explorer::NodeKey>> = use_signal(|| None);
     use_context_provider(|| crate::local_mode::explorer::LastClicked(last_clicked));
+    let visible_flat: Signal<Vec<crate::local_mode::explorer::NodeKey>> =
+        use_signal(Vec::new);
+    use_context_provider(|| crate::local_mode::explorer::VisibleFlat(visible_flat));
     let drag_session: Signal<Option<DragKind>> = use_signal(|| None);
     use_context_provider(|| DragSession(drag_session));
     let clipboard: Signal<Option<Clipboard>> = use_signal(|| None);
