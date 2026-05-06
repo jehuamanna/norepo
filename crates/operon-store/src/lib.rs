@@ -51,4 +51,13 @@ pub mod sql {
 
 pub use error::StoreError;
 pub use ids::*;
+
+// Plans-Phase-2-saving: re-export `Store` from whichever backend is
+// active. Desktop builds expose `StoreConfig` + `StoreMode`; the wasm
+// path's open semantics are different (URI string + VFS) so it doesn't
+// surface those types.
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm-sqlite")))]
 pub use sqlite::{Store, StoreConfig, StoreMode};
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-sqlite"))]
+pub use wasm::Store;
