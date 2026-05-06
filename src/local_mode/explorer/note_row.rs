@@ -464,13 +464,14 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 if prev != next {
                     drop_indicator_setter.set(next);
                     // Plans-Phase-7-snap: bumping the generation invalidates
-                    // any in-flight snap timer for the prior (target, pos).
+                    // any in-flight snap or hover-expand timer for the prior
+                    // (target, pos).
                     snapped.set(false);
                     let gen = hover_generation.with_mut(|g| {
                         *g = g.wrapping_add(1);
                         *g
                     });
-                    // Only arm a snap timer for *valid* drop positions.
+                    // Only arm timers for *valid* drop positions.
                     if matches!(next, Some(Ok(_))) {
                         let captured_gen = gen;
                         let captured_next = next;
@@ -485,6 +486,24 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                                 snapped.set(true);
                             }
                         });
+                        // Plans-Phase-7-hover-expand: if the user is hovering
+                        // the Into zone of a collapsed parent for ≥600 ms,
+                        // auto-expand so they can drop into a descendant.
+                        if matches!(next, Some(Ok(DropPosition::Into))) && has_children && !is_open {
+                            let captured_gen_expand = gen;
+                            let captured_next_expand = next;
+                            spawn(async move {
+                                futures_timer::Delay::new(
+                                    std::time::Duration::from_millis(600),
+                                )
+                                .await;
+                                let still_current = *hover_generation.read() == captured_gen_expand
+                                    && *drop_indicator.read() == captured_next_expand;
+                                if still_current {
+                                    on_toggle_open.call(id);
+                                }
+                            });
+                        }
                     }
                 }
             },
