@@ -183,6 +183,42 @@ pub fn render_node(n: &MdNode) -> Element {
             }
         }
         MdNode::ListItem(_) => rsx! { "" },
+        // Plans-Phase-9-monaco-desktop (rev 9): GFM tables. Render a
+        // `<table>` with `<thead>`/`<tbody>`. Cell contents are
+        // recursively rendered as their inline children. Alignment is
+        // intentionally not surfaced yet — pulldown emits per-column
+        // alignment but the seed-prompt notes don't rely on it.
+        MdNode::Table { headers, rows } => rsx! {
+            div {
+                class: "markdown-table-wrap",
+                table {
+                    class: "markdown-table",
+                    if !headers.is_empty() {
+                        thead {
+                            tr {
+                                for cell in headers.iter() {
+                                    th { {render_children(cell)} }
+                                }
+                            }
+                        }
+                    }
+                    tbody {
+                        for row in rows.iter() {
+                            tr {
+                                for cell in row.iter() {
+                                    td { {render_children(cell)} }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        MdNode::Strikethrough(c) => rsx! { s { {render_children(c)} } },
+        // Internal table-builder nodes never escape the parser, but be
+        // exhaustive so a future pulldown-cmark version that surfaces
+        // them as top-level events doesn't crash the renderer.
+        MdNode::TableRow { .. } | MdNode::TableCell(_) => rsx! { "" },
     }
 }
 

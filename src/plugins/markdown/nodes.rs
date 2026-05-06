@@ -24,6 +24,22 @@ pub enum MdNode {
     /// `"Note^abc12345"`); resolution happens at render time once the
     /// `vfs::resolve_link` infrastructure lands.
     WikiLink { target: String, embed: bool },
+    /// Plans-Phase-9-monaco-desktop (rev 9): GFM table.
+    /// `headers` are the cells of the first (header) row; `rows` are
+    /// the body rows, each a `Vec<Vec<MdNode>>` of cells. Alignment
+    /// info is intentionally dropped for the first cut — pulldown
+    /// emits it but we don't surface it in the renderer yet.
+    Table {
+        headers: Vec<Vec<MdNode>>,
+        rows: Vec<Vec<Vec<MdNode>>>,
+    },
+    /// Plans-Phase-9-monaco-desktop (rev 9): GFM `~~strike~~`.
+    Strikethrough(Vec<MdNode>),
     /// Internal: closed `<li>`-style item — collected when building a [`MdNode::List`].
     ListItem(Vec<MdNode>),
+    /// Internal: closed table row — collected when building a [`MdNode::Table`].
+    /// `head=true` marks the header row so we can split header from body.
+    TableRow { head: bool, cells: Vec<Vec<MdNode>> },
+    /// Internal: closed `<td>`/`<th>` — collected when building [`MdNode::TableRow`].
+    TableCell(Vec<MdNode>),
 }

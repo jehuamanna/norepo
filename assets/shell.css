@@ -657,10 +657,18 @@ html, body {
   position: relative;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
 }
 .operon-local-split-edit {
   border-right: 1px solid var(--vscode-panel-border);
+  /* Monaco owns its own scrollbars; an outer scroll container would
+   * produce a double scrollbar. */
+  overflow: hidden;
+}
+.operon-local-split-view {
+  /* Plans-Phase-9-monaco-desktop (rev 9): preview can grow beyond the
+   * pane; restore native scrolling so the bottom of long markdown
+   * doesn't get clipped. */
+  overflow: auto;
 }
 
 .operon-main-area {

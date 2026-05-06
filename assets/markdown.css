@@ -100,6 +100,36 @@
   margin: 0;
 }
 
+/* Plans-Phase-9-monaco-desktop (rev 9): GFM tables. Wrap is for
+ * horizontal scroll on narrow viewports. */
+.markdown-prose .markdown-table-wrap {
+  overflow-x: auto;
+  margin: 0.8em 0;
+}
+.markdown-prose .markdown-table {
+  border-collapse: collapse;
+  font-size: 0.95em;
+  min-width: 100%;
+}
+.markdown-prose .markdown-table th,
+.markdown-prose .markdown-table td {
+  border: 1px solid var(--vscode-panel-border, #444);
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+.markdown-prose .markdown-table th {
+  background: var(--vscode-tab-inactivebackground, rgba(255, 255, 255, 0.04));
+  font-weight: 600;
+}
+.markdown-prose .markdown-table tbody tr:nth-child(even) td {
+  background: var(--vscode-tab-inactivebackground, rgba(255, 255, 255, 0.02));
+}
+.markdown-prose s {
+  text-decoration: line-through;
+  opacity: 0.8;
+}
+
 /* Plans-Phase-9-wikilink-picker (rev 2): make wikilinks visibly
  * clickable. Without these rules the renderer's <a> elements inherit
  * the body color and look indistinguishable from raw text — the user

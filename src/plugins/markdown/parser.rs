@@ -3,7 +3,7 @@
 //! Raw HTML events are dropped (no execution, no display). YAML-style frontmatter at the
 //! top of the document is removed before parsing so seed-prompt notes look clean.
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Parser, Tag};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
 
 use super::nodes::MdNode;
 
@@ -28,9 +28,21 @@ pub fn strip_frontmatter(input: &str) -> &str {
 }
 
 /// Walk pulldown-cmark events into an [`MdNode`] tree.
+///
+/// Plans-Phase-9-monaco-desktop (rev 9): enable GFM features — tables,
+/// strikethrough, task lists, footnotes, smart punctuation, heading
+/// attributes. These are off by default in pulldown-cmark; without
+/// them GFM-style tables in seed-prompt notes render as flat
+/// `| col | col |` paragraphs.
 pub fn parse(input: &str) -> Vec<MdNode> {
     let body = strip_frontmatter(input);
-    let parser = Parser::new(body);
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_FOOTNOTES);
+    opts.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+    let parser = Parser::new_ext(body, opts);
 
     let mut stack: Vec<Vec<MdNode>> = vec![Vec::new()];
     let mut tag_stack: Vec<OpenTag> = Vec::new();
@@ -81,12 +93,17 @@ enum OpenTag {
     Paragraph,
     Strong,
     Emphasis,
+    Strikethrough,
     Link { dest: String, title: String },
     Image { dest: String, _title: String },
     CodeBlock { lang: Option<String> },
     BlockQuote,
     List { ordered: bool },
     Item,
+    Table,
+    TableHead,
+    TableRow,
+    TableCell,
     Other,
 }
 
@@ -115,6 +132,11 @@ impl OpenTag {
             Tag::BlockQuote => OpenTag::BlockQuote,
             Tag::List(start) => OpenTag::List { ordered: start.is_some() },
             Tag::Item => OpenTag::Item,
+            Tag::Strikethrough => OpenTag::Strikethrough,
+            Tag::Table(_) => OpenTag::Table,
+            Tag::TableHead => OpenTag::TableHead,
+            Tag::TableRow => OpenTag::TableRow,
+            Tag::TableCell => OpenTag::TableCell,
             _ => OpenTag::Other,
         }
     }
@@ -158,6 +180,46 @@ fn build_node(open: OpenTag, children: Vec<MdNode>) -> Option<MdNode> {
             Some(MdNode::List { ordered, items })
         }
         OpenTag::Item => Some(MdNode::ListItem(children)),
+        OpenTag::Strikethrough => Some(MdNode::Strikethrough(children)),
+        // Plans-Phase-9-monaco-desktop (rev 9): table assembly.
+        // Pulldown emits Table > {TableHead, TableRow*} > TableCell+.
+        // We collect the rows and split header (row marked head=true)
+        // from body when `MdNode::Table` is constructed.
+        OpenTag::Table => {
+            let mut headers: Vec<Vec<MdNode>> = Vec::new();
+            let mut rows: Vec<Vec<Vec<MdNode>>> = Vec::new();
+            for child in children {
+                if let MdNode::TableRow { head, cells } = child {
+                    if head {
+                        headers = cells;
+                    } else {
+                        rows.push(cells);
+                    }
+                }
+            }
+            Some(MdNode::Table { headers, rows })
+        }
+        OpenTag::TableHead => {
+            let cells: Vec<Vec<MdNode>> = children
+                .into_iter()
+                .filter_map(|n| match n {
+                    MdNode::TableCell(c) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            Some(MdNode::TableRow { head: true, cells })
+        }
+        OpenTag::TableRow => {
+            let cells: Vec<Vec<MdNode>> = children
+                .into_iter()
+                .filter_map(|n| match n {
+                    MdNode::TableCell(c) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            Some(MdNode::TableRow { head: false, cells })
+        }
+        OpenTag::TableCell => Some(MdNode::TableCell(children)),
         OpenTag::Other => None,
     }
 }
@@ -338,5 +400,42 @@ mod tests {
         let collected = collect_text(&nodes);
         assert!(!collected.contains("<script"));
         assert!(collected.contains("Text after"));
+    }
+
+    // Plans-Phase-9-monaco-desktop (rev 9): GFM tables produce a
+    // `Table` node with header + body rows. Earlier the table source
+    // rendered as a flat paragraph because GFM extensions weren't
+    // enabled in pulldown.
+    #[test]
+    fn gfm_table_is_parsed() {
+        let src = "| col a | col b |\n|-------|-------|\n| 1 | 2 |\n| 3 | 4 |";
+        let nodes = parse(src);
+        let table = nodes
+            .iter()
+            .find(|n| matches!(n, MdNode::Table { .. }))
+            .expect("Table node");
+        if let MdNode::Table { headers, rows } = table {
+            assert_eq!(headers.len(), 2);
+            assert_eq!(rows.len(), 2);
+            // Header cells contain text "col a" / "col b".
+            assert!(collect_text(&headers[0]).contains("col a"));
+            assert!(collect_text(&headers[1]).contains("col b"));
+            // Body rows have 2 cells each.
+            assert_eq!(rows[0].len(), 2);
+            assert_eq!(rows[1].len(), 2);
+            assert!(collect_text(&rows[0][0]).contains("1"));
+            assert!(collect_text(&rows[1][1]).contains("4"));
+        }
+    }
+
+    #[test]
+    fn gfm_strikethrough_is_parsed() {
+        let nodes = parse("normal ~~struck~~ text");
+        let para = first_para_children(&nodes);
+        assert!(
+            para.iter().any(|n| matches!(n, MdNode::Strikethrough(_))),
+            "expected Strikethrough node in {:?}",
+            para
+        );
     }
 }
