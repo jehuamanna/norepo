@@ -731,6 +731,15 @@ pub fn LocalShellOverlay(children: Element) -> Element {
                 let _ = &mut selected_project_setter;
             },
             {children}
+            // Plans-Phase-5-vfs-wikilinks: backlinks pane. Renders a list
+            // of notes referencing the active selection. Renders nothing
+            // when the selection has no referrers.
+            div {
+                style: "position: fixed; right: 12px; bottom: 36px; max-width: 24rem; \
+                        background: var(--operon-bg, #fff); border: 1px solid var(--operon-border); \
+                        border-radius: 0.25rem; box-shadow: 0 1px 4px rgba(0,0,0,0.08); z-index: 30;",
+                crate::local_mode::explorer::BacklinksPanel {}
+            }
             // Floating Save button: only for Local-Mode tabs (manual_save = true).
             if let Some((_, dirty, true)) = active_tab_dirty_and_manual {
                 div {

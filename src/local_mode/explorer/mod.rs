@@ -2,6 +2,7 @@
 //! a "+" button to create a new (default-named) project. Phase 3 nests notes
 //! under each project, persisted via `local_note` + `local_tree_state`.
 
+mod backlinks;
 mod bulk_rename;
 mod note_row;
 mod project_row;
@@ -9,6 +10,7 @@ mod search;
 mod tree_node;
 mod tree_state;
 
+pub use backlinks::BacklinksPanel;
 pub use bulk_rename::BulkRenameModal;
 
 pub use note_row::NoteRow;
