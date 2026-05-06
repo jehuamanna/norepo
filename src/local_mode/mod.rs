@@ -29,3 +29,10 @@ pub use wasm_stub::*;
 pub const SETTINGS_KEY_MODE_REMEMBERED: &str = "mode_remembered";
 pub const MODE_VALUE_LOCAL: &str = "Local";
 pub const MODE_VALUE_CLOUD: &str = "Cloud";
+
+/// Settings key holding the absolute path to the user's notes vault directory.
+/// Set on first run by the `VaultDirPicker` modal; read at boot to decide
+/// whether to mount the workspace or render the picker. Used as the root for
+/// markdown bodies (`<vault>/notes/<id>.md`) and image blobs
+/// (`<vault>/.operon/images/<sha>.<ext>`).
+pub const SETTINGS_KEY_VAULT_ROOT: &str = "vault.root.path";
