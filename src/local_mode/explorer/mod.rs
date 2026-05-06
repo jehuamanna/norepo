@@ -1362,6 +1362,20 @@ pub fn ExplorerPanel() -> Element {
             if !matches!(pos, DropPosition::Into) {
                 return;
             }
+            // Plans-Phase-8-explorer-undo: capture src's pre-move position.
+            let inverse = {
+                let snap = notes_by_project.read();
+                snap.iter().find_map(|(pid, list)| {
+                    list.iter().find(|n| n.id == src).map(|n| {
+                        history::ExplorerAction::MoveWithin {
+                            id: src,
+                            project_id: *pid,
+                            prev_parent: n.parent_id,
+                            prev_index: n.sibling_index,
+                        }
+                    })
+                })
+            };
             let last_index = note_repo_for_drop_pr
                 .list_for_project(target)
                 .map(|rows| rows.iter().filter(|r| r.parent_id.is_none()).count() as i64)
@@ -1369,6 +1383,9 @@ pub fn ExplorerPanel() -> Element {
             if let Err(e) = note_repo_for_drop_pr.move_to(src, target, None, last_index) {
                 eprintln!("operon: drop note onto project failed: {e}");
                 return;
+            }
+            if let Some(inv) = inverse {
+                history.write().push(inv);
             }
             note_version.with_mut(|v| *v += 1);
         });
@@ -1381,6 +1398,20 @@ pub fn ExplorerPanel() -> Element {
             if src == target {
                 return;
             }
+            // Plans-Phase-8-explorer-undo: capture src's pre-move position.
+            let src_inverse = {
+                let snap = notes_by_project.read();
+                snap.iter().find_map(|(pid, list)| {
+                    list.iter().find(|n| n.id == src).map(|n| {
+                        history::ExplorerAction::MoveWithin {
+                            id: src,
+                            project_id: *pid,
+                            prev_parent: n.parent_id,
+                            prev_index: n.sibling_index,
+                        }
+                    })
+                })
+            };
             // Look up target's project + parent.
             let info = notes_by_project.read().iter().find_map(|(pid, list)| {
                 list.iter()
@@ -1410,6 +1441,9 @@ pub fn ExplorerPanel() -> Element {
             if let Err(e) = outcome {
                 eprintln!("operon: drop note onto note failed: {e}");
                 return;
+            }
+            if let Some(inv) = src_inverse {
+                history.write().push(inv);
             }
             note_version.with_mut(|v| *v += 1);
         });
