@@ -21,6 +21,13 @@ pub struct LocalSaveAction {
 }
 
 /// Stub: gear → settings panel signal.
+///
+/// Phase-1 ships the real Settings panel only on desktop because the web
+/// build has no working Local Mode (rusqlite is C-bundled and doesn't
+/// target wasm). Plans-Phase-2-saving introduces the OPFS-backed
+/// `OpfsPersistence` + the wasm `Store` via `sqlite-wasm-rs`; once those
+/// land, this stub gets replaced by a real Settings panel that includes
+/// the `VaultDirPicker` flow + `web_vault_handle::{store,load,clear}`.
 #[derive(Clone, Copy)]
 pub struct SettingsOpen(pub Signal<bool>);
 
