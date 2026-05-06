@@ -242,6 +242,10 @@ pub fn ExplorerPanel() -> Element {
     // a context so descendant-aware DnD validation lives in NoteRow without
     // having to thread the snapshot through twenty props.
     use_context_provider(|| NotesByProjectCtx(notes_by_project));
+    // Plans-Phase-4-explorer-undo-stack: panel-scope undo history. Capacity
+    // 100; wrapped handlers below push inverses before each commit.
+    let mut history: Signal<history::ExplorerHistory> =
+        use_signal(history::ExplorerHistory::default);
     let mut notes_setter = notes_by_project;
     {
         let repo = note_repo.clone();
@@ -570,8 +574,20 @@ pub fn ExplorerPanel() -> Element {
                 ps.into_iter().find(|p| p.id == pid).map(|p| p.name)
             }));
 
+        // Plans-Phase-4-explorer-undo-stack: capture prev title BEFORE the
+        // repo write, push only after success so a failed rename doesn't
+        // pollute the stack.
+        let prev_title_for_undo = old_title.clone();
         match note_repo_for_rename.rename(id, &new_title) {
             Ok(()) => {
+                if let Some(prev) = prev_title_for_undo {
+                    if prev != new_title {
+                        history.write().push(history::ExplorerAction::Rename {
+                            id,
+                            prev_title: prev,
+                        });
+                    }
+                }
                 note_version.with_mut(|v| *v += 1);
                 renaming_note_setter.set(None);
 
@@ -756,25 +772,120 @@ pub fn ExplorerPanel() -> Element {
     });
 
     // ===== Phase-4 handlers: indent/outdent/move/clipboard =====
+    // Plans-Phase-4-explorer-undo-stack: capture (project, parent, sibling)
+    // before each structural move so undo can restore the prior position.
+    // Returns Some when a snapshot was found; None for a missing row (we
+    // log + skip the push instead of mutating).
+    let snapshot_position = move |id: Uuid| -> Option<(Uuid, Option<Uuid>, i64)> {
+        let snap = notes_by_project.read();
+        for (pid, list) in snap.iter() {
+            if let Some(n) = list.iter().find(|n| n.id == id) {
+                return Some((*pid, n.parent_id, n.sibling_index));
+            }
+        }
+        None
+    };
     let note_repo_for_indent = note_repo.clone();
-    let on_indent_note = use_callback(move |id: Uuid| match note_repo_for_indent.indent(id) {
-        Ok(()) => note_version.with_mut(|v| *v += 1),
-        Err(e) => eprintln!("operon: indent note failed: {e}"),
+    let on_indent_note = use_callback(move |id: Uuid| {
+        let prev = snapshot_position(id);
+        match note_repo_for_indent.indent(id) {
+            Ok(()) => {
+                if let Some((project_id, prev_parent, prev_index)) = prev {
+                    history.write().push(history::ExplorerAction::MoveWithin {
+                        id,
+                        project_id,
+                        prev_parent,
+                        prev_index,
+                    });
+                }
+                note_version.with_mut(|v| *v += 1);
+            }
+            Err(e) => eprintln!("operon: indent note failed: {e}"),
+        }
     });
     let note_repo_for_outdent = note_repo.clone();
-    let on_outdent_note = use_callback(move |id: Uuid| match note_repo_for_outdent.outdent(id) {
-        Ok(()) => note_version.with_mut(|v| *v += 1),
-        Err(e) => eprintln!("operon: outdent note failed: {e}"),
+    let on_outdent_note = use_callback(move |id: Uuid| {
+        let prev = snapshot_position(id);
+        match note_repo_for_outdent.outdent(id) {
+            Ok(()) => {
+                if let Some((project_id, prev_parent, prev_index)) = prev {
+                    history.write().push(history::ExplorerAction::MoveWithin {
+                        id,
+                        project_id,
+                        prev_parent,
+                        prev_index,
+                    });
+                }
+                note_version.with_mut(|v| *v += 1);
+            }
+            Err(e) => eprintln!("operon: outdent note failed: {e}"),
+        }
     });
     let note_repo_for_up = note_repo.clone();
-    let on_move_up_note = use_callback(move |id: Uuid| match note_repo_for_up.move_up(id) {
-        Ok(()) => note_version.with_mut(|v| *v += 1),
-        Err(e) => eprintln!("operon: move_up note failed: {e}"),
+    let on_move_up_note = use_callback(move |id: Uuid| {
+        let prev = snapshot_position(id);
+        match note_repo_for_up.move_up(id) {
+            Ok(()) => {
+                if let Some((project_id, prev_parent, prev_index)) = prev {
+                    history.write().push(history::ExplorerAction::MoveWithin {
+                        id,
+                        project_id,
+                        prev_parent,
+                        prev_index,
+                    });
+                }
+                note_version.with_mut(|v| *v += 1);
+            }
+            Err(e) => eprintln!("operon: move_up note failed: {e}"),
+        }
     });
     let note_repo_for_down = note_repo.clone();
-    let on_move_down_note = use_callback(move |id: Uuid| match note_repo_for_down.move_down(id) {
-        Ok(()) => note_version.with_mut(|v| *v += 1),
-        Err(e) => eprintln!("operon: move_down note failed: {e}"),
+    let on_move_down_note = use_callback(move |id: Uuid| {
+        let prev = snapshot_position(id);
+        match note_repo_for_down.move_down(id) {
+            Ok(()) => {
+                if let Some((project_id, prev_parent, prev_index)) = prev {
+                    history.write().push(history::ExplorerAction::MoveWithin {
+                        id,
+                        project_id,
+                        prev_parent,
+                        prev_index,
+                    });
+                }
+                note_version.with_mut(|v| *v += 1);
+            }
+            Err(e) => eprintln!("operon: move_down note failed: {e}"),
+        }
+    });
+
+    // Plans-Phase-4-explorer-undo-stack: pop the latest inverse and apply.
+    // Failures log; the entry is still consumed so the user moves on.
+    let note_repo_for_undo = note_repo.clone();
+    let on_undo = use_callback(move |_: ()| {
+        let action = history.write().pop();
+        let Some(action) = action else { return };
+        match action {
+            history::ExplorerAction::Rename { id, prev_title } => {
+                if let Err(e) = note_repo_for_undo.rename(id, &prev_title) {
+                    eprintln!("operon: undo rename failed: {e}");
+                    return;
+                }
+            }
+            history::ExplorerAction::MoveWithin {
+                id,
+                project_id,
+                prev_parent,
+                prev_index,
+            } => {
+                if let Err(e) =
+                    note_repo_for_undo.move_to(id, project_id, prev_parent, prev_index)
+                {
+                    eprintln!("operon: undo move failed: {e}");
+                    return;
+                }
+            }
+        }
+        note_version.with_mut(|v| *v += 1);
     });
 
     // Plans-Phase-6-image-notes: external image-file drop on a note row.
@@ -1371,6 +1482,26 @@ pub fn ExplorerPanel() -> Element {
         div {
             class: "notes-explorer-list",
             "data-testid": "explorer-panel",
+            "data-explorer-root": "true",
+            tabindex: "0",
+            // Plans-Phase-4-explorer-undo-stack: explorer-scoped Cmd/Ctrl+Z.
+            // Scope check is implicit — the listener only fires for events
+            // whose target is inside this div, so the editor's intrinsic
+            // undo (Monaco) is left alone when focus is in the editor.
+            onkeydown: move |evt| {
+                let key = evt.key().to_string();
+                let mods = evt.modifiers();
+                let with_meta = mods.contains(keyboard_types::Modifiers::META)
+                    || mods.contains(keyboard_types::Modifiers::CONTROL);
+                if with_meta
+                    && !mods.contains(keyboard_types::Modifiers::SHIFT)
+                    && key.eq_ignore_ascii_case("z")
+                {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    on_undo.call(());
+                }
+            },
             style: "list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column;",
             // Header — search input + checkbox + "+" button. Borderless to match
             // Cloud's notes-explorer chrome density.
