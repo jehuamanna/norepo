@@ -385,6 +385,11 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
     // Plans-Phase-5-vfs-wikilinks: link-picker visibility signal. Cmd/Ctrl+K
     // toggles it open; <LinkPicker> closes itself on pick / Escape.
     let mut link_picker_open: Signal<bool> = use_signal(|| false);
+    // Plans-Phase-9-wikilink-picker (rev 1): viewport coords of an active
+    // editor right-click menu, or `None`. Right-click on the textarea
+    // captures `client_coordinates()` here; the menu has a single
+    // "Insert reference…" item that flips `link_picker_open`.
+    let mut editor_menu_pos: Signal<Option<(i32, i32)>> = use_signal(|| None);
 
     // Plans-Phase-6-image-notes: install a JS paste listener that captures
     // clipboard image bytes and posts them back via dioxus.send. We
@@ -884,6 +889,31 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
                     action.callback.call(());
                 }
             },
+            // Plans-Phase-9-wikilink-picker (rev 1): right-click reveals a
+            // tiny menu with one item that opens the LinkPicker. Cmd/Ctrl+K
+            // is still the keyboard path; this gives discoverability for
+            // users who don't know the binding. `prevent_default` stops the
+            // browser's native textarea menu from appearing on top.
+            oncontextmenu: move |evt| {
+                evt.prevent_default();
+                evt.stop_propagation();
+                let coords = evt.client_coordinates();
+                editor_menu_pos.set(Some((coords.x as i32, coords.y as i32)));
+            },
+        }
+        if let Some((x, y)) = *editor_menu_pos.read() {
+            crate::local_mode::ui::ContextMenu {
+                x: x,
+                y: y,
+                items: vec![crate::local_mode::ui::ContextMenuItem::new(
+                    "Insert reference\u{2026}",
+                    Callback::new(move |_| {
+                        editor_menu_pos.set(None);
+                        link_picker_open.set(true);
+                    }),
+                )],
+                on_dismiss: Callback::new(move |_| editor_menu_pos.set(None)),
+            }
         }
         if *link_picker_open.read() {
             LinkPicker {
