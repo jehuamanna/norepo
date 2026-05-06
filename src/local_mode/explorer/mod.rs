@@ -4,6 +4,7 @@
 
 mod backlinks;
 mod bulk_rename;
+pub mod history;
 mod note_row;
 mod project_row;
 mod search;
