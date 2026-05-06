@@ -14,6 +14,7 @@
 
 use std::collections::VecDeque;
 
+use operon_store::repos::SubtreeSnapshot;
 use uuid::Uuid;
 
 /// Inverse of a single user action. The variant carries the *previous*
@@ -32,6 +33,15 @@ pub enum ExplorerAction {
         project_id: Uuid,
         prev_parent: Option<Uuid>,
         prev_index: i64,
+    },
+    /// Plans-Phase-8: full subtree captured before delete; undo re-inserts.
+    Delete {
+        snapshot: SubtreeSnapshot,
+    },
+    /// Plans-Phase-8: paste of a copied subtree. Undo deletes the pasted
+    /// subtree by id (cascade kills its descendants automatically).
+    Paste {
+        pasted_root_id: Uuid,
     },
 }
 

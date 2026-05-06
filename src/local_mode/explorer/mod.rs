@@ -891,6 +891,19 @@ pub fn ExplorerPanel() -> Element {
                     return;
                 }
             }
+            history::ExplorerAction::Delete { snapshot } => {
+                if let Err(e) = note_repo_for_undo.restore_subtree(&snapshot) {
+                    eprintln!("operon: undo delete failed: {e}");
+                    return;
+                }
+            }
+            history::ExplorerAction::Paste { pasted_root_id } => {
+                // Cascade kills descendants automatically via the FK.
+                if let Err(e) = note_repo_for_undo.delete(pasted_root_id) {
+                    eprintln!("operon: undo paste failed: {e}");
+                    return;
+                }
+            }
         }
         note_version.with_mut(|v| *v += 1);
     });
@@ -994,11 +1007,23 @@ pub fn ExplorerPanel() -> Element {
         }
         drop(snap);
 
+        // Plans-Phase-8-explorer-undo: capture each top-level deleted node
+        // as its own Delete inverse. Bulk-undo therefore restores the
+        // selection one entry at a time (LIFO via repeated Cmd+Z), which
+        // is the same UX as repeated single-delete + undo.
         let mut deleted: usize = 0;
         for key in snapshot.iter() {
             if let NodeKey::Note(id) = key {
+                let inverse = note_repo_for_bulk_delete.snapshot_subtree(*id).ok();
                 match note_repo_for_bulk_delete.delete(*id) {
-                    Ok(()) => deleted += 1,
+                    Ok(()) => {
+                        deleted += 1;
+                        if let Some(s) = inverse {
+                            history.write().push(history::ExplorerAction::Delete {
+                                snapshot: s,
+                            });
+                        }
+                    }
                     Err(e) => eprintln!("operon: bulk delete note {id} failed: {e}"),
                 }
             }
@@ -1710,8 +1735,26 @@ pub fn ExplorerPanel() -> Element {
                         }
                     }
                     drop(snap);
+                    // Plans-Phase-8-explorer-undo: snapshot the subtree before
+                    // delete so undo can re-INSERT it. Capture failure is
+                    // non-fatal (we still delete; the user just can't undo).
+                    let undo_snapshot =
+                        match note_repo_for_delete.snapshot_subtree(did) {
+                            Ok(s) => Some(s),
+                            Err(e) => {
+                                eprintln!(
+                                    "operon: snapshot before delete failed: {e}"
+                                );
+                                None
+                            }
+                        };
                     match note_repo_for_delete.delete(did) {
                         Ok(()) => {
+                            if let Some(snapshot) = undo_snapshot {
+                                history
+                                    .write()
+                                    .push(history::ExplorerAction::Delete { snapshot });
+                            }
                             note_version.with_mut(|v| *v += 1);
                             if selected_note_now == Some(did) {
                                 selected_note.set(None);
