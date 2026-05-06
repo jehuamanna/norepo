@@ -206,7 +206,9 @@ pub fn App() -> Element {
     #[cfg(not(target_arch = "wasm32"))]
     let vault_set = vault_root.read().is_some();
     #[cfg(target_arch = "wasm32")]
-    let vault_set = true; // wasm path skips the local-mode picker (Phase 2 work)
+    let vault_set = true; // wasm path skips the local-mode picker
+    #[cfg(target_arch = "wasm32")]
+    let _ = vault_set;
 
     rsx! {
         document::Link { rel: "icon", href: FAVICON }

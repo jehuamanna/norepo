@@ -48,6 +48,7 @@ wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     "Document",
     "DomException",
+    "DomStringList",
     "Element",
     "FileSystemDirectoryHandle",
     "FileSystemFileHandle",
