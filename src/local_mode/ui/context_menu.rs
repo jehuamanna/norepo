@@ -234,3 +234,7 @@ fn ContextMenuRow(props: ContextMenuRowProps) -> Element {
         }
     }
 }
+
+// NB: Constructor unit tests for ContextMenuItem live in `tests-wasm/`
+// because `Callback::new` requires a Dioxus runtime — Phase-1 TestCase U-1
+// is exercised there alongside the Playwright submenu reveal spec.
