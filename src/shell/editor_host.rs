@@ -12,12 +12,74 @@ use dioxus::prelude::*;
 
 use crate::editor::LanguageDescriptor;
 
+/// Plans-Phase-9-monaco-desktop (rev 1): handle parents (e.g.
+/// `LocalNoteEditor`) hold to push programmatic content updates into a
+/// mounted Monaco instance — wikilink picker insert, image-paste splice,
+/// drop-image splice, image-picker splice, etc. The wrapped `Eval` is the
+/// same long-lived script the host owns; `set_content` enqueues a
+/// `setContent` message into the JS-side `dioxus.recv()` loop.
+///
+/// Desktop-only because the wasm path uses `MonacoBackend` directly via
+/// wasm-bindgen rather than `document::eval`. `Eval` itself is available on
+/// both targets, so the type compiles everywhere — but `set_content` is a
+/// no-op until the host's bootstrap script enters its message loop.
+#[derive(Clone, Copy)]
+pub struct MonacoChannel {
+    eval: document::Eval,
+}
+
+impl MonacoChannel {
+    /// Replace Monaco's buffer with `value`. Used after wikilink-picker /
+    /// paste-image / drop-image splices so Monaco's view stays in sync
+    /// with the `Tab.content` mirror Rust holds. The JS side suppresses
+    /// the resulting `change` event so the user-input round-trip can't
+    /// loop.
+    pub fn set_content(&self, value: &str) {
+        let _ = self
+            .eval
+            .send(serde_json::json!({"type":"setContent","value":value}));
+    }
+
+    /// Move the keyboard caret into Monaco. Mirrors the wasm path's
+    /// `EditorCommand::Focus`.
+    pub fn focus(&self) {
+        let _ = self.eval.send(serde_json::json!({"type":"focus"}));
+    }
+
+    /// Insert `text` at Monaco's current caret position. JS-side
+    /// computes the caret from `handle.snapshot()`, so the Rust caller
+    /// doesn't need to round-trip the cursor offset. Falls back to
+    /// end-of-buffer when the cursor is past the content (Monaco
+    /// snapshots `getOffsetAt(getPosition())`, which clamps to model
+    /// length).
+    pub fn splice(&self, text: &str) {
+        let _ = self
+            .eval
+            .send(serde_json::json!({"type":"splice","text":text}));
+    }
+}
+
 #[component]
 pub fn MonacoEditorHost(
     note_id: String,
     content: String,
     language: LanguageDescriptor,
     on_change: EventHandler<String>,
+    /// Plans-Phase-9-monaco-desktop (rev 1): when present, the host
+    /// writes a `MonacoChannel` here once the eval handle exists, so
+    /// the parent can push `setContent` from the picker / paste / drop
+    /// callsites. Optional so existing callers (cloud render path) need
+    /// no change.
+    #[props(default)]
+    channel_sink: Option<Signal<Option<MonacoChannel>>>,
+    /// Plans-Phase-9-monaco-desktop (rev 1): keyboard bindings that
+    /// Monaco normally swallows (Cmd+S, Cmd+K, Cmd+Shift+I, Cmd+Z, Cmd+Shift+Z).
+    /// The bootstrap script intercepts them at the window with
+    /// `capture: true`, calls `preventDefault`, and posts the action
+    /// name. The wasm path doesn't use this — it has its own dispatch
+    /// system. Optional so cloud callers can ignore.
+    #[props(default)]
+    on_action: Option<EventHandler<String>>,
 ) -> Element {
     // The `data-*` attributes let Playwright + wasm-bindgen tests assert the mount fired.
     // Capability-honest: this surface only renders when the active plugin claims `EDIT`,
@@ -92,6 +154,27 @@ pub fn MonacoEditorHost(
                             if (suppress) return;
                             dioxus.send({{type:"change", value:c}});
                         }});
+                        // Plans-Phase-9-monaco-desktop: capture-phase
+                        // keybindings Monaco normally swallows (Cmd+S,
+                        // Cmd+K, Cmd+Shift+I). PreventDefault stops
+                        // browser save/page-source; the action name
+                        // routes back to Rust so LocalNoteEditor can
+                        // wire it to the existing handlers.
+                        const onKey = (ev) => {{
+                            if (!target.contains(ev.target)) return;
+                            const meta = ev.metaKey || ev.ctrlKey;
+                            if (!meta) return;
+                            const key = ev.key && ev.key.toLowerCase();
+                            let action = null;
+                            if (key === "s" && !ev.shiftKey) action = "save";
+                            else if (key === "k" && !ev.shiftKey) action = "linkpicker";
+                            else if (key === "i" && ev.shiftKey) action = "imagepicker";
+                            if (!action) return;
+                            ev.preventDefault();
+                            ev.stopPropagation();
+                            dioxus.send({{type:"keyaction", action}});
+                        }};
+                        window.addEventListener("keydown", onKey, true);
                         dioxus.send({{type:"mounted"}});
                         while (true) {{
                             const msg = await dioxus.recv();
@@ -102,10 +185,30 @@ pub fn MonacoEditorHost(
                                     try {{ handle.setContent(typeof msg.value === "string" ? msg.value : ""); }}
                                     finally {{ suppress = false; }}
                                     break;
+                                case "splice":
+                                    {{
+                                        const state = handle.snapshot();
+                                        const old = handle.getContent();
+                                        const text = typeof msg.text === "string" ? msg.text : "";
+                                        const pos = Math.min(state.cursor || 0, old.length);
+                                        const next = old.slice(0, pos) + text + old.slice(pos);
+                                        suppress = true;
+                                        try {{ handle.setContent(next); }} finally {{ suppress = false; }}
+                                        handle.restore({{
+                                            cursor: pos + text.length,
+                                            selection: null,
+                                            scroll: state.scroll || 0,
+                                        }});
+                                        // Manually emit the change so
+                                        // Rust mirrors the new content.
+                                        dioxus.send({{type:"change", value:next}});
+                                    }}
+                                    break;
                                 case "focus":
                                     handle.dispatch("Focus");
                                     break;
                                 case "dispose":
+                                    window.removeEventListener("keydown", onKey, true);
                                     handle.dispose();
                                     delete window.__operon_monaco_handles['{host_id}'];
                                     return;
@@ -121,6 +224,17 @@ pub fn MonacoEditorHost(
             );
             document::eval(&script)
         });
+
+        // Plans-Phase-9-monaco-desktop (rev 1): expose a channel handle
+        // to the parent (if it asked for one). The channel is just the
+        // Eval (Copy) wrapped in a typed setContent/focus surface; any
+        // messages enqueued before the JS-side recv loop is ready buffer
+        // and dispatch when it catches up.
+        if let Some(mut sink) = channel_sink {
+            if sink.peek().is_none() {
+                sink.set(Some(MonacoChannel { eval: eval_handle }));
+            }
+        }
 
         // Drive the JS → Rust channel. Each `change` becomes an
         // `on_change` invocation matching the wasm path's contract.
@@ -141,6 +255,16 @@ pub fn MonacoEditorHost(
                             .unwrap_or("")
                             .to_string();
                         on_change_for_loop.call(value);
+                    }
+                    Some("keyaction") => {
+                        if let Some(handler) = on_action {
+                            let action = msg
+                                .get("action")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            handler.call(action);
+                        }
                     }
                     Some("mounted") => {}
                     Some("error") => {

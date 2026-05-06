@@ -22,9 +22,10 @@ use operon_store::repos::{
 use operon_store::vfs;
 use uuid::Uuid;
 
-use crate::editor::EditorMode;
+use crate::editor::{EditorMode, LanguageDescriptor};
 use crate::persistence::Persistence;
 use crate::plugins::markdown::wikilink;
+use crate::shell::editor_host::{MonacoChannel, MonacoEditorHost};
 use crate::tabs::{SaveScheduler, Tab, TabId, TabManager};
 
 mod link_picker;
@@ -367,6 +368,13 @@ fn try_render_image_view(
 /// `document::eval` round-trip. Returns `None` when the textarea isn't
 /// mounted or the value is out of bounds, in which case callers fall
 /// back to appending at the end of the body.
+///
+/// Plans-Phase-9-monaco-desktop deprecated the local-mode call sites —
+/// the new path splices via `MonacoChannel::splice` and Monaco computes
+/// the caret server-side. Kept around because the helper is still a
+/// reasonable fallback for any future textarea-shell and the unit
+/// tests of `splice_at_caret` reach it transitively.
+#[allow(dead_code)]
 async fn read_caret_pos(tab_id: TabId) -> Option<usize> {
     let script = format!(
         "(function() {{ const t = document.querySelector('[data-tab-id=\"{}\"]'); \
@@ -421,6 +429,7 @@ mod tests {
 /// Splice `insert` into `body` at character offset `pos` (snapped to the
 /// nearest char boundary). Falls back to appending when `pos` is past
 /// the body's end or no boundary fits.
+#[allow(dead_code)]
 fn splice_at_caret(body: &str, pos: usize, insert: &str) -> String {
     if body.is_empty() {
         return insert.to_string();
@@ -505,6 +514,11 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
     // captures `client_coordinates()` here; the menu has a single
     // "Insert reference…" item that flips `link_picker_open`.
     let mut editor_menu_pos: Signal<Option<(i32, i32)>> = use_signal(|| None);
+    // Plans-Phase-9-monaco-desktop (rev 1): channel the host writes
+    // once Monaco is mounted. Picker / paste / drop / image-picker
+    // splice through this so Monaco's buffer stays in sync with the
+    // `Tab.content` mirror Rust holds.
+    let monaco_channel: Signal<Option<MonacoChannel>> = use_signal(|| None);
 
     // Plans-Phase-6-image-notes: install a JS paste listener that captures
     // clipboard image bytes and posts them back via dioxus.send. We
@@ -620,24 +634,31 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
                     }
                     let short = operon_store::vfs::short_id(new_note.id);
                     let embed = format!("![[{stem}^{short}]]");
-                    let current = tabs_for_paste
-                        .read()
-                        .get(tab.id)
-                        .map(|t| t.content.clone())
-                        .unwrap_or_default();
-                    let caret = read_caret_pos(tab.id).await;
-                    let next = match caret {
-                        Some(pos) => splice_at_caret(&current, pos, &embed),
-                        None => {
-                            if current.ends_with('\n') || current.is_empty() {
-                                format!("{current}{embed}\n")
-                            } else {
-                                format!("{current}\n{embed}\n")
-                            }
-                        }
-                    };
-                    tabs_for_paste.write().set_content(tab.id, next);
-                    tabs_for_paste.write().set_dirty(tab.id, true);
+                    // Plans-Phase-9-monaco-desktop (rev 1): splice via
+                    // Monaco so the inserted text lands at the active
+                    // caret with undo preserved. Monaco's onChange
+                    // mirrors the new content into `Tab.content`; we
+                    // only flip the dirty bit synchronously so save is
+                    // ready immediately after the splice.
+                    if let Some(channel) = *monaco_channel.peek() {
+                        channel.splice(&embed);
+                        tabs_for_paste.write().set_dirty(tab.id, true);
+                    } else {
+                        // No Monaco yet (rare — paste fired before
+                        // mount finished). Append-at-end fallback.
+                        let current = tabs_for_paste
+                            .read()
+                            .get(tab.id)
+                            .map(|t| t.content.clone())
+                            .unwrap_or_default();
+                        let next = if current.ends_with('\n') || current.is_empty() {
+                            format!("{current}{embed}\n")
+                        } else {
+                            format!("{current}\n{embed}\n")
+                        };
+                        tabs_for_paste.write().set_content(tab.id, next);
+                        tabs_for_paste.write().set_dirty(tab.id, true);
+                    }
                 }
             }
         });
@@ -691,7 +712,11 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
     let vault_signal_for_drop = vault_signal_for_paste;
     let tabs_for_drop = tabs;
 
-    let on_insert_image_via_picker = move || {
+    // Plans-Phase-9-monaco-desktop (rev 1): clone before the
+    // `use_callback(move ...)` consumes `tab` so we can still pass
+    // note_id into MonacoEditorHost.
+    let tab_note_id_for_host = tab.note_id.clone();
+    let on_insert_image_via_picker = use_callback(move |_: ()| {
         let Ok(parent_uuid) = Uuid::parse_str(&tab.note_id) else {
             return;
         };
@@ -774,34 +799,29 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
             }
             let short = operon_store::vfs::short_id(new_note.id);
             let embed = format!("![[{}^{}]]", stem, short);
-            let current = tabs_for_image
-                .read()
-                .get(tab_id)
-                .map(|t| t.content.clone())
-                .unwrap_or_default();
-            let caret = read_caret_pos(tab_id).await;
-            let next = match caret {
-                Some(pos) => splice_at_caret(&current, pos, &embed),
-                None => {
-                    if current.ends_with('\n') || current.is_empty() {
-                        format!("{current}{embed}\n")
-                    } else {
-                        format!("{current}\n{embed}\n")
-                    }
-                }
-            };
-            tabs_for_image.write().set_content(tab_id, next);
-            tabs_for_image.write().set_dirty(tab_id, true);
+            // Plans-Phase-9-monaco-desktop (rev 1): splice via Monaco.
+            if let Some(channel) = *monaco_channel.peek() {
+                channel.splice(&embed);
+                tabs_for_image.write().set_dirty(tab_id, true);
+            } else {
+                let current = tabs_for_image
+                    .read()
+                    .get(tab_id)
+                    .map(|t| t.content.clone())
+                    .unwrap_or_default();
+                let next = if current.ends_with('\n') || current.is_empty() {
+                    format!("{current}{embed}\n")
+                } else {
+                    format!("{current}\n{embed}\n")
+                };
+                tabs_for_image.write().set_content(tab_id, next);
+                tabs_for_image.write().set_dirty(tab_id, true);
+            }
         });
-    };
+    });
 
     let mut tabs_for_link = tabs;
     let on_pick_link = move |picked: PickedLink| {
-        let current = tabs_for_link
-            .read()
-            .get(tab_id)
-            .map(|t| t.content.clone())
-            .unwrap_or_default();
         // Plans-Phase-9-wikilink-picker (rev 1): image picks insert the
         // embed form so MarkdownView's `WikiLinkImageResolver` renders an
         // inline `<img>`; markdown / project picks stay on the clickable
@@ -811,34 +831,49 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
         } else {
             format!("[[{}]]", picked.target)
         };
-        spawn(async move {
-            let caret = read_caret_pos(tab_id).await;
-            let next = match caret {
-                Some(pos) => splice_at_caret(&current, pos, &inserted),
-                None => {
-                    if current.ends_with('\n') || current.is_empty() {
-                        format!("{current}{inserted}\n")
-                    } else {
-                        format!("{current}\n{inserted}\n")
-                    }
-                }
+        // Plans-Phase-9-monaco-desktop (rev 1): splice through Monaco
+        // (caret-aware, undo-aware). The resulting onChange propagates
+        // back into `Tab.content` automatically.
+        if let Some(channel) = *monaco_channel.peek() {
+            channel.splice(&inserted);
+            tabs_for_link.write().set_dirty(tab_id, true);
+        } else {
+            let current = tabs_for_link
+                .read()
+                .get(tab_id)
+                .map(|t| t.content.clone())
+                .unwrap_or_default();
+            let next = if current.ends_with('\n') || current.is_empty() {
+                format!("{current}{inserted}\n")
+            } else {
+                format!("{current}\n{inserted}\n")
             };
             tabs_for_link.write().set_content(tab_id, next);
             tabs_for_link.write().set_dirty(tab_id, true);
-        });
+        }
     };
 
+    // Plans-Phase-9-monaco-desktop (rev 1): wrap MonacoEditorHost in a
+    // sizing div whose handlers catch drag/drop, right-click, and the
+    // capture-phase keybindings Monaco swallows. Monaco itself is
+    // mounted inside `MonacoEditorHost` via the desktop bridge.
+    let on_action = {
+        let mut link_picker_open = link_picker_open;
+        let action = action.clone();
+        let on_insert_image_via_picker_for_action = on_insert_image_via_picker;
+        EventHandler::new(move |act: String| match act.as_str() {
+            "save" => action.callback.call(()),
+            "linkpicker" => link_picker_open.set(true),
+            "imagepicker" => on_insert_image_via_picker_for_action.call(()),
+            _ => {}
+        })
+    };
     rsx! {
-        textarea {
-            class: "operon-local-editor",
-            "data-testid": "local-note-textarea",
+        div {
+            class: "operon-local-editor-host",
+            "data-testid": "local-note-editor-host",
             "data-tab-id": "{tab_id.0}",
-            value: "{content}",
-            spellcheck: "false",
-            autofocus: true,
-            oninput: move |evt| {
-                tabs.write().set_content(tab_id, evt.value());
-            },
+            style: "width: 100%; height: 100%; min-height: 400px; display: flex;",
             // Plans-Phase-6-image-notes (drop-to-note-area): preventing
             // default on `ondragover` is what tells the browser this
             // element is a valid drop target — without it, `ondrop`
@@ -950,71 +985,50 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
                             }
                             let short = operon_store::vfs::short_id(new_note.id);
                             let embed = format!("![[{stem}^{short}]]");
-                            let current = tabs_sig
-                                .read()
-                                .get(cur_tab_id)
-                                .map(|t| t.content.clone())
-                                .unwrap_or_default();
-                            let caret = read_caret_pos(cur_tab_id).await;
-                            let next = match caret {
-                                Some(pos) => splice_at_caret(&current, pos, &embed),
-                                None => {
-                                    if current.ends_with('\n') || current.is_empty() {
-                                        format!("{current}{embed}\n")
-                                    } else {
-                                        format!("{current}\n{embed}\n")
-                                    }
-                                }
-                            };
-                            tabs_sig.write().set_content(cur_tab_id, next);
-                            tabs_sig.write().set_dirty(cur_tab_id, true);
+                            // Plans-Phase-9-monaco-desktop (rev 1):
+                            // splice via Monaco (caret-aware, undo-aware).
+                            if let Some(channel) = *monaco_channel.peek() {
+                                channel.splice(&embed);
+                                tabs_sig.write().set_dirty(cur_tab_id, true);
+                            } else {
+                                let current = tabs_sig
+                                    .read()
+                                    .get(cur_tab_id)
+                                    .map(|t| t.content.clone())
+                                    .unwrap_or_default();
+                                let next = if current.ends_with('\n') || current.is_empty() {
+                                    format!("{current}{embed}\n")
+                                } else {
+                                    format!("{current}\n{embed}\n")
+                                };
+                                tabs_sig.write().set_content(cur_tab_id, next);
+                                tabs_sig.write().set_dirty(cur_tab_id, true);
+                            }
                         });
                     }
                 }
             },
-            onkeydown: move |evt| {
-                let mods = evt.modifiers();
-                let with_meta = mods.contains(Modifiers::META) || mods.contains(Modifiers::CONTROL);
-                if with_meta
-                    && mods.contains(Modifiers::SHIFT)
-                    && !mods.contains(Modifiers::ALT)
-                    && evt.key().to_string().eq_ignore_ascii_case("i")
-                {
-                    // Plans-Phase-6-image-notes: insert image via picker.
-                    evt.prevent_default();
-                    on_insert_image_via_picker();
-                    return;
-                }
-                if with_meta
-                    && !mods.contains(Modifiers::SHIFT)
-                    && !mods.contains(Modifiers::ALT)
-                    && evt.key().to_string().eq_ignore_ascii_case("k")
-                {
-                    // Plans-Phase-5-vfs-wikilinks: open link picker.
-                    evt.prevent_default();
-                    link_picker_open.set(true);
-                    return;
-                }
-                if with_meta
-                    && !mods.contains(Modifiers::SHIFT)
-                    && !mods.contains(Modifiers::ALT)
-                    && evt.key().to_string().eq_ignore_ascii_case("s")
-                {
-                    evt.prevent_default();
-                    action.callback.call(());
-                }
-            },
             // Plans-Phase-9-wikilink-picker (rev 1): right-click reveals a
-            // tiny menu with one item that opens the LinkPicker. Cmd/Ctrl+K
-            // is still the keyboard path; this gives discoverability for
-            // users who don't know the binding. `prevent_default` stops the
-            // browser's native textarea menu from appearing on top.
+            // tiny menu with one item that opens the LinkPicker. The
+            // bootstrap script's window-level keydown listener handles
+            // Cmd/Ctrl+K too; this is the discoverable mouse path.
             oncontextmenu: move |evt| {
                 evt.prevent_default();
                 evt.stop_propagation();
                 let coords = evt.client_coordinates();
                 editor_menu_pos.set(Some((coords.x as i32, coords.y as i32)));
             },
+            MonacoEditorHost {
+                note_id: tab_note_id_for_host.clone(),
+                content: content.clone(),
+                language: LanguageDescriptor::markdown(),
+                on_change: EventHandler::new(move |new_content: String| {
+                    tabs.write().set_content(tab_id, new_content);
+                    tabs.write().set_dirty(tab_id, true);
+                }),
+                channel_sink: monaco_channel,
+                on_action: on_action,
+            }
         }
         if let Some((x, y)) = *editor_menu_pos.read() {
             crate::local_mode::ui::ContextMenu {
