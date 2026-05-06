@@ -94,6 +94,13 @@ pub struct LocalUsername(pub Signal<String>);
 #[derive(Clone, Copy)]
 pub struct CurrentVaultRoot(pub Signal<Option<crate::local_mode::vault::VaultRoot>>);
 
+/// App-scope signal holding the live `LockGuard` for the currently-open
+/// vault. Populated by [`crate::local_mode::VaultDirPicker`] on successful
+/// pick; dropped + reacquired when the user changes the vault. Drop runs
+/// at app shutdown, removing `<vault>/.operon/lock`.
+#[derive(Clone, Copy)]
+pub struct VaultLockHolder(pub Signal<Option<crate::local_mode::vault::LockGuard>>);
+
 /// Convenience used by `app.rs` and tests to install the repos. Equivalent to
 /// rendering [`LocalStateProvider`] but callable from a hook position.
 pub fn provide_local_state() {

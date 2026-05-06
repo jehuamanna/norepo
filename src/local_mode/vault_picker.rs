@@ -16,12 +16,13 @@ use std::sync::Arc;
 use dioxus::prelude::*;
 use operon_store::repos::LocalSettingsRepository;
 
-use super::desktop::LocalSettingsRepo;
-use super::vault::{self, VaultErr, VaultRoot};
+use super::desktop::{LocalSettingsRepo, VaultLockHolder};
+use super::vault::{self, LockGuard, VaultErr, VaultRoot};
 
 #[component]
 pub fn VaultDirPicker(blocking: bool, on_chosen: EventHandler<VaultRoot>) -> Element {
     let LocalSettingsRepo(settings) = use_context();
+    let VaultLockHolder(mut vault_lock) = use_context();
     let mut error: Signal<Option<String>> = use_signal(|| None);
     let mut picking: Signal<bool> = use_signal(|| false);
 
@@ -45,7 +46,11 @@ pub fn VaultDirPicker(blocking: bool, on_chosen: EventHandler<VaultRoot>) -> Ele
                 };
                 let raw = handle.path().to_path_buf();
                 match try_set_vault(&settings, &raw) {
-                    Ok(root) => {
+                    Ok((root, guard)) => {
+                        // Drop the previous LockGuard (if any) before
+                        // installing the new one so the old vault's lock
+                        // file is released when the user re-points.
+                        vault_lock.set(Some(guard));
                         picking.set(false);
                         on_chosen.call(root);
                     }
@@ -123,16 +128,12 @@ pub fn VaultDirPicker(blocking: bool, on_chosen: EventHandler<VaultRoot>) -> Ele
 fn try_set_vault(
     settings: &Arc<dyn LocalSettingsRepository>,
     raw_path: &std::path::Path,
-) -> Result<VaultRoot, VaultErr> {
+) -> Result<(VaultRoot, LockGuard), VaultErr> {
     let canonical = vault::validate(raw_path)?;
     let root = VaultRoot { path: canonical };
-    // Best-effort lock acquisition. The lock guard is dropped here on success;
-    // the app holds its own lifetime guard once mounted (a follow-up will wire
-    // a `LockGuard` into a Dioxus context). For first-run, just verifying that
-    // the lock can be acquired is enough.
-    let _guard = vault::acquire_lock(&root)?;
+    let guard = vault::acquire_lock(&root)?;
     vault::store(settings, &root)?;
-    Ok(root)
+    Ok((root, guard))
 }
 
 fn format_vault_err(e: &VaultErr) -> String {

@@ -98,6 +98,28 @@ pub fn App() -> Element {
     };
     #[cfg(not(target_arch = "wasm32"))]
     use_context_provider(|| crate::local_mode::CurrentVaultRoot(vault_root));
+    // Plans-Phase-1-vault-dir: process-lifetime lock guard for the chosen
+    // vault. Picker writes here on success; App scope keeps the lock file
+    // alive until the user closes Operon. On returning-user boot (vault
+    // already in settings), we attempt to acquire the lock immediately so
+    // a second instance pointed at the same vault is rejected.
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut vault_lock: Signal<Option<crate::local_mode::vault::LockGuard>> =
+        use_signal(|| None);
+    #[cfg(not(target_arch = "wasm32"))]
+    use_hook(|| {
+        if let Some(root) = vault_root.read().clone() {
+            match crate::local_mode::vault::acquire_lock(&root) {
+                Ok(guard) => vault_lock.set(Some(guard)),
+                Err(e) => eprintln!(
+                    "operon: could not acquire vault lock at boot ({e}); \
+                     other instance may be running."
+                ),
+            }
+        }
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    use_context_provider(|| crate::local_mode::desktop::VaultLockHolder(vault_lock));
 
     use_hook(|| {
         if let Some(m) = initial_mode_remembered {
