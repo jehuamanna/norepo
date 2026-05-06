@@ -485,6 +485,26 @@ html, body {
   align-items: center;
 }
 
+/* Plans-Phase-8-explorer-undo: toast / snackbar. Fixed bottom-right,
+ * auto-dismissed after 3 s by ToastHost. */
+.operon-toast {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  padding: 0.5rem 0.875rem;
+  border-radius: 4px;
+  border: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-notifications-background, #2d2d30);
+  color: var(--vscode-notifications-foreground, currentColor);
+  box-shadow: 0 4px 16px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.36));
+  font-size: 13px;
+  z-index: 70;
+  max-width: 24rem;
+}
+.operon-toast-info { border-color: var(--vscode-focusborder, #007acc); }
+.operon-toast-warn { border-color: #d2a029; }
+.operon-toast-error { border-color: #c0392b; }
+
 /* Modal scrim used by Local-Mode confirm + settings dialogs. Fills the
  * viewport so the wrapper still catches outside clicks, but is fully
  * transparent — only the dialog card itself draws pixels. */

@@ -7,6 +7,7 @@ pub mod confirm;
 pub mod context_menu;
 pub mod drag_drop;
 pub mod inline_rename;
+pub mod toast;
 
 pub use clipboard::{
     BulkClipboard, ClipKind, ClipPayload, Clipboard, LocalBulkClipboard, LocalClipboard,
@@ -17,3 +18,4 @@ pub use drag_drop::{
     classify_drop_position, DragDescendants, DragKind, DragSession, DropPosition,
 };
 pub use inline_rename::InlineRename;
+pub use toast::{Toast, ToastHost, ToastKind, ToastSlot};

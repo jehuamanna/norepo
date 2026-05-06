@@ -76,6 +76,14 @@ pub fn App() -> Element {
     let request_editor_focus: Signal<Option<String>> = use_signal(|| None);
     use_context_provider(|| crate::editor::RequestEditorFocus(request_editor_focus));
 
+    // Plans-Phase-8-explorer-undo: app-scope toast slot. Producers (e.g.
+    // failed undo) write here; ToastHost reads + auto-clears after 3 s.
+    // Gated on the same cfg as the local_mode::ui module.
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-sqlite"))]
+    let toast_slot: Signal<Option<crate::local_mode::ui::Toast>> = use_signal(|| None);
+    #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-sqlite"))]
+    use_context_provider(|| crate::local_mode::ui::ToastSlot(toast_slot));
+
     // Local Mode wiring: install the LocalUserRepo / LocalSettingsRepo before any
     // component reads them. Then resolve the remembered mode from
     // `local_app_settings`; if absent, AppState defaults to NonLocal but we

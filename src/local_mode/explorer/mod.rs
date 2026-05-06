@@ -892,11 +892,14 @@ pub fn ExplorerPanel() -> Element {
     });
 
     // Plans-Phase-4-explorer-undo-stack: pop the latest inverse and apply.
-    // Failures log; the entry is still consumed so the user moves on.
+    // Failures log + emit a toast; the entry is still consumed so the
+    // user moves on.
     let note_repo_for_undo = note_repo.clone();
     let crate::local_mode::desktop::LocalNoteLinkRepo(link_repo_for_undo) =
         use_context::<crate::local_mode::desktop::LocalNoteLinkRepo>();
     let persistence_for_undo: Arc<dyn Persistence> = use_context();
+    // Plans-Phase-8: app-scope toast slot for surfacing undo failures.
+    let crate::local_mode::ui::ToastSlot(mut toast_slot) = use_context();
     let on_undo = use_callback(move |_: ()| {
         let action = history.write().pop();
         let Some(action) = action else { return };
@@ -910,6 +913,10 @@ pub fn ExplorerPanel() -> Element {
                 // Restore the title first; same call shape as the forward path.
                 if let Err(e) = note_repo_for_undo.rename(id, &prev_title) {
                     eprintln!("operon: undo rename failed: {e}");
+                    toast_slot.set(Some(crate::local_mode::ui::Toast {
+                        message: format!("Undo failed: {e}"),
+                        kind: crate::local_mode::ui::ToastKind::Error,
+                    }));
                     return;
                 }
                 // Plans-Phase-8: rewrite referrer bodies back —
@@ -947,12 +954,20 @@ pub fn ExplorerPanel() -> Element {
                     note_repo_for_undo.move_to(id, project_id, prev_parent, prev_index)
                 {
                     eprintln!("operon: undo move failed: {e}");
+                    toast_slot.set(Some(crate::local_mode::ui::Toast {
+                        message: format!("Undo failed: {e}"),
+                        kind: crate::local_mode::ui::ToastKind::Error,
+                    }));
                     return;
                 }
             }
             history::ExplorerAction::Delete { snapshot } => {
                 if let Err(e) = note_repo_for_undo.restore_subtree(&snapshot) {
                     eprintln!("operon: undo delete failed: {e}");
+                    toast_slot.set(Some(crate::local_mode::ui::Toast {
+                        message: format!("Undo failed: {e}"),
+                        kind: crate::local_mode::ui::ToastKind::Error,
+                    }));
                     return;
                 }
             }
@@ -960,6 +975,10 @@ pub fn ExplorerPanel() -> Element {
                 // Cascade kills descendants automatically via the FK.
                 if let Err(e) = note_repo_for_undo.delete(pasted_root_id) {
                     eprintln!("operon: undo paste failed: {e}");
+                    toast_slot.set(Some(crate::local_mode::ui::Toast {
+                        message: format!("Undo failed: {e}"),
+                        kind: crate::local_mode::ui::ToastKind::Error,
+                    }));
                     return;
                 }
             }
