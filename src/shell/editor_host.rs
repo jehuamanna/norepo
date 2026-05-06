@@ -112,6 +112,29 @@ pub fn MonacoEditorHost(
             });
         });
 
+        // Plans-Phase-7-tab-activation-focus: a second `use_effect` whose
+        // only input is `focus_request` so re-activating an already-mounted
+        // tab (search-result click, wikilink jump, explorer re-click) also
+        // grants focus. The mount-effect above only fires on first mount;
+        // this one fires whenever the focus request signal changes.
+        let backend_for_activation = backend;
+        let note_id_for_activation = note_id.clone();
+        use_effect(move || {
+            let wants = focus_request
+                .read()
+                .as_deref()
+                .map(|id| id == note_id_for_activation.as_str())
+                .unwrap_or(false);
+            if !wants {
+                return;
+            }
+            let bk = backend_for_activation.read().clone();
+            // Skip if the backend isn't mounted yet — the mount-effect's
+            // async branch will take care of it on first mount.
+            bk.borrow().dispatch(EditorCommand::Focus);
+            focus_request.set(None);
+        });
+
         let _drop_guard = use_drop(move || {
             let bk = backend.read().clone();
             bk.borrow_mut().dispose();
