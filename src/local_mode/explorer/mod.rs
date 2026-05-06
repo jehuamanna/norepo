@@ -103,6 +103,60 @@ fn sanitize_filename(title: &str) -> String {
     out
 }
 
+/// Plans-Phase-6-image-notes: shared helper used by both the note-row and
+/// project-row image-drop callbacks. Writes the bytes via
+/// [`crate::local_mode::images::write_image`], mints an image-note via
+/// `create_with_kind`, stamps `blob_path`, and bumps `note_version`.
+fn handle_image_drop(
+    project_id: Uuid,
+    parent_id: Option<Uuid>,
+    bytes: Vec<u8>,
+    filename: String,
+    vault: &crate::local_mode::vault::VaultRoot,
+    note_repo: &Arc<dyn operon_store::repos::LocalNoteRepository>,
+    mut note_version: Signal<u64>,
+) {
+    let lower = filename.to_ascii_lowercase();
+    let mime = if lower.ends_with(".png") {
+        "image/png"
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else if lower.ends_with(".svg") {
+        "image/svg+xml"
+    } else if lower.ends_with(".avif") {
+        "image/avif"
+    } else {
+        eprintln!("operon: image drop: unsupported extension in {filename}");
+        return;
+    };
+    let written = match crate::local_mode::images::write_image(vault, &bytes, mime) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("operon: image drop write_image failed: {e}");
+            return;
+        }
+    };
+    let stem = std::path::Path::new(&filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Image")
+        .to_string();
+    match note_repo.create_with_kind(project_id, parent_id, &stem, NoteKind::Image) {
+        Ok(row) => {
+            let rel = written.relative_path.to_string_lossy().to_string();
+            if let Err(e) = note_repo.set_blob_path(row.id, Some(&rel)) {
+                eprintln!("operon: image drop set_blob_path failed: {e}");
+            }
+            note_version.with_mut(|v| *v += 1);
+        }
+        Err(e) => eprintln!("operon: image drop create_with_kind failed: {e}"),
+    }
+}
+
 /// Pick a unique path inside `dir` with `stem.ext`; appends ` (2)` etc on
 /// collision so a bulk export of repeat-titled notes doesn't overwrite.
 fn unique_path(dir: &std::path::Path, stem: &str, ext: &str) -> std::path::PathBuf {
@@ -662,6 +716,58 @@ pub fn ExplorerPanel() -> Element {
         Ok(()) => note_version.with_mut(|v| *v += 1),
         Err(e) => eprintln!("operon: move_down note failed: {e}"),
     });
+
+    // Plans-Phase-6-image-notes: external image-file drop on a note row.
+    // Writes the bytes to the vault, mints a child image-note under the
+    // target row, and stamps blob_path. Mime is derived from the
+    // filename's extension (caller pre-filtered to image extensions).
+    let note_repo_for_drop_image = note_repo.clone();
+    let crate::local_mode::CurrentVaultRoot(vault_for_drop_image) = use_context();
+    let on_drop_image_into_note =
+        use_callback(move |(parent_id, bytes, name): (Uuid, Vec<u8>, String)| {
+            let Some(vault) = vault_for_drop_image.read().clone() else {
+                eprintln!("operon: image drop: no vault");
+                return;
+            };
+            let project_id_opt = {
+                let snap = notes_by_project.read();
+                snap.iter()
+                    .find_map(|(pid, list)| {
+                        list.iter().find(|n| n.id == parent_id).map(|_| *pid)
+                    })
+            };
+            let Some(project_id) = project_id_opt else {
+                eprintln!("operon: image drop: parent {parent_id} not found");
+                return;
+            };
+            handle_image_drop(
+                project_id,
+                Some(parent_id),
+                bytes,
+                name,
+                &vault,
+                &note_repo_for_drop_image,
+                note_version,
+            );
+        });
+    let note_repo_for_drop_proj_image = note_repo.clone();
+    let vault_for_drop_proj_image = vault_for_drop_image;
+    let on_drop_image_into_project =
+        use_callback(move |(project_id, bytes, name): (Uuid, Vec<u8>, String)| {
+            let Some(vault) = vault_for_drop_proj_image.read().clone() else {
+                eprintln!("operon: image drop: no vault");
+                return;
+            };
+            handle_image_drop(
+                project_id,
+                None,
+                bytes,
+                name,
+                &vault,
+                &note_repo_for_drop_proj_image,
+                note_version,
+            );
+        });
 
     // Plans-Phase-4-multiselect-aria: bulk delete every NodeKey in the
     // multi-selection set, in a single sweep through the repo. FK cascade
@@ -1313,6 +1419,8 @@ pub fn ExplorerPanel() -> Element {
                             on_toggle_project: on_toggle_project,
                             on_add_root_note: on_add_root_note,
                             on_add_image_note: on_add_image_note,
+                            on_drop_image_into_note: on_drop_image_into_note,
+                            on_drop_image_into_project: on_drop_image_into_project,
                             on_select_note: on_select_note,
                             on_toggle_note: on_toggle_note,
                             on_rename_note: on_rename_note,
@@ -1515,6 +1623,8 @@ struct ProjectSubtreeProps {
     on_toggle_project: Callback<Uuid>,
     on_add_root_note: Callback<Uuid>,
     on_add_image_note: Callback<Uuid>,
+    on_drop_image_into_note: Callback<(Uuid, Vec<u8>, String)>,
+    on_drop_image_into_project: Callback<(Uuid, Vec<u8>, String)>,
     on_select_note: Callback<Uuid>,
     on_toggle_note: Callback<(Uuid, Uuid)>,
     on_rename_note: Callback<(Uuid, String)>,
@@ -1594,6 +1704,7 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
             on_toggle: props.on_toggle_project,
             on_add_note: props.on_add_root_note,
             on_add_image_note: props.on_add_image_note,
+            on_drop_image_file: props.on_drop_image_into_project,
             on_cut: props.on_cut_project,
             on_copy: props.on_copy_project,
             on_paste: props.on_paste_into_project,
@@ -1638,6 +1749,7 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
                         on_request_delete: props.on_request_delete_note,
                         on_add_child: props.on_add_child_note,
                         on_add_sibling: props.on_add_sibling_note,
+                        on_drop_image_file: props.on_drop_image_into_note,
                         on_indent: props.on_indent_note,
                         on_outdent: props.on_outdent_note,
                         on_move_up: props.on_move_up_note,

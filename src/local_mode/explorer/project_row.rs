@@ -1,6 +1,7 @@
 //! A single project row inside [`crate::local_mode::explorer::ExplorerPanel`].
 
 use dioxus::prelude::*;
+use dioxus::html::HasFileData;
 use operon_store::repos::LocalProject;
 use uuid::Uuid;
 
@@ -33,6 +34,10 @@ pub struct ProjectRowProps {
     /// image via `images::write_image`, then mints a `NoteKind::Image`
     /// row + an `attachments` entry.
     pub on_add_image_note: Callback<Uuid>,
+    /// Plans-Phase-6-image-notes: external image-file drops onto this
+    /// project row land as top-level image-notes in the project. Tuple is
+    /// (project_id, bytes, suggested filename).
+    pub on_drop_image_file: Callback<(Uuid, Vec<u8>, String)>,
     pub on_cut: Callback<Uuid>,
     pub on_copy: Callback<Uuid>,
     pub on_paste: Callback<Uuid>,
@@ -68,6 +73,7 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     let on_toggle = props.on_toggle;
     let on_add_note = props.on_add_note;
     let on_add_image_note = props.on_add_image_note;
+    let on_drop_image_file = props.on_drop_image_file;
     let on_cut = props.on_cut;
     let on_copy = props.on_copy;
     let on_paste = props.on_paste;
@@ -196,6 +202,34 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
             },
             ondrop: move |evt| {
                 evt.prevent_default();
+                // Plans-Phase-6-image-notes: external image-file drop creates
+                // a top-level image-note in this project.
+                let files = evt.data().files();
+                if !files.is_empty() {
+                    for f in files {
+                        let name = f.name();
+                        let lower = name.to_ascii_lowercase();
+                        if !lower.ends_with(".png")
+                            && !lower.ends_with(".jpg")
+                            && !lower.ends_with(".jpeg")
+                            && !lower.ends_with(".webp")
+                            && !lower.ends_with(".gif")
+                            && !lower.ends_with(".svg")
+                            && !lower.ends_with(".avif")
+                        {
+                            continue;
+                        }
+                        let cb = on_drop_image_file;
+                        spawn(async move {
+                            if let Ok(bytes) = f.read_bytes().await {
+                                cb.call((id, bytes.to_vec(), name));
+                            }
+                        });
+                    }
+                    drag_session.set(None);
+                    drop_indicator_setter.set(None);
+                    return;
+                }
                 let kind = *drag_session.read();
                 let coords = evt.element_coordinates();
                 let pos = classify_drop_position(coords.y, 28.0);

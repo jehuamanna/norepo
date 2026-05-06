@@ -3,6 +3,7 @@
 //! rename / context menu (Phase-4: cut/copy/paste, indent/outdent, move-up/down).
 
 use dioxus::prelude::*;
+use dioxus::html::HasFileData;
 use keyboard_types::Modifiers;
 use operon_store::repos::{LocalNote, NoteKind};
 use uuid::Uuid;
@@ -47,6 +48,10 @@ pub struct NoteRowProps {
     pub on_copy: Callback<Uuid>,
     pub on_paste: Callback<Uuid>,
     pub on_drop_note_on_note: Callback<(Uuid, Uuid, DropPosition)>,
+    /// Plans-Phase-6-image-notes: external image-file drops onto this row
+    /// land as child image-notes. Tuple is (parent_note_id, bytes,
+    /// suggested filename including extension).
+    pub on_drop_image_file: Callback<(Uuid, Vec<u8>, String)>,
     /// Current editor mode for this note when it's open in a tab. None means
     /// the note isn't open yet — picking any mode opens it.
     pub current_mode: Option<EditorMode>,
@@ -100,6 +105,7 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let on_copy = props.on_copy;
     let on_paste = props.on_paste;
     let on_drop_note_on_note = props.on_drop_note_on_note;
+    let on_drop_image_file = props.on_drop_image_file;
     let current_mode = props.current_mode;
     let on_set_mode = props.on_set_mode;
 
@@ -381,6 +387,36 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
             },
             ondrop: move |evt| {
                 evt.prevent_default();
+                // Plans-Phase-6-image-notes: external file drop. If the
+                // event carries any FileData we treat the drop as image
+                // imports (creating child image-notes under this row) and
+                // ignore the in-app DragKind path for this event.
+                let files = evt.data().files();
+                if !files.is_empty() {
+                    for f in files {
+                        let name = f.name();
+                        let lower = name.to_ascii_lowercase();
+                        if !lower.ends_with(".png")
+                            && !lower.ends_with(".jpg")
+                            && !lower.ends_with(".jpeg")
+                            && !lower.ends_with(".webp")
+                            && !lower.ends_with(".gif")
+                            && !lower.ends_with(".svg")
+                            && !lower.ends_with(".avif")
+                        {
+                            continue;
+                        }
+                        let cb = on_drop_image_file;
+                        spawn(async move {
+                            if let Ok(bytes) = f.read_bytes().await {
+                                cb.call((id, bytes.to_vec(), name));
+                            }
+                        });
+                    }
+                    drag_session.set(None);
+                    drop_indicator_setter.set(None);
+                    return;
+                }
                 let kind = *drag_session.read();
                 let coords = evt.element_coordinates();
                 let pos = classify_drop_position(coords.y, 28.0);
