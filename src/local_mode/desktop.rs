@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use super::editor::{install_save_action, LocalSaveAction};
 use super::explorer::{
-    ExplorerSearchFocus, ExplorerSearchRepo, LocalNoteVersion, LocalProjectVersion, SelectedNote,
-    SelectedProject,
+    ExplorerSearchRepo, LocalNoteVersion, LocalProjectVersion, SelectedNote, SelectedProject,
+    TreeStateQueue, WorkspaceOpenMap, WorkspaceTreeQueueCtx,
 };
 use super::ui::{ClipKind, ClipPayload, Clipboard, DragKind, DragSession, LocalClipboard};
 use super::{MODE_VALUE_CLOUD, MODE_VALUE_LOCAL, SETTINGS_KEY_MODE_REMEMBERED};
@@ -472,8 +472,37 @@ pub fn provide_local_app_signals() {
     use_context_provider(|| LocalClipboard(clipboard));
     let bulk_clipboard: Signal<Option<crate::local_mode::ui::BulkClipboard>> = use_signal(|| None);
     use_context_provider(|| crate::local_mode::ui::LocalBulkClipboard(bulk_clipboard));
-    let search_focus_tick: Signal<u64> = use_signal(|| 0);
-    use_context_provider(|| ExplorerSearchFocus(search_focus_tick));
+    // Workspace tree-state — shared between the explorer panel and the
+    // dedicated search panel so a click in either expands the matching
+    // project consistently.
+    let LocalTreeStateRepo(tree_repo) = use_context();
+    let workspace_open: Signal<HashMap<String, bool>> = use_signal(|| {
+        tree_repo
+            .snapshot_for_scope("workspace")
+            .unwrap_or_default()
+    });
+    use_context_provider(|| WorkspaceOpenMap(workspace_open));
+    let tree_queue: Signal<TreeStateQueue> =
+        use_signal(|| TreeStateQueue::new(tree_repo.clone()));
+    use_context_provider(|| WorkspaceTreeQueueCtx(tree_queue));
+    // Re-hydrate `workspace_open` whenever the project list changes — covers
+    // freshly-created projects whose state wasn't fetched on first mount.
+    {
+        let mut workspace_open_setter = workspace_open;
+        let repo = tree_repo.clone();
+        use_effect(move || {
+            let _ = project_version.read();
+            match repo.snapshot_for_scope("workspace") {
+                Ok(snap) => workspace_open_setter.set(snap),
+                Err(e) => eprintln!("operon: tree-state snapshot failed: {e}"),
+            }
+        });
+    }
+
+    let local_search_focus_tick: Signal<u64> = use_signal(|| 0);
+    use_context_provider(|| {
+        crate::plugins::local_search::LocalSearchFocus(local_search_focus_tick)
+    });
 
     let scheduler: crate::tabs::SaveScheduler = use_context();
     let LocalNoteLinkRepo(link_repo) = use_context::<LocalNoteLinkRepo>();
@@ -706,6 +735,41 @@ pub fn provide_local_app_signals() {
     use_context_provider(|| {
         crate::plugins::markdown::render::WikiLinkImageResolver(wikilink_image_resolver)
     });
+
+    // Standard `![alt](path)` resolver: when `path` is a vault-relative
+    // blob (e.g. `.operon/images/<sha>.png` produced by paste-image), turn
+    // it into a `data:` URL so wry's webview can actually render it.
+    // External URLs (http/https/data:) and anything that fails to resolve
+    // pass through as `None`, leaving the literal `dest` on the `<img>`.
+    let vault_for_md_img = vault_for_img;
+    let markdown_image_resolver = use_hook(move || {
+        Callback::new(move |dest: String| -> Option<String> {
+            let trimmed = dest.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            // Bypass absolute URLs and already-resolved data URLs.
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.starts_with("http://")
+                || lower.starts_with("https://")
+                || lower.starts_with("data:")
+                || lower.starts_with("file://")
+                || lower.starts_with("bridge://")
+            {
+                return None;
+            }
+            let vault = vault_for_md_img.read().clone()?;
+            // Strip a leading `./` and treat the rest as vault-relative.
+            let rel = trimmed.strip_prefix("./").unwrap_or(trimmed);
+            crate::local_mode::images::data_url_for_blob(
+                &vault,
+                std::path::Path::new(rel),
+            )
+        })
+    });
+    use_context_provider(|| {
+        crate::plugins::markdown::render::MarkdownImageResolver(markdown_image_resolver)
+    });
 }
 
 /// Wraps the Cloud `Shell` for Local Mode. Owns the Local-only keyboard
@@ -722,7 +786,8 @@ pub fn LocalShellOverlay(children: Element) -> Element {
     let SelectedProject(selected_project) = use_context();
     let SelectedNote(selected_note) = use_context();
     let LocalNoteVersion(note_version) = use_context();
-    let ExplorerSearchFocus(search_focus_tick) = use_context();
+    let crate::plugins::local_search::LocalSearchFocus(local_search_focus_tick) = use_context();
+    let crate::shell::state::ActiveActivity(active_activity) = use_context();
     let SettingsOpen(settings_open) = use_context();
     let LocalUsername(username) = use_context();
     // Plans-Phase-9-monaco-desktop (rev 14): `tabs` and `save_action`
@@ -739,7 +804,8 @@ pub fn LocalShellOverlay(children: Element) -> Element {
     let mut multi_selected_setter = multi_selected;
     let mut selected_project_setter = selected_project;
     let mut note_version_setter = note_version;
-    let mut search_focus_tick_setter = search_focus_tick;
+    let mut local_search_focus_tick_setter = local_search_focus_tick;
+    let mut active_activity_setter = active_activity;
     let _ = username;
     let _ = settings_open;
     let note_repo_for_keys = note_repo.clone();
@@ -760,7 +826,13 @@ pub fn LocalShellOverlay(children: Element) -> Element {
                     && key.eq_ignore_ascii_case("f")
                 {
                     evt.prevent_default();
-                    search_focus_tick_setter.with_mut(|t| *t += 1);
+                    // Activate the dedicated Search panel and bump its focus
+                    // tick so its input grabs focus whether the panel is
+                    // freshly mounted or already visible.
+                    active_activity_setter.set(Some(crate::shell::state::ActivityItemId(
+                        "local-search:default".to_string(),
+                    )));
+                    local_search_focus_tick_setter.with_mut(|t| *t += 1);
                     return;
                 }
                 if with_meta && !mods.contains(Modifiers::ALT) && !mods.contains(Modifiers::SHIFT) {

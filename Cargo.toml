@@ -98,6 +98,13 @@ operon-store = { path = "crates/operon-store" }
 rfd = { version = "0.14", default-features = false, features = ["xdg-portal", "tokio"] }
 # Plans-Phase-6-image-notes: SHA-256 content addressing for image blobs.
 sha2 = "0.10"
+# Read images out of the OS clipboard for the image-note "paste" affordance.
+# WebView clipboard.read() is gated by browser permissions on WebKitGTK/wry,
+# so we bypass JS entirely and ask the OS directly.
+arboard = "3"
+# Encode arboard's RGBA pixel buffer into PNG bytes before attach_blob.
+# Single-format `png` crate is much lighter than the full `image` umbrella.
+png = "0.17"
 
 [features]
 default = ["desktop"]

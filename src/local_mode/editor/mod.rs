@@ -346,6 +346,12 @@ pub fn open_local_note_tab(
 ///
 /// The empty-state branch is the entry point for the "create image
 /// placeholder, attach file later" flow that Operon-Phase-3 introduced.
+///
+/// NOTE: this function is dead since image notes now flow through the
+/// `ImageFormatPlugin` registered in `plugin::registry`. Kept around for
+/// the unit tests of `splice_at_caret` below; remove once the move is
+/// settled.
+#[allow(dead_code)]
 fn try_render_image_view(
     note_id: Uuid,
     note_repo_handle: &crate::local_mode::desktop::LocalNoteRepo,
@@ -583,32 +589,6 @@ fn splice_at_caret(body: &str, pos: usize, insert: &str) -> String {
     format!("{before}{insert}{after}")
 }
 
-/// Tiny inline base64 decoder for the paste-image bridge. Standard
-/// alphabet, ignores whitespace, tolerates missing/extra padding.
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let mut buf: u32 = 0;
-    let mut bits: u32 = 0;
-    for c in s.chars() {
-        let v: u32 = match c {
-            'A'..='Z' => (c as u32) - ('A' as u32),
-            'a'..='z' => (c as u32) - ('a' as u32) + 26,
-            '0'..='9' => (c as u32) - ('0' as u32) + 52,
-            '+' => 62,
-            '/' => 63,
-            '=' | ' ' | '\n' | '\r' | '\t' => continue,
-            _ => return None,
-        };
-        buf = (buf << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((buf >> bits) & 0xff) as u8);
-        }
-    }
-    Some(out)
-}
-
 /// Save button rendered inside the editor toolbar. Calls the installed
 /// `LocalSaveAction` on click.
 #[component]
@@ -657,6 +637,13 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
     // splice through this so Monaco's buffer stays in sync with the
     // `Tab.content` mirror Rust holds.
     let monaco_channel: Signal<Option<MonacoChannel>> = use_signal(|| None);
+    // Flips true once MonacoEditorHost receives the JS `{type:"mounted"}`
+    // handshake. Splice messages sent to `monaco_channel` *before* this
+    // handshake are silently dropped by the Dioxus eval bridge — same
+    // pre-recv-loop dropping hazard the `setContent` path in
+    // `editor_host.rs:339-348` handles. The paste handler waits on this
+    // signal in addition to `monaco_channel`.
+    let monaco_ready_for_paste: Signal<bool> = use_signal(|| false);
 
     // Plans-Phase-6-image-notes: install a JS paste listener that captures
     // clipboard image bytes and posts them back via dioxus.send. We
@@ -671,46 +658,128 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
             project_repo_for_image.clone();
         let crate::local_mode::desktop::CurrentVaultRoot(vault_for_paste) =
             vault_for_image.clone();
+        // The new child image-note must show up in the explorer immediately
+        // after paste; bumping `LocalNoteVersion` re-fetches the project's
+        // note list. The existing splice updates the markdown body, but
+        // without this bump the parent's child list is stale.
+        let crate::local_mode::explorer::LocalNoteVersion(mut note_version_for_paste) =
+            use_context::<crate::local_mode::explorer::LocalNoteVersion>();
         use_future(move || {
             let note_repo = note_repo_for_paste.clone();
             let project_repo = project_repo_for_paste.clone();
             let vault_signal = vault_for_paste;
             async move {
-                // Bind the listener once. dioxus.send messages flow through
-                // this eval handle's recv() future.
+                // Idempotent paste-listener install via a capture-phase
+                // `keydown` on document. Capture phase runs *before*
+                // Monaco's own keydown handler, so even if Monaco
+                // `stopPropagation`s, our message still goes out. We do
+                // NOT `preventDefault`, so Monaco's native text paste
+                // still proceeds for non-image clipboards (arboard
+                // returns ContentNotAvailable and the Rust loop simply
+                // skips). The wired-once guard prevents accumulating
+                // listeners across hot reloads / tab re-mounts.
+                // The `dioxus.send` reference inside this eval string is
+                // bound to THIS eval's query slot. If we kept a single
+                // `.current` pointer per the wired-once pattern, any
+                // earlier editor mount that has since unmounted would
+                // leave a *stale* function on `.current` whose
+                // `dioxus.send` throws `null is not an object (window
+                // .getQuery(N).rustSend)`. Instead we keep a stack of
+                // dispatchers — every mount pushes; a paste tries the
+                // latest, falling through to the previous on failure.
+                // Dead entries are popped lazily when their `send`
+                // throws. Listeners are registered globally once.
+                // The keydown filter is intentionally lax: we fire any
+                // time a Monaco textarea is *mounted* in the DOM, not
+                // only when it has focus. Users routinely click a note
+                // in the explorer (focus → row) and then Ctrl+V without
+                // first clicking back into the editor — the previous
+                // `activeElement.classList.contains('inputarea')` gate
+                // silently swallowed those pastes.
+                //
+                // The image-note empty-state has its own keydown listener
+                // gated on `[data-testid="image-note-empty"]`, so on an
+                // image-note tab Monaco isn't mounted and this listener
+                // does nothing. Each markdown editor tab pushes its own
+                // dispatcher; the broadcast goes to all live ones, and
+                // the Rust handler short-circuits unless the active
+                // tab id matches its own (`self_tab_id` check below).
+                // Always replace the keydown handler on each install. The
+                // previous design used a wired-once `__operonMarkdownPasteWired`
+                // flag which persisted across hot reloads — meaning any
+                // older code's listener (with old filter logic) stayed
+                // attached forever and a new build's listener never
+                // installed. Now we track the current handler under a
+                // known name and remove it before adding the fresh one.
                 let mut eval = document::eval(
-                    "document.addEventListener('paste', async function(e) { \
-                        if (!e.clipboardData) return; \
-                        for (const item of e.clipboardData.items) { \
-                            if (item.kind === 'file' && item.type && item.type.startsWith('image/')) { \
-                                const blob = item.getAsFile(); \
-                                if (!blob) continue; \
-                                const buf = await blob.arrayBuffer(); \
-                                const u8 = new Uint8Array(buf); \
-                                let bin = ''; \
-                                for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]); \
-                                const b64 = btoa(bin); \
-                                dioxus.send({ mime: item.type, name: blob.name || 'pasted.png', b64 }); \
-                            } \
+                    "(function() { \
+                        if (!window.__operonMarkdownPasteSenders) { \
+                            window.__operonMarkdownPasteSenders = []; \
                         } \
-                    });",
+                        window.__operonMarkdownPasteSend = function(payload) { \
+                            const list = window.__operonMarkdownPasteSenders; \
+                            const stillAlive = []; \
+                            for (let i = 0; i < list.length; i++) { \
+                                try { list[i](payload); stillAlive.push(list[i]); } \
+                                catch (e) { /* dead, skip */ } \
+                            } \
+                            window.__operonMarkdownPasteSenders = stillAlive; \
+                        }; \
+                        if (window.__operonMarkdownPasteHandler) { \
+                            document.removeEventListener('keydown', window.__operonMarkdownPasteHandler, true); \
+                        } \
+                        window.__operonMarkdownPasteHandler = function(e) { \
+                            if (!((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey)) return; \
+                            if (e.key !== 'v' && e.key !== 'V') return; \
+                            if (!document.querySelector('textarea.inputarea')) return; \
+                            console.log('operon: markdown keydown intercepted, dispatching'); \
+                            window.__operonMarkdownPasteSend({ request: 'paste' }); \
+                        }; \
+                        document.addEventListener('keydown', window.__operonMarkdownPasteHandler, true); \
+                        console.log('operon: markdown paste handler (re)installed'); \
+                        window.__operonMarkdownPasteSenders.push(function(payload) { dioxus.send(payload); }); \
+                        console.log('operon: markdown dispatcher pushed; stack size now', window.__operonMarkdownPasteSenders.length); \
+                    })();",
                 );
+                let self_tab_id = tab_id;
                 loop {
                     let msg: serde_json::Value = match eval.recv().await {
                         Ok(v) => v,
                         Err(_) => break,
                     };
-                    let mime = msg.get("mime").and_then(|v| v.as_str()).unwrap_or("");
-                    let name = msg
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("pasted")
-                        .to_string();
-                    let b64 = msg.get("b64").and_then(|v| v.as_str()).unwrap_or("");
-                    let bytes = match base64_decode(b64) {
-                        Some(b) => b,
-                        None => continue,
-                    };
+                    // Single source of truth: arboard reads the OS clipboard
+                    // directly, sidestepping wry/WebKitGTK's broken JS
+                    // clipboardData.items behavior. ContentNotAvailable is
+                    // the common "user pasted text only" case — skip and
+                    // let Monaco's native text paste proceed.
+                    if msg.get("request").and_then(|v| v.as_str()) != Some("paste") {
+                        continue;
+                    }
+                    // Tab-affinity gate. The keydown listener broadcasts to
+                    // every live markdown editor's dispatcher; only the
+                    // editor whose tab is *currently active* should act,
+                    // otherwise N open markdown tabs would each create N
+                    // child notes for one paste.
+                    let active_tab_id = tabs_for_paste.read().active().map(|t| t.id);
+                    if active_tab_id != Some(self_tab_id) {
+                        continue;
+                    }
+                    let (bytes, mime, name): (Vec<u8>, String, String) =
+                        match crate::util::clipboard::read_clipboard_image_png() {
+                            Ok((b, m)) => (b, m.to_string(), "pasted".to_string()),
+                            Err(e) => {
+                                // Surface arboard errors to stderr so the
+                                // user can see why nothing happened (e.g.
+                                // missing libxcb on Linux). Text-only
+                                // clipboards return `[arboard] No image
+                                // on the clipboard.` here — silent skip
+                                // is correct for that case.
+                                if !e.contains("No image on the clipboard") {
+                                    eprintln!("operon: paste-image: {e}");
+                                }
+                                continue;
+                            }
+                        };
                     // Active tab + parse uuid.
                     let active = tabs_for_paste.read().active().cloned();
                     let Some(tab) = active else { continue };
@@ -734,7 +803,7 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
                     };
                     let Some(project_id) = project_id else { continue };
                     let written =
-                        match crate::local_mode::images::write_image(&vault, &bytes, mime) {
+                        match crate::local_mode::images::write_image(&vault, &bytes, &mime) {
                             Ok(w) => w,
                             Err(e) => {
                                 eprintln!("operon: paste-image write failed: {e}");
@@ -770,33 +839,52 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
                     if let Err(e) = note_repo.set_blob_path(new_note.id, Some(&rel)) {
                         eprintln!("operon: paste-image set_blob_path failed: {e}");
                     }
-                    let short = operon_store::vfs::short_id(new_note.id);
-                    let embed = format!("![[{stem}^{short}]]");
-                    // Plans-Phase-9-monaco-desktop (rev 1): splice via
-                    // Monaco so the inserted text lands at the active
-                    // caret with undo preserved. Monaco's onChange
-                    // mirrors the new content into `Tab.content`; we
-                    // only flip the dirty bit synchronously so save is
-                    // ready immediately after the splice.
-                    if let Some(channel) = *monaco_channel.peek() {
-                        channel.splice(&embed);
-                        tabs_for_paste.write().set_dirty(tab.id, true);
+                    // Standard markdown image syntax. The path is
+                    // vault-relative; the `MarkdownImageResolver` registered
+                    // in `local_mode/desktop.rs` inflates it to a data URL
+                    // at render time so wry can actually display it. We
+                    // normalise to forward slashes so the same body
+                    // round-trips across Linux / macOS / Windows.
+                    let rel_for_md = rel.replace('\\', "/");
+                    let embed = format!("![{stem}]({rel_for_md})");
+                    eprintln!(
+                        "operon: paste-image: created note {} with blob {}; splicing {}",
+                        new_note.id, rel, embed
+                    );
+                    // Append the markdown image embed to `Tab.content`. The
+                    // MonacoEditorHost prop-mirror at
+                    // `editor_host.rs:336-349` sees the updated content
+                    // prop on the next render and pushes it via the
+                    // gated `setContent` path — the same path that loads
+                    // initial note content (which is known-good). This
+                    // bypasses `MonacoChannel.splice` entirely, avoiding
+                    // accumulated stale-eval / dropped-message bugs.
+                    //
+                    // Trade-off: insertion lands at end-of-document, not
+                    // at the cursor. Acceptable for paste-image; precise
+                    // cursor insertion is a separate concern.
+                    let current = tabs_for_paste
+                        .read()
+                        .get(tab.id)
+                        .map(|t| t.content.clone())
+                        .unwrap_or_default();
+                    let prev_len = current.len();
+                    let next = if current.is_empty() {
+                        embed.clone()
+                    } else if current.ends_with('\n') {
+                        format!("{current}{embed}\n")
                     } else {
-                        // No Monaco yet (rare — paste fired before
-                        // mount finished). Append-at-end fallback.
-                        let current = tabs_for_paste
-                            .read()
-                            .get(tab.id)
-                            .map(|t| t.content.clone())
-                            .unwrap_or_default();
-                        let next = if current.ends_with('\n') || current.is_empty() {
-                            format!("{current}{embed}\n")
-                        } else {
-                            format!("{current}\n{embed}\n")
-                        };
-                        tabs_for_paste.write().set_content(tab.id, next);
-                        tabs_for_paste.write().set_dirty(tab.id, true);
-                    }
+                        format!("{current}\n{embed}\n")
+                    };
+                    let next_len = next.len();
+                    tabs_for_paste.write().set_content(tab.id, next);
+                    tabs_for_paste.write().set_dirty(tab.id, true);
+                    eprintln!(
+                        "operon: paste-image: appended {embed} via Tab.content (len {prev_len} -> {next_len})"
+                    );
+                    // Bump note_version so the explorer sees the new child
+                    // image-note immediately under the markdown parent.
+                    note_version_for_paste.with_mut(|v| *v += 1);
                 }
             }
         });
@@ -813,18 +901,19 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
         };
     };
 
-    if let Ok(uuid) = Uuid::parse_str(&tab.note_id) {
-        if let Some(view) = try_render_image_view(
-            uuid,
-            &note_repo_for_image,
-            &project_repo_for_image,
-            &vault_for_image,
-        ) {
-            return view;
-        }
-    }
+    // Plans-Phase-6-image-notes: image notes now flow through
+    // `ImageFormatPlugin` (`plugin::registry`), so they never reach
+    // `LocalNoteEditor`. The unused `_for_image` repo handles below
+    // are kept until the surrounding paste / drop / picker code is
+    // migrated off them in a follow-up cleanup.
+    let _ = (&note_repo_for_image, &project_repo_for_image, &vault_for_image);
 
     let content = tab.content.clone();
+    eprintln!(
+        "operon: LocalNoteEditor render tab={:?} content_len={}",
+        tab_id,
+        content.len()
+    );
 
     // Plans-Phase-6-image-notes: Cmd/Ctrl+Shift+I opens an image picker,
     // writes the chosen file, mints a child image-note under the current
@@ -1195,6 +1284,7 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
                     propagate_content.call(new_content);
                 }),
                 channel_sink: monaco_channel,
+                ready_sink: Some(monaco_ready_for_paste),
                 on_action: on_action,
             }
         }

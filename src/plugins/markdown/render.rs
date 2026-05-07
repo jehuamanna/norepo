@@ -29,6 +29,15 @@ pub struct WikiLinkChecker(pub Callback<String, bool>);
 #[derive(Clone, Copy)]
 pub struct WikiLinkImageResolver(pub Callback<String, Option<String>>);
 
+/// Standard markdown image (`![alt](src)`) source resolver. The Local-Mode
+/// shell installs this so a relative blob path inside a vault (e.g.
+/// `.operon/images/<sha>.png` minted by paste-image) resolves to a
+/// `data:<mime>;base64,…` URL the wry webview can actually render.
+/// External URLs (`http://`, `https://`, `data:`) and unresolved paths
+/// pass through unchanged via `None`.
+#[derive(Clone, Copy)]
+pub struct MarkdownImageResolver(pub Callback<String, Option<String>>);
+
 #[component]
 pub fn MarkdownView(content: String) -> Element {
     // Plans-Phase-5-vfs-wikilinks: post-process the AST to lift `[[…]]` and
@@ -78,7 +87,16 @@ pub fn render_node(n: &MdNode) -> Element {
         MdNode::Link { dest, children, .. } => rsx! {
             a { href: "{dest}", target: "_blank", {render_children(children)} }
         },
-        MdNode::Image { dest, alt } => rsx! { img { src: "{dest}", alt: "{alt}" } },
+        MdNode::Image { dest, alt } => {
+            // Try the local-mode resolver first so vault-relative blob
+            // paths (`.operon/images/<sha>.png`) inflate to a data: URL
+            // the webview can render. Fall back to the literal `dest`
+            // for absolute URLs or unresolvable paths.
+            let resolved = try_consume_context::<MarkdownImageResolver>()
+                .and_then(|MarkdownImageResolver(cb)| cb.call(dest.clone()));
+            let src = resolved.unwrap_or_else(|| dest.clone());
+            rsx! { img { src: "{src}", alt: "{alt}" } }
+        }
         MdNode::Code(c) => rsx! { code { class: "md-inline-code", "{c}" } },
         MdNode::CodeBlock { code, .. } => rsx! { pre { code { class: "md-code-block", "{code}" } } },
         MdNode::BlockQuote(c) => rsx! { blockquote { {render_children(c)} } },

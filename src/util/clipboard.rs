@@ -28,6 +28,49 @@ pub fn copy_text(text: &str) {
     let _ = document::eval(&script);
 }
 
+/// Read an image out of the OS clipboard (bypassing the webview).
+///
+/// `navigator.clipboard.read()` inside the wry webview is gated behind
+/// browser-style permissions — WebKitGTK rejects it with `NotAllowedError`
+/// in the default desktop config — so the image-note "paste" affordance
+/// asks the OS directly via `arboard`. The returned bytes are PNG-encoded
+/// from arboard's RGBA pixel buffer so they slot straight into the
+/// existing `images::write_image` / `attach_blob` path.
+///
+/// Returns the encoded bytes plus the MIME (`"image/png"`). Errors are
+/// short user-facing strings ("No image on the clipboard.", etc.).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn read_clipboard_image_png() -> Result<(Vec<u8>, &'static str), String> {
+    // Errors are prefixed with `[arboard]` so user-facing surfaces can
+    // distinguish them from the JS-bridge paths (`[js-paste]`,
+    // `[js-keydown]`) and from any leaked legacy listener output.
+    let mut clip = arboard::Clipboard::new()
+        .map_err(|e| format!("[arboard] Could not open clipboard: {e}"))?;
+    let img = match clip.get_image() {
+        Ok(img) => img,
+        Err(arboard::Error::ContentNotAvailable) => {
+            return Err("[arboard] No image on the clipboard.".into());
+        }
+        Err(e) => return Err(format!("[arboard] Clipboard read failed: {e}")),
+    };
+    if img.width == 0 || img.height == 0 {
+        return Err("[arboard] Clipboard image has zero dimensions.".into());
+    }
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, img.width as u32, img.height as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| format!("[arboard] PNG header write failed: {e}"))?;
+        writer
+            .write_image_data(&img.bytes)
+            .map_err(|e| format!("[arboard] PNG encode failed: {e}"))?;
+    }
+    Ok((out, "image/png"))
+}
+
 #[cfg(test)]
 mod tests {
     /// `copy_text` calls `document::eval` which requires a Dioxus runtime to

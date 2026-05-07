@@ -46,6 +46,14 @@ impl MonacoChannel {
         let _ = self.eval.send(serde_json::json!({"type":"focus"}));
     }
 
+    /// Reveal a 1-indexed line, place the caret at column 1, and focus.
+    /// Mirrors the wasm path's `EditorCommand::RevealLine(n)`.
+    pub fn reveal_line(&self, line_number: u32) {
+        let _ = self
+            .eval
+            .send(serde_json::json!({"type":"revealLine","value":line_number}));
+    }
+
     /// Insert `text` at Monaco's current caret position. JS-side
     /// computes the caret from `handle.snapshot()`, so the Rust caller
     /// doesn't need to round-trip the cursor offset. Falls back to
@@ -53,9 +61,17 @@ impl MonacoChannel {
     /// snapshots `getOffsetAt(getPosition())`, which clamps to model
     /// length).
     pub fn splice(&self, text: &str) {
-        let _ = self
+        eprintln!(
+            "operon: MonacoChannel::splice eval.send len={} preview={:?}",
+            text.len(),
+            &text.chars().take(40).collect::<String>()
+        );
+        let r = self
             .eval
             .send(serde_json::json!({"type":"splice","text":text}));
+        if let Err(e) = r {
+            eprintln!("operon: MonacoChannel::splice eval.send FAILED: {e:?}");
+        }
     }
 }
 
@@ -80,6 +96,16 @@ pub fn MonacoEditorHost(
     /// system. Optional so cloud callers can ignore.
     #[props(default)]
     on_action: Option<EventHandler<String>>,
+    /// Mirror of the host's private `monaco_ready: Signal<bool>` for the
+    /// parent. Flips true when the JS bootstrap finishes mounting Monaco
+    /// and emits `{type:"mounted"}`. The paste / splice handlers in
+    /// `LocalNoteEditor` gate their `MonacoChannel.splice(...)` calls on
+    /// this so the message isn't sent into the void before the JS recv
+    /// loop has started — see the long comment on the existing
+    /// `setContent` gate (rev 19) for why pre-handshake messages are
+    /// silently dropped.
+    #[props(default)]
+    ready_sink: Option<Signal<bool>>,
 ) -> Element {
     // The `data-*` attributes let Playwright + wasm-bindgen tests assert the mount fired.
     // Capability-honest: this surface only renders when the active plugin claims `EDIT`,
@@ -147,12 +173,12 @@ pub fn MonacoEditorHost(
                             try {{
                                 await import('bridge://localhost/index.js');
                             }} catch (impErr) {{
-                                dioxus.send({{type:"error", message:"import failed: "+String(impErr && impErr.message || impErr)}});
+                                try {{ dioxus.send({{type:"error", message:"import failed: "+String(impErr && impErr.message || impErr)}}); }} catch (_) {{}}
                                 return;
                             }}
                         }}
                         if (!window.operonBridge) {{
-                            dioxus.send({{type:"error", message:"bridge not loaded"}});
+                            try {{ dioxus.send({{type:"error", message:"bridge not loaded"}}); }} catch (_) {{}}
                             return;
                         }}
                         // Plans-Phase-9-monaco-desktop (rev 14): the
@@ -171,7 +197,7 @@ pub fn MonacoEditorHost(
                             attempts++;
                         }}
                         if (!target) {{
-                            dioxus.send({{type:"error", message:"host element not found"}});
+                            try {{ dioxus.send({{type:"error", message:"host element not found"}}); }} catch (_) {{}}
                             return;
                         }}
                         const handle = await window.operonBridge.mount(target, {{
@@ -187,9 +213,24 @@ pub fn MonacoEditorHost(
                         // setContent so Rust doesn't see its own write
                         // bounce back as user input.
                         let suppress = false;
+                        // Wrap dioxus.send in try/catch — Monaco keeps
+                        // firing onChange events on this handle even
+                        // after the Rust-side `Eval` has been dropped
+                        // (e.g. tab unmount, hot reload). The stale
+                        // dioxus.send then throws `null is not an object
+                        // (window.getQuery(N).rustSend)` and floods the
+                        // console. Same protection for the keydown +
+                        // mounted senders below.
+                        const safeSend = (msg) => {{
+                            try {{ dioxus.send(msg); }} catch (e) {{ /* eval dropped */ }}
+                        }};
                         handle.onChange((c) => {{
                             if (suppress) return;
-                            dioxus.send({{type:"change", value:c}});
+                            // Respect the cross-eval suppress flag so the
+                            // direct setContent path can also silence
+                            // bounce-back changes.
+                            if (window.__operon_suppress_change && window.__operon_suppress_change['{host_id}']) return;
+                            safeSend({{type:"change", value:c}});
                         }});
                         // Plans-Phase-9-monaco-desktop: capture-phase
                         // keybindings Monaco normally swallows (Cmd+S,
@@ -209,12 +250,14 @@ pub fn MonacoEditorHost(
                             if (!action) return;
                             ev.preventDefault();
                             ev.stopPropagation();
-                            dioxus.send({{type:"keyaction", action}});
+                            safeSend({{type:"keyaction", action}});
                         }};
                         window.addEventListener("keydown", onKey, true);
-                        dioxus.send({{type:"mounted"}});
+                        safeSend({{type:"mounted"}});
+                        try {{ console.log("operon: monaco recv loop START", '{host_id}'); }} catch (e) {{}}
                         while (true) {{
                             const msg = await dioxus.recv();
+                            try {{ console.log("operon: monaco recv", '{host_id}', msg && msg.type); }} catch (e) {{}}
                             if (!msg || typeof msg !== "object") continue;
                             switch (msg.type) {{
                                 case "setContent":
@@ -230,6 +273,22 @@ pub fn MonacoEditorHost(
                                         const text = typeof msg.text === "string" ? msg.text : "";
                                         const pos = Math.min(state.cursor || 0, old.length);
                                         const next = old.slice(0, pos) + text + old.slice(pos);
+                                        // Diagnostic: the user has seen
+                                        // splice messages logged from Rust
+                                        // but no change in Monaco. Surface
+                                        // the JS-side state too so we can
+                                        // tell if the insert happened.
+                                        try {{
+                                            console.log("operon: splice", {{
+                                                hostId: '{host_id}',
+                                                cursor: state.cursor,
+                                                oldLen: old.length,
+                                                textLen: text.length,
+                                                pos,
+                                                nextLen: next.length,
+                                                preview: next.slice(Math.max(0, pos-10), pos+text.length+10),
+                                            }});
+                                        }} catch (e) {{}}
                                         suppress = true;
                                         try {{ handle.setContent(next); }} finally {{ suppress = false; }}
                                         handle.restore({{
@@ -239,11 +298,19 @@ pub fn MonacoEditorHost(
                                         }});
                                         // Manually emit the change so
                                         // Rust mirrors the new content.
-                                        dioxus.send({{type:"change", value:next}});
+                                        safeSend({{type:"change", value:next, source:"splice"}});
                                     }}
                                     break;
                                 case "focus":
                                     handle.dispatch("Focus");
+                                    break;
+                                case "revealLine":
+                                    {{
+                                        const n = (typeof msg.value === "number" && msg.value > 0)
+                                            ? Math.floor(msg.value)
+                                            : 1;
+                                        handle.dispatch("RevealLine:" + n);
+                                    }}
                                     break;
                                 case "dispose":
                                     window.removeEventListener("keydown", onKey, true);
@@ -253,7 +320,7 @@ pub fn MonacoEditorHost(
                             }}
                         }}
                     }} catch (e) {{
-                        dioxus.send({{type:"error", message:String(e && e.message || e)}});
+                        try {{ dioxus.send({{type:"error", message:String(e && e.message || e)}}); }} catch (_) {{}}
                     }}
                 }})();"#,
                 host_id = host_id,
@@ -263,15 +330,22 @@ pub fn MonacoEditorHost(
             document::eval(&script)
         });
 
-        // Plans-Phase-9-monaco-desktop (rev 1): expose a channel handle
-        // to the parent (if it asked for one). The channel is just the
-        // Eval (Copy) wrapped in a typed setContent/focus surface; any
-        // messages enqueued before the JS-side recv loop is ready buffer
-        // and dispatch when it catches up.
+        // Plans-Phase-9-monaco-desktop (rev 1, fix): expose this mount's
+        // channel handle to the parent. We MUST overwrite any stale
+        // value the parent's signal holds — when this `MonacoEditorHost`
+        // re-mounts (e.g. after a tab switch or Edit↔Split toggle, or
+        // even just after a hot reload during dev), `use_hook` mints a
+        // new `eval_handle` but the parent's `monaco_channel` Signal
+        // persists with the dead eval from the previous mount. The
+        // earlier `if peek().is_none()` guard kept that stale value,
+        // so paste-image / wikilink splices silently dropped because
+        // they were posting into an Eval whose JS recv loop had ended.
+        // `use_hook` runs once per mount so this still avoids extra
+        // writes on every render.
         if let Some(mut sink) = channel_sink {
-            if sink.peek().is_none() {
+            use_hook(move || {
                 sink.set(Some(MonacoChannel { eval: eval_handle }));
-            }
+            });
         }
 
         // Plans-Phase-9-monaco-desktop (rev 19): gate the content push on
@@ -297,16 +371,96 @@ pub fn MonacoEditorHost(
         let last_pushed: Rc<RefCell<String>> =
             use_hook(|| Rc::new(RefCell::new(content.clone())));
         let mut monaco_ready: Signal<bool> = use_signal(|| false);
+        // Diagnostic: trace each render so we can tell whether the
+        // parent's `content` prop is actually being threaded through
+        // when Tab.content is written from an async paste handler.
+        eprintln!(
+            "operon: MonacoEditorHost render: ready={} content_len={} last_pushed_len={}",
+            *monaco_ready.read(),
+            content.len(),
+            last_pushed.borrow().len()
+        );
+        // Mirror the private readiness flag into the parent's optional
+        // sink so `LocalNoteEditor` can gate `MonacoChannel.splice` on
+        // the `{type:"mounted"}` handshake. Same drop-before-recv-starts
+        // hazard the existing `setContent` push handles.
+        if let Some(mut rsink) = ready_sink {
+            let live = *monaco_ready.read();
+            if *rsink.peek() != live {
+                rsink.set(live);
+            }
+        }
         {
             let ready = *monaco_ready.read();
             let needs_push = ready && *last_pushed.borrow() != content;
             if needs_push {
-                let _ = eval_handle.send(serde_json::json!({
+                eprintln!(
+                    "operon: MonacoEditorHost prop-mirror PUSH setContent (len {})",
+                    content.len()
+                );
+                // Two-pronged push for max reliability:
+                //   1. Send through the bootstrap recv loop (the proven
+                //      path on paper). If Dioxus drops it (we have
+                //      evidence the recv queue is unreliable across
+                //      multiple sends from the same eval handle), the
+                //      backup below fires on the same render.
+                //   2. Fresh `document::eval` script that grabs the
+                //      stored `window.__operon_monaco_handles[hostId]`
+                //      and calls `handle.setContent` directly. No
+                //      queue, no recv loop dependency. We tag a global
+                //      suppress flag for this host so the resulting
+                //      onChange doesn't bounce back as user input.
+                match eval_handle.send(serde_json::json!({
                     "type": "setContent",
                     "value": content.clone(),
-                }));
+                })) {
+                    Ok(()) => eprintln!("operon: prop-mirror eval.send OK"),
+                    Err(e) => eprintln!("operon: prop-mirror eval.send Err: {e:?}"),
+                }
+                let host_id_json = serde_json::to_string(&host_id)
+                    .unwrap_or_else(|_| String::from("\"\""));
+                let content_json = serde_json::to_string(&content)
+                    .unwrap_or_else(|_| String::from("\"\""));
+                let direct_script = format!(
+                    "(function() {{ \
+                        const hid = {host_id_json}; \
+                        const h = (window.__operon_monaco_handles || {{}})[hid]; \
+                        if (!h) {{ console.warn('operon: direct setContent: no handle for', hid); return; }} \
+                        window.__operon_suppress_change = window.__operon_suppress_change || {{}}; \
+                        window.__operon_suppress_change[hid] = true; \
+                        try {{ h.setContent({content_json}); console.log('operon: direct setContent OK', hid, 'len', {len}); }} \
+                        catch (e) {{ console.warn('operon: direct setContent threw', hid, e); }} \
+                        finally {{ window.__operon_suppress_change[hid] = false; }} \
+                        try {{ if (typeof h.layout === 'function') h.layout(); }} catch (e) {{}} \
+                    }})();",
+                    len = content.len(),
+                );
+                let _ = document::eval(&direct_script);
                 *last_pushed.borrow_mut() = content.clone();
             }
+        }
+
+        // Reveal-line request: a click in the LocalSearch panel writes
+        // `(note_id, line)` into this signal. Fire whenever the signal is
+        // touched AND Monaco is mounted (`monaco_ready`). The mount-handshake
+        // path on first open is covered by the same effect because reading
+        // both signals subscribes us to either one transitioning.
+        let crate::editor::RequestEditorRevealLine(reveal_request) = use_context();
+        {
+            let mut reveal_request_setter = reveal_request;
+            let note_id_for_reveal = note_id.clone();
+            let eval_for_reveal = eval_handle;
+            use_effect(move || {
+                let ready = *monaco_ready.read();
+                let req = reveal_request_setter.read().clone();
+                let Some((target_note, line)) = req else { return };
+                if !ready || target_note != note_id_for_reveal {
+                    return;
+                }
+                let _ = eval_for_reveal
+                    .send(serde_json::json!({"type":"revealLine","value":line}));
+                reveal_request_setter.set(None);
+            });
         }
 
         // Drive the JS → Rust channel. Each `change` becomes an
@@ -324,6 +478,7 @@ pub fn MonacoEditorHost(
                 let kind = msg.get("type").and_then(|v| v.as_str());
                 match kind {
                     Some("mounted") => {
+                        eprintln!("operon: monaco mounted handshake received (host scope)");
                         monaco_ready.set(true);
                     }
                     Some("change") => {
@@ -389,6 +544,7 @@ pub fn MonacoEditorHost(
 
         use crate::editor::{
             BackendInit, EditorBackend, EditorCommand, MonacoBackend, RequestEditorFocus,
+            RequestEditorRevealLine,
         };
         use crate::theme::{editor_theme, Theme};
 
@@ -398,6 +554,7 @@ pub fn MonacoEditorHost(
         // Plans-Phase-2-editor-auto-focus: read the app-scope focus-request
         // signal so we can grant focus when our note id matches.
         let RequestEditorFocus(mut focus_request) = use_context();
+        let RequestEditorRevealLine(mut reveal_request) = use_context();
 
         // Mount once on first render with the host element. Re-runs are safe — MonacoBackend
         // tracks `disposed` internally and stale calls are no-ops.
@@ -444,6 +601,15 @@ pub fn MonacoEditorHost(
                         bk.borrow().dispatch(EditorCommand::Focus);
                         focus_request.set(None);
                     }
+                    // Reveal-line: same idiom — dispatch + clear if the
+                    // pending request targets our note id.
+                    let pending_reveal = reveal_request.read().clone();
+                    if let Some((target, line)) = pending_reveal {
+                        if target == note_id_capture.as_str() {
+                            bk.borrow().dispatch(EditorCommand::RevealLine(line));
+                            reveal_request.set(None);
+                        }
+                    }
                 }
             });
         });
@@ -469,6 +635,21 @@ pub fn MonacoEditorHost(
             // async branch will take care of it on first mount.
             bk.borrow().dispatch(EditorCommand::Focus);
             focus_request.set(None);
+        });
+
+        // Reveal-line activation: same pattern as focus, fires on signal
+        // change so a click into an already-mounted tab still scrolls.
+        let backend_for_reveal = backend;
+        let note_id_for_reveal = note_id.clone();
+        use_effect(move || {
+            let pending = reveal_request.read().clone();
+            let Some((target, line)) = pending else { return };
+            if target != note_id_for_reveal {
+                return;
+            }
+            let bk = backend_for_reveal.read().clone();
+            bk.borrow().dispatch(EditorCommand::RevealLine(line));
+            reveal_request.set(None);
         });
 
         // Plans-Phase-7-clear-focus-on-dispose: when this editor host
