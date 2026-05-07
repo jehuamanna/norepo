@@ -273,6 +273,29 @@ pub fn MonacoEditorHost(
             }
         }
 
+        // Plans-Phase-9-monaco-desktop (rev 16): push content prop
+        // changes into Monaco. The bootstrap script bakes the FIRST
+        // mount's content into `editor.create({value, ...})`; without
+        // a follow-up `setContent`, switching tabs (or opening a new
+        // tab while the same `MonacoEditorHost` instance is reused
+        // across `tab_id` changes) leaves Monaco displaying the
+        // *previous* tab's buffer regardless of what
+        // `MonacoEditorHost`'s content prop now says. The JS side
+        // suppresses the resulting `change` event so this can't
+        // bounce back into `tabs.set_content`.
+        let mut last_pushed: Signal<String> = use_signal(|| content.clone());
+        let current_content = content.clone();
+        use_effect(move || {
+            let same = *last_pushed.read() == current_content;
+            if !same {
+                let _ = eval_handle.send(serde_json::json!({
+                    "type": "setContent",
+                    "value": current_content.clone(),
+                }));
+                last_pushed.set(current_content.clone());
+            }
+        });
+
         // Drive the JS → Rust channel. Each `change` becomes an
         // `on_change` invocation matching the wasm path's contract.
         let on_change_for_loop = on_change;
