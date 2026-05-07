@@ -600,6 +600,11 @@ pub fn ExplorerPanel() -> Element {
     // app-scope signal and grants focus when its note id matches. Gated on
     // `renaming_note.is_none()` so the rename input keeps the caret.
     let crate::editor::RequestEditorFocus(mut request_editor_focus) = use_context();
+    // Plans-Phase-9-monaco-desktop (rev 15): clone the persistence
+    // handle once for the on_select_note closure (and any future
+    // async loaders) so the spawned future doesn't capture the
+    // outer context handle.
+    let persistence_for_select = persistence.clone();
     let on_select_note = use_callback(move |note_id: Uuid| {
         selected_note.set(Some(note_id));
         // Find note metadata to get the title; fall back to the id.
@@ -610,13 +615,70 @@ pub fn ExplorerPanel() -> Element {
             .find(|n| n.id == note_id)
             .map(|n| n.title.clone())
             .unwrap_or_else(|| note_id.to_string());
-        let _ = open_local_note_tab(
-            tabs_for_select,
-            scheduler_for_select.clone(),
-            note_id,
-            title,
-            String::new(),
-        );
+
+        // Plans-Phase-9-monaco-desktop (rev 15): "click on note in
+        // explorer" buffer-init logic.
+        // 1. If an Edit-mode tab already exists, focus it (no new
+        //    buffer — keep what the user typed).
+        // 2. Otherwise, if any tab (View / Split / LivePreview) for
+        //    this note exists, copy its in-memory buffer into the
+        //    new Edit tab so the user keeps working from the same
+        //    text they just had open as a preview.
+        // 3. If no tab exists at all, spawn an async load from the
+        //    Persistence trait (SQLite for desktop, OPFS for web)
+        //    and open the tab with the saved content. Falls back to
+        //    empty if the note doesn't exist on disk yet.
+        let note_id_str = note_id.to_string();
+        let existing_edit = {
+            let snap = tabs_for_select.read();
+            let id = snap
+                .iter()
+                .find(|t| t.note_id == note_id_str
+                    && matches!(t.mode, crate::editor::EditorMode::Edit))
+                .map(|t| t.id);
+            id
+        };
+        if let Some(tid) = existing_edit {
+            tabs_for_select.write().activate(tid);
+        } else {
+            let inherited = {
+                let snap = tabs_for_select.read();
+                let c = snap
+                    .iter()
+                    .find(|t| t.note_id == note_id_str)
+                    .map(|t| t.content.clone());
+                c
+            };
+            if let Some(content) = inherited {
+                let _ = open_local_note_tab(
+                    tabs_for_select,
+                    scheduler_for_select.clone(),
+                    note_id,
+                    title,
+                    content,
+                );
+            } else {
+                // No sibling tab — load from disk asynchronously,
+                // then open the new tab with the loaded body.
+                let pers = persistence_for_select.clone();
+                let scheduler = scheduler_for_select.clone();
+                let tabs_handle = tabs_for_select;
+                let note_id_load = note_id_str.clone();
+                spawn(async move {
+                    let content = match pers.load(&note_id_load).await {
+                        Ok(bytes) => String::from_utf8(bytes).unwrap_or_default(),
+                        Err(_) => String::new(),
+                    };
+                    let _ = open_local_note_tab(
+                        tabs_handle,
+                        scheduler,
+                        note_id,
+                        title,
+                        content,
+                    );
+                });
+            }
+        }
         let _ = tabs_for_select.write();
         // Plans-Phase-2: grant focus only when no rename input is alive.
         if renaming_note.read().is_none() {
