@@ -649,33 +649,43 @@ pub fn ExplorerPanel() -> Element {
                     .map(|t| t.content.clone());
                 c
             };
-            if let Some(content) = inherited {
-                let _ = open_local_note_tab(
-                    tabs_for_select,
-                    scheduler_for_select.clone(),
-                    note_id,
-                    title,
-                    content,
-                );
-            } else {
-                // No sibling tab — load from disk asynchronously,
-                // then open the new tab with the loaded body.
+            // Plans-Phase-9-monaco-desktop (rev 18): open the tab
+            // synchronously with whatever we know right now (sibling
+            // buffer if any, else empty). main_area re-renders
+            // immediately and Monaco mounts. Then, in the
+            // no-sibling case, spawn an async load from disk and
+            // push the loaded body into the tab via `set_content`
+            // — Monaco's prop-mirror effect (rev 17) re-pushes the
+            // new content into the editor. Earlier rev gated the
+            // entire `open_local_note_tab` call on the async load,
+            // so until the load resolved the active tab didn't
+            // change and main_area kept showing the previous note.
+            let synchronous_content = inherited
+                .as_ref()
+                .cloned()
+                .unwrap_or_default();
+            let new_tab_id = open_local_note_tab(
+                tabs_for_select,
+                scheduler_for_select.clone(),
+                note_id,
+                title.clone(),
+                synchronous_content,
+            );
+            if inherited.is_none() {
+                // Schedule the disk load. Updates the tab's buffer
+                // when the bytes arrive; the prop-mirror effect in
+                // `MonacoEditorHost` will push them into Monaco.
                 let pers = persistence_for_select.clone();
-                let scheduler = scheduler_for_select.clone();
-                let tabs_handle = tabs_for_select;
+                let mut tabs_handle = tabs_for_select;
                 let note_id_load = note_id_str.clone();
                 spawn(async move {
                     let content = match pers.load(&note_id_load).await {
                         Ok(bytes) => String::from_utf8(bytes).unwrap_or_default(),
-                        Err(_) => String::new(),
+                        Err(_) => return, // no disk row yet (fresh note)
                     };
-                    let _ = open_local_note_tab(
-                        tabs_handle,
-                        scheduler,
-                        note_id,
-                        title,
-                        content,
-                    );
+                    if !content.is_empty() {
+                        tabs_handle.write().set_content(new_tab_id, content);
+                    }
                 });
             }
         }
