@@ -78,6 +78,13 @@ pub struct NoteRowProps {
     pub current_mode: Option<EditorMode>,
     /// Switch the note's editor mode (opens the tab if needed).
     pub on_set_mode: Callback<(Uuid, EditorMode)>,
+    /// Plans-Phase-4-multiselect-aria: bulk variants invoked from the
+    /// context menu when the right-clicked row is itself in
+    /// `MultiSelected` (size >= 2). Cut/Copy populate the `BulkClipboard`;
+    /// Delete raises the existing `pending_bulk_delete` confirmation flag.
+    pub on_bulk_cut: Callback<()>,
+    pub on_bulk_copy: Callback<()>,
+    pub on_bulk_request_delete: Callback<()>,
 }
 
 #[component]
@@ -159,6 +166,15 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let on_drop_image_file = props.on_drop_image_file;
     let current_mode = props.current_mode;
     let on_set_mode = props.on_set_mode;
+    let on_bulk_cut = props.on_bulk_cut;
+    let on_bulk_copy = props.on_bulk_copy;
+    let on_bulk_request_delete = props.on_bulk_request_delete;
+    // Plans-Phase-4-multiselect-aria: when this row is part of the
+    // multi-selection AND the set has 2+ items, surface bulk-aware
+    // menu labels ("Cut N items" etc.) and route Cut/Copy/Delete
+    // through the panel-scope bulk callbacks.
+    let bulk_count = multi_selected.read().len();
+    let is_bulk = in_multi && bulk_count >= 2;
 
     let mut row_class = if selected {
         String::from("notes-explorer-row notes-explorer-row-note notes-explorer-row-active group")
@@ -312,18 +328,36 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 })
                 .collect(),
         ),
-        ContextMenuItem::new(
-            "Cut",
-            Callback::new(move |_| {
-                on_cut.call(id);
-            }),
-        ),
-        ContextMenuItem::new(
-            "Copy",
-            Callback::new(move |_| {
-                on_copy.call(id);
-            }),
-        ),
+        if is_bulk {
+            ContextMenuItem::new(
+                format!("Cut {bulk_count} items"),
+                Callback::new(move |_| {
+                    on_bulk_cut.call(());
+                }),
+            )
+        } else {
+            ContextMenuItem::new(
+                "Cut",
+                Callback::new(move |_| {
+                    on_cut.call(id);
+                }),
+            )
+        },
+        if is_bulk {
+            ContextMenuItem::new(
+                format!("Copy {bulk_count} items"),
+                Callback::new(move |_| {
+                    on_bulk_copy.call(());
+                }),
+            )
+        } else {
+            ContextMenuItem::new(
+                "Copy",
+                Callback::new(move |_| {
+                    on_copy.call(id);
+                }),
+            )
+        },
         paste_item,
         indent_item,
         outdent_item,
@@ -354,12 +388,21 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
             item.enabled = !history.read().redo_is_empty();
             item
         },
-        ContextMenuItem::new(
-            "Delete",
-            Callback::new(move |_| {
-                on_request_delete.call(id);
-            }),
-        ),
+        if is_bulk {
+            ContextMenuItem::new(
+                format!("Delete {bulk_count} items"),
+                Callback::new(move |_| {
+                    on_bulk_request_delete.call(());
+                }),
+            )
+        } else {
+            ContextMenuItem::new(
+                "Delete",
+                Callback::new(move |_| {
+                    on_request_delete.call(id);
+                }),
+            )
+        },
     ]);
 
     let caret_glyph = if has_children {
@@ -580,7 +623,24 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                         } else if src == id || drag_descendants.read().contains(&id) {
                             Some(Err(()))
                         } else {
-                            Some(Ok(pos))
+                            // Plans-Phase-4-multiselect-aria: if the drag
+                            // source is part of a 2+ multi-set, every member
+                            // must share the same `SiblingGroup` (same
+                            // parent_id, or all WorkspaceRoot for projects).
+                            // A non-sibling set surfaces a forbidden
+                            // indicator so users see the rejection during
+                            // drag.
+                            let multi_snap = multi_selected.read().clone();
+                            if multi_snap.contains(&NodeKey::Note(src)) && multi_snap.len() >= 2 {
+                                let notes_snap = notes_by_project_ctx.read();
+                                if !crate::local_mode::explorer::all_siblings(&multi_snap, &notes_snap) {
+                                    Some(Err(()))
+                                } else {
+                                    Some(Ok(pos))
+                                }
+                            } else {
+                                Some(Ok(pos))
+                            }
                         }
                     }
                     _ => None,
@@ -644,37 +704,45 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
             },
             ondrop: move |evt| {
                 evt.prevent_default();
-                // Plans-Phase-6-image-notes: external file drop. If the
-                // event carries any FileData we treat the drop as image
-                // imports (creating child image-notes under this row) and
-                // ignore the in-app DragKind path for this event.
-                let files = evt.data().files();
-                if !files.is_empty() {
-                    for f in files {
-                        let name = f.name();
-                        let lower = name.to_ascii_lowercase();
-                        if !lower.ends_with(".png")
-                            && !lower.ends_with(".jpg")
-                            && !lower.ends_with(".jpeg")
-                            && !lower.ends_with(".webp")
-                            && !lower.ends_with(".gif")
-                            && !lower.ends_with(".svg")
-                            && !lower.ends_with(".avif")
-                        {
-                            continue;
-                        }
-                        let cb = on_drop_image_file;
-                        spawn(async move {
-                            if let Ok(bytes) = f.read_bytes().await {
-                                cb.call((id, bytes.to_vec(), name));
-                            }
-                        });
-                    }
-                    drag_session.set(None);
-                    drop_indicator_setter.set(None);
-                    return;
-                }
+                // An in-app drag (note row in this explorer) wins over any
+                // payload the browser may have stuffed into
+                // `evt.data().files()`. Some image-bearing in-app drags
+                // surface there too (Dioxus desktop / wry shim), and
+                // letting the file-drop branch run for those caused image
+                // notes to be re-imported under the file's stem instead
+                // of moved. `drag_session` is `Some` iff an in-app drag
+                // is in flight, so it is the right discriminator.
                 let kind = *drag_session.read();
+                if kind.is_none() {
+                    // No in-app drag → treat as an OS file drop. Image
+                    // files mint new child image-notes under this row;
+                    // anything else is ignored.
+                    let files = evt.data().files();
+                    if !files.is_empty() {
+                        for f in files {
+                            let name = f.name();
+                            let lower = name.to_ascii_lowercase();
+                            if !lower.ends_with(".png")
+                                && !lower.ends_with(".jpg")
+                                && !lower.ends_with(".jpeg")
+                                && !lower.ends_with(".webp")
+                                && !lower.ends_with(".gif")
+                                && !lower.ends_with(".svg")
+                                && !lower.ends_with(".avif")
+                            {
+                                continue;
+                            }
+                            let cb = on_drop_image_file;
+                            spawn(async move {
+                                if let Ok(bytes) = f.read_bytes().await {
+                                    cb.call((id, bytes.to_vec(), name));
+                                }
+                            });
+                        }
+                        drop_indicator_setter.set(None);
+                        return;
+                    }
+                }
                 let coords = evt.element_coordinates();
                 let pos = classify_drop_position(coords.y, 28.0);
                 // Recompute depth from the drop's own coords — the dragover
@@ -703,10 +771,24 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                     }
                     // Plans-Phase-4-multiselect-aria: if the drag source is
                     // a member of the multi-set, drop the whole set at the
-                    // target. Otherwise just the source.
+                    // target — but only when every member shares the same
+                    // `SiblingGroup`. A mixed-parent (or note+project) set
+                    // already showed a forbidden indicator during dragover;
+                    // reject the drop here too so behavior matches.
                     let set_snap = multi_selected.read().clone();
-                    let multi_drop = set_snap.contains(&NodeKey::Note(src));
+                    let multi_drop = set_snap.contains(&NodeKey::Note(src)) && set_snap.len() >= 2;
                     if multi_drop {
+                        let notes_snap = notes_by_project_ctx.read();
+                        if !crate::local_mode::explorer::all_siblings(&set_snap, &notes_snap) {
+                            drag_session.set(None);
+                            drop_indicator_setter.set(None);
+                            drag_descendants.set(std::collections::BTreeSet::new());
+                            snapped.set(false);
+                            hover_generation.with_mut(|g| *g = g.wrapping_add(1));
+                            chosen_depth.set(0);
+                            return;
+                        }
+                        drop(notes_snap);
                         for k in set_snap.iter() {
                             if let NodeKey::Note(n_id) = k {
                                 if *n_id != id && !descendants_snap.contains(n_id) {

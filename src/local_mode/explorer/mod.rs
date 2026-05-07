@@ -17,8 +17,8 @@ pub use bulk_rename::BulkRenameModal;
 pub use note_row::NoteRow;
 pub use project_row::ProjectRow;
 pub use search::{
-    click_handler as search_click_handler, load_body_cache, BodyCache, ExplorerSearch,
-    ExplorerSearchFocus, ExplorerSearchRepo, ResultsList,
+    click_handler as search_click_handler, debounce_window, load_body_cache, BodyCache,
+    ExplorerSearch, ExplorerSearchRepo, ResultsList,
 };
 pub use tree_node::{flatten_visible, NoteForest};
 pub use tree_state::TreeStateQueue;
@@ -70,6 +70,48 @@ pub enum NodeKey {
 #[derive(Clone, Copy)]
 pub struct MultiSelected(pub Signal<std::collections::BTreeSet<NodeKey>>);
 
+/// Sibling-group classification for the bulk drag/drop guard. Two
+/// `NodeKey`s are siblings iff they map to the same `SiblingGroup`.
+/// Projects collectively share the workspace root; notes share whatever
+/// `parent_id` they sit directly under (regardless of project).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum SiblingGroup {
+    WorkspaceRoot,
+    UnderParent(Option<Uuid>),
+}
+
+fn classify_sibling_group(
+    key: &NodeKey,
+    notes_by_project: &HashMap<Uuid, Vec<LocalNote>>,
+) -> Option<SiblingGroup> {
+    match key {
+        NodeKey::Project(_) => Some(SiblingGroup::WorkspaceRoot),
+        NodeKey::Note(id) => notes_by_project
+            .values()
+            .flat_map(|v| v.iter())
+            .find(|n| &n.id == id)
+            .map(|n| SiblingGroup::UnderParent(n.parent_id)),
+    }
+}
+
+/// True iff every member of `set` resolves to the same [`SiblingGroup`].
+/// An empty / singleton set is trivially "all siblings". Members not
+/// found in `notes_by_project` are skipped (a missing note is treated as
+/// neither violating nor satisfying the rule — the caller's drop logic
+/// already rejects unresolved sources).
+pub(super) fn all_siblings(
+    set: &std::collections::BTreeSet<NodeKey>,
+    notes_by_project: &HashMap<Uuid, Vec<LocalNote>>,
+) -> bool {
+    let mut iter = set
+        .iter()
+        .filter_map(|k| classify_sibling_group(k, notes_by_project));
+    let Some(first) = iter.next() else {
+        return true;
+    };
+    iter.all(|g| g == first)
+}
+
 /// Track the most recently clicked row so Shift+click can compute a range
 /// over the visible flattened tree.
 #[derive(Clone, Copy)]
@@ -105,6 +147,19 @@ pub struct ExplorerUndoCtx {
 /// affected project when this changes.
 #[derive(Clone, Copy)]
 pub struct LocalNoteVersion(pub Signal<u64>);
+
+/// App-scope: which projects are expanded in the workspace tree-state.
+/// Promoted out of the explorer panel so the dedicated search panel can
+/// expand the matching project on click without round-tripping through
+/// `LocalProjectVersion`.
+#[derive(Clone, Copy)]
+pub struct WorkspaceOpenMap(pub Signal<HashMap<String, bool>>);
+
+/// App-scope: shared `TreeStateQueue` instance. Both the explorer and the
+/// search panel enqueue toggles through this queue so the debounced flush
+/// coalesces writes from either panel.
+#[derive(Clone, Copy)]
+pub struct WorkspaceTreeQueueCtx(pub Signal<TreeStateQueue>);
 
 const SCOPE_WORKSPACE: &str = "workspace";
 
@@ -255,11 +310,13 @@ pub fn ExplorerPanel() -> Element {
     let SelectedNote(mut selected_note) = use_context();
     let DragSession(drag_session) = use_context();
     let LocalClipboard(clipboard) = use_context();
+    let crate::local_mode::ui::LocalBulkClipboard(bulk_clipboard) = use_context();
     let tabs: Signal<TabManager> = use_context();
     let save_scheduler: SaveScheduler = use_context();
     let _save_action: LocalSaveAction = use_context();
     let persistence: Arc<dyn Persistence> = use_context();
-    let ExplorerSearchFocus(focus_tick) = use_context();
+    let WorkspaceOpenMap(workspace_open) = use_context();
+    let WorkspaceTreeQueueCtx(tree_queue) = use_context();
 
     // Re-fetch project list when version bumps.
     let projects: Signal<Vec<LocalProject>> = use_signal(Vec::new);
@@ -275,21 +332,9 @@ pub fn ExplorerPanel() -> Element {
         });
     }
 
-    // Workspace-scope tree-state snapshot (which projects are open).
-    let workspace_open: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
-    let mut workspace_open_setter = workspace_open;
-    {
-        let repo = tree_repo.clone();
-        use_effect(move || {
-            // Re-hydrate when the project list changes (covers freshly-created
-            // projects whose state wasn't fetched on first mount).
-            let _ = project_version.read();
-            match repo.snapshot_for_scope(SCOPE_WORKSPACE) {
-                Ok(snap) => workspace_open_setter.set(snap),
-                Err(e) => eprintln!("operon: tree-state snapshot failed: {e}"),
-            }
-        });
-    }
+    // Workspace-scope tree-state snapshot (which projects are open) lives in
+    // app scope (`WorkspaceOpenMap`) so the dedicated search panel shares it.
+    // Hydration also lives in app scope; the explorer just reads.
 
     // Per-project note lists, keyed by project_id. Re-fetched on note_version bump.
     let notes_by_project: Signal<HashMap<Uuid, Vec<LocalNote>>> = use_signal(HashMap::new);
@@ -323,15 +368,13 @@ pub fn ExplorerPanel() -> Element {
     // Per-project note open/closed snapshots, lazily hydrated when a project opens.
     let project_note_open: Signal<HashMap<Uuid, HashMap<String, bool>>> = use_signal(HashMap::new);
 
-    // Tree-state debounce queue.
-    let tree_queue: Signal<TreeStateQueue> = use_signal(|| TreeStateQueue::new(tree_repo.clone()));
+    // Tree-state debounce queue is provided in app scope via
+    // `WorkspaceTreeQueueCtx` so the search panel can enqueue toggles too.
 
-    // ===== Phase-5: search state =====
+    // ===== Phase-5: search state (title-only quick filter) =====
     let search_query: Signal<String> = use_signal(String::new);
-    let search_in_content: Signal<bool> = use_signal(|| false);
     // Debounced query — only flushed 150ms after the user stops typing.
     let debounced_query: Signal<String> = use_signal(String::new);
-    let body_cache: Signal<BodyCache> = use_signal(BodyCache::default);
     // Snapshot of the previously-selected note so Esc can restore focus.
     let prev_selection: Signal<Option<Uuid>> = use_signal(|| None);
 
@@ -383,38 +426,9 @@ pub fn ExplorerPanel() -> Element {
         });
     }
 
-    // Body cache lifecycle: load when in_content flips on; clear when off.
-    {
-        let mut body_cache_setter = body_cache;
-        let p_repo = project_repo.clone();
-        let n_repo = note_repo.clone();
-        let persistence_for_cache = persistence.clone();
-        use_effect(move || {
-            let on = *search_in_content.read();
-            if !on {
-                body_cache_setter.set(BodyCache::default());
-                return;
-            }
-            let Ok(projects) = p_repo.list() else {
-                return;
-            };
-            let mut all_ids: Vec<Uuid> = Vec::new();
-            for p in projects {
-                if let Ok(rows) = n_repo.list_for_project(p.id) {
-                    all_ids.extend(rows.iter().map(|r| r.id));
-                }
-            }
-            let persistence = persistence_for_cache.clone();
-            spawn(async move {
-                let map = search::load_body_cache(all_ids, persistence).await;
-                body_cache_setter.set(BodyCache(Arc::new(map)));
-            });
-        });
-    }
-
-    // Track focus_tick → focus the input. The ExplorerSearch component reads
-    // the focus_tick signal in its onmounted.
-    let _ = focus_tick;
+    // Cross-note content search lives in `crate::plugins::local_search`; the
+    // explorer's input is a title-only quick filter, so there is no body
+    // cache to load here.
 
     let renaming_project: Signal<Option<Uuid>> = use_signal(|| None);
     let pending_delete_project: Signal<Option<Uuid>> = use_signal(|| None);
@@ -1361,6 +1375,11 @@ pub fn ExplorerPanel() -> Element {
     let note_repo_for_bulk_delete = note_repo.clone();
     let project_repo_for_bulk_gc = project_repo.clone();
     let note_repo_for_bulk_gc = note_repo.clone();
+    // Plans-Phase-4-multiselect-aria: bulk-delete now also handles
+    // Project members of the multi-set (per the user's "notes + projects"
+    // scope decision). We delete projects after notes so any project that
+    // was just stripped of children still vanishes.
+    let project_repo_for_bulk_project_delete = project_repo.clone();
     let crate::local_mode::CurrentVaultRoot(vault_root_for_bulk_gc) = use_context();
     let mut tabs_for_bulk_delete = tabs;
     let on_confirm_bulk_delete = use_callback(move |_: ()| {
@@ -1414,6 +1433,7 @@ pub fn ExplorerPanel() -> Element {
         // selection one entry at a time (LIFO via repeated Cmd+Z), which
         // is the same UX as repeated single-delete + undo.
         let mut deleted: usize = 0;
+        let mut deleted_projects: usize = 0;
         for key in snapshot.iter() {
             if let NodeKey::Note(id) = key {
                 let inverse = note_repo_for_bulk_delete.snapshot_subtree(*id).ok();
@@ -1429,6 +1449,28 @@ pub fn ExplorerPanel() -> Element {
                     Err(e) => eprintln!("operon: bulk delete note {id} failed: {e}"),
                 }
             }
+        }
+        // Plans-Phase-4-multiselect-aria: delete project members. Done
+        // after the note loop so project-row gymnastics (children flushed
+        // first) match single-project delete semantics. No undo entry
+        // pushed: the existing single-project delete path doesn't have a
+        // snapshot/restore inverse either, so bulk parity is fine.
+        for key in snapshot.iter() {
+            if let NodeKey::Project(id) = key {
+                match project_repo_for_bulk_project_delete.delete(*id) {
+                    Ok(()) => {
+                        deleted_projects += 1;
+                        if *selected_project.read() == Some(*id) {
+                            selected_project.set(None);
+                        }
+                    }
+                    Err(e) => eprintln!("operon: bulk delete project {id} failed: {e}"),
+                }
+            }
+        }
+        if deleted_projects > 0 {
+            project_version.with_mut(|v| *v += 1);
+            note_version.with_mut(|v| *v += 1);
         }
         if deleted > 0 {
             note_version.with_mut(|v| *v += 1);
@@ -1616,6 +1658,59 @@ pub fn ExplorerPanel() -> Element {
     let mut clipboard_for_copy_p = clipboard;
     let on_copy_project = use_callback(move |id: Uuid| {
         clipboard_for_copy_p.set(Some(Clipboard::copy_project(id)));
+    });
+
+    // Plans-Phase-4-multiselect-aria: row-context bulk variants. Mirror the
+    // keyboard handler in `LocalShellOverlay` (`desktop.rs`): when the
+    // multi-set holds 2+ items, write a `BulkClipboard` and clear the
+    // single-id clipboard so paste can disambiguate. Bulk-delete just
+    // raises the existing confirmation flag — `on_confirm_bulk_delete`
+    // already iterates the set.
+    let mut bulk_clipboard_for_cut = bulk_clipboard;
+    let mut single_clipboard_for_bulk_cut = clipboard;
+    let multi_for_bulk_cut = multi_selected;
+    let on_bulk_cut = use_callback(move |_: ()| {
+        let items: Vec<ClipPayload> = multi_for_bulk_cut
+            .read()
+            .iter()
+            .map(|k| match k {
+                NodeKey::Note(id) => ClipPayload::Note(*id),
+                NodeKey::Project(id) => ClipPayload::Project(*id),
+            })
+            .collect();
+        if items.len() < 2 {
+            return;
+        }
+        bulk_clipboard_for_cut.set(Some(crate::local_mode::ui::BulkClipboard {
+            kind: ClipKind::Cut,
+            items,
+        }));
+        single_clipboard_for_bulk_cut.set(None);
+    });
+    let mut bulk_clipboard_for_copy = bulk_clipboard;
+    let mut single_clipboard_for_bulk_copy = clipboard;
+    let multi_for_bulk_copy = multi_selected;
+    let on_bulk_copy = use_callback(move |_: ()| {
+        let items: Vec<ClipPayload> = multi_for_bulk_copy
+            .read()
+            .iter()
+            .map(|k| match k {
+                NodeKey::Note(id) => ClipPayload::Note(*id),
+                NodeKey::Project(id) => ClipPayload::Project(*id),
+            })
+            .collect();
+        if items.len() < 2 {
+            return;
+        }
+        bulk_clipboard_for_copy.set(Some(crate::local_mode::ui::BulkClipboard {
+            kind: ClipKind::Copy,
+            items,
+        }));
+        single_clipboard_for_bulk_copy.set(None);
+    });
+    let mut bulk_delete_flag_setter = pending_bulk_delete_setter;
+    let on_bulk_request_delete = use_callback(move |_: ()| {
+        bulk_delete_flag_setter.set(true);
     });
 
     // Paste from row context menu (target = row id). Selected note → child;
@@ -1933,8 +2028,6 @@ pub fn ExplorerPanel() -> Element {
     // keystroke re-renders the panel and runs O(notes_total) clones / walks
     // for data the search-results branch never reads.
     let debounced_now = debounced_query.read().clone();
-    let in_content_now = *search_in_content.read();
-    let body_cache_now = body_cache.read().clone();
     let show_results = !debounced_now.trim().is_empty();
 
     // Derive the note (and its enclosing project) currently bound to the
@@ -2036,17 +2129,14 @@ pub fn ExplorerPanel() -> Element {
         note_meta_signal,
         persistence.clone(),
         search_query,
-        search_in_content,
     );
 
     // Esc inside the search input clears query + restores focus to prev_selection.
     let prev_selection_setter = prev_selection;
     let mut search_query_setter = search_query;
-    let mut search_in_content_setter = search_in_content;
     let mut selected_note_for_clear = selected_note;
     let on_search_clear = use_callback(move |_| {
         search_query_setter.set(String::new());
-        search_in_content_setter.set(false);
         if let Some(prev) = *prev_selection_setter.read() {
             selected_note_for_clear.set(Some(prev));
         }
@@ -2113,8 +2203,6 @@ pub fn ExplorerPanel() -> Element {
                     class: "notes-explorer-toolbar-search",
                     ExplorerSearch {
                         query: search_query,
-                        in_content: search_in_content,
-                        focus_tick: focus_tick,
                         on_clear: on_search_clear,
                     }
                 }
@@ -2133,8 +2221,6 @@ pub fn ExplorerPanel() -> Element {
             if show_results {
                 ResultsList {
                     query: debounced_now.clone(),
-                    in_content: in_content_now,
-                    body_cache: body_cache_now.clone(),
                     on_pick: on_search_pick,
                 }
             } else {
@@ -2237,6 +2323,9 @@ pub fn ExplorerPanel() -> Element {
                             on_drop_note_on_note: on_drop_note_on_note,
                             note_modes: note_modes_snapshot.clone(),
                             on_set_note_mode: on_set_note_mode,
+                            on_bulk_cut: on_bulk_cut,
+                            on_bulk_copy: on_bulk_copy,
+                            on_bulk_request_delete: on_bulk_request_delete,
                         }
                     }
                 }
@@ -2485,6 +2574,12 @@ struct ProjectSubtreeProps {
     on_drop_note_on_note: Callback<(Uuid, Uuid, DropPosition, i64)>,
     note_modes: HashMap<Uuid, EditorMode>,
     on_set_note_mode: Callback<(Uuid, EditorMode)>,
+    /// Plans-Phase-4-multiselect-aria: row-context bulk variants. The row
+    /// component decides whether to fire these (when its id is in
+    /// `MultiSelected` and the set has 2+ items) or the per-id callbacks.
+    on_bulk_cut: Callback<()>,
+    on_bulk_copy: Callback<()>,
+    on_bulk_request_delete: Callback<()>,
 }
 
 #[component]
@@ -2560,6 +2655,9 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
             on_paste: props.on_paste_into_project,
             on_drop_project_on_project: props.on_drop_project_on_project,
             on_drop_note_on_project: props.on_drop_note_on_project,
+            on_bulk_cut: props.on_bulk_cut,
+            on_bulk_copy: props.on_bulk_copy,
+            on_bulk_request_delete: props.on_bulk_request_delete,
         }
         for note in visible.into_iter() {
             {
@@ -2611,6 +2709,9 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
                         on_drop_note_on_note: props.on_drop_note_on_note,
                         current_mode: props.note_modes.get(&note.id).copied(),
                         on_set_mode: props.on_set_note_mode,
+                        on_bulk_cut: props.on_bulk_cut,
+                        on_bulk_copy: props.on_bulk_copy,
+                        on_bulk_request_delete: props.on_bulk_request_delete,
                     }
                 }
             }

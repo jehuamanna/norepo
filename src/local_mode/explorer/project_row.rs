@@ -7,7 +7,11 @@ use uuid::Uuid;
 
 use operon_store::repos::NoteKind;
 
-use crate::local_mode::explorer::ExplorerUndoCtx;
+use keyboard_types::Modifiers;
+
+use crate::local_mode::explorer::{
+    ExplorerUndoCtx, LastClicked, MultiSelected, NodeKey, NotesByProjectCtx, VisibleFlat,
+};
 use crate::local_mode::ui::{
     classify_drop_position, ContextMenu, ContextMenuItem, DragKind, DragSession, DropPosition,
     InlineRename,
@@ -49,6 +53,13 @@ pub struct ProjectRowProps {
     pub on_paste: Callback<Uuid>,
     pub on_drop_project_on_project: Callback<(Uuid, Uuid, DropPosition)>,
     pub on_drop_note_on_project: Callback<(Uuid, Uuid, DropPosition)>,
+    /// Plans-Phase-4-multiselect-aria: bulk variants invoked from the
+    /// context menu when the right-clicked project is itself in
+    /// `MultiSelected` (size >= 2). Cut/Copy populate the `BulkClipboard`;
+    /// Delete raises the existing `pending_bulk_delete` confirmation flag.
+    pub on_bulk_cut: Callback<()>,
+    pub on_bulk_copy: Callback<()>,
+    pub on_bulk_request_delete: Callback<()>,
 }
 
 #[component]
@@ -71,13 +82,23 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     // Plans-Phase-8-explorer-undo: panel-scope undo handle for the
     // "Undo last action" menu entry.
     let ExplorerUndoCtx { history, on_undo, on_redo } = use_context::<ExplorerUndoCtx>();
+    // Plans-Phase-4-multiselect-aria: project rows now participate in
+    // the same multi-select set as note rows (Cmd/Ctrl+click toggles,
+    // Shift+click range-fills via VisibleFlat).
+    let MultiSelected(mut multi_selected) = use_context();
+    let LastClicked(mut last_clicked) = use_context();
+    let VisibleFlat(visible_flat) = use_context();
+    let NotesByProjectCtx(notes_by_project_ctx) = use_context();
 
     let project = props.project.clone();
     let id = project.id;
     let id_str = id.to_string();
     let name = project.name.clone();
 
-    let selected = props.selected;
+    let in_multi = multi_selected.read().contains(&NodeKey::Project(id));
+    let bulk_count = multi_selected.read().len();
+    let is_bulk = in_multi && bulk_count >= 2;
+    let selected = props.selected || in_multi;
     let in_rename = props.in_rename;
     let is_open = props.is_open;
     let cut = props.cut;
@@ -97,6 +118,9 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     let on_paste = props.on_paste;
     let on_drop_project_on_project = props.on_drop_project_on_project;
     let on_drop_note_on_project = props.on_drop_note_on_project;
+    let on_bulk_cut = props.on_bulk_cut;
+    let on_bulk_copy = props.on_bulk_copy;
+    let on_bulk_request_delete = props.on_bulk_request_delete;
 
     let mut row_class = if selected {
         String::from("notes-explorer-row notes-explorer-row-project notes-explorer-row-active group")
@@ -162,18 +186,36 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
                 })
                 .collect(),
         ),
-        ContextMenuItem::new(
-            "Cut",
-            Callback::new(move |_| {
-                on_cut.call(id);
-            }),
-        ),
-        ContextMenuItem::new(
-            "Copy",
-            Callback::new(move |_| {
-                on_copy.call(id);
-            }),
-        ),
+        if is_bulk {
+            ContextMenuItem::new(
+                format!("Cut {bulk_count} items"),
+                Callback::new(move |_| {
+                    on_bulk_cut.call(());
+                }),
+            )
+        } else {
+            ContextMenuItem::new(
+                "Cut",
+                Callback::new(move |_| {
+                    on_cut.call(id);
+                }),
+            )
+        },
+        if is_bulk {
+            ContextMenuItem::new(
+                format!("Copy {bulk_count} items"),
+                Callback::new(move |_| {
+                    on_bulk_copy.call(());
+                }),
+            )
+        } else {
+            ContextMenuItem::new(
+                "Copy",
+                Callback::new(move |_| {
+                    on_copy.call(id);
+                }),
+            )
+        },
         paste_item,
         // Plans-Phase-8-explorer-undo: surface the keybinding (Cmd+Z) for
         // discovery. Disabled when the stack is empty.
@@ -199,12 +241,21 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
             item.enabled = !history.read().redo_is_empty();
             item
         },
-        ContextMenuItem::new(
-            "Delete",
-            Callback::new(move |_| {
-                on_request_delete.call(id);
-            }),
-        ),
+        if is_bulk {
+            ContextMenuItem::new(
+                format!("Delete {bulk_count} items"),
+                Callback::new(move |_| {
+                    on_bulk_request_delete.call(());
+                }),
+            )
+        } else {
+            ContextMenuItem::new(
+                "Delete",
+                Callback::new(move |_| {
+                    on_request_delete.call(id);
+                }),
+            )
+        },
     ];
 
     let caret_glyph = if is_open { "\u{25BE}" } else { "\u{25B8}" };
@@ -230,6 +281,48 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
             draggable: "true",
             onclick: move |evt| {
                 evt.stop_propagation();
+                let mods = evt.modifiers();
+                let with_meta = mods.contains(Modifiers::META) || mods.contains(Modifiers::CONTROL);
+                let key = NodeKey::Project(id);
+                if with_meta && !mods.contains(Modifiers::SHIFT) {
+                    // Plans-Phase-4-multiselect-aria: Cmd/Ctrl+click toggles
+                    // this project in the multi-set without disturbing the
+                    // single-select signal.
+                    multi_selected.with_mut(|set| {
+                        if !set.remove(&key) {
+                            set.insert(key);
+                        }
+                    });
+                    last_clicked.set(Some(key));
+                    return;
+                }
+                if mods.contains(Modifiers::SHIFT) {
+                    let mut set: std::collections::BTreeSet<NodeKey> =
+                        multi_selected.read().clone();
+                    let flat = visible_flat.read().clone();
+                    let prev_opt = *last_clicked.read();
+                    if let Some(prev) = prev_opt {
+                        let a = flat.iter().position(|k| k == &prev);
+                        let b = flat.iter().position(|k| k == &key);
+                        if let (Some(a), Some(b)) = (a, b) {
+                            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                            for k in &flat[lo..=hi] {
+                                set.insert(*k);
+                            }
+                        } else {
+                            set.insert(prev);
+                            set.insert(key);
+                        }
+                    } else {
+                        set.insert(key);
+                    }
+                    multi_selected.set(set);
+                    return;
+                }
+                if !multi_selected.read().is_empty() {
+                    multi_selected.set(std::collections::BTreeSet::new());
+                }
+                last_clicked.set(Some(key));
                 on_select.call(id);
             },
             ondoubleclick: move |evt| {
@@ -260,21 +353,36 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
                 //   - allowed → Some(Ok(pos))
                 //   - forbidden (self-drop or wrong position) → Some(Err(()))
                 //   - no relevant drag → None
+                let multi_snap = multi_selected.read().clone();
+                let multi_active = multi_snap.len() >= 2;
+                // Plans-Phase-4-multiselect-aria: when the drag source is in
+                // a 2+ multi-set, every member must share the same
+                // SiblingGroup. A note+project mix yields Err.
+                let sibling_violation = if multi_active {
+                    let notes_snap = notes_by_project_ctx.read();
+                    !crate::local_mode::explorer::all_siblings(&multi_snap, &notes_snap)
+                } else {
+                    false
+                };
                 let next: Option<Result<DropPosition, ()>> = match kind {
                     Some(DragKind::Project(src)) => {
                         if src == id {
                             Some(Err(()))
                         } else if matches!(pos, DropPosition::Into) {
                             Some(Err(()))
+                        } else if multi_snap.contains(&NodeKey::Project(src)) && sibling_violation {
+                            Some(Err(()))
                         } else {
                             Some(Ok(pos))
                         }
                     }
-                    Some(DragKind::Note(_)) => {
-                        if matches!(pos, DropPosition::Into) {
-                            Some(Ok(pos))
-                        } else {
+                    Some(DragKind::Note(src)) => {
+                        if !matches!(pos, DropPosition::Into) {
                             Some(Err(()))
+                        } else if multi_snap.contains(&NodeKey::Note(src)) && sibling_violation {
+                            Some(Err(()))
+                        } else {
+                            Some(Ok(pos))
                         }
                     }
                     None => None,
@@ -286,43 +394,85 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
             },
             ondrop: move |evt| {
                 evt.prevent_default();
-                // Plans-Phase-6-image-notes: external image-file drop creates
-                // a top-level image-note in this project.
-                let files = evt.data().files();
-                if !files.is_empty() {
-                    for f in files {
-                        let name = f.name();
-                        let lower = name.to_ascii_lowercase();
-                        if !lower.ends_with(".png")
-                            && !lower.ends_with(".jpg")
-                            && !lower.ends_with(".jpeg")
-                            && !lower.ends_with(".webp")
-                            && !lower.ends_with(".gif")
-                            && !lower.ends_with(".svg")
-                            && !lower.ends_with(".avif")
-                        {
-                            continue;
-                        }
-                        let cb = on_drop_image_file;
-                        spawn(async move {
-                            if let Ok(bytes) = f.read_bytes().await {
-                                cb.call((id, bytes.to_vec(), name));
-                            }
-                        });
-                    }
-                    drag_session.set(None);
-                    drop_indicator_setter.set(None);
-                    return;
-                }
+                // In-app drag wins over `evt.data().files()` — see the
+                // matching comment in `note_row.rs::ondrop`. Real OS file
+                // drops never go through any in-app `ondragstart`, so
+                // `drag_session` is `None` and the file-drop branch runs.
                 let kind = *drag_session.read();
+                if kind.is_none() {
+                    let files = evt.data().files();
+                    if !files.is_empty() {
+                        for f in files {
+                            let name = f.name();
+                            let lower = name.to_ascii_lowercase();
+                            if !lower.ends_with(".png")
+                                && !lower.ends_with(".jpg")
+                                && !lower.ends_with(".jpeg")
+                                && !lower.ends_with(".webp")
+                                && !lower.ends_with(".gif")
+                                && !lower.ends_with(".svg")
+                                && !lower.ends_with(".avif")
+                            {
+                                continue;
+                            }
+                            let cb = on_drop_image_file;
+                            spawn(async move {
+                                if let Ok(bytes) = f.read_bytes().await {
+                                    cb.call((id, bytes.to_vec(), name));
+                                }
+                            });
+                        }
+                        drop_indicator_setter.set(None);
+                        return;
+                    }
+                }
                 let coords = evt.element_coordinates();
                 let pos = classify_drop_position(coords.y, 28.0);
+                // Plans-Phase-4-multiselect-aria: when the source is in a
+                // 2+ multi-set, gate the drop on `all_siblings` and (for
+                // projects) iterate the set so every selected project
+                // reorders together. The sibling guard already raised a
+                // forbidden indicator during dragover; the drop just
+                // mirrors that decision.
+                let multi_snap = multi_selected.read().clone();
+                let multi_active = multi_snap.len() >= 2;
+                let siblings_ok = if multi_active {
+                    let notes_snap = notes_by_project_ctx.read();
+                    crate::local_mode::explorer::all_siblings(&multi_snap, &notes_snap)
+                } else {
+                    true
+                };
                 match kind {
-                    Some(DragKind::Project(src)) if src != id && !matches!(pos, DropPosition::Into) => {
-                        on_drop_project_on_project.call((src, id, pos));
+                    Some(DragKind::Project(src))
+                        if src != id && !matches!(pos, DropPosition::Into) =>
+                    {
+                        if multi_active && multi_snap.contains(&NodeKey::Project(src)) {
+                            if siblings_ok {
+                                for k in multi_snap.iter() {
+                                    if let NodeKey::Project(p_id) = k {
+                                        if *p_id != id {
+                                            on_drop_project_on_project.call((*p_id, id, pos));
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            on_drop_project_on_project.call((src, id, pos));
+                        }
                     }
                     Some(DragKind::Note(src)) if matches!(pos, DropPosition::Into) => {
-                        on_drop_note_on_project.call((src, id, pos));
+                        // Note-into-project drops are still single-target
+                        // by design (the panel-side handler doesn't support
+                        // bulk-into-project moves). Reject if the source is
+                        // part of a non-sibling multi-set.
+                        if multi_active
+                            && multi_snap.contains(&NodeKey::Note(src))
+                            && !siblings_ok
+                        {
+                            // forbidden — no-op
+                        } else {
+                            on_drop_note_on_project.call((src, id, pos));
+                        }
                     }
                     _ => {}
                 }
