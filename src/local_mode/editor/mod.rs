@@ -83,9 +83,21 @@ pub fn install_save_action(
         let link_repo = link_repo.clone();
         let scheduler = scheduler.clone();
 
+        // Plans-Phase-9-monaco-desktop (rev 17): probe to confirm
+        // Cmd/Ctrl+S actually reaches the save callback. If we never
+        // see this line in stderr after pressing Save, the keyaction
+        // chain (Monaco bootstrap → recv loop → on_action handler →
+        // action.callback) is broken upstream. Removed in cleanup.
+        eprintln!(
+            "operon: save fired note_id={note_id} len={} dirty={}",
+            content.len(),
+            tab.dirty
+        );
+
         spawn(async move {
             match scheduler.flush(tab_id, &note_id, &content).await {
                 Ok(()) => {
+                    eprintln!("operon: save flushed note_id={note_id} len={}", content.len());
                     if let Err(e) = repo.touch_updated(note_uuid) {
                         eprintln!("operon: touch_updated failed for {note_uuid}: {e}");
                     }

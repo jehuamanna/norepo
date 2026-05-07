@@ -273,26 +273,36 @@ pub fn MonacoEditorHost(
             }
         }
 
-        // Plans-Phase-9-monaco-desktop (rev 16): push content prop
-        // changes into Monaco. The bootstrap script bakes the FIRST
-        // mount's content into `editor.create({value, ...})`; without
-        // a follow-up `setContent`, switching tabs (or opening a new
-        // tab while the same `MonacoEditorHost` instance is reused
-        // across `tab_id` changes) leaves Monaco displaying the
-        // *previous* tab's buffer regardless of what
-        // `MonacoEditorHost`'s content prop now says. The JS side
-        // suppresses the resulting `change` event so this can't
-        // bounce back into `tabs.set_content`.
+        // Plans-Phase-9-monaco-desktop (rev 17): push content prop
+        // changes into Monaco. Rev 16 captured `current_content`
+        // (a String) by move into the effect closure — but Dioxus
+        // 0.7's `use_effect` only re-runs when *Signals* read inside
+        // the closure change. A captured String prop is invisible to
+        // the reactive context, so the effect fired exactly once at
+        // mount and never again on prop change. Switching tabs left
+        // Monaco displaying whatever buffer was loaded at first
+        // mount (= "Note B shows the contents of Note A").
+        //
+        // Fix: mirror the prop into a Signal each render. When the
+        // prop differs from the mirror, write through; the effect
+        // subscribes to that mirror and re-runs on the change. The
+        // JS side's `suppress` flag during programmatic setContent
+        // keeps the resulting `change` event from bouncing back into
+        // `tabs.set_content`.
+        let mut content_mirror: Signal<String> = use_signal(|| content.clone());
+        if *content_mirror.peek() != content {
+            content_mirror.set(content.clone());
+        }
         let mut last_pushed: Signal<String> = use_signal(|| content.clone());
-        let current_content = content.clone();
         use_effect(move || {
-            let same = *last_pushed.read() == current_content;
-            if !same {
+            let cur = content_mirror.read().clone();
+            let last = last_pushed.read().clone();
+            if cur != last {
                 let _ = eval_handle.send(serde_json::json!({
                     "type": "setContent",
-                    "value": current_content.clone(),
+                    "value": cur.clone(),
                 }));
-                last_pushed.set(current_content.clone());
+                last_pushed.set(cur);
             }
         });
 
