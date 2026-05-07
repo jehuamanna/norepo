@@ -111,7 +111,9 @@ pub fn register_local_builtins(
     _ctx: &PluginContext,
 ) -> Result<(), String> {
     use crate::plugins::local_projects_explorer::LocalProjectsExplorer;
+    use crate::plugins::local_search::LocalSearch;
     registry.add_ui_plugin(Box::new(LocalProjectsExplorer::new()))?;
+    registry.add_ui_plugin(Box::new(LocalSearch::new()))?;
     register_format_builtins(registry)
 }
 
@@ -119,6 +121,7 @@ fn register_format_builtins(registry: &mut PluginRegistry) -> Result<(), String>
     use crate::plugins::canvas::CanvasFormatPlugin;
     use crate::plugins::code::CodeFormatPlugin;
     use crate::plugins::excalidraw::ExcalidrawFormatPlugin;
+    use crate::plugins::image::ImageFormatPlugin;
     use crate::plugins::json_format::JsonFormatPlugin;
     use crate::plugins::kanban::KanbanFormatPlugin;
     use crate::plugins::markdown::MarkdownFormatPlugin;
@@ -134,6 +137,7 @@ fn register_format_builtins(registry: &mut PluginRegistry) -> Result<(), String>
     registry.add_format_plugin(Box::new(KanbanFormatPlugin::new()))?;
     registry.add_format_plugin(Box::new(CanvasFormatPlugin::new()))?;
     registry.add_format_plugin(Box::new(ExcalidrawFormatPlugin::new()))?;
+    registry.add_format_plugin(Box::new(ImageFormatPlugin::new()))?;
     Ok(())
 }
 

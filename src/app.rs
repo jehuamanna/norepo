@@ -76,6 +76,14 @@ pub fn App() -> Element {
     let request_editor_focus: Signal<Option<String>> = use_signal(|| None);
     use_context_provider(|| crate::editor::RequestEditorFocus(request_editor_focus));
 
+    // App-scope reveal-line request: a search-panel line click writes
+    // `(note_id, line)` here so the editor host can scroll + place the caret
+    // when its backend mounts (or immediately, when the tab was already open).
+    let request_editor_reveal_line: Signal<Option<(String, u32)>> = use_signal(|| None);
+    use_context_provider(|| {
+        crate::editor::RequestEditorRevealLine(request_editor_reveal_line)
+    });
+
     // Plans-Phase-8-explorer-undo: app-scope toast slot. Producers (e.g.
     // failed undo) write here; ToastHost reads + auto-clears after 3 s.
     // Gated on the same cfg as the local_mode::ui module.

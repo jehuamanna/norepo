@@ -46,6 +46,13 @@ const PATHS: &[(&str, &str)] = &[
         "settings",
         "M8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5zm-1.2-3.5l-.5 1.6a4.4 4.4 0 0 0-1 .6l-1.6-.4-1.2 2 1.1 1.2a4.4 4.4 0 0 0 0 1.2L2.5 9.4l1.2 2 1.6-.4q.45.4 1 .6l.5 1.6h2.4l.5-1.6q.55-.2 1-.6l1.6.4 1.2-2-1.1-1.2a4.4 4.4 0 0 0 0-1.2L13.5 6l-1.2-2-1.6.4q-.45-.4-1-.6L9.2 2z",
     ),
+    // Magnifier — thin-outline lens (annulus formed by opposite-winding
+    // contours so nonzero fill leaves a hole) + a diagonal handle.
+    // LocalSearch activity icon.
+    (
+        "search",
+        "M2.5 6.5a4 4 0 1 0 8 0 4 4 0 0 0-8 0zM3.5 6.5a3 3 0 1 1 6 0 3 3 0 1 1-6 0zM8.91 9.75 9.75 8.91 13.92 13.08 13.08 13.92Z",
+    ),
     // Hollow rectangle with a right-third splitter — companion-area toggle.
     (
         "sidebar-right",

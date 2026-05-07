@@ -67,14 +67,13 @@ pub fn MainArea() -> Element {
                         EditorMode::View => plugin.render(&note_id, &content),
                         EditorMode::Edit => {
                             // Local Mode dispatch:
-                            //   - Markdown / Image keep the LocalNoteEditor
-                            //     shell (textarea + paste-image + image
-                            //     viewer + wikilink picker), which is the
-                            //     historical default.
-                            //   - Every other format_id (mdx, code, kanban,
-                            //     canvas, excalidraw, …) goes through its
-                            //     FormatPlugin's render_edit so each kind
-                            //     gets its own bespoke editor surface.
+                            //   - Markdown keeps the LocalNoteEditor shell
+                            //     (Monaco + paste-image + wikilink picker).
+                            //   - Every other format_id (image, mdx, code,
+                            //     kanban, canvas, excalidraw, …) goes
+                            //     through its FormatPlugin's render_edit
+                            //     so each kind gets its own bespoke editor
+                            //     surface.
                             //   - If somehow a kind without a registered
                             //     plugin slips through, we fall back to
                             //     LocalNoteEditor so the user can still
@@ -84,8 +83,7 @@ pub fn MainArea() -> Element {
                             // when the active tab changes, then mount a
                             // fresh instance for the new tab.
                             if is_local {
-                                let uses_local_shell =
-                                    matches!(format_id.as_str(), "markdown" | "image");
+                                let uses_local_shell = format_id.as_str() == "markdown";
                                 if uses_local_shell {
                                     if let Some(action) = local_save {
                                         rsx! {

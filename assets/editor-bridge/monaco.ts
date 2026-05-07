@@ -132,6 +132,20 @@ export function mountMonaco(target: HTMLElement, init: BackendInit): Handle {
     },
     dispatch(cmd: string) {
       if (disposed) return;
+      // RevealLine:N — reveal a 1-indexed line in center, place caret at col 1,
+      // and steal focus so keyboard scrolling/selection picks up immediately.
+      if (cmd.startsWith("RevealLine:")) {
+        const raw = cmd.slice("RevealLine:".length);
+        const lineNumber = Math.max(1, parseInt(raw, 10) || 1);
+        try {
+          editor.revealLineInCenter(lineNumber);
+          editor.setPosition({ lineNumber, column: 1 });
+          editor.focus();
+        } catch (e) {
+          console.warn("[operon-bridge] revealLine failed", e);
+        }
+        return;
+      }
       switch (cmd) {
         case "Undo":
           editor.trigger("bridge", "undo", null);

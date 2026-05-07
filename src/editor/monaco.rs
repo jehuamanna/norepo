@@ -204,16 +204,17 @@ mod imp {
         }
 
         fn dispatch(&self, cmd: EditorCommand) {
-            let s = match cmd {
-                EditorCommand::Undo => "Undo",
-                EditorCommand::Redo => "Redo",
-                EditorCommand::FormatDocument => "FormatDocument",
-                EditorCommand::FindReplace => "FindReplace",
-                EditorCommand::ToggleComment => "ToggleComment",
+            let s: String = match cmd {
+                EditorCommand::Undo => "Undo".into(),
+                EditorCommand::Redo => "Redo".into(),
+                EditorCommand::FormatDocument => "FormatDocument".into(),
+                EditorCommand::FindReplace => "FindReplace".into(),
+                EditorCommand::ToggleComment => "ToggleComment".into(),
                 // Plans-Phase-2-editor-auto-focus: route to the JS shim's
                 // dispatch handler, which calls `editor.focus()` on the
                 // underlying Monaco instance.
-                EditorCommand::Focus => "Focus",
+                EditorCommand::Focus => "Focus".into(),
+                EditorCommand::RevealLine(n) => format!("RevealLine:{n}"),
             };
             self.invoke("dispatch", &[s.into()]);
         }

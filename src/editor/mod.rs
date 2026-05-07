@@ -54,6 +54,15 @@ pub struct EditorState {
 #[derive(Clone, Copy)]
 pub struct RequestEditorFocus(pub dioxus::prelude::Signal<Option<String>>);
 
+/// App-scope signal: a `LocalSearch` line-result click writes
+/// `(note_id_string, 1-indexed_line)` here. The editor host consumes it once
+/// the matching backend mounts (or immediately if already mounted), dispatches
+/// `EditorCommand::RevealLine`, and clears the signal.
+#[derive(Clone, Copy)]
+pub struct RequestEditorRevealLine(
+    pub dioxus::prelude::Signal<Option<(String, u32)>>,
+);
+
 /// Editor commands dispatched via [`EditorBackend::dispatch`]. Backends route these to their
 /// underlying library.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -67,6 +76,10 @@ pub enum EditorCommand {
     /// focus. Each backend maps this to its own focus call (Monaco's
     /// `editor.focus()`, CM6's `view.focus()`, etc.).
     Focus,
+    /// Reveal a 1-indexed line and place the caret at column 1. Backends
+    /// without a meaningful line concept (Tiptap rich-text, etc.) treat
+    /// this as a no-op.
+    RevealLine(u32),
 }
 
 /// Static descriptor a format plugin hands the editor backend at mount time. `monaco_language`
