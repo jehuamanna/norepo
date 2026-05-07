@@ -367,13 +367,51 @@ html, body {
   font-size: 13px;
   padding: 4px 6px;
   padding-left: calc(var(--depth, 0) * 12px + 6px);
+  /* Reserve a 2px left border so the tab-active accent doesn't shift the
+   * row content horizontally when toggled. */
+  border-left: 2px solid transparent;
 }
-.notes-explorer-row:hover {
-  background: var(--vscode-list-inactiveselectionbackground, var(--vscode-activitybar-activebackground));
+/* Per-kind tinting: project rows pick up a warm amber wash on hover /
+ * selected so their interaction states stay visually paired with the
+ * amber tab-active accent; note rows stay in the neutral gray family
+ * paired with the blue note tab-active accent. The split is a more
+ * specific selector pair so the project rules win over the shared
+ * `.notes-explorer-row` defaults that follow. */
+.notes-explorer-row-note:hover {
+  background: var(--vscode-list-hoverbackground, rgba(128, 128, 128, 0.10));
 }
-.notes-explorer-row-active {
-  background: var(--vscode-list-activeselectionbackground);
-  color: var(--vscode-list-activeselectionforeground, currentColor);
+.notes-explorer-row-note.notes-explorer-row-active {
+  background: var(--vscode-list-inactiveselectionbackground, rgba(128, 128, 128, 0.18));
+  color: var(--vscode-list-inactiveselectionforeground, currentColor);
+}
+.notes-explorer-row-project:hover {
+  background: rgba(209, 134, 22, 0.10);
+}
+.notes-explorer-row-project.notes-explorer-row-active {
+  background: rgba(209, 134, 22, 0.18);
+  color: var(--vscode-list-inactiveselectionforeground, currentColor);
+}
+/* Note (or project containing the note) bound to the currently active
+ * editor tab. Distinct from `-row-active` (which is explorer click-
+ * selection): the left accent + bold title indicate "this is what the
+ * editor is currently showing". Composes with `-row-active` so a row can
+ * be both clicked-selected AND editor-active at once. */
+.notes-explorer-row-tab-active {
+  font-weight: 600;
+}
+/* Note tab-active uses the same blue accent as the active editor tab so
+ * the two indicators read as a single "this note is what the editor is
+ * showing" cue across the chrome. */
+.notes-explorer-row-tab-active-note {
+  border-left-color: var(--vscode-tab-activeborder, var(--vscode-focusborder));
+}
+/* Project tab-active uses a warm amber so the project bar is visually
+ * distinct from the (cool blue) note bar — useful when a project is
+ * collapsed and only its accent is visible to signal "active note lives
+ * inside here". Falls back to a hex literal because the VS Code theme
+ * doesn't ship a folder/symbolicon token in our tokens.rs whitelist. */
+.notes-explorer-row-tab-active-project {
+  border-left-color: var(--vscode-charts-orange, #d18616);
 }
 .notes-explorer-row-cut {
   opacity: 0.5;
@@ -700,6 +738,8 @@ html, body {
   background: var(--vscode-tab-inactivebackground);
   color: var(--vscode-tab-inactiveforeground);
   border-right: 1px solid var(--vscode-panel-border);
+  /* Reserve 2px so switching active state doesn't shift content vertically. */
+  border-top: 2px solid transparent;
   font-size: 13px;
   user-select: none;
   white-space: nowrap;
@@ -708,6 +748,8 @@ html, body {
 .operon-tab[data-active="true"] {
   background: var(--vscode-tab-activebackground);
   color: var(--vscode-tab-activeforeground);
+  border-top-color: var(--vscode-tab-activeborder, var(--vscode-focusborder));
+  font-weight: 600;
 }
 
 .operon-tab-title {
@@ -841,4 +883,134 @@ html, body {
   font-size: 12px;
   border-top: 1px solid var(--vscode-panel-border);
   gap: 12px;
+}
+
+/* ============================================================
+ * Explorer drag-and-drop polish.
+ *
+ * The Tailwind utility classes on the indicators (`absolute`, `h-0.5`,
+ * `bg-[var(--operon-accent)]`, etc.) handle layout and color. The rules
+ * below add motion: cursor-X-driven `left` shifts and the `Before/After`
+ * width interpolate smoothly, the dragged row dims, and the snapped state
+ * pulses to confirm "release here". data-testid selectors are stable test
+ * hooks already asserted by the e2e suite, so we reuse them here instead
+ * of inventing new class names.
+ * ============================================================ */
+
+/* Drop-indicator accent color — alias the active VS Code focus border so
+ * the indicator picks up the user's theme (Solarized → cyan, Monokai →
+ * gold, etc.) without having to thread `accent` through every component.
+ * Tailwind classes already reference `var(--operon-accent)`; this rule is
+ * what makes that variable resolvable. Falls back to the VS Code default
+ * blue if the theme tokens haven't been emitted yet. */
+:root {
+  --operon-accent: var(--vscode-focusborder, #0078D4);
+}
+
+[data-testid="note-row"][data-testid][draggable="true"]:active,
+[data-testid="project-row"][draggable="true"]:active {
+  cursor: grabbing;
+}
+
+[data-testid^="drop-indicator-before"],
+[data-testid^="drop-indicator-after"] {
+  /* Slide horizontally as the user re-anchors depth with cursor X, and
+   * fade in instead of popping. */
+  transition: left 90ms ease-out, height 120ms ease-out, opacity 90ms ease-out,
+    box-shadow 120ms ease-out;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px var(--vscode-editor-background, transparent);
+  animation: operon-drop-indicator-fade 120ms ease-out;
+}
+
+[data-testid="drop-indicator-into"],
+[data-testid="drop-indicator-into-snap"] {
+  transition: box-shadow 120ms ease-out, background-color 120ms ease-out;
+  border-radius: 4px;
+  animation: operon-drop-indicator-fade 120ms ease-out;
+}
+
+/* Snapped variants — once the cursor has been stable for ≥80 ms the
+ * indicator pulses gently so the user feels the "release here" affordance
+ * without the whole panel feeling busy. */
+[data-testid="drop-indicator-before-snap"],
+[data-testid="drop-indicator-after-snap"] {
+  animation: operon-drop-indicator-snap-pulse 900ms ease-in-out infinite;
+  box-shadow: 0 0 6px 0 var(--operon-accent, #3b82f6);
+}
+
+[data-testid="drop-indicator-into-snap"] {
+  animation: operon-drop-indicator-into-pulse 900ms ease-in-out infinite;
+}
+
+/* Forbidden / cycle-creating drop — small wiggle so the rejection reads
+ * as deliberate rather than as an unresponsive UI. */
+[data-testid="drop-indicator-forbidden"] {
+  animation: operon-drop-indicator-forbidden 280ms ease-out;
+  border-radius: 4px;
+}
+
+/* The dragged row itself dims while the drag is active (`drag_active`
+ * prop already toggles a parent class). Native HTML5 DnD handles the
+ * ghost image; this just makes the source row feel "lifted". */
+.notes-explorer-row[draggable="true"]:active {
+  opacity: 0.7;
+  transition: opacity 100ms ease-out;
+}
+
+@keyframes operon-drop-indicator-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes operon-drop-indicator-snap-pulse {
+  0%, 100% {
+    box-shadow: 0 0 4px 0 var(--operon-accent, #3b82f6);
+    transform: scaleY(1);
+  }
+  50% {
+    box-shadow: 0 0 10px 1px var(--operon-accent, #3b82f6);
+    transform: scaleY(1.4);
+  }
+}
+
+@keyframes operon-drop-indicator-into-pulse {
+  0%, 100% {
+    box-shadow: inset 0 0 0 2px var(--operon-accent, #3b82f6),
+      0 0 0 0 rgba(59, 130, 246, 0.0);
+  }
+  50% {
+    box-shadow: inset 0 0 0 3px var(--operon-accent, #3b82f6),
+      0 0 8px 0 rgba(59, 130, 246, 0.45);
+  }
+}
+
+@keyframes operon-drop-indicator-forbidden {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-3px); }
+  40% { transform: translateX(3px); }
+  60% { transform: translateX(-2px); }
+  80% { transform: translateX(2px); }
+}
+
+/* When a parent row auto-expands during a long Into-zone hover (≥600 ms),
+ * its disclosure caret rotates with the same easing as a real click so
+ * the user's eye tracks the change naturally. */
+[data-testid="disclosure-caret"] {
+  transition: transform 140ms ease-out;
+}
+
+/* Respect users who've turned motion off at the OS level — disable all
+ * the indicator animations but keep the position/visibility transitions
+ * (those are functional, not decorative). */
+@media (prefers-reduced-motion: reduce) {
+  [data-testid^="drop-indicator-"],
+  [data-testid="drop-indicator-into-snap"],
+  [data-testid="drop-indicator-forbidden"] {
+    animation: none !important;
+  }
+  [data-testid^="drop-indicator-before"],
+  [data-testid^="drop-indicator-after"] {
+    transition: left 0ms, height 0ms, opacity 0ms;
+  }
 }

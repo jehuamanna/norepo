@@ -1,5 +1,13 @@
 [application]
 
+[bundle]
+identifier = "com.operon.dioxus"
+publisher = "Operon"
+copyright = "Copyright (c) 2026 Operon"
+category = "Productivity"
+short_description = "Operon — local-first notes editor"
+long_description = "Operon-dioxus is a local-first, project-aware notes editor."
+
 [web.app]
 
 # HTML title tag content

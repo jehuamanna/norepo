@@ -17,6 +17,11 @@ use crate::local_mode::ui::{
     DropPosition, InlineRename,
 };
 
+/// Per-level indent in pixels — matches the `--depth * 12px` formula in
+/// `assets/shell.css`'s `.notes-explorer-row` rule. Drop indicators use this
+/// to align the horizontal line with the chosen target depth.
+const INDENT_PX: f64 = 12.0;
+
 #[derive(Props, Clone, PartialEq)]
 pub struct NoteRowProps {
     pub note: LocalNote,
@@ -24,6 +29,10 @@ pub struct NoteRowProps {
     pub has_children: bool,
     pub is_open: bool,
     pub selected: bool,
+    /// True when this note is open in the currently active tab. Renders as
+    /// a left accent bar + bold title to distinguish "open in editor" from
+    /// the lighter "explorer click-selection" state.
+    pub tab_active: bool,
     pub in_rename: bool,
     pub is_first_sibling: bool,
     pub is_last_sibling: bool,
@@ -52,7 +61,14 @@ pub struct NoteRowProps {
     pub on_cut: Callback<Uuid>,
     pub on_copy: Callback<Uuid>,
     pub on_paste: Callback<Uuid>,
-    pub on_drop_note_on_note: Callback<(Uuid, Uuid, DropPosition)>,
+    /// Plans-Phase-3-explorer-drag-drop-feedback: tuple is
+    /// (src, target, position, chosen_depth). `chosen_depth` is the depth
+    /// the user picked with the cursor's X position relative to the row's
+    /// indent baseline — only meaningful for `After` (Notion-style outdent
+    /// or indent-into-target). `Into` and `Before` ignore it. The handler
+    /// in `explorer/mod.rs` runs `resolve_drop_parent` to translate the
+    /// triple into a concrete `(parent_id, sibling_index)` for `move_to`.
+    pub on_drop_note_on_note: Callback<(Uuid, Uuid, DropPosition, i64)>,
     /// Plans-Phase-6-image-notes: external image-file drops onto this row
     /// land as child image-notes. Tuple is (parent_note_id, bytes,
     /// suggested filename including extension).
@@ -68,6 +84,12 @@ pub struct NoteRowProps {
 pub fn NoteRow(props: NoteRowProps) -> Element {
     let menu_pos: Signal<Option<(i32, i32)>> = use_signal(|| None);
     let mut menu_pos_setter = menu_pos;
+    // Operon-Phase-3-note-kind-dropdown: + button on a note row opens a
+    // dropdown of every NoteKind so the user can create a child of any
+    // kind in one click. Tracked separately from `menu_pos` so the
+    // right-click menu and the + dropdown can't collide.
+    let add_menu_pos: Signal<Option<(i32, i32)>> = use_signal(|| None);
+    let mut add_menu_pos_setter = add_menu_pos;
     // Plans-Phase-3-explorer-drag-drop-feedback: tri-state indicator —
     // None = no drag over this row; Some(Ok(pos)) = a valid drop position;
     // Some(Err(())) = a forbidden drop (would create a cycle, or the row
@@ -80,6 +102,12 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     // before the timer fired.
     let mut snapped: Signal<bool> = use_signal(|| false);
     let mut hover_generation: Signal<u64> = use_signal(|| 0);
+    // Notion-style depth-aware drop: the cursor's X position relative to
+    // the row's indent baseline picks a target depth, which (for `After`)
+    // selects which ancestor of `target` becomes the new parent. `Before`
+    // and `Into` ignore this; the state still tracks it so the visual
+    // indent line follows the cursor smoothly during a drag.
+    let mut chosen_depth: Signal<i64> = use_signal(|| 0);
     let DragSession(mut drag_session) = use_context();
     // Plans-Phase-3-explorer-drag-drop-feedback: descendant set of the
     // dragged note (populated below by ondragstart) and the panel-scope
@@ -88,7 +116,7 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let NotesByProjectCtx(notes_by_project_ctx) = use_context();
     // Plans-Phase-8-explorer-undo: handle to the panel's undo stack +
     // dispatch callback so we can render an "Undo last action" item.
-    let ExplorerUndoCtx { history, on_undo } = use_context::<ExplorerUndoCtx>();
+    let ExplorerUndoCtx { history, on_undo, on_redo } = use_context::<ExplorerUndoCtx>();
     // Plans-Phase-4-multiselect-aria
     let MultiSelected(mut multi_selected) = use_context();
     let LastClicked(mut last_clicked) = use_context();
@@ -133,17 +161,46 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let on_set_mode = props.on_set_mode;
 
     let mut row_class = if selected {
-        String::from("notes-explorer-row notes-explorer-row-active group")
+        String::from("notes-explorer-row notes-explorer-row-note notes-explorer-row-active group")
     } else {
-        String::from("notes-explorer-row group")
+        String::from("notes-explorer-row notes-explorer-row-note group")
     };
+    if props.tab_active {
+        row_class.push_str(" notes-explorer-row-tab-active notes-explorer-row-tab-active-note");
+    }
     if cut {
         row_class.push_str(" notes-explorer-row-cut");
     }
     let style = format!("--depth: {depth};");
 
-    let initial_title = title.clone();
+    // Freshly-created Markdown notes are persisted with an empty title. Render
+    // the inline rename input with "Untitled" so the user has visible text to
+    // overwrite (paired with the on-mount select-all in InlineRename).
+    let initial_title = if title.is_empty() {
+        String::from("Untitled")
+    } else {
+        title.clone()
+    };
     let dismiss_menu = use_callback(move |_: ()| menu_pos_setter.set(None));
+    let dismiss_add_menu = use_callback(move |_: ()| add_menu_pos_setter.set(None));
+
+    // Operon-Phase-3: the + dropdown creates a CHILD note (matches the
+    // historical default behavior of this button). Items mirror
+    // `NoteKind::all_creatable()` so adding a future variant lights up
+    // here automatically.
+    let add_menu_items: Vec<ContextMenuItem> = NoteKind::all_creatable()
+        .iter()
+        .copied()
+        .map(|kind| {
+            let label = kind.display_name();
+            ContextMenuItem::new(
+                label,
+                Callback::new(move |_| {
+                    on_add_child.call((id, kind));
+                }),
+            )
+        })
+        .collect();
 
     let mut paste_item = ContextMenuItem::new(
         "Paste",
@@ -227,37 +284,33 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
         ),
         ContextMenuItem::submenu(
             "Add child note",
-            vec![
-                ContextMenuItem::new(
-                    "Markdown",
-                    Callback::new(move |_| {
-                        on_add_child.call((id, NoteKind::Markdown));
-                    }),
-                ),
-                ContextMenuItem::new(
-                    "Image",
-                    Callback::new(move |_| {
-                        on_add_child.call((id, NoteKind::Image));
-                    }),
-                ),
-            ],
+            NoteKind::all_creatable()
+                .iter()
+                .copied()
+                .map(|kind| {
+                    ContextMenuItem::new(
+                        kind.display_name(),
+                        Callback::new(move |_| {
+                            on_add_child.call((id, kind));
+                        }),
+                    )
+                })
+                .collect(),
         ),
         ContextMenuItem::submenu(
             "Add sibling note",
-            vec![
-                ContextMenuItem::new(
-                    "Markdown",
-                    Callback::new(move |_| {
-                        on_add_sibling.call((id, NoteKind::Markdown));
-                    }),
-                ),
-                ContextMenuItem::new(
-                    "Image",
-                    Callback::new(move |_| {
-                        on_add_sibling.call((id, NoteKind::Image));
-                    }),
-                ),
-            ],
+            NoteKind::all_creatable()
+                .iter()
+                .copied()
+                .map(|kind| {
+                    ContextMenuItem::new(
+                        kind.display_name(),
+                        Callback::new(move |_| {
+                            on_add_sibling.call((id, kind));
+                        }),
+                    )
+                })
+                .collect(),
         ),
         ContextMenuItem::new(
             "Cut",
@@ -286,6 +339,19 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 }),
             );
             item.enabled = !history.read().is_empty();
+            item
+        },
+        {
+            // Plans-Phase-11: paired Redo entry (Cmd/Ctrl+Shift+Z). Disabled
+            // when the redo deque is empty (e.g. fresh session, or after a
+            // user gesture invalidated the redo path).
+            let mut item = ContextMenuItem::new(
+                "Redo last action",
+                Callback::new(move |_| {
+                    on_redo.call(());
+                }),
+            );
+            item.enabled = !history.read().redo_is_empty();
             item
         },
         ContextMenuItem::new(
@@ -405,6 +471,27 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                         crate::util::clipboard::copy_text(&id_for_keys);
                         return;
                     }
+                    // Plans-Phase-11: row-level Cmd/Ctrl+Z + Shift variant
+                    // for undo / redo. The panel root carries the same
+                    // listener via event bubbling, but in some WebView
+                    // builds keydown does not bubble out of a focused
+                    // tabindex=0 child reliably — handling it here as
+                    // well is cheap and makes the shortcut work whenever
+                    // a row has focus. We skip while in inline-rename so
+                    // the input keeps native text-undo.
+                    if with_meta && !mods.contains(Modifiers::ALT)
+                        && key.eq_ignore_ascii_case("z")
+                        && !in_rename
+                    {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        if mods.contains(Modifiers::SHIFT) {
+                            on_redo.call(());
+                        } else {
+                            on_undo.call(());
+                        }
+                        return;
+                    }
                     if key == "Tab" {
                         evt.prevent_default();
                         evt.stop_propagation();
@@ -452,12 +539,35 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 drag_descendants.set(std::collections::BTreeSet::new());
                 snapped.set(false);
                 hover_generation.with_mut(|g| *g = g.wrapping_add(1));
+                chosen_depth.set(0);
             },
             ondragover: move |evt| {
                 evt.prevent_default();
                 let kind = *drag_session.read();
                 let coords = evt.element_coordinates();
                 let pos = classify_drop_position(coords.y, 28.0);
+                // Notion-style depth chooser, anchored at target's own indent.
+                // The row's content sits at `depth * 12px + 6px` of left
+                // padding, so the *natural* cursor position (over the row's
+                // text or anywhere right of the indent baseline) defaults to
+                // sibling-at-target-depth — what users expect for a simple
+                // reorder. Only when the user deliberately pulls the cursor
+                // *left* of that anchor does the chosen depth step down by
+                // one per `INDENT_PX` of leftward travel. We never auto-
+                // indent past the target's depth; users who want "first
+                // child" can drop Into the target instead.
+                let target_anchor_x = depth as f64 * INDENT_PX;
+                let dx = coords.x - target_anchor_x;
+                let new_chosen_depth = if dx < 0.0 {
+                    let outdent_steps = ((-dx) / INDENT_PX).ceil() as i64;
+                    (depth - outdent_steps).max(0)
+                } else {
+                    depth
+                };
+                let prev_chosen_depth = *chosen_depth.read();
+                if prev_chosen_depth != new_chosen_depth {
+                    chosen_depth.set(new_chosen_depth);
+                }
                 // Plans-Phase-3: classify the drop as
                 //   - Some(Ok(pos))  → allowed; show coloured indicator
                 //   - Some(Err(()))  → forbidden; show no-drop indicator
@@ -476,8 +586,13 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                     _ => None,
                 };
                 let prev = *drop_indicator.read();
-                if prev != next {
-                    drop_indicator_setter.set(next);
+                // Reset snap when the indent line shifts horizontally too —
+                // a cursor that's still moving horizontally hasn't "settled".
+                let depth_changed = prev_chosen_depth != new_chosen_depth;
+                if prev != next || depth_changed {
+                    if prev != next {
+                        drop_indicator_setter.set(next);
+                    }
                     // Plans-Phase-7-snap: bumping the generation invalidates
                     // any in-flight snap or hover-expand timer for the prior
                     // (target, pos).
@@ -562,6 +677,18 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 let kind = *drag_session.read();
                 let coords = evt.element_coordinates();
                 let pos = classify_drop_position(coords.y, 28.0);
+                // Recompute depth from the drop's own coords — the dragover
+                // signal can lag by a frame. Same anchor-relative rule as
+                // ondragover: default sibling-at-target-depth, outdent only
+                // on deliberate leftward drag.
+                let target_anchor_x = depth as f64 * INDENT_PX;
+                let dx = coords.x - target_anchor_x;
+                let drop_depth = if dx < 0.0 {
+                    let outdent_steps = ((-dx) / INDENT_PX).ceil() as i64;
+                    (depth - outdent_steps).max(0)
+                } else {
+                    depth
+                };
                 // Plans-Phase-3-explorer-drag-drop-feedback: refuse drops on
                 // a row mid-rename or when the target is a descendant of
                 // the source. The visual indicator already reflects this
@@ -583,12 +710,12 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                         for k in set_snap.iter() {
                             if let NodeKey::Note(n_id) = k {
                                 if *n_id != id && !descendants_snap.contains(n_id) {
-                                    on_drop_note_on_note.call((*n_id, id, pos));
+                                    on_drop_note_on_note.call((*n_id, id, pos, drop_depth));
                                 }
                             }
                         }
                     } else if src != id {
-                        on_drop_note_on_note.call((src, id, pos));
+                        on_drop_note_on_note.call((src, id, pos, drop_depth));
                     }
                 }
                 drag_session.set(None);
@@ -596,6 +723,7 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 drag_descendants.set(std::collections::BTreeSet::new());
                 snapped.set(false);
                 hover_generation.with_mut(|g| *g = g.wrapping_add(1));
+                chosen_depth.set(0);
             },
             // Plans-Phase-3-note-id-create: leading grip glyph as a visible
             // indicator that the row is draggable. Drag itself is still
@@ -649,16 +777,14 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 // updates as soon as the row is rendered with a refreshed
                 // record.
                 {
-                    let (label, css) = match note.kind {
-                        NoteKind::Markdown => ("[md]", "kind-badge kind-md"),
-                        NoteKind::Image => ("[im]", "kind-badge kind-im"),
-                    };
+                    let icon = note.kind.icon();
+                    let kind_str = note.kind.as_str();
                     rsx! {
                         span {
-                            class: "{css} text-[0.65rem] mr-1 px-1 rounded select-none opacity-60 shrink-0",
+                            class: "kind-badge kind-{kind_str} text-[0.65rem] mr-1 px-1 rounded select-none opacity-60 shrink-0",
                             "data-testid": "kind-badge",
-                            "data-note-kind": "{note.kind.as_str()}",
-                            "{label}"
+                            "data-note-kind": "{kind_str}",
+                            "[{icon}]"
                         }
                     }
                 }
@@ -673,12 +799,11 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                     "data-testid": "add-note-button",
                     "data-note-id": "{id_str}",
                     "aria-label": "Add child note",
+                    "aria-haspopup": "menu",
                     onclick: move |evt| {
                         evt.stop_propagation();
-                        // Plans-Phase-1: quick-button defaults to Markdown.
-                        // Image notes go through the context-menu submenu so
-                        // the file picker UX is reachable.
-                        on_add_child.call((id, NoteKind::Markdown));
+                        let coords = evt.client_coordinates();
+                        add_menu_pos_setter.set(Some((coords.x as i32, coords.y as i32)));
                     },
                     "+"
                 }
@@ -686,8 +811,19 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
             if drag_active {
                 {
                     let snap_now = *snapped.read();
+                    let chosen_now = *chosen_depth.read();
                     match drop_pos_now {
-                        Some(Ok(p)) => rsx! { DropIndicator { position: p, snapped: snap_now } },
+                        Some(Ok(p)) => {
+                            // Resolver ignores chosen_depth for Before/Into,
+                            // so pin those indicators to a stable position
+                            // (row's own depth) — only After shifts with X.
+                            let effective_depth = match p {
+                                DropPosition::Before => depth,
+                                DropPosition::Into => 0,
+                                DropPosition::After => chosen_now,
+                            };
+                            rsx! { DropIndicator { position: p, snapped: snap_now, depth: effective_depth } }
+                        }
                         Some(Err(())) => rsx! { ForbiddenIndicator {} },
                         None => rsx! {},
                     }
@@ -702,23 +838,36 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 on_dismiss: dismiss_menu,
             }
         }
+        if let Some((x, y)) = *add_menu_pos.read() {
+            ContextMenu {
+                x: x,
+                y: y,
+                items: add_menu_items,
+                on_dismiss: dismiss_add_menu,
+            }
+        }
     }
 }
 
 #[component]
-fn DropIndicator(position: DropPosition, snapped: bool) -> Element {
+fn DropIndicator(position: DropPosition, snapped: bool, depth: i64) -> Element {
     // Plans-Phase-7-snap: when `snapped` is true (cursor stable for ≥80 ms),
     // emphasise the indicator — thicker line for Before/After, ring-4 for
     // Into. The data-testid suffixes `-snap` so e2e specs can assert the
     // transition.
+    //
+    // Notion-style depth offset: for Before/After, the line starts at
+    // `depth * 12px` from the row's left edge so it visually aligns with
+    // the indent column the user picked with their cursor X. Into still
+    // rings the entire row.
     let (testid, class) = match (position, snapped) {
         (DropPosition::Before, false) => (
             "drop-indicator-before",
-            "absolute left-0 right-0 top-0 h-0.5 bg-[var(--operon-accent)]",
+            "absolute right-0 top-0 h-0.5 bg-[var(--operon-accent)]",
         ),
         (DropPosition::Before, true) => (
             "drop-indicator-before-snap",
-            "absolute left-0 right-0 top-0 h-1 bg-[var(--operon-accent)]",
+            "absolute right-0 top-0 h-1 bg-[var(--operon-accent)]",
         ),
         (DropPosition::Into, false) => (
             "drop-indicator-into",
@@ -730,17 +879,23 @@ fn DropIndicator(position: DropPosition, snapped: bool) -> Element {
         ),
         (DropPosition::After, false) => (
             "drop-indicator-after",
-            "absolute left-0 right-0 bottom-0 h-0.5 bg-[var(--operon-accent)]",
+            "absolute right-0 bottom-0 h-0.5 bg-[var(--operon-accent)]",
         ),
         (DropPosition::After, true) => (
             "drop-indicator-after-snap",
-            "absolute left-0 right-0 bottom-0 h-1 bg-[var(--operon-accent)]",
+            "absolute right-0 bottom-0 h-1 bg-[var(--operon-accent)]",
         ),
+    };
+    let style = match position {
+        DropPosition::Into => String::new(),
+        _ => format!("left: {}px;", (depth as f64 * INDENT_PX) as i64),
     };
     rsx! {
         span {
             class: "{class}",
+            style: "{style}",
             "data-testid": "{testid}",
+            "data-drop-depth": "{depth}",
         }
     }
 }

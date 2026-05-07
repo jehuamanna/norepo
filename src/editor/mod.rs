@@ -89,6 +89,15 @@ impl LanguageDescriptor {
     pub const fn json() -> Self {
         Self { id: "json", monaco_language: "json", monarch_grammar: None }
     }
+    /// Generic source-code editor. Monaco accepts the language id at mount
+    /// time and can be re-set later; defaults to plaintext so an unknown
+    /// language still gets a usable editor.
+    pub const fn code() -> Self {
+        Self { id: "code", monaco_language: "plaintext", monarch_grammar: None }
+    }
+    pub const fn code_with(language: &'static str) -> Self {
+        Self { id: "code", monaco_language: language, monarch_grammar: None }
+    }
 }
 
 /// Theme blob translated from the app's `Signal<Theme>` into a per-backend representation.

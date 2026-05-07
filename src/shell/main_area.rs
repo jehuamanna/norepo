@@ -66,28 +66,37 @@ pub fn MainArea() -> Element {
                     match mode {
                         EditorMode::View => plugin.render(&note_id, &content),
                         EditorMode::Edit => {
-                            // Local Mode notes use a textarea — Monaco doesn't
-                            // mount on the desktop build. Cloud paths still go
-                            // through the format plugin's editor backend.
+                            // Local Mode dispatch:
+                            //   - Markdown / Image keep the LocalNoteEditor
+                            //     shell (textarea + paste-image + image
+                            //     viewer + wikilink picker), which is the
+                            //     historical default.
+                            //   - Every other format_id (mdx, code, kanban,
+                            //     canvas, excalidraw, …) goes through its
+                            //     FormatPlugin's render_edit so each kind
+                            //     gets its own bespoke editor surface.
+                            //   - If somehow a kind without a registered
+                            //     plugin slips through, we fall back to
+                            //     LocalNoteEditor so the user can still
+                            //     edit text.
+                            // `key` forces Dioxus to unmount the prior
+                            // editor (and any embedded Monaco bootstrap)
+                            // when the active tab changes, then mount a
+                            // fresh instance for the new tab.
                             if is_local {
-                                if let Some(action) = local_save {
-                                    // `key` forces Dioxus to unmount the prior
-                                    // `LocalNoteEditor` (and its embedded
-                                    // `MonacoEditorHost`) when the active tab
-                                    // changes, then mount a fresh instance for
-                                    // the new tab. Without this, switching
-                                    // tabs reused the same Monaco bootstrap
-                                    // script's captured state, which kept
-                                    // showing the previous tab's buffer ("Note
-                                    // B shows Note A's contents"). Per-tab key
-                                    // = per-tab editor identity = correct
-                                    // buffer-to-tab association.
-                                    rsx! {
-                                        crate::local_mode::LocalNoteEditor {
-                                            key: "{tab_id:?}",
-                                            tab_id,
-                                            action,
+                                let uses_local_shell =
+                                    matches!(format_id.as_str(), "markdown" | "image");
+                                if uses_local_shell {
+                                    if let Some(action) = local_save {
+                                        rsx! {
+                                            crate::local_mode::LocalNoteEditor {
+                                                key: "{tab_id:?}",
+                                                tab_id,
+                                                action,
+                                            }
                                         }
+                                    } else {
+                                        plugin.render_edit(&note_id, &content, on_change)
                                     }
                                 } else {
                                     plugin.render_edit(&note_id, &content, on_change)

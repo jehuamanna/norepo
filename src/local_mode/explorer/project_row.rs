@@ -18,6 +18,9 @@ pub struct ProjectRowProps {
     pub project: LocalProject,
     pub is_open: bool,
     pub selected: bool,
+    /// True when one of this project's notes is open in the active tab.
+    /// Mirrors the NoteRow accent so the user can scan to the active branch.
+    pub tab_active: bool,
     pub in_rename: bool,
     /// Source row of the current Cut clipboard.
     pub cut: bool,
@@ -52,6 +55,12 @@ pub struct ProjectRowProps {
 pub fn ProjectRow(props: ProjectRowProps) -> Element {
     let menu_pos: Signal<Option<(i32, i32)>> = use_signal(|| None);
     let mut menu_pos_setter = menu_pos;
+    // Operon-Phase-3-note-kind-dropdown: the + button opens a dropdown of
+    // every NoteKind in `NoteKind::all_creatable()` instead of hard-coding
+    // Markdown. Tracked by its own signal so it does not collide with the
+    // right-click context menu on the same row.
+    let add_menu_pos: Signal<Option<(i32, i32)>> = use_signal(|| None);
+    let mut add_menu_pos_setter = add_menu_pos;
     // Plans-Phase-7-projectrow-forbidden: tri-state indicator mirroring
     // NoteRow. Some(Ok(pos)) → allowed; Some(Err(())) → forbidden
     // (self-drop, or a position not allowed for the dragged kind);
@@ -61,7 +70,7 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     let DragSession(mut drag_session) = use_context();
     // Plans-Phase-8-explorer-undo: panel-scope undo handle for the
     // "Undo last action" menu entry.
-    let ExplorerUndoCtx { history, on_undo } = use_context::<ExplorerUndoCtx>();
+    let ExplorerUndoCtx { history, on_undo, on_redo } = use_context::<ExplorerUndoCtx>();
 
     let project = props.project.clone();
     let id = project.id;
@@ -90,10 +99,13 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     let on_drop_note_on_project = props.on_drop_note_on_project;
 
     let mut row_class = if selected {
-        String::from("notes-explorer-row notes-explorer-row-active group")
+        String::from("notes-explorer-row notes-explorer-row-project notes-explorer-row-active group")
     } else {
-        String::from("notes-explorer-row group")
+        String::from("notes-explorer-row notes-explorer-row-project group")
     };
+    if props.tab_active {
+        row_class.push_str(" notes-explorer-row-tab-active notes-explorer-row-tab-active-project");
+    }
     if cut {
         row_class.push_str(" notes-explorer-row-cut");
     }
@@ -101,6 +113,24 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
 
     let initial_name = name.clone();
     let dismiss_menu = use_callback(move |_: ()| menu_pos_setter.set(None));
+    let dismiss_add_menu = use_callback(move |_: ()| add_menu_pos_setter.set(None));
+
+    // Operon-Phase-3: dropdown items, one per creatable kind. Driven by
+    // `NoteKind::all_creatable()` so adding a future variant lights up
+    // the dropdown automatically.
+    let add_menu_items: Vec<ContextMenuItem> = NoteKind::all_creatable()
+        .iter()
+        .copied()
+        .map(|kind| {
+            let label = kind.display_name();
+            ContextMenuItem::new(
+                label,
+                Callback::new(move |_| {
+                    on_add_note.call((id, kind));
+                }),
+            )
+        })
+        .collect();
 
     let mut paste_item = ContextMenuItem::new(
         "Paste",
@@ -119,20 +149,18 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
         ),
         ContextMenuItem::submenu(
             "Add note",
-            vec![
-                ContextMenuItem::new(
-                    "Markdown",
-                    Callback::new(move |_| {
-                        on_add_note.call((id, NoteKind::Markdown));
-                    }),
-                ),
-                ContextMenuItem::new(
-                    "Image",
-                    Callback::new(move |_| {
-                        on_add_note.call((id, NoteKind::Image));
-                    }),
-                ),
-            ],
+            NoteKind::all_creatable()
+                .iter()
+                .copied()
+                .map(|kind| {
+                    ContextMenuItem::new(
+                        kind.display_name(),
+                        Callback::new(move |_| {
+                            on_add_note.call((id, kind));
+                        }),
+                    )
+                })
+                .collect(),
         ),
         ContextMenuItem::new(
             "Cut",
@@ -157,6 +185,18 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
                 }),
             );
             item.enabled = !history.read().is_empty();
+            item
+        },
+        {
+            // Plans-Phase-11: paired Redo entry (Cmd/Ctrl+Shift+Z). Disabled
+            // when the redo deque is empty.
+            let mut item = ContextMenuItem::new(
+                "Redo last action",
+                Callback::new(move |_| {
+                    on_redo.call(());
+                }),
+            );
+            item.enabled = !history.read().redo_is_empty();
             item
         },
         ContextMenuItem::new(
@@ -328,10 +368,11 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
                     "data-testid": "add-note-button",
                     "data-project-id": "{id_str}",
                     "aria-label": "Add note",
+                    "aria-haspopup": "menu",
                     onclick: move |evt| {
                         evt.stop_propagation();
-                        // Plans-Phase-1: quick-button defaults to Markdown.
-                        on_add_note.call((id, NoteKind::Markdown));
+                        let coords = evt.client_coordinates();
+                        add_menu_pos_setter.set(Some((coords.x as i32, coords.y as i32)));
                     },
                     "+"
                 }
@@ -350,6 +391,14 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
                 y: y,
                 items: menu_items,
                 on_dismiss: dismiss_menu,
+            }
+        }
+        if let Some((x, y)) = *add_menu_pos.read() {
+            ContextMenu {
+                x: x,
+                y: y,
+                items: add_menu_items,
+                on_dismiss: dismiss_add_menu,
             }
         }
     }

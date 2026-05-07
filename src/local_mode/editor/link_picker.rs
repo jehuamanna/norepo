@@ -186,8 +186,7 @@ pub fn LinkPicker(open: Signal<bool>, on_pick: EventHandler<PickedLink>) -> Elem
                             "data-testid": "link-picker-result",
                             "data-highlighted": if i == *highlight.read() { "true" } else { "false" },
                             "data-note-kind": match note_kind {
-                                Some(NoteKind::Markdown) => "markdown",
-                                Some(NoteKind::Image) => "image",
+                                Some(k) => k.as_str(),
                                 None => "project",
                             },
                             onmouseenter: move |_| highlight.set(i),
@@ -203,19 +202,14 @@ pub fn LinkPicker(open: Signal<bool>, on_pick: EventHandler<PickedLink>) -> Elem
                             // can't be embedded.
                             if let Some(kind) = note_kind {
                                 {
-                                    let (label, css) = match kind {
-                                        NoteKind::Markdown => ("[md]", "kind-badge kind-md"),
-                                        NoteKind::Image => ("[im]", "kind-badge kind-im"),
-                                    };
+                                    let icon = kind.icon();
+                                    let kind_str = kind.as_str();
                                     rsx! {
                                         span {
-                                            class: "{css} text-[0.65rem] mr-1 px-1 rounded select-none opacity-60",
+                                            class: "kind-badge kind-{kind_str} text-[0.65rem] mr-1 px-1 rounded select-none opacity-60",
                                             "data-testid": "kind-badge",
-                                            "data-note-kind": match kind {
-                                                NoteKind::Markdown => "markdown",
-                                                NoteKind::Image => "image",
-                                            },
-                                            "{label}"
+                                            "data-note-kind": "{kind_str}",
+                                            "[{icon}]"
                                         }
                                     }
                                 }

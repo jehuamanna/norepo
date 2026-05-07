@@ -70,6 +70,9 @@ pub struct CommandContext {
     pub palette: Signal<PaletteState>,
     pub layout: Signal<LayoutState>,
     pub theme_registry: Rc<ThemeRegistry>,
+    /// Visibility of the About dialog. The `help.about` command flips this
+    /// to `true`; the dialog itself owns the close path.
+    pub about_open: Signal<bool>,
     /// Available only when Local Mode is active. Cloud Mode leaves this `None`,
     /// so commands gated behind it (e.g. `file.saveNote`) become no-ops there.
     pub local_save: Option<crate::local_mode::LocalSaveAction>,

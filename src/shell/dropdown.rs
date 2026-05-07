@@ -27,6 +27,7 @@ pub fn Dropdown(menu: MenuId) -> Element {
     let LastActiveActivity(last_active) = use_context();
     let palette: Signal<PaletteState> = use_context();
     let layout: Signal<LayoutState> = use_context();
+    let crate::shell::about::AboutOpen(about_open) = use_context();
     let mut open_menu: Signal<Option<MenuId>> = use_context();
 
     let category = menu.category_label();
@@ -71,6 +72,7 @@ pub fn Dropdown(menu: MenuId) -> Element {
                                     palette,
                                     layout,
                                     theme_registry: theme_reg.clone(),
+                                    about_open,
                                     local_save: try_consume_context(),
                                 };
                                 let _ = cmd_reg.execute(&id, &context);

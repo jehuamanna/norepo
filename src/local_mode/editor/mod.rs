@@ -307,6 +307,7 @@ pub fn open_local_note_tab(
     note_uuid: Uuid,
     title: String,
     initial_content: String,
+    kind: operon_store::repos::NoteKind,
 ) -> TabId {
     let note_id_str = note_uuid.to_string();
     // Look for an existing Edit-mode tab to focus.
@@ -323,10 +324,13 @@ pub fn open_local_note_tab(
         return tid;
     }
     // No Edit-mode tab — force a new tab so View / Split tabs
-    // remain undisturbed.
+    // remain undisturbed. format_id is derived from the note's kind so
+    // MainArea can dispatch to the right FormatPlugin (markdown → textarea
+    // fallback inside LocalNoteEditor; mdx/canvas/excalidraw/kanban/code →
+    // their own plugin's render_edit).
     let id = tabs.write().open_manual_save_new(
         note_id_str,
-        "markdown".into(),
+        kind.format_id().to_string(),
         title,
         initial_content,
     );
@@ -335,11 +339,13 @@ pub fn open_local_note_tab(
     id
 }
 
-/// Plans-Phase-6-image-notes: if the given note id is an image, return an
-/// inline image viewer. Reads the LocalNote row + the vault root from
-/// already-resolved context handles, then base64-encodes the image bytes
-/// for an inline `<img>` src. Returns `None` when the note isn't an image,
-/// the row can't be found, or the blob is missing.
+/// Image-note dispatch: returns the image viewer when the note has an
+/// attached blob, an empty-state pane (with a file-picker button) when
+/// the row exists but `blob_path` is `None`, or `None` when the note
+/// isn't an image / the row can't be found.
+///
+/// The empty-state branch is the entry point for the "create image
+/// placeholder, attach file later" flow that Operon-Phase-3 introduced.
 fn try_render_image_view(
     note_id: Uuid,
     note_repo_handle: &crate::local_mode::desktop::LocalNoteRepo,
@@ -365,6 +371,99 @@ fn try_render_image_view(
     if !matches!(row.kind, NoteKind::Image) {
         return None;
     }
+
+    // Empty-state branch. Image note exists but no blob attached yet.
+    if row.blob_path.is_none() {
+        let note_repo_for_pick = note_repo.clone();
+        let vault_for_pick = vault.clone();
+        let crate::local_mode::explorer::LocalNoteVersion(mut note_version) =
+            use_context::<crate::local_mode::explorer::LocalNoteVersion>();
+        let pick_image = move || {
+            let note_repo = note_repo_for_pick.clone();
+            let vault = vault_for_pick.clone();
+            spawn(async move {
+                let Some(handle) = rfd::AsyncFileDialog::new()
+                    .set_title("Choose an image")
+                    .add_filter(
+                        "Image",
+                        &["png", "jpg", "jpeg", "webp", "gif", "svg", "avif"],
+                    )
+                    .pick_file()
+                    .await
+                else {
+                    return;
+                };
+                let path = handle.path().to_path_buf();
+                let bytes = match std::fs::read(&path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("operon: read image file {path:?} failed: {e}");
+                        return;
+                    }
+                };
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_ascii_lowercase())
+                    .unwrap_or_default();
+                let mime = match ext.as_str() {
+                    "png" => "image/png",
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "webp" => "image/webp",
+                    "gif" => "image/gif",
+                    "svg" => "image/svg+xml",
+                    "avif" => "image/avif",
+                    _ => {
+                        eprintln!("operon: image picker: unsupported extension {ext}");
+                        return;
+                    }
+                };
+                let written = match crate::local_mode::images::write_image(&vault, &bytes, mime) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        eprintln!("operon: write_image failed: {e}");
+                        return;
+                    }
+                };
+                let rel = written.relative_path.to_string_lossy().to_string();
+                if let Err(e) = note_repo.set_blob_path(note_id, Some(&rel)) {
+                    eprintln!("operon: set_blob_path failed: {e}");
+                    return;
+                }
+                // Bump note_version so the explorer + editor re-read the
+                // row and swap the empty-state pane for the viewer.
+                note_version.with_mut(|v| *v += 1);
+            });
+        };
+        return Some(rsx! {
+            div {
+                class: "operon-local-image-empty",
+                "data-testid": "image-note-empty",
+                "data-note-id": "{note_id}",
+                style: "display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.75rem; height: 100%; padding: 2rem; text-align: center; color: var(--operon-fg, #ddd); background: var(--operon-bg, #111);",
+                p {
+                    style: "margin: 0; opacity: 0.75;",
+                    "No image attached yet."
+                }
+                button {
+                    r#type: "button",
+                    class: "operon-button",
+                    "data-testid": "image-note-pick-button",
+                    style: "padding: 0.5rem 1rem; border-radius: 0.25rem; cursor: pointer;",
+                    onclick: move |evt| {
+                        evt.stop_propagation();
+                        pick_image();
+                    },
+                    "Choose image…"
+                }
+                p {
+                    style: "margin: 0; font-size: 0.85em; opacity: 0.5;",
+                    "PNG, JPG, WebP, GIF, SVG, AVIF"
+                }
+            }
+        });
+    }
+
     let rel = row.blob_path.clone()?;
     let rel_path = std::path::Path::new(&rel).to_path_buf();
     let data_url = crate::local_mode::images::data_url_for_blob(&vault, &rel_path)?;

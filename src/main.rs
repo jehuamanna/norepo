@@ -101,9 +101,13 @@ fn main() {
 
     #[cfg(feature = "desktop")]
     {
+        // `with_menu(None)` suppresses dioxus-desktop's default native
+        // Window/Edit/Help menubar — Operon ships its own in-app Menubar
+        // (`src/shell/menubar.rs`) and the OS-level strip is redundant.
         let cfg = dioxus::desktop::Config::new()
             .with_custom_head(CRITICAL_HEAD.to_string())
-            .with_custom_protocol("bridge", bridge_protocol_handler);
+            .with_custom_protocol("bridge", bridge_protocol_handler)
+            .with_menu(None);
         dioxus::LaunchBuilder::new()
             .with_cfg(cfg)
             .launch(operon_dioxus::app::App);

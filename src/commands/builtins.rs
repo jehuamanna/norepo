@@ -26,6 +26,24 @@ pub fn register_builtin_commands(reg: &mut CommandRegistry) -> Result<(), String
     })?;
 
     reg.register(Command {
+        id: "file.exit".into(),
+        title: "Exit".into(),
+        category: "File".into(),
+        handler: Box::new(|_ctx: &CommandContext| {
+            // On desktop, close the active window. With the default
+            // `exit_on_last_window_close` config (true), closing the only
+            // window terminates the process. On web/wasm builds the
+            // command is a harmless no-op — browsers can't close a tab
+            // they didn't open from a user gesture, and there is no
+            // window to dismiss.
+            #[cfg(feature = "desktop")]
+            {
+                dioxus::desktop::window().close();
+            }
+        }),
+    })?;
+
+    reg.register(Command {
         id: "view.toggleTheme".into(),
         title: "Toggle Theme".into(),
         category: "View".into(),
@@ -173,6 +191,19 @@ pub fn register_builtin_commands(reg: &mut CommandRegistry) -> Result<(), String
         }),
     })?;
 
+    // `Help` menu maps to the `Palette` category (see `MenuId::category_label`),
+    // so registering About here surfaces it in Help → About and in the
+    // command palette under "About".
+    reg.register(Command {
+        id: "help.about".into(),
+        title: "About".into(),
+        category: "Palette".into(),
+        handler: Box::new(|ctx: &CommandContext| {
+            let mut about_open = ctx.about_open;
+            about_open.set(true);
+        }),
+    })?;
+
     Ok(())
 }
 
@@ -189,7 +220,9 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "file.saveNote".to_string(),
+                "file.exit".to_string(),
+                "file.saveNote".into(),
+                "help.about".into(),
                 "notes.openSample".into(),
                 "palette.show".into(),
                 "palette.showCommands".into(),

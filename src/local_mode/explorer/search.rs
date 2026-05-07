@@ -25,6 +25,7 @@ use crate::local_mode::editor::open_local_note_tab;
 use crate::local_mode::explorer::tree_state::TreeStateQueue;
 use crate::persistence::Persistence;
 use crate::tabs::{SaveScheduler, TabManager};
+use operon_store::repos::NoteKind;
 
 /// Signal flipped by the `Ctrl+Shift+F` global shortcut. The search input
 /// component watches this and steals focus when bumped.
@@ -241,7 +242,8 @@ pub fn click_handler(
     mut selected_project: Signal<Option<Uuid>>,
     mut workspace_open: Signal<HashMap<String, bool>>,
     tree_queue: Signal<TreeStateQueue>,
-    note_titles: Signal<HashMap<Uuid, String>>,
+    note_meta: Signal<HashMap<Uuid, (String, NoteKind)>>,
+    persistence: Arc<dyn Persistence>,
     mut query: Signal<String>,
     mut in_content: Signal<bool>,
 ) -> Callback<(SearchKind, Uuid, Option<Uuid>)> {
@@ -271,13 +273,62 @@ pub fn click_handler(
                             .read()
                             .enqueue(SCOPE_WORKSPACE, pid.to_string(), true);
                     }
-                    let title = note_titles
+                    let (title, kind) = note_meta
                         .read()
                         .get(&id)
                         .cloned()
-                        .unwrap_or_else(|| id.to_string());
-                    let _ =
-                        open_local_note_tab(tabs, save_scheduler.clone(), id, title, String::new());
+                        .unwrap_or_else(|| (id.to_string(), NoteKind::Markdown));
+                    // Hydrate the tab buffer from disk before opening, mirroring
+                    // the explorer click path (`on_select_note` in mod.rs). On
+                    // desktop, `FilesystemPersistence::load` wraps a synchronous
+                    // `std::fs::read`, so `block_on` resolves in one poll. On
+                    // wasm, fall back to opening empty + async-set_content so we
+                    // don't deadlock the browser thread.
+                    let id_str = id.to_string();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let initial_content = match futures::executor::block_on(
+                        persistence.load(&id_str),
+                    ) {
+                        Ok(bytes) => String::from_utf8(bytes).unwrap_or_default(),
+                        Err(crate::persistence::PersistError::NotFound) => String::new(),
+                        Err(e) => {
+                            eprintln!("operon: search-open load error note={id_str}: {e:?}");
+                            String::new()
+                        }
+                    };
+                    #[cfg(target_arch = "wasm32")]
+                    let initial_content = String::new();
+
+                    let new_tab_id = open_local_note_tab(
+                        tabs,
+                        save_scheduler.clone(),
+                        id,
+                        title,
+                        initial_content,
+                        kind,
+                    );
+
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let pers = persistence.clone();
+                        let mut tabs_handle = tabs;
+                        spawn(async move {
+                            match pers.load(&id_str).await {
+                                Ok(bytes) => {
+                                    if let Ok(content) = String::from_utf8(bytes) {
+                                        tabs_handle.write().set_content(new_tab_id, content);
+                                    }
+                                }
+                                Err(crate::persistence::PersistError::NotFound) => {}
+                                Err(e) => eprintln!(
+                                    "operon: search-open load error note={id_str}: {e:?}"
+                                ),
+                            }
+                        });
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _ = new_tab_id;
+
                     let _ = tabs.write();
                 }
             }

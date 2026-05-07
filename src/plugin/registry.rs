@@ -116,7 +116,11 @@ pub fn register_local_builtins(
 }
 
 fn register_format_builtins(registry: &mut PluginRegistry) -> Result<(), String> {
+    use crate::plugins::canvas::CanvasFormatPlugin;
+    use crate::plugins::code::CodeFormatPlugin;
+    use crate::plugins::excalidraw::ExcalidrawFormatPlugin;
     use crate::plugins::json_format::JsonFormatPlugin;
+    use crate::plugins::kanban::KanbanFormatPlugin;
     use crate::plugins::markdown::MarkdownFormatPlugin;
     use crate::plugins::mdx::MdxFormatPlugin;
     use crate::plugins::plaintext::PlaintextFormatPlugin;
@@ -126,6 +130,10 @@ fn register_format_builtins(registry: &mut PluginRegistry) -> Result<(), String>
     registry.add_format_plugin(Box::new(JsonFormatPlugin::new()))?;
     registry.add_format_plugin(Box::new(RichTextTiptapFormatPlugin::new()))?;
     registry.add_format_plugin(Box::new(MdxFormatPlugin::new()))?;
+    registry.add_format_plugin(Box::new(CodeFormatPlugin::new()))?;
+    registry.add_format_plugin(Box::new(KanbanFormatPlugin::new()))?;
+    registry.add_format_plugin(Box::new(CanvasFormatPlugin::new()))?;
+    registry.add_format_plugin(Box::new(ExcalidrawFormatPlugin::new()))?;
     Ok(())
 }
 

@@ -57,6 +57,13 @@ pub const SETTINGS_KEY_MODE_REMEMBERED: &str = "mode_remembered";
 pub const MODE_VALUE_LOCAL: &str = "Local";
 pub const MODE_VALUE_CLOUD: &str = "Cloud";
 
+/// App-scope reactive flag for "user has picked a mode".
+/// Initialised from the boot value of `mode_remembered`; flipped by
+/// [`StartupChooser`] when the user clicks Local or Cloud so the App rsx
+/// transitions out of the chooser without a restart.
+#[derive(Clone, Copy)]
+pub struct ModeChosen(pub dioxus::prelude::Signal<bool>);
+
 /// Settings key holding the absolute path to the user's notes vault directory.
 /// Set on first run by the `VaultDirPicker` modal; read at boot to decide
 /// whether to mount the workspace or render the picker. Used as the root for

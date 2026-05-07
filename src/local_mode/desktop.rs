@@ -273,12 +273,14 @@ pub fn SettingsPanel(open: Signal<bool>, username: Signal<String>) -> Element {
 pub fn StartupChooser() -> Element {
     let LocalSettingsRepo(settings_repo) = use_context();
     let mut state = use_context::<Signal<AppState>>();
+    let crate::local_mode::ModeChosen(mut mode_chosen) = use_context();
 
     let pick_local = {
         let settings = settings_repo.clone();
         move |_| {
             let _ = settings.set(SETTINGS_KEY_MODE_REMEMBERED, MODE_VALUE_LOCAL);
             state.with_mut(|s| s.mode = Mode::Local);
+            mode_chosen.set(true);
         }
     };
     let pick_cloud = {
@@ -286,6 +288,7 @@ pub fn StartupChooser() -> Element {
         move |_| {
             let _ = settings.set(SETTINGS_KEY_MODE_REMEMBERED, MODE_VALUE_CLOUD);
             state.with_mut(|s| s.mode = Mode::NonLocal);
+            mode_chosen.set(true);
         }
     };
 
@@ -528,19 +531,23 @@ pub fn provide_local_app_signals() {
                 &form,
             ) {
                 Ok(note_id) => {
-                    let title = note_repo_for_links_resolver
+                    let (title, kind) = note_repo_for_links_resolver
                         .list_for_project(source_project_id)
                         .ok()
                         .and_then(|notes| {
-                            notes.into_iter().find(|n| n.id == note_id).map(|n| n.title)
+                            notes
+                                .into_iter()
+                                .find(|n| n.id == note_id)
+                                .map(|n| (n.title, n.kind))
                         })
-                        .unwrap_or_else(|| target.clone());
+                        .unwrap_or_else(|| (target.clone(), NoteKind::Markdown));
                     super::editor::open_local_note_tab(
                         tabs_for_links,
                         scheduler_for_links.clone(),
                         note_id,
                         title,
                         String::new(),
+                        kind,
                     );
                     selected_note_for_links_setter.set(Some(note_id));
                 }

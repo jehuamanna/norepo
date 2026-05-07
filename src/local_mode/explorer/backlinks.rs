@@ -14,12 +14,14 @@ use crate::local_mode::desktop::{LocalNoteLinkRepo, LocalNoteRepo, LocalProjectR
 use crate::local_mode::editor::open_local_note_tab;
 use crate::local_mode::explorer::{LocalNoteVersion, SelectedNote};
 use crate::tabs::{SaveScheduler, TabManager};
+use operon_store::repos::NoteKind;
 
 #[derive(Clone, PartialEq)]
 struct Backref {
     id: Uuid,
     title: String,
     breadcrumb: String,
+    kind: NoteKind,
 }
 
 #[component]
@@ -54,22 +56,23 @@ pub fn BacklinksPanel() -> Element {
                 return;
             }
             let projects = project_repo.list().unwrap_or_default();
-            let mut by_id: std::collections::HashMap<Uuid, (String, String)> =
+            let mut by_id: std::collections::HashMap<Uuid, (String, String, NoteKind)> =
                 std::collections::HashMap::new();
             for p in &projects {
                 if let Ok(notes) = note_repo.list_for_project(p.id) {
                     for n in notes {
-                        by_id.insert(n.id, (n.title, p.name.clone()));
+                        by_id.insert(n.id, (n.title, p.name.clone(), n.kind));
                     }
                 }
             }
             let mut rows: Vec<Backref> = Vec::new();
             for id in referrers {
-                if let Some((title, proj)) = by_id.get(&id).cloned() {
+                if let Some((title, proj, kind)) = by_id.get(&id).cloned() {
                     rows.push(Backref {
                         id,
                         breadcrumb: format!("{proj} / {title}"),
                         title,
+                        kind,
                     });
                 }
             }
@@ -110,6 +113,7 @@ pub fn BacklinksPanel() -> Element {
                                     row.id,
                                     row.title.clone(),
                                     String::new(),
+                                    row.kind,
                                 );
                                 selected_setter.set(Some(row.id));
                             }

@@ -93,6 +93,13 @@ pub fn App() -> Element {
     let mut app_state: Signal<AppState> = use_signal(AppState::default);
     use_context_provider(|| app_state);
 
+    // App-scope visibility for the About dialog (surfaced from Help → About
+    // and the `help.about` command). Provided here so any descendant
+    // (palette, dropdown, command handlers) can flip it without prop-
+    // drilling. The dialog itself owns the close path.
+    let about_open: Signal<bool> = use_signal(|| false);
+    use_context_provider(|| crate::shell::about::AboutOpen(about_open));
+
     #[cfg(not(target_arch = "wasm32"))]
     let initial_mode_remembered: Option<Mode> = {
         let crate::local_mode::LocalSettingsRepo(settings) = use_context();
@@ -112,7 +119,7 @@ pub fn App() -> Element {
     // App-scope state via `CurrentVaultRoot` so SettingsPanel "Change…" can
     // hot-apply a re-pick without a reload.
     #[cfg(not(target_arch = "wasm32"))]
-    let mut vault_root: Signal<Option<VaultRoot>> = {
+    let vault_root: Signal<Option<VaultRoot>> = {
         let crate::local_mode::LocalSettingsRepo(settings) = use_context();
         use_signal(|| crate::local_mode::read_vault_root(&settings))
     };
@@ -147,17 +154,15 @@ pub fn App() -> Element {
         }
     });
 
-    // Mode is now resolved — pick the right default activity item and the
-    // right plugin registry contributions accordingly.
-    let initial_activity_id = match initial_mode_remembered {
-        Some(Mode::Local) => Some(ActivityItemId(
-            "local-projects-explorer:default".to_string(),
-        )),
-        Some(Mode::NonLocal) => Some(ActivityItemId("notes-explorer:default".to_string())),
-        None => None,
-    };
-    let active: Signal<Option<ActivityItemId>> = use_signal(|| initial_activity_id);
-    use_context_provider(|| ActiveActivity(active));
+    // Reactive "user has chosen a mode" flag — flipped by StartupChooser when
+    // either button is clicked so App can transition out of the chooser
+    // without requiring a restart. Seeded from the once-read remembered mode.
+    let mode_chosen: Signal<bool> = use_signal(|| initial_mode_remembered.is_some());
+    use_context_provider(|| crate::local_mode::ModeChosen(mode_chosen));
+
+    // The `ActiveActivity` signal is mode-dependent (its initial item id
+    // differs between Local and NonLocal builtins) and so is provided by
+    // `Workspace`, not here.
 
     let last_active: Signal<Option<ActivityItemId>> = use_signal(|| None);
     use_context_provider(|| LastActiveActivity(last_active));
@@ -180,17 +185,117 @@ pub fn App() -> Element {
     let mut log_buffer: Signal<LogBuffer> = use_signal(LogBuffer::new);
     use_context_provider(|| log_buffer);
 
+    // Mode-dependent setup (persistence path, plugin registry, default
+    // activity item, Local-Mode app-scope signals) lives in `Workspace`
+    // below. `Workspace` is only mounted after the user has chosen a mode,
+    // so its hooks always run with the resolved mode in hand — avoiding
+    // the "registry initialised once for the wrong mode" bug that came
+    // from running these in App during the StartupChooser phase.
+
+    use_context_provider(|| {
+        let mut reg = CommandRegistry::new();
+        if let Err(err) = register_builtin_commands(&mut reg) {
+            eprintln!("operon: register_builtin_commands failed: {err}");
+        }
+        Rc::new(reg)
+    });
+
+    use_hook(|| {
+        log_info!(log_buffer, "Operon: ready");
+    });
+
+    // HTML5 drag-and-drop on wry's WebKit/webkit2gtk backend silently aborts
+    // a `dragstart` whose handler doesn't populate `dataTransfer`. Dioxus
+    // 0.7's `DragData` exposes no source-side `setData` API, so we install a
+    // tiny capture-phase JS shim here that stuffs a placeholder payload on
+    // any draggable explorer row (`data-explorer="true"`). The Rust event
+    // chain (DragSession signal, descendant cycle check, drop dispatch) is
+    // the source of truth; this shim only exists to keep the native drag
+    // alive so dragover/drop fire.
+    use_hook(|| {
+        document::eval(
+            r#"
+            if (!window.__operonDndShimInstalled) {
+                window.__operonDndShimInstalled = true;
+                document.addEventListener('dragstart', function(e) {
+                    var t = e.target && e.target.closest
+                        ? e.target.closest('[data-explorer="true"][draggable="true"]')
+                        : null;
+                    if (!t || !e.dataTransfer) return;
+                    e.dataTransfer.effectAllowed = 'move';
+                    var id = t.dataset.noteId || t.dataset.projectId || 'operon-row';
+                    try { e.dataTransfer.setData('text/plain', id); } catch (_) {}
+                }, true);
+            }
+            "#,
+        );
+    });
+
+    use_effect(move || {
+        let snapshot = theme.read();
+        let data = snapshot.data_attr();
+        let data_id = snapshot.data_id_attr();
+        let style = snapshot.css_variables();
+        drop(snapshot);
+        let script = format!(
+            "document.documentElement.setAttribute('data-theme', '{data}');\
+             document.documentElement.setAttribute('data-theme-id', '{data_id}');\
+             document.documentElement.setAttribute('style', '{style}');"
+        );
+        document::eval(&script);
+    });
+
+    let mode_known = *mode_chosen.read();
+
+    rsx! {
+        document::Link { rel: "icon", href: FAVICON }
+        // Stylesheets are emitted in <head> at template-build time via
+        // manganis static_head (see asset!() options at the top of this
+        // file). The runtime document::Stylesheet entries below ensure
+        // hot-reload still re-applies CSS after a non-hot-reloadable
+        // change; Dioxus dedupes them against the static-head links by
+        // href so there is no duplicate fetch.
+        document::Stylesheet { href: MAIN_CSS }
+        document::Stylesheet { href: TAILWIND_CSS }
+        document::Stylesheet { href: THEME_CSS }
+        document::Stylesheet { href: SHELL_CSS }
+        document::Stylesheet { href: MARKDOWN_CSS }
+        div {
+            id: "operon-root",
+            if !mode_known {
+                StartupChooser {}
+            } else {
+                Workspace {}
+            }
+        }
+        // Top-level overlay so the dialog floats above StartupChooser and
+        // Workspace alike. Component returns an empty fragment when the
+        // signal is false.
+        crate::shell::about::AboutDialog {}
+    }
+}
+
+/// Mounts only after the user has picked a mode. Owns every context
+/// provider whose initialiser depends on `AppState.mode` or the chosen
+/// vault so they are computed exactly once with the resolved values.
+#[component]
+fn Workspace() -> Element {
+    let app_state = use_context::<Signal<AppState>>();
+    let theme = use_context::<Signal<Theme>>();
+    let tabs = use_context::<Signal<TabManager>>();
+
     let resolved_mode = app_state.read().mode;
+
     #[cfg(not(target_arch = "wasm32"))]
-    let persistence = {
-        // Plans-Phase-2-saving: route Local-Mode FS persistence through the
-        // user-chosen vault. Cloud mode stays on the legacy default dir until
-        // we finish migrating cloud-mode notes too.
+    let crate::local_mode::CurrentVaultRoot(mut vault_root) = use_context();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let persistence: Arc<dyn Persistence> = {
         let vault_now = vault_root.read().clone();
         provide_persistence_with_vault(resolved_mode, vault_now.as_ref())
     };
     #[cfg(target_arch = "wasm32")]
-    let persistence = provide_persistence(resolved_mode);
+    let persistence: Arc<dyn Persistence> = provide_persistence(resolved_mode);
     let scheduler = SaveScheduler::new(persistence.clone());
     use_context_provider(|| persistence);
     use_context_provider(|| scheduler);
@@ -211,89 +316,49 @@ pub fn App() -> Element {
         Rc::new(registry)
     });
 
-    // Local-only app-scope signals — must be installed before mounting Shell so
-    // the mode-aware StatusBar/ActivityBar/SideBar plugin can read them.
-    if resolved_mode == Mode::Local {
-        crate::local_mode::provide_local_app_signals();
-    }
+    // Local-Mode app-scope signals (consume `tabs`, `persistence`, and
+    // the SQLite repos installed by `provide_local_state` in App).
+    crate::local_mode::provide_local_app_signals();
 
-    use_context_provider(|| {
-        let mut reg = CommandRegistry::new();
-        if let Err(err) = register_builtin_commands(&mut reg) {
-            eprintln!("operon: register_builtin_commands failed: {err}");
-        }
-        Rc::new(reg)
-    });
+    let initial_activity_id = match resolved_mode {
+        Mode::Local => Some(ActivityItemId(
+            "local-projects-explorer:default".to_string(),
+        )),
+        Mode::NonLocal => Some(ActivityItemId("notes-explorer:default".to_string())),
+    };
+    let active: Signal<Option<ActivityItemId>> = use_signal(|| initial_activity_id);
+    use_context_provider(|| ActiveActivity(active));
 
-    use_hook(|| {
-        log_info!(log_buffer, "Operon: ready");
-    });
-
-    use_effect(move || {
-        let snapshot = theme.read();
-        let data = snapshot.data_attr();
-        let data_id = snapshot.data_id_attr();
-        let style = snapshot.css_variables();
-        drop(snapshot);
-        let script = format!(
-            "document.documentElement.setAttribute('data-theme', '{data}');\
-             document.documentElement.setAttribute('data-theme-id', '{data_id}');\
-             document.documentElement.setAttribute('style', '{style}');"
-        );
-        document::eval(&script);
-    });
-
-    let mode_known = initial_mode_remembered.is_some();
-    let current_mode = app_state.read().mode;
     #[cfg(not(target_arch = "wasm32"))]
     let vault_set = vault_root.read().is_some();
     #[cfg(target_arch = "wasm32")]
-    let vault_set = true; // wasm path skips the local-mode picker
+    let vault_set = true;
     #[cfg(target_arch = "wasm32")]
     let _ = vault_set;
 
     rsx! {
-        document::Link { rel: "icon", href: FAVICON }
-        // Stylesheets are emitted in <head> at template-build time via
-        // manganis static_head (see asset!() options at the top of this
-        // file). The runtime document::Stylesheet entries below ensure
-        // hot-reload still re-applies CSS after a non-hot-reloadable
-        // change; Dioxus dedupes them against the static-head links by
-        // href so there is no duplicate fetch.
-        document::Stylesheet { href: MAIN_CSS }
-        document::Stylesheet { href: TAILWIND_CSS }
-        document::Stylesheet { href: THEME_CSS }
-        document::Stylesheet { href: SHELL_CSS }
-        document::Stylesheet { href: MARKDOWN_CSS }
-        div {
-            id: "operon-root",
-            if !mode_known {
-                StartupChooser {}
-            } else if current_mode == Mode::Local {
+        if resolved_mode == Mode::Local {
+            {
+                #[cfg(not(target_arch = "wasm32"))]
                 {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        if !vault_set {
-                            rsx! {
-                                VaultDirPicker {
-                                    blocking: true,
-                                    on_chosen: move |root: VaultRoot| {
-                                        vault_root.set(Some(root));
-                                    },
-                                }
-                            }
-                        } else {
-                            rsx! {
-                                crate::local_mode::LocalShellOverlay { Shell {} }
+                    if !vault_set {
+                        rsx! {
+                            VaultDirPicker {
+                                blocking: true,
+                                on_chosen: move |root: VaultRoot| {
+                                    vault_root.set(Some(root));
+                                },
                             }
                         }
+                    } else {
+                        rsx! { crate::local_mode::LocalShellOverlay { Shell {} } }
                     }
-                    #[cfg(target_arch = "wasm32")]
-                    rsx! { crate::local_mode::LocalShellOverlay { Shell {} } }
                 }
-            } else {
-                Shell {}
+                #[cfg(target_arch = "wasm32")]
+                rsx! { crate::local_mode::LocalShellOverlay { Shell {} } }
             }
+        } else {
+            Shell {}
         }
     }
 }

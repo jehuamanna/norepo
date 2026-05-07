@@ -97,7 +97,7 @@ pub fn light() -> Theme {
     c.insert(ThemeToken::CommandPaletteSelectionBackground, "#0060C040".into());
     c.insert(ThemeToken::DropdownBackground, "#FFFFFF".into());
     c.insert(ThemeToken::ListActiveSelectionBackground, "#0060C040".into());
-    c.insert(ThemeToken::ListInactiveSelectionBackground, "#E4E6F1".into());
+    c.insert(ThemeToken::ListInactiveSelectionBackground, "#D0D0D6".into());
     c.insert(ThemeToken::SplitterBackground, "#E5E5E5".into());
     c.insert(ThemeToken::SplitterHoverBackground, "#005FB8".into());
     c.insert(ThemeToken::ScrollbarSliderBackground, "#64646466".into());

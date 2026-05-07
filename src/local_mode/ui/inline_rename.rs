@@ -33,20 +33,15 @@ pub fn InlineRename(props: InlineRenameProps) -> Element {
                 // synchronously, but clippy still flags the unawaited future. Drop
                 // it explicitly so the lint is satisfied.
                 drop(evt.set_focus(true));
-                // On wasm, also pre-select the input's placeholder so a freshly
-                // created note can be retitled by typing without the user
-                // first selecting the existing text. Desktop falls back to
-                // autofocus-only.
-                #[cfg(target_arch = "wasm32")]
-                {
-                    use dioxus::web::WebEventExt;
-                    use wasm_bindgen::JsCast;
-                    if let Some(node) = evt.data().try_as_web_event() {
-                        if let Ok(input) = node.dyn_into::<web_sys::HtmlInputElement>() {
-                            input.select();
-                        }
-                    }
-                }
+                // Pre-select the input's text so a freshly-created note can be
+                // retitled by typing without first deleting the placeholder.
+                // Dioxus desktop hosts a webview, so <input>.select() is reachable
+                // via the portable eval bridge on both web and desktop targets.
+                // Only one inline-rename input is ever mounted at a time (gated
+                // by the `renaming_note` signal), so a global selector is safe.
+                let _ = dioxus::document::eval(
+                    "const el = document.querySelector('[data-testid=\"inline-rename-input\"]'); if (el) el.select();"
+                );
             },
             oninput: move |evt| value.set(evt.value()),
             onkeydown: move |evt| {

@@ -15,7 +15,8 @@ pub use clipboard::{
 pub use confirm::ConfirmDialog;
 pub use context_menu::{ContextMenu, ContextMenuItem};
 pub use drag_drop::{
-    classify_drop_position, DragDescendants, DragKind, DragSession, DropPosition,
+    classify_drop_position, classify_target_depth, resolve_drop_parent, DragDescendants, DragKind,
+    DragSession, DropPosition,
 };
 pub use inline_rename::InlineRename;
 pub use toast::{Toast, ToastHost, ToastKind, ToastSlot};

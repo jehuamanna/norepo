@@ -22,6 +22,7 @@ use crate::shell::state::{ActiveActivity, ActivityItemId, LastActiveActivity};
 use crate::tabs::TabManager;
 
 mod activity_bar;
+pub mod about;
 pub mod codemirror_host;
 mod companion_area;
 #[cfg(not(target_arch = "wasm32"))]

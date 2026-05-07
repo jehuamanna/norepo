@@ -14,27 +14,92 @@ use crate::time::now_ms;
 
 const DEFAULT_NOTE_TITLE: &str = "Untitled";
 
-/// Plans-Phase-6-image-notes: the note's content kind. Backed by the
-/// `local_note.kind` column added in migration 008.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// The note's content kind. Backed by the `local_note.kind` column. The
+/// allowed string set is enforced by a CHECK constraint at the SQL layer
+/// (migrations 008 and 011) — adding a new variant here requires a new
+/// migration that broadens the CHECK.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum NoteKind {
     Markdown,
+    Mdx,
     Image,
+    Canvas,
+    Excalidraw,
+    Kanban,
+    Code,
 }
 
 impl NoteKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Markdown => "markdown",
+            Self::Mdx => "mdx",
             Self::Image => "image",
+            Self::Canvas => "canvas",
+            Self::Excalidraw => "excalidraw",
+            Self::Kanban => "kanban",
+            Self::Code => "code",
         }
     }
 
     pub fn from_str(s: &str) -> Self {
         match s {
+            "mdx" => Self::Mdx,
             "image" => Self::Image,
+            "canvas" => Self::Canvas,
+            "excalidraw" => Self::Excalidraw,
+            "kanban" => Self::Kanban,
+            "code" => Self::Code,
             _ => Self::Markdown,
         }
+    }
+
+    /// Stable identifier the editor host uses to look up a `FormatPlugin`
+    /// in `PluginRegistry`. Keep in sync with the `format_id` returned by
+    /// each plugin's `manifest()`.
+    pub fn format_id(&self) -> &'static str {
+        self.as_str()
+    }
+
+    /// Human-readable label for the explorer's + dropdown.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Markdown => "Markdown",
+            Self::Mdx => "MDX",
+            Self::Image => "Image",
+            Self::Canvas => "Canvas",
+            Self::Excalidraw => "Excalidraw",
+            Self::Kanban => "Kanban",
+            Self::Code => "Code",
+        }
+    }
+
+    /// Single-character glyph used by the explorer to badge each note row.
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Self::Markdown => "md",
+            Self::Mdx => "mx",
+            Self::Image => "im",
+            Self::Canvas => "cv",
+            Self::Excalidraw => "ex",
+            Self::Kanban => "kb",
+            Self::Code => "{}",
+        }
+    }
+
+    /// Variants the user can pick from the explorer's + dropdown, in the
+    /// order they should appear. Drives `project_row` and `note_row` so a
+    /// future variant lights up everywhere by editing this list.
+    pub fn all_creatable() -> &'static [NoteKind] {
+        &[
+            Self::Markdown,
+            Self::Mdx,
+            Self::Code,
+            Self::Image,
+            Self::Kanban,
+            Self::Canvas,
+            Self::Excalidraw,
+        ]
     }
 }
 
@@ -1710,5 +1775,40 @@ mod tests {
             listed.iter().map(|r| (r.id, r)).collect();
         assert_eq!(by_id.get(&b.id).unwrap().sibling_index, 1);
         assert_eq!(by_id.get(&c.id).unwrap().sibling_index, 3);
+    }
+
+    #[test]
+    fn note_kind_string_round_trip_covers_every_variant() {
+        for &kind in NoteKind::all_creatable() {
+            let s = kind.as_str();
+            assert_eq!(NoteKind::from_str(s), kind, "round-trip failed for {s}");
+        }
+        // Unknown strings collapse to Markdown so old rows stay readable.
+        assert_eq!(NoteKind::from_str("definitely-not-a-kind"), NoteKind::Markdown);
+    }
+
+    #[test]
+    fn note_kind_format_id_matches_as_str() {
+        for &kind in NoteKind::all_creatable() {
+            assert_eq!(kind.format_id(), kind.as_str());
+        }
+    }
+
+    #[test]
+    fn create_with_kind_persists_each_variant() {
+        let (_p, n, project_id) = make_pair();
+        for &kind in NoteKind::all_creatable() {
+            let label = kind.as_str();
+            let created = n
+                .create_with_kind(project_id, None, label, kind)
+                .unwrap_or_else(|e| panic!("create_with_kind({label}) failed: {e}"));
+            assert_eq!(created.kind, kind, "kind mismatch for {label}");
+        }
+        let listed = n.list_for_project(project_id).unwrap();
+        for &kind in NoteKind::all_creatable() {
+            let label = kind.as_str();
+            let row = listed.iter().find(|r| r.title == label).unwrap();
+            assert_eq!(row.kind, kind);
+        }
     }
 }

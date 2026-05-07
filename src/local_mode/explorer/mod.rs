@@ -34,10 +34,10 @@ use crate::editor::EditorMode;
 use crate::local_mode::desktop::{LocalNoteRepo, LocalProjectRepo, LocalTreeStateRepo};
 use crate::local_mode::editor::{open_local_note_tab, LocalSaveAction};
 use crate::local_mode::ui::{
-    ClipKind, ClipPayload, Clipboard, ConfirmDialog, DragKind, DragSession, DropPosition,
-    LocalClipboard,
+    resolve_drop_parent, ClipKind, ClipPayload, Clipboard, ConfirmDialog, DragKind, DragSession,
+    DropPosition, LocalClipboard,
 };
-use crate::persistence::Persistence;
+use crate::persistence::{PersistError, Persistence};
 use crate::tabs::{SaveScheduler, TabManager};
 
 /// App-scope signal: bumped on every successful project mutation. The panel
@@ -92,12 +92,13 @@ pub struct NotesByProjectCtx(pub Signal<HashMap<Uuid, Vec<LocalNote>>>);
 
 /// Plans-Phase-8-explorer-undo: panel-scope handle to the explorer's
 /// undo stack and the callback that pops + applies the latest inverse.
-/// Rows read `history.read().is_empty()` to gate the menu item and call
-/// `on_undo` to fire it.
+/// Rows read `history.read().is_empty()` (and `redo_is_empty()`) to gate
+/// menu items and call `on_undo` / `on_redo` to fire them.
 #[derive(Clone, Copy)]
 pub struct ExplorerUndoCtx {
     pub history: Signal<history::ExplorerHistory>,
     pub on_undo: Callback<()>,
+    pub on_redo: Callback<()>,
 }
 
 /// Bumped on every note mutation. The panel re-fetches notes for the
@@ -334,15 +335,50 @@ pub fn ExplorerPanel() -> Element {
     // Snapshot of the previously-selected note so Esc can restore focus.
     let prev_selection: Signal<Option<Uuid>> = use_signal(|| None);
 
+    // VS Code-style "auto-reveal": when the active tab changes (e.g. user
+    // clicks a tab in the strip), move the explorer's selected_note to that
+    // tab's note so the gray-bg selection follows the user's editor focus,
+    // not just the small blue left bar. peek() on selected_note avoids
+    // subscribing the effect to its own writes — without that guard, the
+    // .set() would re-fire the effect, and `prev_selection` would loop the
+    // same way it did in image 9.
+    {
+        let mut selected_note_for_sync = selected_note;
+        use_effect(move || {
+            let active_id = tabs
+                .read()
+                .active()
+                .and_then(|t| Uuid::parse_str(&t.note_id).ok());
+            if let Some(id) = active_id {
+                if *selected_note_for_sync.peek() != Some(id) {
+                    selected_note_for_sync.set(Some(id));
+                }
+            }
+        });
+    }
+
     // Debounce: spawn a delay each time the query changes; only the last spawn
-    // wins by checking a generation counter.
+    // wins by checking a generation counter. Without cancellation, typing N
+    // chars rapidly would queue N spawned tasks that all fire `set()` after
+    // 150ms, causing N redundant panel re-renders on the trailing edge.
+    let mut debounce_gen: Signal<u64> = use_signal(|| 0u64);
     {
         let mut debounced_setter = debounced_query;
         use_effect(move || {
             let q = search_query.read().clone();
+            // Bump-and-capture the generation under which this spawn is born.
+            // peek() avoids subscribing the effect to its own writes (read()
+            // would create a feedback loop).
+            let my_gen = {
+                let next = *debounce_gen.peek() + 1;
+                debounce_gen.set(next);
+                next
+            };
             spawn(async move {
                 search::debounce_window().await;
-                debounced_setter.set(q);
+                if *debounce_gen.peek() == my_gen {
+                    debounced_setter.set(q);
+                }
             });
         });
     }
@@ -400,6 +436,7 @@ pub fn ExplorerPanel() -> Element {
     // ===== Project handlers =====
     let on_select_project = use_callback(move |id: Uuid| {
         selected_project.set(Some(id));
+        selected_note.set(None);
     });
 
     let project_repo_for_create = project_repo.clone();
@@ -475,8 +512,79 @@ pub fn ExplorerPanel() -> Element {
         }
     });
 
+    // Auto-open the project at the workspace level so a freshly-created
+    // root/child/sibling/image note becomes visible even when the project
+    // chevron was collapsed at the time of creation. Mirrors the open-side
+    // branch of `on_toggle_project`: flips `workspace_open[project_id]`,
+    // enqueues the persistence write, and lazy-hydrates the per-project
+    // note-open map on first open.
+    let queue_for_open_project = tree_queue;
+    let mut workspace_open_for_open_project = workspace_open;
+    let mut project_note_open_for_open_project = project_note_open;
+    let tree_repo_for_open_project = tree_repo.clone();
+    let open_project_workspace = move |project_id: Uuid| {
+        let key = project_id.to_string();
+        let already_open = workspace_open_for_open_project
+            .read()
+            .get(&key)
+            .copied()
+            .unwrap_or(false);
+        if already_open {
+            return;
+        }
+        workspace_open_for_open_project.with_mut(|m| {
+            m.insert(key.clone(), true);
+        });
+        queue_for_open_project
+            .read()
+            .enqueue(SCOPE_WORKSPACE, key, true);
+        if !project_note_open_for_open_project
+            .read()
+            .contains_key(&project_id)
+        {
+            match tree_repo_for_open_project.snapshot_for_scope(&scope_for_project(project_id)) {
+                Ok(snap) => project_note_open_for_open_project.with_mut(|m| {
+                    m.insert(project_id, snap);
+                }),
+                Err(e) => eprintln!(
+                    "operon: snapshot_for_scope project:{project_id} failed (open-on-create): {e}"
+                ),
+            }
+        }
+    };
+
+    // Plans-Phase-3-note-id-create: auto-expand the parent (and any collapsed
+    // ancestors) so the new child/sibling rename input is visible without
+    // manual chevron clicks. Walks the parent_id chain in `notes_by_project`
+    // for the given project, marks each ancestor open in both the in-memory
+    // `project_note_open` map and the persisted `tree_state` queue.
+    let queue_for_expand = tree_queue;
+    let mut project_note_open_for_expand = project_note_open;
+    let notes_by_project_for_expand = notes_by_project;
+    let expand_ancestors = move |project_id: Uuid, mut cursor: Option<Uuid>| {
+        let scope = scope_for_project(project_id);
+        let snap = notes_by_project_for_expand.read();
+        let Some(list) = snap.get(&project_id) else {
+            return;
+        };
+        // Build a parent lookup once so the ancestor walk is O(depth)
+        // instead of O(depth * project size).
+        let parent_by_id: HashMap<Uuid, Option<Uuid>> =
+            list.iter().map(|n| (n.id, n.parent_id)).collect();
+        while let Some(id) = cursor {
+            let key = id.to_string();
+            project_note_open_for_expand.with_mut(|map| {
+                map.entry(project_id).or_default().insert(key.clone(), true);
+            });
+            queue_for_expand.read().enqueue(scope.clone(), key, true);
+            cursor = parent_by_id.get(&id).copied().flatten();
+        }
+    };
+
     let note_repo_for_add_root = note_repo.clone();
+    let mut open_project_for_root = open_project_workspace.clone();
     let on_add_root_markdown_note = use_callback(move |project_id: Uuid| {
+        open_project_for_root(project_id);
         match note_repo_for_add_root.create(project_id, None, "") {
             Ok(n) => {
                 // Plans-Phase-10: undoable create.
@@ -491,106 +599,67 @@ pub fn ExplorerPanel() -> Element {
         }
     });
 
-    // Plans-Phase-6-image-notes: Add image note via native file picker.
-    // Reads the chosen file, writes via images::write_image, mints an
-    // image-note row, and attaches blob_path. Lives entirely on the
-    // desktop side because rfd is desktop-only.
-    //
-    // Plans-Phase-6 (follow-up F1): generalised to accept a `parent_id` and
-    // optional `sibling_after_idx` so the same picker drives the project,
-    // child, and sibling Image submenu leaves. Newly-created rows enter
-    // inline rename (item 3 — auto-rename on Image create).
+    // Operon-Phase-3-note-kinds: Image-note creation is now placeholder-
+    // first. The historical OS file picker has moved into the empty-state
+    // pane of the image editor (`local_mode::editor::try_render_image_view`
+    // empty branch) — clicking "Image" in any + dropdown or right-click
+    // submenu mints an empty Image note (blob_path = None), opens its tab,
+    // and lets the user pick / paste / drop a file from inside the editor.
+    // No async / file system work happens here, so this is a lean,
+    // synchronous callback.
     let note_repo_for_add_image = note_repo.clone();
-    let crate::local_mode::CurrentVaultRoot(vault_root_signal) = use_context();
+    let crate::local_mode::CurrentVaultRoot(vault_root_signal) = use_context::<crate::local_mode::CurrentVaultRoot>();
+    let mut open_project_for_image = open_project_workspace.clone();
+    let mut expand_ancestors_for_image = expand_ancestors.clone();
     let on_pick_image_note = use_callback(move |
         (project_id, parent_id, sibling_after_idx): (Uuid, Option<Uuid>, Option<i64>),
     | {
-        let Some(vault) = vault_root_signal.read().clone() else {
-            eprintln!("operon: add image note: no vault");
-            return;
-        };
-        let note_repo = note_repo_for_add_image.clone();
-        spawn(async move {
-            let Some(handle) = rfd::AsyncFileDialog::new()
-                .set_title("Choose an image")
-                .add_filter("Image", &["png", "jpg", "jpeg", "webp", "gif", "svg", "avif"])
-                .pick_file()
-                .await
-            else {
-                return;
-            };
-            let path = handle.path().to_path_buf();
-            let bytes = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("operon: read image file {path:?} failed: {e}");
-                    return;
-                }
-            };
-            // Cheap MIME inference from the chosen extension.
-            let ext = path
-                .extension()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_ascii_lowercase())
-                .unwrap_or_default();
-            let mime = match ext.as_str() {
-                "png" => "image/png",
-                "jpg" | "jpeg" => "image/jpeg",
-                "webp" => "image/webp",
-                "gif" => "image/gif",
-                "svg" => "image/svg+xml",
-                "avif" => "image/avif",
-                _ => {
-                    eprintln!("operon: add image note: unsupported extension {ext}");
-                    return;
-                }
-            };
-            let written = match crate::local_mode::images::write_image(&vault, &bytes, mime) {
-                Ok(w) => w,
-                Err(e) => {
-                    eprintln!("operon: write_image failed: {e}");
-                    return;
-                }
-            };
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Image")
-                .to_string();
-            match note_repo.create_with_kind(project_id, parent_id, &stem, NoteKind::Image) {
-                Ok(row) => {
-                    // Sibling case: relocate immediately after the anchor.
-                    if let Some(idx) = sibling_after_idx {
-                        if let Err(e) = note_repo.move_to(row.id, project_id, parent_id, idx) {
-                            eprintln!("operon: image sibling move_to failed: {e}");
-                        }
+        open_project_for_image(project_id);
+        expand_ancestors_for_image(project_id, parent_id);
+        match note_repo_for_add_image.create_with_kind(project_id, parent_id, "", NoteKind::Image) {
+            Ok(row) => {
+                if let Some(idx) = sibling_after_idx {
+                    if let Err(e) = note_repo_for_add_image.move_to(row.id, project_id, parent_id, idx) {
+                        eprintln!("operon: image sibling move_to failed: {e}");
                     }
-                    let rel = written.relative_path.to_string_lossy().to_string();
-                    if let Err(e) = note_repo.set_blob_path(row.id, Some(&rel)) {
-                        eprintln!("operon: set_blob_path failed: {e}");
-                    }
-                    // Plans-Phase-10: undoable create — pass the blob path
-                    // so undo can GC the orphaned file.
-                    history.write().push(history::ExplorerAction::Create {
-                        id: row.id,
-                        blob_path: Some(rel.clone()),
-                    });
-                    note_version.with_mut(|v| *v += 1);
-                    renaming_note_setter.set(Some(row.id));
                 }
-                Err(e) => eprintln!("operon: create image note failed: {e}"),
+                history.write().push(history::ExplorerAction::Create {
+                    id: row.id,
+                    blob_path: None,
+                });
+                note_version.with_mut(|v| *v += 1);
+                renaming_note_setter.set(Some(row.id));
             }
-        });
+            Err(e) => eprintln!("operon: create image placeholder failed: {e}"),
+        }
     });
 
-    // Plans-Phase-1-note-creation-context-menu: unified project-level Add
-    // note dispatch. The submenu's Markdown leaf takes the existing fast
-    // path (auto-rename); Image leaf reuses the generalised picker path
-    // with parent_id=None and no sibling anchor.
+    // Operon-Phase-1-note-kinds: unified project-level Add note dispatch.
+    // Markdown still takes the auto-rename fast path. Image continues
+    // through the picker callback. Every other kind (Mdx, Code, Kanban,
+    // Canvas, Excalidraw) is created at the root via create_with_kind —
+    // empty content, inline rename triggered, format dispatched at render
+    // time via NoteKind::format_id().
+    let note_repo_for_add_project = note_repo.clone();
+    let mut open_project_for_add = open_project_workspace.clone();
     let on_add_project_note =
         use_callback(move |(project_id, kind): (Uuid, NoteKind)| match kind {
             NoteKind::Markdown => on_add_root_markdown_note.call(project_id),
             NoteKind::Image => on_pick_image_note.call((project_id, None, None)),
+            other => {
+                open_project_for_add(project_id);
+                match note_repo_for_add_project.create_with_kind(project_id, None, "", other) {
+                    Ok(n) => {
+                        history.write().push(history::ExplorerAction::Create {
+                            id: n.id,
+                            blob_path: None,
+                        });
+                        note_version.with_mut(|v| *v += 1);
+                        renaming_note_setter.set(Some(n.id));
+                    }
+                    Err(e) => eprintln!("operon: create root {} note failed: {e}", other.as_str()),
+                }
+            }
         });
 
     // ===== Note handlers =====
@@ -607,14 +676,17 @@ pub fn ExplorerPanel() -> Element {
     let persistence_for_select = persistence.clone();
     let on_select_note = use_callback(move |note_id: Uuid| {
         selected_note.set(Some(note_id));
-        // Find note metadata to get the title; fall back to the id.
-        let title = notes_by_project
+        selected_project.set(None);
+        // Find note metadata to get the title + kind; fall back to id +
+        // Markdown so the editor still mounts (textarea path) for missing
+        // rows.
+        let (title, kind) = notes_by_project
             .read()
             .values()
             .flat_map(|list| list.iter())
             .find(|n| n.id == note_id)
-            .map(|n| n.title.clone())
-            .unwrap_or_else(|| note_id.to_string());
+            .map(|n| (n.title.clone(), n.kind))
+            .unwrap_or_else(|| (note_id.to_string(), NoteKind::Markdown));
 
         // Plans-Phase-9-monaco-desktop (rev 15): "click on note in
         // explorer" buffer-init logic.
@@ -649,45 +721,75 @@ pub fn ExplorerPanel() -> Element {
                     .map(|t| t.content.clone());
                 c
             };
-            // Plans-Phase-9-monaco-desktop (rev 18): open the tab
-            // synchronously with whatever we know right now (sibling
-            // buffer if any, else empty). main_area re-renders
-            // immediately and Monaco mounts. Then, in the
-            // no-sibling case, spawn an async load from disk and
-            // push the loaded body into the tab via `set_content`
-            // — Monaco's prop-mirror effect (rev 17) re-pushes the
-            // new content into the editor. Earlier rev gated the
-            // entire `open_local_note_tab` call on the async load,
-            // so until the load resolved the active tab didn't
-            // change and main_area kept showing the previous note.
-            let synchronous_content = inherited
-                .as_ref()
-                .cloned()
-                .unwrap_or_default();
+            // Plans-Phase-9-monaco-desktop (rev 20): drive the persistence
+            // load synchronously on desktop and pass the bytes as the
+            // tab's initial content, so Monaco mounts with the saved body
+            // already populated via `monaco.editor.create({value: …})`.
+            // Earlier revs spawned an async load and pushed `setContent`
+            // post-mount; in practice the first post-mount `eval.send`
+            // is dropped between Wry's `evaluate_script` and the JS
+            // `Channel.recv()` even though `eval.send` returns Ok and
+            // the bootstrap recv loop is alive. `FilesystemPersistence`
+            // wraps a synchronous `std::fs::read`, so `block_on` resolves
+            // in one poll — no UI block. On wasm, `OpfsPersistence` is
+            // genuinely async and `block_on` would deadlock the browser
+            // thread, so the spawn-then-set_content path stays there.
+            #[cfg(not(target_arch = "wasm32"))]
+            let synchronous_content = match inherited {
+                Some(content) => content,
+                None => {
+                    let pers = persistence_for_select.clone();
+                    let note_id_load = note_id_str.clone();
+                    match futures::executor::block_on(pers.load(&note_id_load)) {
+                        Ok(bytes) => String::from_utf8(bytes).unwrap_or_default(),
+                        Err(PersistError::NotFound) => String::new(),
+                        Err(e) => {
+                            eprintln!(
+                                "operon: load error note_id={note_id_load}: {e:?}"
+                            );
+                            String::new()
+                        }
+                    }
+                }
+            };
+            #[cfg(target_arch = "wasm32")]
+            let synchronous_content = inherited.as_ref().cloned().unwrap_or_default();
+
             let new_tab_id = open_local_note_tab(
                 tabs_for_select,
                 scheduler_for_select.clone(),
                 note_id,
                 title.clone(),
                 synchronous_content,
+                kind,
             );
-            if inherited.is_none() {
-                // Schedule the disk load. Updates the tab's buffer
-                // when the bytes arrive; the prop-mirror effect in
-                // `MonacoEditorHost` will push them into Monaco.
-                let pers = persistence_for_select.clone();
-                let mut tabs_handle = tabs_for_select;
-                let note_id_load = note_id_str.clone();
-                spawn(async move {
-                    let content = match pers.load(&note_id_load).await {
-                        Ok(bytes) => String::from_utf8(bytes).unwrap_or_default(),
-                        Err(_) => return, // no disk row yet (fresh note)
-                    };
-                    if !content.is_empty() {
-                        tabs_handle.write().set_content(new_tab_id, content);
-                    }
-                });
+            // Web build: keep the existing spawn-then-set_content path
+            // since OpfsPersistence's load is genuinely async. The
+            // `monaco_ready` gate in MonacoEditorHost handles the
+            // post-mount setContent timing on this path.
+            #[cfg(target_arch = "wasm32")]
+            {
+                if inherited.is_none() {
+                    let pers = persistence_for_select.clone();
+                    let mut tabs_handle = tabs_for_select;
+                    let note_id_load = note_id_str.clone();
+                    spawn(async move {
+                        match pers.load(&note_id_load).await {
+                            Ok(bytes) => {
+                                if let Ok(content) = String::from_utf8(bytes) {
+                                    tabs_handle.write().set_content(new_tab_id, content);
+                                }
+                            }
+                            Err(PersistError::NotFound) => {}
+                            Err(e) => eprintln!(
+                                "operon: load error note_id={note_id_load}: {e:?}"
+                            ),
+                        }
+                    });
+                }
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = new_tab_id;
         }
         let _ = tabs_for_select.write();
         // Plans-Phase-2: grant focus only when no rename input is alive.
@@ -788,36 +890,9 @@ pub fn ExplorerPanel() -> Element {
         pending_delete_note_setter.set(Some(id));
     });
 
-    // Plans-Phase-3-note-id-create: auto-expand the parent (and any collapsed
-    // ancestors) so the new child/sibling rename input is visible without
-    // manual chevron clicks. Walks the parent_id chain in `notes_by_project`
-    // for the given project, marks each ancestor open in both the in-memory
-    // `project_note_open` map and the persisted `tree_state` queue.
-    let queue_for_expand = tree_queue;
-    let mut project_note_open_for_expand = project_note_open;
-    let notes_by_project_for_expand = notes_by_project;
-    let expand_ancestors = move |project_id: Uuid, mut cursor: Option<Uuid>| {
-        let scope = scope_for_project(project_id);
-        let snap = notes_by_project_for_expand.read();
-        let Some(list) = snap.get(&project_id) else {
-            return;
-        };
-        // Build a parent lookup once so the ancestor walk is O(depth)
-        // instead of O(depth * project size).
-        let parent_by_id: HashMap<Uuid, Option<Uuid>> =
-            list.iter().map(|n| (n.id, n.parent_id)).collect();
-        while let Some(id) = cursor {
-            let key = id.to_string();
-            project_note_open_for_expand.with_mut(|map| {
-                map.entry(project_id).or_default().insert(key.clone(), true);
-            });
-            queue_for_expand.read().enqueue(scope.clone(), key, true);
-            cursor = parent_by_id.get(&id).copied().flatten();
-        }
-    };
-
     let note_repo_for_add_child = note_repo.clone();
     let mut expand_ancestors_for_child = expand_ancestors.clone();
+    let mut open_project_for_child = open_project_workspace.clone();
     // Plans-Phase-1-note-creation-context-menu: kind-aware add-child dispatch.
     // Markdown → existing fast path with auto-rename. Image → drives the
     // file picker via on_pick_image_note (item 2 — picker for child).
@@ -830,22 +905,24 @@ pub fn ExplorerPanel() -> Element {
             eprintln!("operon: add child note: parent {parent_id} not found");
             return;
         };
+        open_project_for_child(project_id);
         expand_ancestors_for_child(project_id, Some(parent_id));
         match kind {
-            NoteKind::Markdown => match note_repo_for_add_child.create(project_id, Some(parent_id), "") {
-                Ok(n) => {
-                    // Plans-Phase-10: undoable create.
-                    history.write().push(history::ExplorerAction::Create {
-                        id: n.id,
-                        blob_path: None,
-                    });
-                    note_version.with_mut(|v| *v += 1);
-                    renaming_note_setter.set(Some(n.id));
-                }
-                Err(e) => eprintln!("operon: create child note failed: {e}"),
-            },
             NoteKind::Image => {
                 on_pick_image_note.call((project_id, Some(parent_id), None));
+            }
+            other => {
+                match note_repo_for_add_child.create_with_kind(project_id, Some(parent_id), "", other) {
+                    Ok(n) => {
+                        history.write().push(history::ExplorerAction::Create {
+                            id: n.id,
+                            blob_path: None,
+                        });
+                        note_version.with_mut(|v| *v += 1);
+                        renaming_note_setter.set(Some(n.id));
+                    }
+                    Err(e) => eprintln!("operon: create child {} note failed: {e}", other.as_str()),
+                }
             }
         }
     });
@@ -857,6 +934,7 @@ pub fn ExplorerPanel() -> Element {
     // and expands ancestors so the new row is visible.
     let note_repo_for_add_sibling = note_repo.clone();
     let mut expand_ancestors_for_sibling = expand_ancestors.clone();
+    let mut open_project_for_sibling = open_project_workspace.clone();
     // Plans-Phase-1-note-creation-context-menu: kind-aware add-sibling.
     // Markdown branch creates + move_to(target_idx+1) + auto-rename.
     // Image branch routes through on_pick_image_note with the target's
@@ -875,30 +953,32 @@ pub fn ExplorerPanel() -> Element {
             eprintln!("operon: add sibling: target {target_id} not found");
             return;
         };
+        open_project_for_sibling(project_id);
         expand_ancestors_for_sibling(project_id, parent_id);
         match kind {
-            NoteKind::Markdown => match note_repo_for_add_sibling.create(project_id, parent_id, "") {
-                Ok(n) => {
-                    if let Err(e) = note_repo_for_add_sibling.move_to(
-                        n.id,
-                        project_id,
-                        parent_id,
-                        target_idx + 1,
-                    ) {
-                        eprintln!("operon: add sibling: move_to failed: {e}");
-                    }
-                    // Plans-Phase-10: undoable create.
-                    history.write().push(history::ExplorerAction::Create {
-                        id: n.id,
-                        blob_path: None,
-                    });
-                    note_version.with_mut(|v| *v += 1);
-                    renaming_note_setter.set(Some(n.id));
-                }
-                Err(e) => eprintln!("operon: create sibling note failed: {e}"),
-            },
             NoteKind::Image => {
                 on_pick_image_note.call((project_id, parent_id, Some(target_idx + 1)));
+            }
+            other => {
+                match note_repo_for_add_sibling.create_with_kind(project_id, parent_id, "", other) {
+                    Ok(n) => {
+                        if let Err(e) = note_repo_for_add_sibling.move_to(
+                            n.id,
+                            project_id,
+                            parent_id,
+                            target_idx + 1,
+                        ) {
+                            eprintln!("operon: add sibling: move_to failed: {e}");
+                        }
+                        history.write().push(history::ExplorerAction::Create {
+                            id: n.id,
+                            blob_path: None,
+                        });
+                        note_version.with_mut(|v| *v += 1);
+                        renaming_note_setter.set(Some(n.id));
+                    }
+                    Err(e) => eprintln!("operon: create sibling {} note failed: {e}", other.as_str()),
+                }
             }
         }
     });
@@ -1217,6 +1297,7 @@ pub fn ExplorerPanel() -> Element {
     use_context_provider(|| ExplorerUndoCtx {
         history,
         on_undo,
+        on_redo,
     });
 
     // Plans-Phase-6-image-notes: external image-file drop on a note row.
@@ -1281,12 +1362,16 @@ pub fn ExplorerPanel() -> Element {
     let project_repo_for_bulk_gc = project_repo.clone();
     let note_repo_for_bulk_gc = note_repo.clone();
     let crate::local_mode::CurrentVaultRoot(vault_root_for_bulk_gc) = use_context();
+    let mut tabs_for_bulk_delete = tabs;
     let on_confirm_bulk_delete = use_callback(move |_: ()| {
         let snapshot = multi_selected.read().clone();
         // Plans-Phase-6-image-notes: snapshot blob_paths to potentially
         // GC. We collect every blob_path of the targets + any descendants
-        // before the delete tx fires (FK cascade loses them after).
+        // before the delete tx fires (FK cascade loses them after). Same
+        // walk also collects the note ids whose tabs we must close after
+        // the deletes commit.
         let mut blobs: Vec<String> = Vec::new();
+        let mut deleted_note_ids: Vec<String> = Vec::new();
         let snap = notes_by_project.read();
         let target_ids: std::collections::HashSet<Uuid> = snapshot
             .iter()
@@ -1295,6 +1380,9 @@ pub fn ExplorerPanel() -> Element {
                 NodeKey::Project(_) => None,
             })
             .collect();
+        for tid in &target_ids {
+            deleted_note_ids.push(tid.to_string());
+        }
         for list in snap.values() {
             for n in list.iter() {
                 let touched = target_ids.contains(&n.id) || {
@@ -1312,6 +1400,9 @@ pub fn ExplorerPanel() -> Element {
                 if touched {
                     if let Some(p) = n.blob_path.clone() {
                         blobs.push(p);
+                    }
+                    if !target_ids.contains(&n.id) {
+                        deleted_note_ids.push(n.id.to_string());
                     }
                 }
             }
@@ -1341,6 +1432,20 @@ pub fn ExplorerPanel() -> Element {
         }
         if deleted > 0 {
             note_version.with_mut(|v| *v += 1);
+            // Close any open tabs for the deleted subtree(s).
+            let to_close: Vec<crate::tabs::TabId> = {
+                let snap = tabs_for_bulk_delete.read();
+                snap.iter()
+                    .filter(|t| deleted_note_ids.iter().any(|d| d == &t.note_id))
+                    .map(|t| t.id)
+                    .collect()
+            };
+            if !to_close.is_empty() {
+                let mut tm = tabs_for_bulk_delete.write();
+                for tid in to_close {
+                    tm.close(tid);
+                }
+            }
             if let Some(vault) = vault_root_for_bulk_gc.read().clone() {
                 let projects = project_repo_for_bulk_gc.list().unwrap_or_default();
                 for blob in blobs {
@@ -1418,16 +1523,6 @@ pub fn ExplorerPanel() -> Element {
                 };
                 let safe_title = sanitize_filename(&note.title);
                 match note.kind {
-                    operon_store::repos::NoteKind::Markdown => {
-                        let body = match persistence.load(&id.to_string()).await {
-                            Ok(b) => b,
-                            Err(_) => Vec::new(),
-                        };
-                        let path = unique_path(&target, &safe_title, "md");
-                        if std::fs::write(&path, &body).is_ok() {
-                            written += 1;
-                        }
-                    }
                     operon_store::repos::NoteKind::Image => {
                         let Some(rel) = note.blob_path.clone() else { continue };
                         let Some(vr) = vault.clone() else { continue };
@@ -1444,6 +1539,24 @@ pub fn ExplorerPanel() -> Element {
                             .unwrap_or("png");
                         let path = unique_path(&target, &safe_title, ext);
                         if std::fs::write(&path, &bytes).is_ok() {
+                            written += 1;
+                        }
+                    }
+                    other => {
+                        let body = match persistence.load(&id.to_string()).await {
+                            Ok(b) => b,
+                            Err(_) => Vec::new(),
+                        };
+                        let ext = match other {
+                            operon_store::repos::NoteKind::Mdx => "mdx",
+                            operon_store::repos::NoteKind::Canvas => "canvas",
+                            operon_store::repos::NoteKind::Excalidraw => "excalidraw",
+                            operon_store::repos::NoteKind::Kanban => "kanban.json",
+                            operon_store::repos::NoteKind::Code => "txt",
+                            _ => "md",
+                        };
+                        let path = unique_path(&target, &safe_title, ext);
+                        if std::fs::write(&path, &body).is_ok() {
                             written += 1;
                         }
                     }
@@ -1466,23 +1579,25 @@ pub fn ExplorerPanel() -> Element {
         let tab_id = if let Some(id) = existing_tab_id {
             id
         } else {
-            let title = notes_by_project
+            let (title, kind) = notes_by_project
                 .read()
                 .values()
                 .flat_map(|list| list.iter())
                 .find(|n| n.id == note_id)
-                .map(|n| n.title.clone())
-                .unwrap_or_else(|| note_id.to_string());
+                .map(|n| (n.title.clone(), n.kind))
+                .unwrap_or_else(|| (note_id.to_string(), NoteKind::Markdown));
             open_local_note_tab(
                 tabs_for_mode,
                 scheduler_for_mode.clone(),
                 note_id,
                 title,
                 String::new(),
+                kind,
             )
         };
         tabs_for_mode.write().set_mode(tab_id, target);
         selected_note.set(Some(note_id));
+        selected_project.set(None);
     });
 
     // Clipboard helpers shared by row context-menu items.
@@ -1704,8 +1819,8 @@ pub fn ExplorerPanel() -> Element {
     // Drag-drop: note onto note. Before/After → sibling at target.parent_id;
     // Into → child of target.
     let note_repo_for_drop_n = note_repo.clone();
-    let on_drop_note_on_note =
-        use_callback(move |(src, target, pos): (Uuid, Uuid, DropPosition)| {
+    let on_drop_note_on_note = use_callback(
+        move |(src, target, pos, chosen_depth): (Uuid, Uuid, DropPosition, i64)| {
             if src == target {
                 return;
             }
@@ -1723,32 +1838,22 @@ pub fn ExplorerPanel() -> Element {
                     })
                 })
             };
-            // Look up target's project + parent.
-            let info = notes_by_project.read().iter().find_map(|(pid, list)| {
+            // Look up target's project and full row so the depth-aware
+            // resolver can walk its ancestor chain. We snapshot the per-
+            // project list once because resolve_drop_parent needs it for
+            // outdent steps.
+            let lookup = notes_by_project.read().iter().find_map(|(pid, list)| {
                 list.iter()
                     .find(|n| n.id == target)
-                    .map(|n| (*pid, n.parent_id, n.sibling_index))
+                    .cloned()
+                    .map(|n| (*pid, list.clone(), n))
             });
-            let Some((project_id, target_parent, target_sibling)) = info else {
+            let Some((project_id, project_notes, target_note)) = lookup else {
                 return;
             };
-            let outcome = match pos {
-                DropPosition::Into => {
-                    let last_index = note_repo_for_drop_n
-                        .list_for_project(project_id)
-                        .map(|rows| {
-                            rows.iter().filter(|r| r.parent_id == Some(target)).count() as i64
-                        })
-                        .unwrap_or(0);
-                    note_repo_for_drop_n.move_to(src, project_id, Some(target), last_index)
-                }
-                DropPosition::Before => {
-                    note_repo_for_drop_n.move_to(src, project_id, target_parent, target_sibling)
-                }
-                DropPosition::After => {
-                    note_repo_for_drop_n.move_to(src, project_id, target_parent, target_sibling + 1)
-                }
-            };
+            let (new_parent, new_index) =
+                resolve_drop_parent(&target_note, pos, chosen_depth, &project_notes);
+            let outcome = note_repo_for_drop_n.move_to(src, project_id, new_parent, new_index);
             if let Err(e) = outcome {
                 eprintln!("operon: drop note onto note failed: {e}");
                 return;
@@ -1757,7 +1862,8 @@ pub fn ExplorerPanel() -> Element {
                 history.write().push(inv);
             }
             note_version.with_mut(|v| *v += 1);
-        });
+        },
+    );
 
     // Toggle a note open/closed.
     let queue_for_note_toggle = tree_queue;
@@ -1822,6 +1928,33 @@ pub fn ExplorerPanel() -> Element {
     let selected_project_now = *selected_project.read();
     let selected_note_now = *selected_note.read();
 
+    // Search-mode flag — lifted up so the heavy tree-only snapshots below
+    // can short-circuit when search results are showing. Without this, every
+    // keystroke re-renders the panel and runs O(notes_total) clones / walks
+    // for data the search-results branch never reads.
+    let debounced_now = debounced_query.read().clone();
+    let in_content_now = *search_in_content.read();
+    let body_cache_now = body_cache.read().clone();
+    let show_results = !debounced_now.trim().is_empty();
+
+    // Derive the note (and its enclosing project) currently bound to the
+    // active tab so the explorer can render a distinct "this is open in
+    // the active editor" highlight separate from explorer click-selection.
+    // Memoized so unrelated panel re-renders (search keystrokes, multi-
+    // select, drag-session, etc.) don't reread `tabs` / `notes_by_project`.
+    let active_tab_note: Memo<Option<Uuid>> = use_memo(move || {
+        tabs.read()
+            .active()
+            .and_then(|t| Uuid::parse_str(&t.note_id).ok())
+    });
+    let active_tab_project: Memo<Option<Uuid>> = use_memo(move || {
+        let nid = (*active_tab_note.read())?;
+        notes_by_project
+            .read()
+            .iter()
+            .find_map(|(pid, list)| list.iter().any(|n| n.id == nid).then_some(*pid))
+    });
+
     let pending_delete_project_id = *pending_delete_project.read();
     let pending_delete_project_name = pending_delete_project_id.and_then(|did| {
         projects_snapshot
@@ -1841,17 +1974,31 @@ pub fn ExplorerPanel() -> Element {
 
     let project_repo_for_delete = project_repo.clone();
     let note_repo_for_delete = note_repo.clone();
+    let mut tabs_for_delete = tabs;
     // Snapshot the per-note current editor mode from the tab manager so each
     // NoteRow can show the right context-menu items (View / Edit / Split).
-    let note_modes_snapshot: HashMap<Uuid, EditorMode> = {
+    // Skipped in search-results mode — the tree (and its NoteRows) is not
+    // rendered, so the snapshot would be pure waste on every keystroke.
+    let note_modes_snapshot: HashMap<Uuid, EditorMode> = if show_results {
+        HashMap::new()
+    } else {
         let snap = tabs.read();
         snap.iter()
             .filter_map(|t| Uuid::parse_str(&t.note_id).ok().map(|u| (u, t.mode)))
             .collect()
     };
-    let workspace_snap = workspace_open.read().clone();
-    let project_note_open_snap = project_note_open.read().clone();
-    let notes_snap = notes_by_project.read().clone();
+    // Tree-only snapshots — full clones of the workspace/notes maps that the
+    // search-results branch never reads. Gated on `show_results` so typing
+    // doesn't churn through O(notes_total) clones per keystroke.
+    let (workspace_snap, project_note_open_snap, notes_snap) = if show_results {
+        (HashMap::new(), HashMap::new(), HashMap::new())
+    } else {
+        (
+            workspace_open.read().clone(),
+            project_note_open.read().clone(),
+            notes_by_project.read().clone(),
+        )
+    };
     let clipboard_snap = *clipboard.read();
     let drag_session_now = *drag_session.read();
     let has_clip_note = matches!(
@@ -1862,19 +2009,21 @@ pub fn ExplorerPanel() -> Element {
         })
     );
 
-    // Phase-5: title lookup for the search-result click handler.
-    let note_titles_signal: Signal<HashMap<Uuid, String>> = use_signal(HashMap::new);
+    // Title + kind lookup for the search-result click handler. The kind
+    // half drives `open_local_note_tab`'s format_id derivation so opening
+    // a non-markdown note from search lands the user in the right editor.
+    let note_meta_signal: Signal<HashMap<Uuid, (String, NoteKind)>> = use_signal(HashMap::new);
     {
-        let mut titles_setter = note_titles_signal;
+        let mut meta_setter = note_meta_signal;
         use_effect(move || {
             let map = notes_by_project.read();
-            let mut out: HashMap<Uuid, String> = HashMap::new();
+            let mut out: HashMap<Uuid, (String, NoteKind)> = HashMap::new();
             for list in map.values() {
                 for n in list {
-                    out.insert(n.id, n.title.clone());
+                    out.insert(n.id, (n.title.clone(), n.kind));
                 }
             }
-            titles_setter.set(out);
+            meta_setter.set(out);
         });
     }
     let on_search_pick = search_click_handler(
@@ -1884,7 +2033,8 @@ pub fn ExplorerPanel() -> Element {
         selected_project,
         workspace_open,
         tree_queue,
-        note_titles_signal,
+        note_meta_signal,
+        persistence.clone(),
         search_query,
         search_in_content,
     );
@@ -1903,22 +2053,23 @@ pub fn ExplorerPanel() -> Element {
     });
 
     // Capture prev_selection on transition from empty -> non-empty query.
+    // peek() (not read()) on prev_setter and selected_note so the effect
+    // only re-runs when search_query changes — without this, writing to
+    // prev_setter inside the effect re-triggers the effect through its
+    // own subscription, looping forever whenever selected_note is None
+    // (the .set(None) on a None signal still wakes subscribers).
     {
         let mut prev_setter = prev_selection;
         use_effect(move || {
             let q = search_query.read().clone();
-            if !q.is_empty() && prev_setter.read().is_none() {
-                prev_setter.set(*selected_note.read());
-            } else if q.is_empty() {
+            let prev_is_some = prev_setter.peek().is_some();
+            if !q.is_empty() && !prev_is_some {
+                prev_setter.set(*selected_note.peek());
+            } else if q.is_empty() && prev_is_some {
                 prev_setter.set(None);
             }
         });
     }
-
-    let debounced_now = debounced_query.read().clone();
-    let in_content_now = *search_in_content.read();
-    let body_cache_now = body_cache.read().clone();
-    let show_results = !debounced_now.trim().is_empty();
 
     rsx! {
         div {
@@ -2050,6 +2201,8 @@ pub fn ExplorerPanel() -> Element {
                                 .unwrap_or_default(),
                             renaming_note: renaming_note_now,
                             selected_note: selected_note_now,
+                            active_tab_note: *active_tab_note.read(),
+                            active_tab_project: *active_tab_project.read(),
                             clipboard: clipboard_snap,
                             has_clip_note: has_clip_note,
                             drag_session: drag_session_now,
@@ -2127,8 +2280,11 @@ pub fn ExplorerPanel() -> Element {
                 on_confirm: Callback::new(move |_| {
                     // Plans-Phase-6-image-notes: snapshot the note's blob_path
                     // (and the blob_paths of any descendants) BEFORE delete,
-                    // since the FK cascade will lose them.
+                    // since the FK cascade will lose them. Same walk also
+                    // collects the note ids whose tabs we must close after
+                    // a successful delete.
                     let mut blobs_to_check: Vec<String> = Vec::new();
+                    let mut deleted_note_ids: Vec<String> = vec![did.to_string()];
                     let snap = notes_by_project.read();
                     for list in snap.values() {
                         // Collect the target plus all descendants whose
@@ -2147,6 +2303,7 @@ pub fn ExplorerPanel() -> Element {
                                     if let Some(ref p) = n.blob_path {
                                         blobs_to_check.push(p.clone());
                                     }
+                                    deleted_note_ids.push(n.id.to_string());
                                     break;
                                 }
                                 cur = list.iter().find(|x| x.id == pid).and_then(|x| x.parent_id);
@@ -2177,6 +2334,23 @@ pub fn ExplorerPanel() -> Element {
                             note_version.with_mut(|v| *v += 1);
                             if selected_note_now == Some(did) {
                                 selected_note.set(None);
+                            }
+                            // Close any open tabs that referenced the deleted
+                            // subtree — multiple tabs can target the same
+                            // note_id (View / Edit / Split), so collect-then-
+                            // close to avoid mutating during iteration.
+                            let to_close: Vec<crate::tabs::TabId> = {
+                                let snap = tabs_for_delete.read();
+                                snap.iter()
+                                    .filter(|t| deleted_note_ids.iter().any(|d| d == &t.note_id))
+                                    .map(|t| t.id)
+                                    .collect()
+                            };
+                            if !to_close.is_empty() {
+                                let mut tm = tabs_for_delete.write();
+                                for tid in to_close {
+                                    tm.close(tid);
+                                }
                             }
                             // Refcount each blob: if no remaining note
                             // references it, delete the on-disk file.
@@ -2271,6 +2445,12 @@ struct ProjectSubtreeProps {
     note_open_snap: HashMap<String, bool>,
     renaming_note: Option<Uuid>,
     selected_note: Option<Uuid>,
+    /// Note id bound to the currently active tab (if any). NoteRow uses this
+    /// to render an accent indicating "this note is what the editor shows".
+    active_tab_note: Option<Uuid>,
+    /// Project that contains `active_tab_note`. ProjectRow uses this to
+    /// mirror the same accent at the project level.
+    active_tab_project: Option<Uuid>,
     clipboard: Option<Clipboard>,
     has_clip_note: bool,
     drag_session: Option<DragKind>,
@@ -2302,7 +2482,7 @@ struct ProjectSubtreeProps {
     on_paste_into_project: Callback<Uuid>,
     on_drop_project_on_project: Callback<(Uuid, Uuid, DropPosition)>,
     on_drop_note_on_project: Callback<(Uuid, Uuid, DropPosition)>,
-    on_drop_note_on_note: Callback<(Uuid, Uuid, DropPosition)>,
+    on_drop_note_on_note: Callback<(Uuid, Uuid, DropPosition, i64)>,
     note_modes: HashMap<Uuid, EditorMode>,
     on_set_note_mode: Callback<(Uuid, EditorMode)>,
 }
@@ -2345,11 +2525,24 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
         .map(|c| c.is_cut_project(project_id))
         .unwrap_or(false);
 
+    // Only flag the project as tab-active when the active note's row is NOT
+    // currently visible (project collapsed, or hidden behind a collapsed
+    // ancestor). When the note row is visible, its own accent is enough —
+    // duplicating it on the parent reads as one merged block instead of
+    // two distinct rows.
+    let active_note_visible = props
+        .active_tab_note
+        .map(|nid| visible.iter().any(|n| n.id == nid))
+        .unwrap_or(false);
+    let project_tab_active =
+        props.active_tab_project == Some(project_id) && !active_note_visible;
+
     rsx! {
         ProjectRow {
             project: props.project.clone(),
             is_open: props.is_open,
             selected: props.selected,
+            tab_active: project_tab_active,
             in_rename: props.in_rename,
             cut: cut_project,
             has_clip_note: props.has_clip_note,
@@ -2393,6 +2586,7 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
                             .copied()
                             .unwrap_or(false),
                         selected: props.selected_note == Some(note.id),
+                        tab_active: props.active_tab_note == Some(note.id),
                         in_rename: props.renaming_note == Some(note.id),
                         is_first_sibling: is_first,
                         is_last_sibling: is_last,

@@ -74,9 +74,15 @@ pub fn ContextMenu(props: ContextMenuProps) -> Element {
     let open_submenu: Signal<Option<usize>> = use_signal(|| None);
 
     rsx! {
-        // Full-viewport scrim catches outside clicks.
+        // Full-viewport scrim catches outside clicks. z-index sits above the
+        // shell splitters (z=50 in shell.css) so hovering the splitter region
+        // while the menu is open hits the scrim — preventing the splitter's
+        // hover highlight from firing through. The menu itself (z=60) and
+        // submenu (z=61) still paint above this scrim within its stacking
+        // context.
         div {
-            class: "fixed inset-0 z-50",
+            class: "fixed inset-0",
+            style: "z-index: 55;",
             "data-testid": "context-menu-scrim",
             onclick: move |evt| {
                 evt.stop_propagation();

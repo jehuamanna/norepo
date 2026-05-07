@@ -221,6 +221,7 @@ pub fn MonacoEditorHost(
                                     suppress = true;
                                     try {{ handle.setContent(typeof msg.value === "string" ? msg.value : ""); }}
                                     finally {{ suppress = false; }}
+                                    try {{ if (typeof handle.layout === "function") handle.layout(); }} catch (e) {{}}
                                     break;
                                 case "splice":
                                     {{
@@ -273,31 +274,32 @@ pub fn MonacoEditorHost(
             }
         }
 
-        // Plans-Phase-9-monaco-desktop (rev 18): push content prop
-        // changes into Monaco. Earlier revs tried `use_effect`
-        // (rev 16) and a mirror-Signal-with-effect (rev 17); both
-        // missed actual prop turnovers because Dioxus 0.7's
-        // `use_effect` reactive context doesn't reliably observe
-        // `Signal::set` calls fired during the render body. Switching
-        // tabs left Monaco showing the previous buffer (= "Note B
-        // shows Note A's contents", "Notes A and B share content").
+        // Plans-Phase-9-monaco-desktop (rev 19): gate the content push on
+        // the bootstrap script's `{type:"mounted"}` handshake. Even though
+        // dioxus-desktop's eval bridge buffers Rust→JS messages in a
+        // per-channel `pending` array, in practice an `eval.send` fired
+        // during the render body before the bootstrap's `await dioxus.recv()`
+        // loop starts gets dropped — see the comment on `MonacoChannel` at
+        // the top of this file. The bootstrap already announces readiness
+        // via `dioxus.send({type:"mounted"})`; we now listen for it,
+        // flip a Signal, and only push setContent once the recv loop is
+        // live. When the Signal flips, the render body re-runs and the
+        // pending content (loaded from disk by `on_select_note`) finally
+        // reaches Monaco.
         //
-        // Fix: inline the push directly in the render body using a
-        // non-reactive `Rc<RefCell<String>>` allocated via `use_hook`
-        // (one per `MonacoEditorHost` instance, persistent across
-        // re-renders). On every render we compare the prop to the
-        // last value we pushed; on mismatch, send `setContent`
-        // through the eval channel and update the cell. No Signal
-        // mutation during render, no reactive context trickiness.
-        // The JS side's `suppress` flag during programmatic
-        // setContent keeps the resulting `change` event from
-        // bouncing back into `tabs.set_content`, so there's no loop.
+        // Earlier revs tried `use_effect` (rev 16), a mirror-Signal-with-
+        // effect (rev 17), and the inline non-reactive Rc<RefCell> push
+        // (rev 18). Rev 18 fixed the tab-switch case (where Monaco is
+        // already mounted) but not the cold-reopen case (where the load
+        // fires before mount completes).
         use std::cell::RefCell;
         use std::rc::Rc;
         let last_pushed: Rc<RefCell<String>> =
             use_hook(|| Rc::new(RefCell::new(content.clone())));
+        let mut monaco_ready: Signal<bool> = use_signal(|| false);
         {
-            let needs_push = *last_pushed.borrow() != content;
+            let ready = *monaco_ready.read();
+            let needs_push = ready && *last_pushed.borrow() != content;
             if needs_push {
                 let _ = eval_handle.send(serde_json::json!({
                     "type": "setContent",
@@ -309,6 +311,8 @@ pub fn MonacoEditorHost(
 
         // Drive the JS → Rust channel. Each `change` becomes an
         // `on_change` invocation matching the wasm path's contract.
+        // The `mounted` handshake flips `monaco_ready` so the prop-mirror
+        // above can finally fire its first push.
         let on_change_for_loop = on_change;
         let mut eval_for_loop = eval_handle;
         use_future(move || async move {
@@ -319,6 +323,9 @@ pub fn MonacoEditorHost(
                 };
                 let kind = msg.get("type").and_then(|v| v.as_str());
                 match kind {
+                    Some("mounted") => {
+                        monaco_ready.set(true);
+                    }
                     Some("change") => {
                         let value = msg
                             .get("value")
