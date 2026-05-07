@@ -273,38 +273,39 @@ pub fn MonacoEditorHost(
             }
         }
 
-        // Plans-Phase-9-monaco-desktop (rev 17): push content prop
-        // changes into Monaco. Rev 16 captured `current_content`
-        // (a String) by move into the effect closure — but Dioxus
-        // 0.7's `use_effect` only re-runs when *Signals* read inside
-        // the closure change. A captured String prop is invisible to
-        // the reactive context, so the effect fired exactly once at
-        // mount and never again on prop change. Switching tabs left
-        // Monaco displaying whatever buffer was loaded at first
-        // mount (= "Note B shows the contents of Note A").
+        // Plans-Phase-9-monaco-desktop (rev 18): push content prop
+        // changes into Monaco. Earlier revs tried `use_effect`
+        // (rev 16) and a mirror-Signal-with-effect (rev 17); both
+        // missed actual prop turnovers because Dioxus 0.7's
+        // `use_effect` reactive context doesn't reliably observe
+        // `Signal::set` calls fired during the render body. Switching
+        // tabs left Monaco showing the previous buffer (= "Note B
+        // shows Note A's contents", "Notes A and B share content").
         //
-        // Fix: mirror the prop into a Signal each render. When the
-        // prop differs from the mirror, write through; the effect
-        // subscribes to that mirror and re-runs on the change. The
-        // JS side's `suppress` flag during programmatic setContent
-        // keeps the resulting `change` event from bouncing back into
-        // `tabs.set_content`.
-        let mut content_mirror: Signal<String> = use_signal(|| content.clone());
-        if *content_mirror.peek() != content {
-            content_mirror.set(content.clone());
-        }
-        let mut last_pushed: Signal<String> = use_signal(|| content.clone());
-        use_effect(move || {
-            let cur = content_mirror.read().clone();
-            let last = last_pushed.read().clone();
-            if cur != last {
+        // Fix: inline the push directly in the render body using a
+        // non-reactive `Rc<RefCell<String>>` allocated via `use_hook`
+        // (one per `MonacoEditorHost` instance, persistent across
+        // re-renders). On every render we compare the prop to the
+        // last value we pushed; on mismatch, send `setContent`
+        // through the eval channel and update the cell. No Signal
+        // mutation during render, no reactive context trickiness.
+        // The JS side's `suppress` flag during programmatic
+        // setContent keeps the resulting `change` event from
+        // bouncing back into `tabs.set_content`, so there's no loop.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let last_pushed: Rc<RefCell<String>> =
+            use_hook(|| Rc::new(RefCell::new(content.clone())));
+        {
+            let needs_push = *last_pushed.borrow() != content;
+            if needs_push {
                 let _ = eval_handle.send(serde_json::json!({
                     "type": "setContent",
-                    "value": cur.clone(),
+                    "value": content.clone(),
                 }));
-                last_pushed.set(cur);
+                *last_pushed.borrow_mut() = content.clone();
             }
-        });
+        }
 
         // Drive the JS → Rust channel. Each `change` becomes an
         // `on_change` invocation matching the wasm path's contract.

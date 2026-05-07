@@ -71,8 +71,23 @@ pub fn MainArea() -> Element {
                             // through the format plugin's editor backend.
                             if is_local {
                                 if let Some(action) = local_save {
+                                    // `key` forces Dioxus to unmount the prior
+                                    // `LocalNoteEditor` (and its embedded
+                                    // `MonacoEditorHost`) when the active tab
+                                    // changes, then mount a fresh instance for
+                                    // the new tab. Without this, switching
+                                    // tabs reused the same Monaco bootstrap
+                                    // script's captured state, which kept
+                                    // showing the previous tab's buffer ("Note
+                                    // B shows Note A's contents"). Per-tab key
+                                    // = per-tab editor identity = correct
+                                    // buffer-to-tab association.
                                     rsx! {
-                                        crate::local_mode::LocalNoteEditor { tab_id, action }
+                                        crate::local_mode::LocalNoteEditor {
+                                            key: "{tab_id:?}",
+                                            tab_id,
+                                            action,
+                                        }
                                     }
                                 } else {
                                     plugin.render_edit(&note_id, &content, on_change)
@@ -93,7 +108,11 @@ pub fn MainArea() -> Element {
                                             class: "operon-local-split",
                                             div {
                                                 class: "operon-local-split-edit",
-                                                crate::local_mode::LocalNoteEditor { tab_id, action }
+                                                crate::local_mode::LocalNoteEditor {
+                                                    key: "{tab_id:?}",
+                                                    tab_id,
+                                                    action,
+                                                }
                                             }
                                             div {
                                                 class: "operon-local-split-view",
