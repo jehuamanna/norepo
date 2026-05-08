@@ -4,7 +4,8 @@
 //! components; this module is the one place the newtypes live so both
 //! sides can import them without circular module deps.
 
-use dioxus::prelude::*;
+use dioxus::prelude::Signal;
+use dioxus::signals::GlobalSignal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -50,16 +51,23 @@ pub struct ChatSessionVersion(pub Signal<u64>);
 
 /// Bumped by background drainers (the artifact runner, the workflow
 /// cascade) every time they `repo.append` to `chat_message`. The
-/// companion's transcript-load `use_effect` watches this in addition
-/// to `ActiveChatSession` so a viewer sees streaming events from a
-/// run that another component is driving — without it, the load
-/// effect only fires on session change and the transcript stays
-/// frozen at whatever was persisted at switch time. Regular
-/// companion chats DON'T bump this signal (their drainer updates the
-/// in-memory transcript directly), so adding the watcher here is
-/// safe.
-#[derive(Clone, Copy)]
-pub struct ChatMessageVersion(pub Signal<u64>);
+/// companion's transcript-load `use_effect` watches this so a viewer
+/// sees streaming events from a run that another component is
+/// driving — without it, the load effect only fires on session
+/// change and the transcript stays frozen at whatever was persisted
+/// at switch time. Regular companion chats DON'T bump it (their
+/// drainer updates the in-memory transcript directly).
+///
+/// **Why a `GlobalSignal` and not a context-provided `Signal`:** the
+/// runner spawns its async work via `spawn_forever` which attaches
+/// to the virtual root scope (ScopeId 0, "app") — that scope is an
+/// ancestor of every user-defined component, not a descendant. A
+/// `Signal` created in any user component (App, Workspace, …) is
+/// owned by that component's scope; writes from outside its subtree
+/// are silently dropped and Dioxus emits a `__copy_value_hoisted`
+/// warning. `GlobalSignal` is application-wide, owned by no
+/// component's scope, and safe to read/write from anywhere.
+pub static CHAT_MESSAGE_VERSION: GlobalSignal<u64> = Signal::global(|| 0);
 
 /// One-shot inbox the companion's composer subscribes to. When a remote
 /// caller (e.g., the skill plugin's Play button) writes `Some(prompt)`,

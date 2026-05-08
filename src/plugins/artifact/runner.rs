@@ -12,7 +12,6 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use dioxus::prelude::{Signal, WritableExt};
 use futures::StreamExt;
 use operon_plugins_claude_code::{ClaudeCodeChatPlugin, ClaudeCodeEvent};
 use operon_store::repos::{
@@ -74,12 +73,12 @@ pub struct RunOutcome {
 /// path before invoking this — same convention as the workflow
 /// executor.
 ///
-/// `chat_message_version` (Phase D): when present, the runner bumps
-/// it after each `chat_message` append. The companion's transcript
-/// load-effect watches this signal and re-fetches, giving the user
-/// a live view of Claude's stream. Pass `None` for callers that
-/// don't want that wiring (the runner's behavior is otherwise
-/// unchanged).
+/// Phase D: each `chat_message` append also bumps the global
+/// `CHAT_MESSAGE_VERSION` signal so the companion's load-effect
+/// re-fetches and the transcript ticks live. The signal is a
+/// `GlobalSignal` (not context-provided) — see the long comment on
+/// its definition in `shell::companion_state` for why a
+/// scope-bound `Signal` doesn't work here.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_skill_on_source(
     note_repo: &Arc<dyn LocalNoteRepository>,
@@ -87,7 +86,6 @@ pub async fn run_skill_on_source(
     persistence: &Arc<dyn Persistence>,
     plugin: &Arc<ClaudeCodeChatPlugin>,
     chat_repo: Option<&Arc<dyn ChatMessageRepository>>,
-    chat_message_version: Option<Signal<u64>>,
     chat_session_id: Uuid,
     source_note_id: Uuid,
     skill_note_id: Uuid,
@@ -187,7 +185,7 @@ pub async fn run_skill_on_source(
                     "operon: artifact runner persisted user prompt ({} bytes) to session {chat_session_id}",
                     prompt.len()
                 );
-                bump_message_version(chat_message_version);
+                bump_message_version();
             }
             Err(e) => {
                 eprintln!(
@@ -232,7 +230,7 @@ pub async fn run_skill_on_source(
                 eprintln!(
                     "operon: artifact runner persisted event #{total_appended} to chat_message"
                 );
-                bump_message_version(chat_message_version);
+                bump_message_version();
             }
         }
         match ev {
@@ -245,7 +243,7 @@ pub async fn run_skill_on_source(
                         None,
                         &serde_json::json!({ "text": format!("error: {msg}") }),
                     );
-                    bump_message_version(chat_message_version);
+                    bump_message_version();
                 }
                 return Err(RunnerError::Plugin(msg));
             }
@@ -261,7 +259,7 @@ pub async fn run_skill_on_source(
                 None,
                 &serde_json::json!({ "text": std::mem::take(&mut assistant_buf) }),
             );
-            bump_message_version(chat_message_version);
+            bump_message_version();
         }
     }
 
@@ -526,32 +524,20 @@ fn persist_event(
     }
 }
 
-/// Bump the optional live-transcript version signal so the
-/// companion's load-effect re-fetches `chat_message`. Logs the bump
-/// so we can verify Phase-D wiring from the dx-serve terminal — if
-/// the runner is persisting messages but the user reports the
-/// transcript is still empty, this trace shows whether the bump
-/// path is reaching the signal at all.
-fn bump_message_version(sig: Option<Signal<u64>>) {
-    match sig {
-        Some(mut s) => {
-            let mut next = 0u64;
-            s.with_mut(|v| {
-                *v = v.saturating_add(1);
-                next = *v;
-            });
-            eprintln!(
-                "operon: artifact runner bumped ChatMessageVersion -> {next}"
-            );
-        }
-        None => {
-            eprintln!(
-                "operon: artifact runner WARNING — no ChatMessageVersion signal, \
-                 live transcript won't tick (clicking off+back to the rail entry \
-                 still works)"
-            );
-        }
-    }
+/// Bump the global live-transcript version so the companion's
+/// load-effect re-fetches `chat_message`. Uses the application-wide
+/// `CHAT_MESSAGE_VERSION` `GlobalSignal` rather than a
+/// context-provided `Signal` — the runner's task lives in the
+/// virtual root scope (via `spawn_forever`), and writes from there
+/// to a scope-bound signal are silently dropped (Dioxus emits a
+/// `__copy_value_hoisted` warning).
+fn bump_message_version() {
+    let mut next = 0u64;
+    crate::shell::companion_state::CHAT_MESSAGE_VERSION.with_mut(|v| {
+        *v = v.saturating_add(1);
+        next = *v;
+    });
+    eprintln!("operon: artifact runner bumped CHAT_MESSAGE_VERSION -> {next}");
 }
 
 #[cfg(test)]

@@ -38,7 +38,7 @@ use crate::local_mode::explorer::LocalProjectVersion;
 use crate::plugins::markdown::MarkdownView;
 use crate::shell::companion_state::{
     ActiveChatScope, ActiveChatSession, ActiveRepoPath, ChatMessage, ChatMessageKind,
-    ChatMessageRepo, ChatMessageVersion, ChatScope, ChatSessionRepo, CompanionComposerInbox,
+    ChatMessageRepo, ChatScope, ChatSessionRepo, CompanionComposerInbox, CHAT_MESSAGE_VERSION,
 };
 use crate::shell::session_rail::SessionRail;
 use crate::shell::tool_card::{ToolCard, ToolResultBody};
@@ -190,15 +190,9 @@ pub fn CompanionChat() -> Element {
             };
         }
     };
-    // Phase D: re-load the transcript when a background drainer
-    // (artifact runner / workflow cascade) appends to chat_message.
-    // Soft-fail: if the context isn't present we just lose the live
-    // refresh — the user can still click off and back to force a
-    // reload.
-    let message_version_signal: Signal<u64> = match try_consume_context::<ChatMessageVersion>() {
-        Some(ChatMessageVersion(s)) => s,
-        None => use_signal(|| 0u64),
-    };
+    // Phase D: live transcript re-load is handled via the
+    // `CHAT_MESSAGE_VERSION` GlobalSignal — see the load-effect
+    // below. No Signal hook needed here.
     let session_repo = match try_consume_context::<ChatSessionRepo>() {
         Some(ChatSessionRepo(r)) => r,
         None => {
@@ -285,8 +279,8 @@ pub fn CompanionChat() -> Element {
     // persisted history for the newly-active session. Cost meter doesn't
     // restore from disk (deferred — needs per-session usage column).
     //
-    // Phase D: also re-fire when `ChatMessageVersion` bumps, which a
-    // background drainer (the artifact runner) does after each
+    // Phase D: also re-fire when `CHAT_MESSAGE_VERSION` bumps, which
+    // a background drainer (the artifact runner) does after each
     // `chat_message` append. That re-reads the row list and reflects
     // streaming events in the transcript even though we aren't the
     // ones draining the claude stream. Regular companion chats don't
@@ -294,16 +288,15 @@ pub fn CompanionChat() -> Element {
     // via `apply_event`), so this watcher is a no-op for them.
     {
         let session = session_signal;
-        let version = message_version_signal;
         let mut transcript_setter = transcript;
         let mut usage_setter = usage_total;
         let mut pending_setter = pending_assistant;
         let repo = message_repo.clone();
         use_effect(move || {
             let sid = *session.read();
-            // Subscribe to version bumps so this effect re-runs on
-            // background appends.
-            let _ = *version.read();
+            // Subscribe to GlobalSignal bumps so this effect re-runs
+            // on background appends from the artifact runner.
+            let _ = *CHAT_MESSAGE_VERSION.read();
             usage_setter.set(Usage::default());
             pending_setter.set(false);
             match sid {
