@@ -69,6 +69,15 @@ pub(crate) struct PluginState {
 pub(crate) struct SessionBinding {
     pub cwd: PathBuf,
     pub claude_session_id: Option<String>,
+    /// Optional override of the global `permission_mode` for THIS
+    /// session only. Set by callers that need a stricter or looser
+    /// policy than the user's companion-toolbar default — e.g. the
+    /// artifact runner sets `Some("acceptEdits")` so its automated
+    /// Write tool calls don't hang waiting for stdin approval, while
+    /// the user's normal companion chats keep using whatever mode
+    /// they picked from the toolbar. `None` = fall back to the
+    /// global `PluginState.permission_mode`.
+    pub permission_mode: Option<String>,
 }
 
 impl ClaudeCodeChatPlugin {
@@ -87,15 +96,21 @@ impl ClaudeCodeChatPlugin {
     pub fn bind_session(&self, operon_session: Uuid, cwd: PathBuf) {
         let mut s = self.state.lock().expect("plugin state mutex poisoned");
         let existing = s.bindings.get(&operon_session).cloned();
-        let claude_session_id = match existing {
-            Some(b) if b.cwd == cwd => b.claude_session_id,
-            _ => None,
+        let (claude_session_id, permission_mode) = match existing {
+            Some(b) if b.cwd == cwd => (b.claude_session_id, b.permission_mode),
+            // cwd changed: invalidate the cached claude session id (it
+            // was tied to the previous directory) but keep the
+            // permission-mode override — that's a deliberate caller
+            // decision that doesn't depend on the working directory.
+            Some(b) => (None, b.permission_mode),
+            None => (None, None),
         };
         s.bindings.insert(
             operon_session,
             SessionBinding {
                 cwd,
                 claude_session_id,
+                permission_mode,
             },
         );
     }
@@ -140,6 +155,19 @@ impl ClaudeCodeChatPlugin {
     pub fn set_permission_mode(&self, mode: Option<String>) {
         let mut s = self.state.lock().expect("plugin state mutex poisoned");
         s.permission_mode = mode;
+    }
+
+    /// Set a per-session permission-mode override. The value passed
+    /// here is preferred over the global `set_permission_mode` value
+    /// when spawning subsequent turns for `operon_session`. Pass
+    /// `None` to clear the override and fall back to the global
+    /// state. No-op if `bind_session` hasn't been called for the
+    /// session id yet.
+    pub fn set_session_permission_mode(&self, operon_session: Uuid, mode: Option<String>) {
+        let mut s = self.state.lock().expect("plugin state mutex poisoned");
+        if let Some(b) = s.bindings.get_mut(&operon_session) {
+            b.permission_mode = mode;
+        }
     }
 
     pub fn current_default_model(&self) -> Option<String> {
@@ -243,11 +271,20 @@ impl ClaudeCodeChatPlugin {
                     retryable: false,
                 }
             })?;
+            // Per-session permission_mode override wins over the
+            // global one. Lets the artifact runner force
+            // `acceptEdits` for its automated runs while normal
+            // companion chats keep using whatever mode the user
+            // picked from the toolbar.
+            let effective_mode = binding
+                .permission_mode
+                .clone()
+                .or_else(|| s.permission_mode.clone());
             (
                 binding.cwd.clone(),
                 binding.claude_session_id.clone(),
                 s.default_model.clone(),
-                s.permission_mode.clone(),
+                effective_mode,
             )
         };
 
@@ -266,8 +303,11 @@ impl ClaudeCodeChatPlugin {
             cmd.arg("--resume").arg(sid);
         }
         // Per-call model override → static cfg fallback → claude's own
-        // default. Permission mode is global (PluginState) so toggling
-        // from the toolbar affects every session.
+        // default. Permission mode is per-session-override-then-global
+        // (see effective_mode resolution above): the artifact runner's
+        // session uses `acceptEdits` even when the toolbar default is
+        // `default`, so automated Write tool calls don't hang waiting
+        // for stdin approval.
         let effective_model = model_override.or_else(|| self.cfg.model.clone());
         if let Some(model) = &effective_model {
             cmd.arg("--model").arg(model);
@@ -493,6 +533,63 @@ mod tests {
         assert_eq!(
             plugin.current_claude_session(sid).as_deref(),
             Some("claude-session-A")
+        );
+    }
+
+    #[test]
+    fn set_session_permission_mode_overrides_global() {
+        let plugin = ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
+            claude_bin: "/usr/bin/false".into(),
+            model: None,
+        });
+        let sid = Uuid::new_v4();
+        plugin.set_permission_mode(Some("default".into()));
+        plugin.bind_session(sid, "/tmp/repo".into());
+        plugin.set_session_permission_mode(sid, Some("acceptEdits".into()));
+        // The per-session value should win when reading the binding.
+        let st = plugin.state.lock().unwrap();
+        assert_eq!(
+            st.bindings.get(&sid).and_then(|b| b.permission_mode.as_deref()),
+            Some("acceptEdits")
+        );
+        assert_eq!(st.permission_mode.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn set_session_permission_mode_falls_back_to_global_when_cleared() {
+        let plugin = ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
+            claude_bin: "/usr/bin/false".into(),
+            model: None,
+        });
+        let sid = Uuid::new_v4();
+        plugin.set_permission_mode(Some("default".into()));
+        plugin.bind_session(sid, "/tmp/repo".into());
+        plugin.set_session_permission_mode(sid, Some("acceptEdits".into()));
+        plugin.set_session_permission_mode(sid, None);
+        let st = plugin.state.lock().unwrap();
+        assert!(
+            st.bindings.get(&sid).and_then(|b| b.permission_mode.as_ref()).is_none(),
+            "override should be cleared so the spawn picks up the global value"
+        );
+    }
+
+    #[test]
+    fn bind_session_with_new_cwd_preserves_permission_override() {
+        let plugin = ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
+            claude_bin: "/usr/bin/false".into(),
+            model: None,
+        });
+        let sid = Uuid::new_v4();
+        plugin.bind_session(sid, "/tmp/repo-a".into());
+        plugin.set_session_permission_mode(sid, Some("acceptEdits".into()));
+        // Re-bind with a different cwd — the cached claude_session_id
+        // resets but the permission override is the caller's
+        // intent, unrelated to working directory.
+        plugin.bind_session(sid, "/tmp/repo-b".into());
+        let st = plugin.state.lock().unwrap();
+        assert_eq!(
+            st.bindings.get(&sid).and_then(|b| b.permission_mode.as_deref()),
+            Some("acceptEdits")
         );
     }
 

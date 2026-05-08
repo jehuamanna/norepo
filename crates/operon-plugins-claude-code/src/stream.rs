@@ -318,6 +318,7 @@ mod tests {
             SessionBinding {
                 cwd: PathBuf::from("/tmp/repo"),
                 claude_session_id: None,
+                permission_mode: None,
             },
         );
         Arc::new(Mutex::new(state))
@@ -440,6 +441,7 @@ mod tests {
             SessionBinding {
                 cwd: PathBuf::from("/tmp/other"),
                 claude_session_id: Some("preexisting-B".into()),
+                permission_mode: None,
             },
         );
         let _ = parse_line(line, &state, sid_a);

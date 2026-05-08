@@ -78,6 +78,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "015_local_note_kind_skill_workflow",
         include_str!("../migrations/015_local_note_kind_skill_workflow.sql"),
     ),
+    (
+        16,
+        "016_local_note_kind_artifact",
+        include_str!("../migrations/016_local_note_kind_artifact.sql"),
+    ),
 ];
 
 fn ensure_migrations_table(conn: &Connection) -> Result<(), StoreError> {

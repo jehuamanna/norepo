@@ -35,6 +35,14 @@ pub enum NoteKind {
     /// M3 preview: a workflow DAG of skill-node references. Stored at
     /// the SQL level for now; the React Flow editor lands in M3.
     Workflow,
+    /// SDLC pipeline: an artifact produced by running a skill against
+    /// a parent artifact. Body is markdown with YAML frontmatter
+    /// declaring `artifact_kind` (epic / feature / story / task /
+    /// plan / test_cases / summary), `status`, and the source skill /
+    /// parent links. The artifact tree is the canonical workflow
+    /// surface; running a skill on a selected artifact produces N
+    /// new artifact notes under it.
+    Artifact,
 }
 
 impl NoteKind {
@@ -49,6 +57,7 @@ impl NoteKind {
             Self::Code => "code",
             Self::Skill => "skill",
             Self::Workflow => "workflow",
+            Self::Artifact => "artifact",
         }
     }
 
@@ -62,6 +71,7 @@ impl NoteKind {
             "code" => Self::Code,
             "skill" => Self::Skill,
             "workflow" => Self::Workflow,
+            "artifact" => Self::Artifact,
             _ => Self::Markdown,
         }
     }
@@ -85,6 +95,7 @@ impl NoteKind {
             Self::Code => "Code",
             Self::Skill => "Skill",
             Self::Workflow => "Workflow",
+            Self::Artifact => "Artifact",
         }
     }
 
@@ -100,6 +111,7 @@ impl NoteKind {
             Self::Code => "{}",
             Self::Skill => "sk",
             Self::Workflow => "wf",
+            Self::Artifact => "ar",
         }
     }
 
@@ -113,6 +125,7 @@ impl NoteKind {
             Self::Code,
             Self::Skill,
             Self::Workflow,
+            Self::Artifact,
             Self::Image,
             Self::Kanban,
             Self::Canvas,

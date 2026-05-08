@@ -128,6 +128,7 @@ fn register_format_builtins(registry: &mut PluginRegistry) -> Result<(), String>
     use crate::plugins::mdx::MdxFormatPlugin;
     use crate::plugins::plaintext::PlaintextFormatPlugin;
     use crate::plugins::richtext_tiptap::RichTextTiptapFormatPlugin;
+    use crate::plugins::artifact::ArtifactFormatPlugin;
     use crate::plugins::skill::SkillFormatPlugin;
     use crate::plugins::workflow::WorkflowFormatPlugin;
     registry.add_format_plugin(Box::new(MarkdownFormatPlugin::new()))?;
@@ -142,6 +143,7 @@ fn register_format_builtins(registry: &mut PluginRegistry) -> Result<(), String>
     registry.add_format_plugin(Box::new(ImageFormatPlugin::new()))?;
     registry.add_format_plugin(Box::new(SkillFormatPlugin::new()))?;
     registry.add_format_plugin(Box::new(WorkflowFormatPlugin::new()))?;
+    registry.add_format_plugin(Box::new(ArtifactFormatPlugin::new()))?;
     Ok(())
 }
 

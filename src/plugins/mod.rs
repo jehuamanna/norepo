@@ -1,5 +1,6 @@
 //! Built-in plugin implementations bundled with the Shell.
 
+pub mod artifact;
 pub mod canvas;
 pub mod code;
 pub mod excalidraw;

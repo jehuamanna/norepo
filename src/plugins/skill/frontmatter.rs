@@ -70,6 +70,75 @@ pub fn field<'a>(lines: &'a [&'a str], key: &str) -> Option<&'a str> {
     None
 }
 
+/// SDLC pipeline contract: declared in a skill's frontmatter so the
+/// engine knows which artifact kinds the skill consumes / produces,
+/// whether a single run produces one or many output artifacts, and
+/// whether the user must approve outputs before downstream skills can
+/// run. All fields default sensibly when absent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SkillContract {
+    /// Artifact kind the skill expects as input. Strings here mirror
+    /// `ArtifactKind` ("epic", "feature", "story", "task",
+    /// "requirements", …); kept as a free string so a skill can
+    /// declare a custom kind without forcing a code change.
+    pub input_kind: Option<String>,
+    /// Artifact kind the skill produces.
+    pub output_kind: Option<String>,
+    /// "one" → exactly one artifact note per run (Plan / TestCases /
+    /// Summary). "many" → fan out: every Write tool call inside the
+    /// project's `Artifacts/` directory becomes a sibling artifact
+    /// note. Default is "one" so existing skills don't change shape.
+    pub output_count: SkillOutputCount,
+    /// Whether the user must explicitly approve produced artifacts
+    /// before downstream skills become eligible. Default is gated.
+    pub gate: SkillGate,
+    /// Optional persona label (BA / Architect / QA / Engineer) — the
+    /// engine treats this as opaque metadata; the artifact view uses
+    /// it for a small badge.
+    pub persona: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SkillOutputCount {
+    #[default]
+    One,
+    Many,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SkillGate {
+    /// Outputs land in `pending` status and must be Approved before
+    /// downstream skills run on them.
+    #[default]
+    Approval,
+    /// Outputs land in `approved` immediately. Use for low-risk
+    /// summarizers where review is unnecessary.
+    Auto,
+}
+
+/// Read the contract fields from a skill note's frontmatter. Always
+/// succeeds; missing keys land as `None`/defaults.
+pub fn contract(lines: &[&str]) -> SkillContract {
+    let input_kind = field(lines, "input_kind").map(str::to_string);
+    let output_kind = field(lines, "output_kind").map(str::to_string);
+    let output_count = match field(lines, "output_count") {
+        Some("many") | Some("Many") | Some("MANY") => SkillOutputCount::Many,
+        _ => SkillOutputCount::One,
+    };
+    let gate = match field(lines, "gate") {
+        Some("auto") | Some("Auto") | Some("AUTO") => SkillGate::Auto,
+        _ => SkillGate::Approval,
+    };
+    let persona = field(lines, "persona").map(str::to_string);
+    SkillContract {
+        input_kind,
+        output_kind,
+        output_count,
+        gate,
+        persona,
+    }
+}
+
 /// Slug a string for use as a filename: lowercase, replace non-alnum with
 /// `-`, collapse runs of dashes, trim leading/trailing dashes. Empty
 /// inputs become "untitled".
@@ -134,6 +203,34 @@ mod tests {
     fn field_strips_quotes() {
         let lines = vec![r#"skill_name: "quoted slug""#];
         assert_eq!(field(&lines, "skill_name"), Some("quoted slug"));
+    }
+
+    #[test]
+    fn contract_defaults_when_no_fields() {
+        let lines: Vec<&str> = vec!["skill_name: x"];
+        let c = contract(&lines);
+        assert_eq!(c.input_kind, None);
+        assert_eq!(c.output_kind, None);
+        assert_eq!(c.output_count, SkillOutputCount::One);
+        assert_eq!(c.gate, SkillGate::Approval);
+    }
+
+    #[test]
+    fn contract_reads_all_fields() {
+        let lines = vec![
+            "skill_name: ba-decompose-epic",
+            "input_kind: epic",
+            "output_kind: feature",
+            "output_count: many",
+            "gate: auto",
+            "persona: BA",
+        ];
+        let c = contract(&lines);
+        assert_eq!(c.input_kind.as_deref(), Some("epic"));
+        assert_eq!(c.output_kind.as_deref(), Some("feature"));
+        assert_eq!(c.output_count, SkillOutputCount::Many);
+        assert_eq!(c.gate, SkillGate::Auto);
+        assert_eq!(c.persona.as_deref(), Some("BA"));
     }
 
     #[test]
