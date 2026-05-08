@@ -16,7 +16,7 @@ const DEFAULT_NOTE_TITLE: &str = "Untitled";
 
 /// The note's content kind. Backed by the `local_note.kind` column. The
 /// allowed string set is enforced by a CHECK constraint at the SQL layer
-/// (migrations 008 and 011) — adding a new variant here requires a new
+/// (migrations 008, 011, 015) — adding a new variant here requires a new
 /// migration that broadens the CHECK.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum NoteKind {
@@ -27,6 +27,14 @@ pub enum NoteKind {
     Excalidraw,
     Kanban,
     Code,
+    /// M2: a Claude Code skill authored as a note. Body is markdown with
+    /// optional YAML frontmatter (skill_name, skill_version, inputs,
+    /// output_frontmatter). Materialized to `<repo>/.claude/skills/`
+    /// on Play so claude's native skill loader resolves it.
+    Skill,
+    /// M3 preview: a workflow DAG of skill-node references. Stored at
+    /// the SQL level for now; the React Flow editor lands in M3.
+    Workflow,
 }
 
 impl NoteKind {
@@ -39,6 +47,8 @@ impl NoteKind {
             Self::Excalidraw => "excalidraw",
             Self::Kanban => "kanban",
             Self::Code => "code",
+            Self::Skill => "skill",
+            Self::Workflow => "workflow",
         }
     }
 
@@ -50,6 +60,8 @@ impl NoteKind {
             "excalidraw" => Self::Excalidraw,
             "kanban" => Self::Kanban,
             "code" => Self::Code,
+            "skill" => Self::Skill,
+            "workflow" => Self::Workflow,
             _ => Self::Markdown,
         }
     }
@@ -71,6 +83,8 @@ impl NoteKind {
             Self::Excalidraw => "Excalidraw",
             Self::Kanban => "Kanban",
             Self::Code => "Code",
+            Self::Skill => "Skill",
+            Self::Workflow => "Workflow",
         }
     }
 
@@ -84,6 +98,8 @@ impl NoteKind {
             Self::Excalidraw => "ex",
             Self::Kanban => "kb",
             Self::Code => "{}",
+            Self::Skill => "sk",
+            Self::Workflow => "wf",
         }
     }
 
@@ -95,6 +111,7 @@ impl NoteKind {
             Self::Markdown,
             Self::Mdx,
             Self::Code,
+            Self::Skill,
             Self::Image,
             Self::Kanban,
             Self::Canvas,

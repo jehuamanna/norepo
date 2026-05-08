@@ -33,11 +33,12 @@ use uuid::Uuid;
 
 use crate::agent::plugins::{ClaudeCodeChatPlugin, ClaudeCodeConfig};
 use crate::agent::CancellationToken;
-use crate::local_mode::desktop::CurrentVaultRoot;
+use crate::local_mode::desktop::{CurrentVaultRoot, LocalProjectRepo};
+use crate::local_mode::explorer::LocalProjectVersion;
 use crate::plugins::markdown::MarkdownView;
 use crate::shell::companion_state::{
     ActiveChatScope, ActiveChatSession, ActiveRepoPath, ChatMessage, ChatMessageKind,
-    ChatMessageRepo, ChatScope, ChatSessionRepo,
+    ChatMessageRepo, ChatScope, ChatSessionRepo, CompanionComposerInbox,
 };
 use crate::shell::session_rail::SessionRail;
 use crate::shell::tool_card::{ToolCard, ToolResultBody};
@@ -187,11 +188,43 @@ pub fn CompanionChat() -> Element {
             };
         }
     };
+    // Optional inbox — remote callers (e.g., the skill plugin's Play
+    // button) can drop a prompt here and the composer picks it up on the
+    // next render. Render-body sync uses peek + clear so missing context
+    // is harmless and the signal flips back to None after consumption.
+    let composer_inbox = try_consume_context::<CompanionComposerInbox>().map(|c| c.0);
+    if let Some(mut inbox) = composer_inbox {
+        let pending = inbox.peek().clone();
+        if let Some(text) = pending {
+            composer.set(text);
+            inbox.set(None);
+        }
+    }
 
-    // Resolve cwd for the active scope.
+    // Resolve cwd for the active scope. For Project scope, look the
+    // repo_path up directly from `local_project` keyed by the scope's
+    // project id — bypasses the broken `active_repo_path` use_effect
+    // that wasn't firing when the user clicked a NOTE inside a project
+    // (selected_project stays None; only selected_note flips). The
+    // `_ = active_repo.read()` keeps backward subscribers happy without
+    // letting the broken signal gate the actual cwd value.
+    let project_repo_for_cwd = match try_consume_context::<LocalProjectRepo>() {
+        Some(LocalProjectRepo(r)) => Some(r),
+        None => None,
+    };
+    let project_version = try_consume_context::<LocalProjectVersion>().map(|c| c.0);
     let cwd_for_scope = use_memo(move || -> Option<PathBuf> {
+        let _ = active_repo.read();
+        if let Some(v) = project_version.as_ref() {
+            let _ = v.read();
+        }
         match *scope_signal.read() {
-            ChatScope::Project(_) => active_repo.read().clone(),
+            ChatScope::Project(pid) => project_repo_for_cwd.as_ref().and_then(|repo| {
+                repo.list()
+                    .ok()
+                    .and_then(|projects| projects.into_iter().find(|p| p.id == pid))
+                    .and_then(|p| p.repo_path)
+            }),
             ChatScope::Vault => vault_root.read().as_ref().map(|v| v.path.clone()),
         }
     });

@@ -47,3 +47,10 @@ pub struct ChatMessageRepo(pub Arc<dyn ChatMessageRepository>);
 /// the list refreshes without a full remount.
 #[derive(Clone, Copy)]
 pub struct ChatSessionVersion(pub Signal<u64>);
+
+/// One-shot inbox the companion's composer subscribes to. When a remote
+/// caller (e.g., the skill plugin's Play button) writes `Some(prompt)`,
+/// the companion swaps that text into its composer field on the next
+/// render and clears the signal. The user reviews + clicks Send.
+#[derive(Clone, Copy)]
+pub struct CompanionComposerInbox(pub Signal<Option<String>>);

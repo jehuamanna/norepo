@@ -495,6 +495,10 @@ pub fn provide_local_app_signals() {
     use_context_provider(|| {
         crate::shell::companion_state::ChatSessionVersion(chat_session_version)
     });
+    let companion_composer_inbox: Signal<Option<String>> = use_signal(|| None);
+    use_context_provider(|| {
+        crate::shell::companion_state::CompanionComposerInbox(companion_composer_inbox)
+    });
     let selected_note: Signal<Option<Uuid>> = use_signal(|| None);
     use_context_provider(|| SelectedNote(selected_note));
     // Plans-Phase-4-multiselect-aria: parallel multi-selection set.

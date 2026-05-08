@@ -13,3 +13,4 @@ pub mod mdx;
 pub mod notes_explorer;
 pub mod plaintext;
 pub mod richtext_tiptap;
+pub mod skill;

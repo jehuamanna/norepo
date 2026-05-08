@@ -1515,3 +1515,86 @@ html, body {
   color: var(--vscode-foreground, var(--vscode-editor-foreground));
 }
 
+/* ============================================================
+ * Skill notes (M2) — toolbar + body wrapper
+ * ============================================================ */
+.operon-skill-surface {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.operon-skill-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-editorWidget-background, rgba(127, 127, 127, 0.04));
+  flex: 0 0 auto;
+}
+.operon-skill-play {
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--vscode-button-foreground, white);
+  background: var(--operon-accent);
+  border: 1px solid var(--operon-accent);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.operon-skill-play:hover {
+  filter: brightness(1.08);
+}
+.operon-skill-toolbar-spacer { flex: 0 0 8px; }
+.operon-skill-toolbar-meta {
+  font-size: 11px;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+}
+.operon-skill-toolbar-status {
+  font-size: 11px;
+}
+.operon-skill-toolbar-status-ok {
+  color: var(--operon-accent);
+}
+.operon-skill-toolbar-status-error {
+  color: var(--vscode-errorforeground, #f48771);
+}
+.operon-skill-meta {
+  display: flex;
+  gap: 6px;
+  padding: 6px 12px;
+  font-size: 11px;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+  border-bottom: 1px solid var(--vscode-panel-border);
+  flex: 0 0 auto;
+}
+.operon-skill-meta-label {
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-weight: 600;
+}
+.operon-skill-meta-value {
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  margin-right: 12px;
+}
+.operon-skill-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px;
+}
+.operon-skill-textarea {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  resize: none;
+  border: none;
+  outline: none;
+  padding: 12px;
+  font: inherit;
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  background: transparent;
+  color: var(--vscode-editor-foreground);
+}
+

@@ -217,6 +217,8 @@ const fn path_extension_for_kind(k: NoteKind) -> &'static str {
         NoteKind::Canvas => "json",
         NoteKind::Excalidraw => "json",
         NoteKind::Image => "bin",
+        NoteKind::Skill => "md",
+        NoteKind::Workflow => "json",
     }
 }
 
