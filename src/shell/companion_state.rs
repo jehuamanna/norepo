@@ -6,6 +6,7 @@
 
 use dioxus::prelude::Signal;
 use dioxus::signals::GlobalSignal;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -68,6 +69,31 @@ pub struct ChatSessionVersion(pub Signal<u64>);
 /// warning. `GlobalSignal` is application-wide, owned by no
 /// component's scope, and safe to read/write from anywhere.
 pub static CHAT_MESSAGE_VERSION: GlobalSignal<u64> = Signal::global(|| 0);
+
+/// State of the most recent artifact-skill run for a given source
+/// artifact. The artifact view reads this to render its inline
+/// status pill (`Running…` / `Created N artifact(s)` / `Run failed:
+/// …`); the picker writes `Running` synchronously when the user
+/// clicks a skill, and the runner's `spawn_forever` Result handler
+/// writes `Done` / `Failed` after Claude finishes.
+///
+/// Why a `GlobalSignal<HashMap<Uuid, _>>` and not a per-artifact
+/// `Signal`: the picker's `Running` write happens in the click
+/// handler (component scope, fine), but the spawn_forever's
+/// Done / Failed write happens at the virtual root scope. Writes
+/// from there to a component-scoped `Signal` get the
+/// `__copy_value_hoisted` warning ("may cause writes to fail"). The
+/// HashMap-keyed `GlobalSignal` sidesteps that — it's app-wide and
+/// safe to write from any scope.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ArtifactRunState {
+    Running,
+    Done { artifact_count: usize },
+    Failed { reason: String },
+}
+
+pub static ARTIFACT_RUN_STATE: GlobalSignal<HashMap<Uuid, ArtifactRunState>> =
+    Signal::global(HashMap::new);
 
 /// One-shot inbox the companion's composer subscribes to. When a remote
 /// caller (e.g., the skill plugin's Play button) writes `Some(prompt)`,

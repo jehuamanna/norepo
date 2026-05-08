@@ -19,7 +19,8 @@ use crate::plugins::artifact::frontmatter::{
 };
 use crate::plugins::markdown::MarkdownView;
 use crate::shell::companion_state::{
-    ChatMessageRepo, ChatSessionRepo, ChatSessionVersion, ClaudeCodePluginCtx,
+    ArtifactRunState, ChatMessageRepo, ChatSessionRepo, ChatSessionVersion,
+    ClaudeCodePluginCtx, ARTIFACT_RUN_STATE,
 };
 
 #[derive(Props, Clone, PartialEq)]
@@ -79,11 +80,13 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
     let mut picker_open = use_signal(|| false);
     let source_uuid = Uuid::parse_str(&props.note_id).ok();
     let source_kind_str = fm.artifact_kind.as_ref().map(|k| k.as_str().to_string());
-    // Phase C: status of the last run lives at the artifact-view
-    // scope so it survives the picker's close. The picker pushes
-    // updates through this signal; we render the pill near the
-    // action buttons regardless of whether the picker is open.
-    let run_status: Signal<Option<Result<String, String>>> = use_signal(|| None);
+    // Phase E: read run state from the global `ARTIFACT_RUN_STATE`
+    // map keyed on source artifact id. Reading the GlobalSignal
+    // here subscribes the artifact view to map updates, so the
+    // status pill ticks as the runner progresses (Running → Done /
+    // Failed) without scope-ownership warnings.
+    let run_state_view: Option<ArtifactRunState> = source_uuid
+        .and_then(|id| ARTIFACT_RUN_STATE.read().get(&id).cloned());
     rsx! {
         div { class: "operon-artifact-surface",
             "data-testid": "artifact-surface",
@@ -159,33 +162,36 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                         source_note_id: src_uuid,
                         source_artifact_kind: source_kind_str.clone(),
                         on_dismiss: Callback::new(move |_| picker_open.set(false)),
-                        run_status: run_status,
                     }
                 }
             }
-            // Phase C: inline run-status row, visible regardless of
-            // whether the picker is open. Empty before the first
-            // run; replaced by "Created N..." or the error message
-            // after each run completes.
-            {
-                let snapshot = run_status.read().clone();
-                match snapshot {
-                    None => rsx! {},
-                    Some(Ok(msg)) => rsx! {
-                        div {
-                            class: "operon-artifact-run-status operon-artifact-run-status-ok",
-                            "data-testid": "artifact-run-status",
-                            "{msg}"
-                        }
-                    },
-                    Some(Err(msg)) => rsx! {
-                        div {
-                            class: "operon-artifact-run-status operon-artifact-run-status-err",
-                            "data-testid": "artifact-run-status",
-                            "{msg}"
-                        }
-                    },
-                }
+            // Inline run-status row, visible regardless of whether
+            // the picker is open. Empty before the first run;
+            // shows the live state (Running / Done / Failed) keyed
+            // off the global run-state map.
+            match run_state_view {
+                None => rsx! {},
+                Some(ArtifactRunState::Running) => rsx! {
+                    div {
+                        class: "operon-artifact-run-status operon-artifact-run-status-ok",
+                        "data-testid": "artifact-run-status",
+                        "Running\u{2026} (transcript visible in the rail)"
+                    }
+                },
+                Some(ArtifactRunState::Done { artifact_count }) => rsx! {
+                    div {
+                        class: "operon-artifact-run-status operon-artifact-run-status-ok",
+                        "data-testid": "artifact-run-status",
+                        "Created {artifact_count} artifact(s) under this note."
+                    }
+                },
+                Some(ArtifactRunState::Failed { reason }) => rsx! {
+                    div {
+                        class: "operon-artifact-run-status operon-artifact-run-status-err",
+                        "data-testid": "artifact-run-status",
+                        "Run failed: {reason}"
+                    }
+                },
             }
             div { class: "operon-artifact-body",
                 if body_editable {
@@ -343,10 +349,6 @@ struct SkillPickerPanelProps {
     source_note_id: Uuid,
     source_artifact_kind: Option<String>,
     on_dismiss: Callback<()>,
-    /// Hoisted from `ArtifactView` so the result line survives the
-    /// picker's close. `None` = no run yet; `Some(Ok(_))` = the last
-    /// run produced N artifacts; `Some(Err(_))` = it failed.
-    run_status: Signal<Option<Result<String, String>>>,
 }
 
 #[component]
@@ -390,7 +392,6 @@ fn SkillPickerPanel(props: SkillPickerPanelProps) -> Element {
         .collect();
 
     let source_kind = props.source_artifact_kind.clone();
-    let last_status = props.run_status;
 
     rsx! {
         div { class: "operon-artifact-skill-picker",
@@ -445,7 +446,6 @@ fn SkillPickerPanel(props: SkillPickerPanelProps) -> Element {
                             let plugin_for_run = plugin.clone();
                             let chat_session_repo_for_run = chat_session_repo.clone();
                             let chat_message_repo_for_run = chat_message_repo.clone();
-                            let mut status_setter = last_status;
                             let mut note_version_setter = note_version;
                             let mut chat_session_version_setter = chat_session_version;
                             let mut active_session_setter = active_session;
@@ -474,7 +474,6 @@ fn SkillPickerPanel(props: SkillPickerPanelProps) -> Element {
                                                 &mut chat_session_version_setter,
                                                 &mut active_session_setter,
                                                 &mut active_scope_setter,
-                                                &mut status_setter,
                                             );
                                             on_dismiss.call(());
                                         },
@@ -494,16 +493,6 @@ fn SkillPickerPanel(props: SkillPickerPanelProps) -> Element {
                             }
                         }
                     }
-                }
-            }
-            if let Some(s) = last_status.read().as_ref() {
-                match s {
-                    Ok(msg) => rsx! {
-                        div { class: "operon-artifact-skill-picker-status operon-artifact-skill-picker-status-ok", "{msg}" }
-                    },
-                    Err(msg) => rsx! {
-                        div { class: "operon-artifact-skill-picker-status operon-artifact-skill-picker-status-err", "{msg}" }
-                    },
                 }
             }
         }
@@ -569,23 +558,32 @@ fn spawn_runner(
     chat_session_version: &mut Signal<u64>,
     active_session: &mut Signal<Option<Uuid>>,
     active_scope: &mut Signal<operon_store::repos::ChatScope>,
-    status: &mut Signal<Option<Result<String, String>>>,
 ) {
     // Resolve repo path up front so a missing binding fails loudly
     // rather than silently no-op'ing inside the spawned task.
     let projects = match project_repo.list() {
         Ok(p) => p,
         Err(e) => {
-            status.set(Some(Err(format!("list projects: {e}"))));
+            ARTIFACT_RUN_STATE.with_mut(|m| {
+                m.insert(
+                    source_note_id,
+                    ArtifactRunState::Failed { reason: format!("list projects: {e}") },
+                );
+            });
             return;
         }
     };
     let repo_path = match projects.into_iter().find(|p| p.id == project_id).and_then(|p| p.repo_path) {
         Some(p) => p,
         None => {
-            status.set(Some(Err(
-                "Set the project's repository (right-click \u{2192} Set repository\u{2026}) before running a skill.".into(),
-            )));
+            ARTIFACT_RUN_STATE.with_mut(|m| {
+                m.insert(
+                    source_note_id,
+                    ArtifactRunState::Failed {
+                        reason: "Set the project's repository (right-click \u{2192} Set repository\u{2026}) before running a skill.".into(),
+                    },
+                );
+            });
             return;
         }
     };
@@ -623,12 +621,19 @@ fn spawn_runner(
 
     plugin.bind_session(chat_session_id, repo_path.clone());
 
+    // Show the in-flight indicator immediately. Writing to the
+    // global `ARTIFACT_RUN_STATE` map from this synchronous click
+    // handler is a normal `with_mut` — no scope-ownership warning.
+    ARTIFACT_RUN_STATE.with_mut(|m| {
+        m.insert(source_note_id, ArtifactRunState::Running);
+    });
+    // The post-completion `LocalNoteVersion` bump still happens
+    // from inside `spawn_forever` and emits a `__copy_value_hoisted`
+    // warning, but the write empirically propagates (the user sees
+    // new artifacts appear in the explorer). Promoting LocalNoteVersion
+    // to a GlobalSignal would silence the warning entirely but
+    // touches a lot of explorer code; deferred.
     let mut note_version_setter = *note_version;
-    let mut status_setter = *status;
-    // Show an in-flight indicator immediately so the user has visual
-    // feedback even before Claude starts streaming. Final status
-    // (success / failure) overwrites this once the runner returns.
-    status_setter.set(Some(Ok("Running\u{2026} (transcript visible in the rail)".into())));
     // `spawn_forever` (NOT plain `spawn`) attaches the task to the
     // root scope. We need this because the SkillPickerPanel that
     // owns this click handler is dismissed immediately after via
@@ -647,16 +652,32 @@ fn spawn_runner(
             skill_note_id,
         )
         .await;
+        // Both Ok/Err writes go to the GlobalSignal map, so they
+        // don't trigger `__copy_value_hoisted` warnings. The
+        // artifact view subscribes to the map and re-renders the
+        // status pill automatically.
         match result {
             Ok(outcome) => {
                 let n = outcome.created_artifact_ids.len();
-                status_setter.set(Some(Ok(format!(
-                    "Created {n} artifact(s) under this note."
-                ))));
+                ARTIFACT_RUN_STATE.with_mut(|m| {
+                    m.insert(
+                        source_note_id,
+                        ArtifactRunState::Done { artifact_count: n },
+                    );
+                });
+                // Refresh the explorer so the new artifact rows
+                // appear under the source. (Emits a
+                // `__copy_value_hoisted` warning — see the comment
+                // above note_version_setter.)
                 note_version_setter.with_mut(|v| *v = v.saturating_add(1));
             }
             Err(e) => {
-                status_setter.set(Some(Err(format!("Run failed: {e}"))));
+                ARTIFACT_RUN_STATE.with_mut(|m| {
+                    m.insert(
+                        source_note_id,
+                        ArtifactRunState::Failed { reason: format!("{e}") },
+                    );
+                });
             }
         }
     });
