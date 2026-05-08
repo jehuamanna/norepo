@@ -257,7 +257,7 @@ fn canonical_json(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::workflow::state::{Edge, NodeStatus};
+    use crate::plugins::workflow::state::{Edge, Node, NodeStatus};
 
     fn skill(version: &str, body: &str) -> SkillSnapshot {
         SkillSnapshot {

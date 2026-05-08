@@ -1598,3 +1598,172 @@ html, body {
   color: var(--vscode-editor-foreground);
 }
 
+/* ============================================================
+ * Workflow notes (M3b) — toolbar + SVG canvas + JSON editor
+ * ============================================================ */
+.operon-workflow-surface {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.operon-workflow-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-editorWidget-background, rgba(127, 127, 127, 0.04));
+  position: relative;
+  flex: 0 0 auto;
+}
+.operon-workflow-toolbar-button {
+  padding: 4px 12px;
+  font-size: 12px;
+  background: var(--vscode-button-background, transparent);
+  color: var(--vscode-button-foreground, var(--vscode-editor-foreground));
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.operon-workflow-toolbar-button[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.operon-workflow-toolbar-button:hover:not([disabled]) {
+  background: var(--vscode-button-hoverbackground, var(--vscode-list-hoverbackground, rgba(127, 127, 127, 0.15)));
+}
+
+.operon-workflow-skill-picker {
+  position: absolute;
+  top: 100%;
+  left: 12px;
+  margin-top: 4px;
+  z-index: 50;
+  width: 280px;
+  max-height: 360px;
+  overflow-y: auto;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background, white));
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+}
+.operon-workflow-skill-picker-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  font-size: 12px;
+}
+.operon-workflow-skill-picker-close {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--vscode-descriptionforeground, inherit);
+}
+.operon-workflow-skill-picker-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.operon-workflow-skill-picker-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.operon-workflow-skill-picker-item:hover {
+  background: var(--vscode-list-hoverbackground, rgba(127, 127, 127, 0.1));
+}
+.operon-workflow-skill-picker-empty {
+  padding: 10px;
+  font-size: 12px;
+  color: var(--vscode-descriptionforeground, inherit);
+}
+
+.operon-workflow-pane {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 360px;
+}
+.operon-workflow-canvas {
+  position: relative;
+  background: var(--vscode-editor-background);
+  border-right: 1px solid var(--vscode-panel-border);
+  overflow: hidden;
+}
+.operon-workflow-canvas-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+}
+.operon-workflow-svg {
+  display: block;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+}
+.operon-workflow-edge {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  opacity: 0.6;
+}
+.operon-workflow-node {
+  fill: var(--vscode-editorWidget-background, rgba(127, 127, 127, 0.08));
+  stroke: var(--vscode-panel-border);
+  stroke-width: 1;
+}
+.operon-workflow-node-fresh   { stroke: var(--operon-accent); }
+.operon-workflow-node-dirty   { stroke: #d99a3c; stroke-dasharray: 4 3; }
+.operon-workflow-node-running { stroke: var(--operon-accent); stroke-width: 2; }
+.operon-workflow-node-error   { stroke: var(--vscode-errorforeground, #f48771); }
+.operon-workflow-node-title {
+  fill: var(--vscode-editor-foreground);
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+}
+.operon-workflow-node-status {
+  fill: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.operon-workflow-json {
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--vscode-panel-border);
+  min-height: 0;
+}
+.operon-workflow-parse-error {
+  padding: 6px 8px;
+  font-size: 11px;
+  color: var(--vscode-errorforeground, #f48771);
+  background: var(--vscode-editorinfo-background, rgba(244, 135, 113, 0.08));
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+.operon-workflow-textarea {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  resize: none;
+  border: none;
+  outline: none;
+  padding: 8px 12px;
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  font-size: 12px;
+  background: transparent;
+  color: var(--vscode-editor-foreground);
+}
+
