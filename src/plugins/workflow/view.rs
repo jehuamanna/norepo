@@ -140,9 +140,24 @@ struct WorkflowCanvasProps {
     apply_graph: Callback<WorkflowGraph>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DragState {
+    node: NodeId,
+    /// Mouse client position at drag start, so subsequent mousemove
+    /// events can compute a delta against it (we update the node's
+    /// position by that delta).
+    start_client_x: f64,
+    start_client_y: f64,
+    /// Node position at drag start.
+    start_node_x: f64,
+    start_node_y: f64,
+}
+
 #[component]
 fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
-    let g = props.graph;
+    let g = props.graph.clone();
+    let mut drag = use_signal::<Option<DragState>>(|| None);
+    let mut selected_node = use_signal::<Option<NodeId>>(|| None);
     // Auto-place nodes whose `position` is exactly (0, 0) — keeps the
     // hand-edited "create a node by adding to JSON" flow usable without
     // having to do math. Stable id-sorted layout.
@@ -176,9 +191,54 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
     let (min_x, min_y, max_x, max_y) = bounds(&nodes);
     let viewbox = format!("{min_x} {min_y} {} {}", max_x - min_x, max_y - min_y);
 
+    // Inspector readout for the selected node — extra_instructions live
+    // edits and a skill-id readout for now (typed_fields edit lives in
+    // the JSON pane to keep schema-validation consistent).
+    let selected = *selected_node.read();
+    let selected_node_view = selected.and_then(|sid| g.nodes.get(&sid).cloned());
+
     rsx! {
         div { class: "operon-workflow-canvas",
             "data-testid": "workflow-canvas",
+            if let Some(sn) = selected_node_view.as_ref() {
+                {
+                    let sid = sn.id;
+                    let extra = sn.extra_instructions.clone();
+                    let skill_id_str = sn.skill_note_id.to_string();
+                    let apply = props.apply_graph;
+                    let mut graph_for_inspector = g.clone();
+                    rsx! {
+                        div { class: "operon-workflow-inspector",
+                            "data-testid": "workflow-inspector",
+                            "data-node-id": "{sid}",
+                            div { class: "operon-workflow-inspector-row",
+                                span { class: "operon-workflow-inspector-label", "skill id" }
+                                code { class: "md-inline-code operon-workflow-inspector-code", "{skill_id_str}" }
+                                button {
+                                    r#type: "button",
+                                    class: "operon-workflow-inspector-close",
+                                    onclick: move |_| selected_node.set(None),
+                                    "\u{2715}"
+                                }
+                            }
+                            label { class: "operon-workflow-inspector-row",
+                                span { class: "operon-workflow-inspector-label", "extra instructions" }
+                                textarea {
+                                    class: "operon-workflow-inspector-textarea",
+                                    "data-testid": "workflow-inspector-extra",
+                                    value: "{extra}",
+                                    oninput: move |e| {
+                                        if let Some(node) = graph_for_inspector.nodes.get_mut(&sid) {
+                                            node.extra_instructions = e.value();
+                                        }
+                                        apply.call(graph_for_inspector.clone());
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if nodes.is_empty() {
                 div { class: "operon-workflow-canvas-empty",
                     "data-testid": "workflow-canvas-empty",
@@ -191,6 +251,35 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                     height: "100%",
                     "viewBox": "{viewbox}",
                     preserve_aspect_ratio: "xMidYMid meet",
+                    // Track drags at the SVG level so the cursor
+                    // doesn't have to stay perfectly inside the node
+                    // rect during a fast drag.
+                    onmousemove: {
+                        let apply = props.apply_graph;
+                        let mut graph = g.clone();
+                        move |e: dioxus::events::MouseEvent| {
+                            let cur = match *drag.read() {
+                                Some(d) => d,
+                                None => return,
+                            };
+                            let coords = e.client_coordinates();
+                            let dx = coords.x - cur.start_client_x;
+                            let dy = coords.y - cur.start_client_y;
+                            if let Some(node) = graph.nodes.get_mut(&cur.node) {
+                                node.position = (
+                                    cur.start_node_x + dx,
+                                    cur.start_node_y + dy,
+                                );
+                            }
+                            apply.call(graph.clone());
+                        }
+                    },
+                    onmouseup: move |_| {
+                        drag.set(None);
+                    },
+                    onmouseleave: move |_| {
+                        drag.set(None);
+                    },
                     defs {
                         marker {
                             id: "operon-workflow-arrow",
@@ -212,7 +301,9 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                     }
                     for n in nodes.iter() {
                         {
-                            let node_id_for_run = n.id;
+                            let node_id = n.id;
+                            let n_x = n.x;
+                            let n_y = n.y;
                             let note_id_for_run = props.note_id.clone();
                             let apply_for_run = props.apply_graph;
                             let graph_for_run = g.clone();
@@ -220,16 +311,36 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                 evt.stop_propagation();
                                 spawn_run_node(
                                     note_id_for_run.clone(),
-                                    node_id_for_run,
+                                    node_id,
                                     graph_for_run.clone(),
                                     apply_for_run,
                                 );
                             };
+                            let on_node_mousedown = move |evt: dioxus::events::MouseEvent| {
+                                evt.stop_propagation();
+                                let coords = evt.client_coordinates();
+                                drag.set(Some(DragState {
+                                    node: node_id,
+                                    start_client_x: coords.x,
+                                    start_client_y: coords.y,
+                                    start_node_x: n_x,
+                                    start_node_y: n_y,
+                                }));
+                                selected_node.set(Some(node_id));
+                            };
+                            let is_selected = *selected_node.read() == Some(node_id);
+                            let group_class = if is_selected {
+                                "operon-workflow-node-group operon-workflow-node-group-selected"
+                            } else {
+                                "operon-workflow-node-group"
+                            };
                             rsx! {
                                 g {
-                                    class: "operon-workflow-node-group",
+                                    class: "{group_class}",
                                     "data-node-id": "{n.id}",
+                                    "data-selected": if is_selected { "true" } else { "false" },
                                     transform: "translate({n.x}, {n.y})",
+                                    onmousedown: on_node_mousedown,
                                     rect {
                                         class: status_class(&n.status),
                                         "data-testid": "workflow-node",
@@ -255,6 +366,9 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                         "data-testid": "workflow-node-run",
                                         transform: "translate({NODE_W - 28.0}, 8.0)",
                                         onclick: on_run_node,
+                                        onmousedown: move |evt: dioxus::events::MouseEvent| {
+                                            evt.stop_propagation();
+                                        },
                                         rect {
                                             width: "20",
                                             height: "20",

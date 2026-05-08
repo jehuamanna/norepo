@@ -1314,6 +1314,34 @@ html, body {
   cursor: pointer;
 }
 
+.operon-companion-toolbar-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.operon-companion-model-picker {
+  font-size: 11px;
+  padding: 2px 4px;
+  background: var(--vscode-input-background, transparent);
+  color: var(--vscode-input-foreground, var(--vscode-editor-foreground));
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  border-radius: 4px;
+}
+.operon-companion-plan-toggle {
+  font-size: 11px;
+  padding: 2px 8px;
+  background: transparent;
+  color: var(--vscode-foreground, var(--vscode-editor-foreground));
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.operon-companion-plan-toggle-on {
+  background: var(--operon-accent);
+  color: var(--vscode-button-foreground, white);
+  border-color: var(--operon-accent);
+}
+
 .operon-companion-chat-send:disabled {
   opacity: 0.4;
   cursor: not-allowed;
@@ -1752,6 +1780,67 @@ html, body {
   fill: var(--vscode-button-foreground, white);
   font-size: 10px;
   pointer-events: none;
+}
+.operon-workflow-node-group { cursor: grab; }
+.operon-workflow-node-group:active { cursor: grabbing; }
+.operon-workflow-node-group-selected .operon-workflow-node {
+  stroke-width: 2;
+}
+
+.operon-workflow-inspector {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
+  z-index: 10;
+}
+.operon-workflow-inspector-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.operon-workflow-inspector-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--vscode-descriptionforeground, inherit);
+  flex: 0 0 auto;
+}
+.operon-workflow-inspector-code {
+  flex: 1 1 auto;
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.operon-workflow-inspector-close {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--vscode-descriptionforeground, inherit);
+}
+.operon-workflow-inspector-textarea {
+  width: 100%;
+  min-height: 60px;
+  resize: vertical;
+  font: inherit;
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  padding: 4px 6px;
+  background: var(--vscode-input-background, transparent);
+  color: var(--vscode-input-foreground, inherit);
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  border-radius: 4px;
 }
 
 .operon-workflow-json {

@@ -271,13 +271,24 @@ fn play_skill(
     active_scope.set(scope);
     active_session.set(Some(new_session.id));
 
-    // 5. Pre-fill the companion composer with the invocation prompt. The
-    //    user clicks Send to actually execute (gives them a chance to
-    //    review / amend before paying claude tokens).
-    let prompt = format!("Use the skill named \"{slug}\".");
+    // 5. Pre-fill the companion composer with the invocation prompt
+    //    AND tell claude to capture the run's output to disk so future
+    //    workflows can chain to this skill's output without scraping
+    //    the chat transcript. The user clicks Send to actually execute.
+    let output_path = repo_path
+        .join(".operon")
+        .join("outputs")
+        .join("skills")
+        .join(format!("{note_id_str}.md"));
+    let _ = std::fs::create_dir_all(repo_path.join(".operon").join("outputs").join("skills"));
+    let prompt = format!(
+        "Use the skill named \"{slug}\".\n\nWrite your output (markdown body, optionally with YAML frontmatter) to the absolute path: {}",
+        output_path.display()
+    );
     composer_inbox.set(Some(prompt));
     session_version.with_mut(|v| *v += 1);
     status.set(Some(Ok(format!(
-        "Materialized {slug}.md \u{2192} session \u{201C}Run: {slug}\u{201D} ready"
+        "Materialized {slug}.md \u{2192} session ready \u{2022} output will land at {}",
+        output_path.display()
     ))));
 }

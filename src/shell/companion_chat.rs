@@ -311,6 +311,55 @@ pub fn CompanionChat() -> Element {
                 "data-region": "companion-chat",
                 div { class: "operon-companion-chat-header",
                     span { class: "operon-companion-chat-title", "Companion" }
+                    {
+                        let plugin_arc = plugin.read().clone();
+                        let current_model = plugin_arc.current_default_model();
+                        let current_plan = plugin_arc.current_plan_mode();
+                        let plugin_for_model = plugin_arc.clone();
+                        let plugin_for_plan = plugin_arc.clone();
+                        rsx! {
+                            label { class: "operon-companion-toolbar-label",
+                                title: "Model used for new turns",
+                                span { class: "sr-only", "Model" }
+                                select {
+                                    class: "operon-companion-model-picker",
+                                    "data-testid": "companion-model-picker",
+                                    onchange: move |e| {
+                                        let v = e.value();
+                                        let next = if v == "default" { None } else { Some(v) };
+                                        plugin_for_model.set_default_model(next);
+                                    },
+                                    option { value: "default",
+                                        selected: current_model.is_none(),
+                                        "Default"
+                                    }
+                                    option { value: "claude-opus-4-7",
+                                        selected: current_model.as_deref() == Some("claude-opus-4-7"),
+                                        "Opus 4.7"
+                                    }
+                                    option { value: "claude-sonnet-4-6",
+                                        selected: current_model.as_deref() == Some("claude-sonnet-4-6"),
+                                        "Sonnet 4.6"
+                                    }
+                                    option { value: "claude-haiku-4-5",
+                                        selected: current_model.as_deref() == Some("claude-haiku-4-5"),
+                                        "Haiku 4.5"
+                                    }
+                                }
+                            }
+                            button {
+                                r#type: "button",
+                                class: if current_plan { "operon-companion-plan-toggle operon-companion-plan-toggle-on" } else { "operon-companion-plan-toggle" },
+                                "data-testid": "companion-plan-toggle",
+                                "data-active": if current_plan { "true" } else { "false" },
+                                title: "Plan mode \u{2014} claude produces a plan before any tool use",
+                                onclick: move |_| {
+                                    plugin_for_plan.set_plan_mode(!current_plan);
+                                },
+                                if current_plan { "\u{1F5C2} Plan: ON" } else { "\u{1F5C2} Plan" }
+                            }
+                        }
+                    }
                     if *in_flight.read() {
                         button {
                             class: "operon-companion-chat-stop",

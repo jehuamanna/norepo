@@ -54,6 +54,14 @@ pub(crate) struct PluginState {
     /// first turn completes) the claude-side session id used to resume
     /// the conversation on subsequent turns.
     pub bindings: BTreeMap<Uuid, SessionBinding>,
+    /// Runtime override for the model id forwarded as `--model`. When
+    /// `None`, the per-spawn default from `ClaudeCodeConfig.model` is
+    /// used (which may itself be `None` to let claude pick).
+    pub default_model: Option<String>,
+    /// When true, every `claude` spawn passes `--permission-mode=plan`
+    /// so the assistant produces a plan before any tool use. Toggled
+    /// from the companion toolbar.
+    pub plan_mode: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +124,29 @@ impl ClaudeCodeChatPlugin {
         if let Some(b) = s.bindings.get_mut(&operon_session) {
             b.claude_session_id = Some(claude_session_id);
         }
+    }
+
+    /// Override the model id forwarded as `--model` on subsequent turns.
+    /// Pass `None` to fall back to the `ClaudeCodeConfig.model` default.
+    pub fn set_default_model(&self, model: Option<String>) {
+        let mut s = self.state.lock().expect("plugin state mutex poisoned");
+        s.default_model = model;
+    }
+
+    /// Toggle plan mode for subsequent turns. When `true`, `claude` is
+    /// spawned with `--permission-mode=plan`; the assistant emits a
+    /// plan before any tool use and asks for approval to execute it.
+    pub fn set_plan_mode(&self, on: bool) {
+        let mut s = self.state.lock().expect("plugin state mutex poisoned");
+        s.plan_mode = on;
+    }
+
+    pub fn current_default_model(&self) -> Option<String> {
+        self.state.lock().ok().and_then(|s| s.default_model.clone())
+    }
+
+    pub fn current_plan_mode(&self) -> bool {
+        self.state.lock().map(|s| s.plan_mode).unwrap_or(false)
     }
 
     /// Send a single user prompt for `operon_session` and return a stream
@@ -196,21 +227,24 @@ impl ClaudeCodeChatPlugin {
         operon_session: Uuid,
         ct: CancellationToken,
     ) -> OperonResult<UnboundedReceiver<ClaudeCodeEvent>> {
-        let (cwd, claude_session_id) = {
+        let (cwd, claude_session_id, model_override, plan_on) = {
             let s = self.state.lock().expect("plugin state mutex poisoned");
-            match s.bindings.get(&operon_session) {
-                Some(b) => (b.cwd.clone(), b.claude_session_id.clone()),
-                None => {
-                    return Err(OperonError::Provider {
-                        provider: "claude-code".into(),
-                        message: format!(
-                            "session {operon_session} is not bound to a repository; \
-                             call ClaudeCodeChatPlugin::bind_session before chatting"
-                        ),
-                        retryable: false,
-                    });
+            let binding = s.bindings.get(&operon_session).ok_or_else(|| {
+                OperonError::Provider {
+                    provider: "claude-code".into(),
+                    message: format!(
+                        "session {operon_session} is not bound to a repository; \
+                         call ClaudeCodeChatPlugin::bind_session before chatting"
+                    ),
+                    retryable: false,
                 }
-            }
+            })?;
+            (
+                binding.cwd.clone(),
+                binding.claude_session_id.clone(),
+                s.default_model.clone(),
+                s.plan_mode,
+            )
         };
 
         let mut cmd = tokio::process::Command::new(&self.cfg.claude_bin);
@@ -227,8 +261,15 @@ impl ClaudeCodeChatPlugin {
         if let Some(sid) = &claude_session_id {
             cmd.arg("--resume").arg(sid);
         }
-        if let Some(model) = &self.cfg.model {
+        // Per-call model override → static cfg fallback → claude's own
+        // default. Plan mode is global (PluginState) so toggling from
+        // the toolbar affects every session.
+        let effective_model = model_override.or_else(|| self.cfg.model.clone());
+        if let Some(model) = &effective_model {
             cmd.arg("--model").arg(model);
+        }
+        if plan_on {
+            cmd.arg("--permission-mode").arg("plan");
         }
 
         let mut child = cmd.spawn().map_err(|e| OperonError::Provider {
