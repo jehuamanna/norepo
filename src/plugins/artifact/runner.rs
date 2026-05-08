@@ -145,13 +145,30 @@ pub async fn run_skill_on_source(
 
     // 7. Persist the prompt as a User message (transcript visibility).
     if let Some(repo) = chat_repo {
-        let _ = repo.append(
+        match repo.append(
             chat_session_id,
             ChatMessageKind::User,
             None,
             &serde_json::json!({ "text": prompt.clone() }),
+        ) {
+            Ok(_) => {
+                eprintln!(
+                    "operon: artifact runner persisted user prompt ({} bytes) to session {chat_session_id}",
+                    prompt.len()
+                );
+                bump_message_version(chat_message_version);
+            }
+            Err(e) => {
+                eprintln!(
+                    "operon: artifact runner FAILED to persist user prompt to session \
+                     {chat_session_id}: {e:?}"
+                );
+            }
+        }
+    } else {
+        eprintln!(
+            "operon: artifact runner WARNING — no chat_repo provided, transcript will be empty"
         );
-        bump_message_version(chat_message_version);
     }
 
     // 8. Run claude. The runner forces `acceptEdits` on this
@@ -173,12 +190,17 @@ pub async fn run_skill_on_source(
         .await
         .map_err(|e| RunnerError::Plugin(format!("send_rich: {e}")))?;
     let mut assistant_buf = String::new();
+    let mut total_appended = 0usize;
     while let Some(ev) = rx.next().await {
         // Persist event to the rail's chat_message (mirroring the
         // workflow executor's pattern).
         if let Some(repo) = chat_repo {
             let appended = persist_event(repo, chat_session_id, &ev, &mut assistant_buf);
             if appended {
+                total_appended += 1;
+                eprintln!(
+                    "operon: artifact runner persisted event #{total_appended} to chat_message"
+                );
                 bump_message_version(chat_message_version);
             }
         }
@@ -474,10 +496,30 @@ fn persist_event(
 }
 
 /// Bump the optional live-transcript version signal so the
-/// companion's load-effect re-fetches `chat_message`.
+/// companion's load-effect re-fetches `chat_message`. Logs the bump
+/// so we can verify Phase-D wiring from the dx-serve terminal — if
+/// the runner is persisting messages but the user reports the
+/// transcript is still empty, this trace shows whether the bump
+/// path is reaching the signal at all.
 fn bump_message_version(sig: Option<Signal<u64>>) {
-    if let Some(mut s) = sig {
-        s.with_mut(|v| *v = v.saturating_add(1));
+    match sig {
+        Some(mut s) => {
+            let mut next = 0u64;
+            s.with_mut(|v| {
+                *v = v.saturating_add(1);
+                next = *v;
+            });
+            eprintln!(
+                "operon: artifact runner bumped ChatMessageVersion -> {next}"
+            );
+        }
+        None => {
+            eprintln!(
+                "operon: artifact runner WARNING — no ChatMessageVersion signal, \
+                 live transcript won't tick (clicking off+back to the rail entry \
+                 still works)"
+            );
+        }
     }
 }
 
