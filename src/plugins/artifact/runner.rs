@@ -453,6 +453,34 @@ fn persist_event(
                     "result": serde_json::Value::Null,
                 }),
             );
+            // Phase F: when claude uses the Write tool to produce an
+            // artifact file, mirror the file's content into the rail
+            // as a readable Assistant message alongside the
+            // (collapsible) ToolCall card. The card has the
+            // structural details (path, status); the Assistant
+            // block has the markdown body so the user can follow
+            // each artifact's content as a streaming text feed
+            // rather than digging into the JSON-formatted ToolCall
+            // input.
+            if name == "Write" {
+                if let Some(content) = input.get("content").and_then(|v| v.as_str()) {
+                    let path = input
+                        .get("file_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("artifact");
+                    let label = std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(path);
+                    let body = format!("\u{1F4C4} **{label}**\n\n{content}");
+                    let _ = repo.append(
+                        chat_session_id,
+                        ChatMessageKind::Assistant,
+                        None,
+                        &serde_json::json!({ "body": body }),
+                    );
+                }
+            }
             flushed || true
         }
         ToolResult {

@@ -261,6 +261,31 @@ pub async fn run_node(
                             "result": serde_json::Value::Null,
                         }),
                     );
+                    // Phase F: mirror Write tool content into the
+                    // rail as a readable Assistant message — same
+                    // pattern as the artifact runner.
+                    if name == "Write" {
+                        if let Some(content) =
+                            input.get("content").and_then(|v| v.as_str())
+                        {
+                            let path = input
+                                .get("file_path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("artifact");
+                            let label = std::path::Path::new(path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(path);
+                            let body =
+                                format!("\u{1F4C4} **{label}**\n\n{content}");
+                            let _ = sink.chat_repo.append(
+                                sink.chat_session_id,
+                                ChatMessageKind::Assistant,
+                                None,
+                                &serde_json::json!({ "body": body }),
+                            );
+                        }
+                    }
                 }
             }
             ClaudeCodeEvent::ToolResult { tool_use_id, content, is_error } => {
