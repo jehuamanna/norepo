@@ -278,14 +278,6 @@ pub fn CompanionChat() -> Element {
     // Reset transcript + cost on session switch, then replay any
     // persisted history for the newly-active session. Cost meter doesn't
     // restore from disk (deferred — needs per-session usage column).
-    //
-    // Phase D: also re-fire when `CHAT_MESSAGE_VERSION` bumps, which
-    // a background drainer (the artifact runner) does after each
-    // `chat_message` append. That re-reads the row list and reflects
-    // streaming events in the transcript even though we aren't the
-    // ones draining the claude stream. Regular companion chats don't
-    // bump the version (they update the in-memory transcript directly
-    // via `apply_event`), so this watcher is a no-op for them.
     {
         let session = session_signal;
         let mut transcript_setter = transcript;
@@ -293,30 +285,14 @@ pub fn CompanionChat() -> Element {
         let mut pending_setter = pending_assistant;
         let repo = message_repo.clone();
         use_effect(move || {
-            // Subscribe to GlobalSignal bumps so this effect re-runs
-            // on background appends from the artifact runner.
-            let version_now = *CHAT_MESSAGE_VERSION.read();
             let sid = *session.read();
-            eprintln!(
-                "operon: companion transcript-load effect FIRED \
-                 session={:?} chat_msg_version={version_now}",
-                sid
-            );
             usage_setter.set(Usage::default());
             pending_setter.set(false);
             match sid {
                 Some(id) => match repo.list(id) {
                     Ok(rows) => {
-                        eprintln!(
-                            "operon: companion transcript-load loaded {} row(s) for session {id}",
-                            rows.len()
-                        );
                         let restored: Vec<TranscriptItem> =
                             rows.iter().filter_map(transcript_item_from_message).collect();
-                        eprintln!(
-                            "operon: companion transcript-load mapped {} TranscriptItem(s)",
-                            restored.len()
-                        );
                         transcript_setter.set(restored);
                     }
                     Err(e) => {
@@ -328,6 +304,48 @@ pub fn CompanionChat() -> Element {
                     }
                 },
                 None => transcript_setter.set(Vec::new()),
+            }
+        });
+    }
+
+    // Phase D: live transcript updates via polling. We previously
+    // tried `*CHAT_MESSAGE_VERSION.read()` inside the load effect,
+    // but reading a `GlobalSignal` inside `use_effect` interacted
+    // with the effect's own writes to create a tight infinite loop
+    // (effect runs → writes transcript → component re-renders →
+    // effect re-fires, ~200×/sec). Polling sidesteps the
+    // subscription quirk entirely: every 500ms, if the active
+    // session is set and `chat_message` rows differ from the
+    // current transcript, push the new rows. The runner's
+    // `bump_message_version()` calls become advisory — they hint
+    // that a poll might find new rows but the poll is the
+    // authoritative trigger. 500ms is below the noticeable-lag
+    // threshold for typing UIs and the cost is one SQLite SELECT.
+    {
+        let session = session_signal;
+        let mut transcript_setter = transcript;
+        let repo = message_repo.clone();
+        use_future(move || {
+            let repo = repo.clone();
+            async move {
+                use std::time::Duration;
+                let mut last_seen_version: u64 = 0;
+                loop {
+                    futures_timer::Delay::new(Duration::from_millis(500)).await;
+                    let sid = *session.peek();
+                    let cur_version = *CHAT_MESSAGE_VERSION.peek();
+                    if cur_version == last_seen_version {
+                        continue;
+                    }
+                    last_seen_version = cur_version;
+                    let Some(id) = sid else { continue };
+                    let Ok(rows) = repo.list(id) else { continue };
+                    let restored: Vec<TranscriptItem> =
+                        rows.iter().filter_map(transcript_item_from_message).collect();
+                    if restored != *transcript_setter.peek() {
+                        transcript_setter.set(restored);
+                    }
+                }
             }
         });
     }
