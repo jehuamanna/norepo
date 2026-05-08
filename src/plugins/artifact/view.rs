@@ -637,7 +637,15 @@ fn spawn_runner(
     eprintln!(
         "operon: spawn_runner about to spawn async task source={source_note_id} skill={skill_note_id}"
     );
-    spawn(async move {
+    // `spawn_forever` (NOT plain `spawn`) attaches the task to the
+    // root scope. We need this because the SkillPickerPanel that
+    // owns this click handler is dismissed immediately after via
+    // `on_dismiss.call(())` — with plain `spawn`, the task would be
+    // attached to the picker's scope and dropped before the
+    // executor polls it. The runner would never start, which is
+    // exactly the symptom user dogfooding hit (`spawn_runner about
+    // to spawn` logged but `async task START` never did).
+    dioxus::core::spawn_forever(async move {
         eprintln!("operon: spawn_runner async task START");
         let result = crate::plugins::artifact::run_skill_on_source(
             &note_repo,
