@@ -495,14 +495,12 @@ pub fn provide_local_app_signals() {
     use_context_provider(|| {
         crate::shell::companion_state::ChatSessionVersion(chat_session_version)
     });
-    // Phase D: bumped by background drainers (artifact runner) when
-    // they append to `chat_message`. Lets the companion's load
-    // effect re-fetch the transcript so live streaming is visible
-    // even when the companion isn't the one draining the stream.
-    let chat_message_version: Signal<u64> = use_signal(|| 0);
-    use_context_provider(|| {
-        crate::shell::companion_state::ChatMessageVersion(chat_message_version)
-    });
+    // NOTE: `ChatMessageVersion` is now provided in `app.rs::App()`
+    // (root scope) instead of here. The artifact runner's
+    // `spawn_forever` task lives at root, and Dioxus signals can
+    // only be written from within their owning scope's subtree —
+    // creating it in Workspace meant root-scoped writes were
+    // silently dropped (Dioxus logs `__copy_value_hoisted` warnings).
     let companion_composer_inbox: Signal<Option<String>> = use_signal(|| None);
     use_context_provider(|| {
         crate::shell::companion_state::CompanionComposerInbox(companion_composer_inbox)

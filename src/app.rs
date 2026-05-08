@@ -92,6 +92,19 @@ pub fn App() -> Element {
     #[cfg(any(not(target_arch = "wasm32"), feature = "wasm-sqlite"))]
     use_context_provider(|| crate::local_mode::ui::ToastSlot(toast_slot));
 
+    // ChatMessageVersion MUST be owned by the App (root) scope, not by
+    // Workspace, because the artifact runner writes to it from inside
+    // a `spawn_forever` task. spawn_forever attaches the task to the
+    // root scope; signals owned by Workspace (a child of root) cannot
+    // be safely written from outside their owning subtree — Dioxus
+    // emits a `__copy_value_hoisted` warning and the writes silently
+    // drop. Put the signal here so both Workspace AND any
+    // root-scoped task can read/write it.
+    let chat_message_version: Signal<u64> = use_signal(|| 0);
+    use_context_provider(|| {
+        crate::shell::companion_state::ChatMessageVersion(chat_message_version)
+    });
+
     // Local Mode wiring: install the LocalUserRepo / LocalSettingsRepo before any
     // component reads them. Then resolve the remembered mode from
     // `local_app_settings`; if absent, AppState defaults to NonLocal but we
