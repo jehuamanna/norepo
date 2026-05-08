@@ -278,13 +278,13 @@ fn play_skill(
     // 5. Pre-fill the companion composer with the invocation prompt
     //    AND tell claude to capture the run's output to disk so future
     //    workflows can chain to this skill's output without scraping
-    //    the chat transcript. The user clicks Send to actually execute.
-    let output_path = repo_path
-        .join(".operon")
-        .join("outputs")
-        .join("skills")
-        .join(format!("{note_id_str}.md"));
-    let _ = std::fs::create_dir_all(repo_path.join(".operon").join("outputs").join("skills"));
+    //    the chat transcript. Path is unified with workflow runs:
+    //    `<repo>/.operon/outputs/<slug>-output.md`. Re-running the same
+    //    skill (Play button OR a workflow node referencing it)
+    //    overwrites the same file.
+    let outputs_dir = repo_path.join(".operon").join("outputs");
+    let _ = std::fs::create_dir_all(&outputs_dir);
+    let output_path = outputs_dir.join(format!("{slug}-output.md"));
     let prompt = format!(
         "Use the skill named \"{slug}\".\n\nWrite your output (markdown body, optionally with YAML frontmatter) to the absolute path: {}",
         output_path.display()

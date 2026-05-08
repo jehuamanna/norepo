@@ -326,7 +326,7 @@ pub fn CompanionChat() -> Element {
             section { class: "operon-companion-chat",
                 "data-region": "companion-chat",
                 div { class: "operon-companion-chat-header",
-                    span { class: "operon-companion-chat-title", "Companion" }
+                    span { class: "operon-companion-chat-title", "" }
                     {
                         let plugin_arc = plugin.read().clone();
                         let current_model = plugin_arc.current_default_model();

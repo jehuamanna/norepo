@@ -42,6 +42,20 @@ pub trait ChatSessionRepository: Send + Sync {
     fn list_in_scope(&self, scope: ChatScope) -> Result<Vec<ChatSession>, StoreError>;
     fn get(&self, id: Uuid) -> Result<Option<ChatSession>, StoreError>;
     fn create(&self, scope: ChatScope, label: &str) -> Result<ChatSession, StoreError>;
+    /// Phase-2-output-surfacing: insert a chat session at a caller-chosen
+    /// id. Used by the workflow cascade so it can derive a stable id for
+    /// "this workflow's cascade session" (via `Uuid::new_v5` from the
+    /// workflow note id) and look up that row across re-runs without a
+    /// secondary mapping table. Returns `Conflict` (or the SQLite-native
+    /// PRIMARY KEY violation surfaced as `Sql`) when the id already
+    /// exists — callers should `get` first if upsert semantics are
+    /// desired.
+    fn create_with_id(
+        &self,
+        id: Uuid,
+        scope: ChatScope,
+        label: &str,
+    ) -> Result<ChatSession, StoreError>;
     fn rename(&self, id: Uuid, label: &str) -> Result<(), StoreError>;
     fn delete(&self, id: Uuid) -> Result<(), StoreError>;
     /// Bumps `last_used_ms` to now.
@@ -150,9 +164,17 @@ impl ChatSessionRepository for SqliteChatSessionRepository {
     }
 
     fn create(&self, scope: ChatScope, label: &str) -> Result<ChatSession, StoreError> {
+        self.create_with_id(Uuid::new_v4(), scope, label)
+    }
+
+    fn create_with_id(
+        &self,
+        id: Uuid,
+        scope: ChatScope,
+        label: &str,
+    ) -> Result<ChatSession, StoreError> {
         let trimmed = label.trim();
         let resolved_label = if trimmed.is_empty() { "New chat" } else { trimmed };
-        let id = Uuid::new_v4();
         let now = now_ms();
         let (kind, scope_id) = scope_columns(scope);
         let conn = self.store.conn()?;
@@ -348,5 +370,24 @@ mod tests {
     fn get_unknown_id_returns_none() {
         let repo = make_repo();
         assert!(repo.get(Uuid::new_v4()).unwrap().is_none());
+    }
+
+    #[test]
+    fn create_with_id_round_trips_and_rejects_duplicate() {
+        let repo = make_repo();
+        let proj = Uuid::new_v4();
+        let chosen = Uuid::new_v4();
+        let s = repo
+            .create_with_id(chosen, ChatScope::Project(proj), "deterministic")
+            .unwrap();
+        assert_eq!(s.id, chosen, "row.id reflects the caller-chosen uuid");
+        assert_eq!(repo.get(chosen).unwrap().unwrap().id, chosen);
+        // Inserting again with the same id is rejected by the PRIMARY KEY
+        // constraint. The exact error variant depends on the sqlite driver
+        // wrapper; the relevant guarantee is that it errors rather than
+        // silently overwriting an existing row.
+        assert!(repo
+            .create_with_id(chosen, ChatScope::Project(proj), "duplicate")
+            .is_err());
     }
 }

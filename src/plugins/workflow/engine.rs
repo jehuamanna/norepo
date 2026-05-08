@@ -275,6 +275,7 @@ mod tests {
             position: (0.0, 0.0),
             cached_output_path: None,
             cached_input_hash: None,
+            cached_output_note_id: None,
             status: NodeStatus::Dirty,
         }
     }

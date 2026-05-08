@@ -15,6 +15,7 @@
 
 use futures::StreamExt;
 use operon_plugins_claude_code::{ClaudeCodeChatPlugin, ClaudeCodeEvent};
+use operon_store::repos::{ChatMessageKind, ChatMessageRepository};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -22,6 +23,30 @@ use uuid::Uuid;
 
 use crate::plugins::workflow::engine::{compute_input_hash, hash_body, SkillBag, SkillSnapshot};
 use crate::plugins::workflow::state::{Node, NodeId, WorkflowGraph};
+
+/// Phase-4 cascade transcript persistence: when the cascade routes
+/// through a real `chat_session`, the executor records each Claude
+/// turn into `chat_message` so the rail entry is browseable like any
+/// other companion chat. Both fields must be `Some` for persistence
+/// to fire — per-node ▶ runs that don't go through the rail can pass
+/// `None`/`None` to disable.
+#[derive(Clone)]
+pub struct CascadeTranscriptSink {
+    pub chat_session_id: Uuid,
+    pub chat_repo: Arc<dyn ChatMessageRepository>,
+}
+
+/// Canonical project-scoped outputs directory. Skill ▶ runs and
+/// workflow node runs both target this directory so the explorer's
+/// `Outputs` note can list everything in one place.
+pub fn output_dir(repo_path: &Path) -> PathBuf {
+    repo_path.join(".operon").join("outputs")
+}
+
+/// Compute the canonical output file path for a slug.
+pub fn output_file(repo_path: &Path, slug: &str) -> PathBuf {
+    output_dir(repo_path).join(format!("{slug}-output.md"))
+}
 
 /// Result of one successful node run. Caller writes these back into
 /// the node before kicking off the next step in a cascade.
@@ -77,6 +102,7 @@ impl From<std::io::Error> for ExecError {
 /// - flipping the node's `status` to `Running` before the call so the UI
 ///   reflects the in-flight state, and to `Fresh`/`Error` afterward
 ///   based on the returned `Result`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_node(
     plugin: Arc<ClaudeCodeChatPlugin>,
     operon_session: Uuid,
@@ -86,20 +112,29 @@ pub async fn run_node(
     node: &Node,
     skill_body: &str,
     skill_version: &str,
+    // `skill_slug` is derived from the skill's note title and drives
+    // the output filename: `<repo>/.operon/outputs/<slug>-output.md`.
+    // Re-runs of the same skill (whether triggered from the standalone
+    // Play button, a workflow cascade, or a per-node ▶) overwrite the
+    // same file. Two workflow nodes referencing the same skill share
+    // one file by design — the caller is responsible for slug
+    // uniqueness if that matters.
+    skill_slug: &str,
     upstream_outputs: &[(NodeId, String)],
     graph_for_hash: &WorkflowGraph,
+    transcript_sink: Option<CascadeTranscriptSink>,
 ) -> Result<RunArtifact, ExecError> {
     if skill_body.trim().is_empty() {
         return Err(ExecError::NoSkillBody(node.skill_note_id));
     }
+    let _ = workflow_id; // Kept for callers that may want it later (cwd subdir, telemetry).
 
-    // Build canonical output path under the repo. Create the dir.
-    let out_dir = repo_path
-        .join(".operon")
-        .join("outputs")
-        .join(workflow_id.to_string());
+    // Unified output path: one folder per repo, file named after the
+    // skill's slug. See doc-comment on `skill_slug` above for the
+    // overwrite semantics.
+    let out_dir = output_dir(&repo_path);
     std::fs::create_dir_all(&out_dir)?;
-    let output_path = out_dir.join(format!("{node_id}.md"));
+    let output_path = out_dir.join(format!("{skill_slug}-output.md"));
 
     // Build the prompt.
     let prompt = build_prompt(
@@ -131,22 +166,140 @@ pub async fn run_node(
     let input_hash = compute_input_hash(node_id, graph_for_hash, &skill_bag)
         .map_err(|e| ExecError::Plugin(format!("hash: {e}")))?;
 
+    // Phase-4: persist the prompt as a User message before send_rich
+    // so the rail's transcript reads "user: <prompt> / assistant: …"
+    // for each cascade turn. The user-visible label includes the node
+    // id so a multi-node cascade is readable.
+    if let Some(sink) = transcript_sink.as_ref() {
+        let header = format!("[workflow node {node_id}]");
+        let _ = sink.chat_repo.append(
+            sink.chat_session_id,
+            ChatMessageKind::User,
+            None,
+            &serde_json::json!({ "text": format!("{header}\n\n{prompt}") }),
+        );
+    }
+
     // Run claude.
+    eprintln!(
+        "operon: executor::run_node [{node_id}] calling plugin.send_rich \
+         (prompt_len={}, output_path={})",
+        prompt.len(),
+        output_path.display()
+    );
     let ct = CancellationToken::new();
     let mut rx = plugin
         .send_rich(prompt, operon_session, ct)
         .await
         .map_err(|e| ExecError::Plugin(format!("send_rich: {e}")))?;
+    eprintln!("operon: executor::run_node [{node_id}] send_rich returned, draining events");
 
+    // Accumulate Text deltas across the turn — claude streams them in
+    // pieces, but the rail wants ONE assistant row per turn (matches
+    // the regular companion's `flush_pending_assistant` behavior).
+    let mut assistant_buf = String::new();
+    let flush_assistant = |buf: &mut String| {
+        if buf.is_empty() {
+            return;
+        }
+        if let Some(sink) = transcript_sink.as_ref() {
+            let _ = sink.chat_repo.append(
+                sink.chat_session_id,
+                ChatMessageKind::Assistant,
+                None,
+                &serde_json::json!({ "text": std::mem::take(buf) }),
+            );
+        } else {
+            buf.clear();
+        }
+    };
+
+    let mut events = 0usize;
     while let Some(ev) = rx.next().await {
+        events += 1;
+        let kind = match &ev {
+            ClaudeCodeEvent::Done { .. } => "Done",
+            ClaudeCodeEvent::Error(_) => "Error",
+            ClaudeCodeEvent::Text(_) => "Text",
+            ClaudeCodeEvent::Thinking(_) => "Thinking",
+            ClaudeCodeEvent::ToolUse { .. } => "ToolUse",
+            ClaudeCodeEvent::ToolResult { .. } => "ToolResult",
+        };
+        eprintln!("operon: executor::run_node [{node_id}] event {events}: {kind}");
+        // Persist + apply the event's effect.
         match ev {
-            ClaudeCodeEvent::Done { .. } => break,
-            ClaudeCodeEvent::Error(msg) => return Err(ExecError::Plugin(msg)),
-            // Text / Thinking / ToolUse / ToolResult are not surfaced
-            // from the cascade; the workflow UI shows status, not chat.
-            _ => {}
+            ClaudeCodeEvent::Text(t) => {
+                assistant_buf.push_str(&t);
+            }
+            ClaudeCodeEvent::Thinking(t) => {
+                flush_assistant(&mut assistant_buf);
+                if let Some(sink) = transcript_sink.as_ref() {
+                    let _ = sink.chat_repo.append(
+                        sink.chat_session_id,
+                        ChatMessageKind::Thinking,
+                        None,
+                        &serde_json::json!({ "text": t }),
+                    );
+                }
+            }
+            ClaudeCodeEvent::ToolUse { id, name, input } => {
+                flush_assistant(&mut assistant_buf);
+                if let Some(sink) = transcript_sink.as_ref() {
+                    let _ = sink.chat_repo.append(
+                        sink.chat_session_id,
+                        ChatMessageKind::ToolCall,
+                        Some(&id),
+                        &serde_json::json!({
+                            "id": id,
+                            "name": name,
+                            "input": input,
+                            "result": serde_json::Value::Null,
+                        }),
+                    );
+                }
+            }
+            ClaudeCodeEvent::ToolResult { tool_use_id, content, is_error } => {
+                if let Some(sink) = transcript_sink.as_ref() {
+                    // Patch the prior ToolCall row so the rail reads as
+                    // a complete round-trip card. Same shape regular
+                    // companion uses (companion_chat.rs::apply_event).
+                    let _ = sink.chat_repo.update_tool_result(
+                        sink.chat_session_id,
+                        &tool_use_id,
+                        &serde_json::json!({
+                            "id": tool_use_id,
+                            "result": {
+                                "content": content,
+                                "is_error": is_error,
+                            },
+                        }),
+                    );
+                }
+            }
+            ClaudeCodeEvent::Done { .. } => {
+                flush_assistant(&mut assistant_buf);
+                break;
+            }
+            ClaudeCodeEvent::Error(msg) => {
+                flush_assistant(&mut assistant_buf);
+                if let Some(sink) = transcript_sink.as_ref() {
+                    let _ = sink.chat_repo.append(
+                        sink.chat_session_id,
+                        ChatMessageKind::System,
+                        None,
+                        &serde_json::json!({ "text": format!("error: {msg}") }),
+                    );
+                }
+                return Err(ExecError::Plugin(msg));
+            }
         }
     }
+    // In case the stream ended without a Done event, flush any
+    // accumulated assistant text so it doesn't get lost.
+    flush_assistant(&mut assistant_buf);
+    eprintln!(
+        "operon: executor::run_node [{node_id}] event-stream ended, {events} event(s) total"
+    );
 
     // claude's Write tool reports success before fsync; tolerate a
     // tight retry window.
@@ -264,6 +417,7 @@ mod tests {
             position: (0.0, 0.0),
             cached_output_path: None,
             cached_input_hash: None,
+            cached_output_note_id: None,
             status: NodeStatus::Dirty,
         }
     }

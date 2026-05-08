@@ -59,6 +59,14 @@ pub struct Node {
     /// after every mutation; persisted so reopens render immediately.
     #[serde(default)]
     pub status: NodeStatus,
+    /// Phase-2 output surfacing: the explorer note row that mirrors
+    /// this node's last run output. Stamped on first successful run,
+    /// reused across re-runs (the body gets overwritten via
+    /// `Persistence::save`). `None` when the node hasn't run yet, or
+    /// when the auto-created note was deleted by the user — in which
+    /// case the cascade re-creates it on the next run.
+    #[serde(default)]
+    pub cached_output_note_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -145,6 +153,7 @@ mod tests {
             cached_output_path: None,
             cached_input_hash: None,
             status: NodeStatus::Fresh,
+            cached_output_note_id: None,
         }
     }
 

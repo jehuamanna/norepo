@@ -1780,6 +1780,28 @@ html, body {
   background: var(--vscode-editor-background);
   border-right: 1px solid var(--vscode-panel-border);
   overflow: hidden;
+  /* Pan/zoom layer swallows wheel events so the page doesn't scroll
+     behind it. `overscroll-behavior: contain` keeps trackpad scroll-
+     chaining inside; `touch-action: none` does the same on touch. */
+  overscroll-behavior: contain;
+  touch-action: none;
+}
+.operon-workflow-reset-view {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 5;
+  background: var(--vscode-editor-background, #1e1e1e);
+  border: 1px solid var(--vscode-panel-border);
+  color: var(--vscode-editor-foreground);
+  border-radius: 3px;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0.7;
+}
+.operon-workflow-reset-view:hover {
+  opacity: 1;
 }
 .operon-workflow-canvas-empty {
   position: absolute;
@@ -1821,6 +1843,25 @@ html, body {
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
+.operon-workflow-node-view { cursor: pointer; }
+.operon-workflow-node-view-bg {
+  fill: var(--vscode-editor-background, #1e1e1e);
+  stroke: var(--operon-accent);
+  stroke-width: 1.5;
+}
+.operon-workflow-node-view:hover .operon-workflow-node-view-bg {
+  fill: var(--operon-accent);
+}
+.operon-workflow-node-view-glyph {
+  font-size: 12px;
+  fill: var(--operon-accent);
+  pointer-events: none;
+  user-select: none;
+}
+.operon-workflow-node-view:hover .operon-workflow-node-view-glyph {
+  fill: var(--vscode-editor-background, #1e1e1e);
+}
+
 .operon-workflow-node-run { cursor: pointer; }
 .operon-workflow-node-run-bg {
   fill: var(--operon-accent);
@@ -1885,12 +1926,23 @@ html, body {
   stroke: var(--operon-accent);
   stroke-width: 1.5;
   cursor: crosshair;
-}
-.operon-workflow-handle:hover {
-  fill: var(--operon-accent);
+  pointer-events: none;
 }
 .operon-workflow-handle-output { cursor: crosshair; }
 .operon-workflow-handle-input { cursor: cell; }
+/* Transparent oversized hit area sits in front of the visible handle.
+   The visible circle has pointer-events: none so it can't swallow the
+   event; this circle is the actual target. r=14 so a release within
+   ~14 viewBox units of the handle commits the click directly (the
+   SVG-level proximity snap handles release further away). */
+.operon-workflow-handle-hit {
+  fill: transparent;
+  stroke: transparent;
+  cursor: crosshair;
+}
+.operon-workflow-handle-hit:hover + .operon-workflow-handle {
+  fill: var(--operon-accent);
+}
 
 .operon-workflow-inspector {
   position: absolute;
@@ -1949,6 +2001,24 @@ html, body {
   background: var(--vscode-errorforeground, #f48771);
   color: var(--vscode-editor-background, #1e1e1e);
 }
+.operon-workflow-inspector-view {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 1px solid var(--operon-accent);
+  color: var(--operon-accent);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 3px;
+}
+.operon-workflow-inspector-view:hover:not([disabled]) {
+  background: var(--operon-accent);
+  color: var(--vscode-editor-background, #1e1e1e);
+}
+.operon-workflow-inspector-view[disabled] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
 .operon-workflow-inspector-textarea {
   width: 100%;
   min-height: 60px;
@@ -1960,6 +2030,30 @@ html, body {
   color: var(--vscode-input-foreground, inherit);
   border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
   border-radius: 4px;
+}
+/* Last-output preview shown when a workflow node has a
+   cached_output_path. The body itself is a MarkdownView; this
+   wrapper bounds the height so a long output doesn't push the
+   inspector off the canvas. */
+.operon-workflow-inspector-output {
+  width: 100%;
+  max-height: 250px;
+  overflow: auto;
+  padding: 6px 8px;
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  border-radius: 4px;
+  background: var(--vscode-input-background, transparent);
+  font-size: 12px;
+}
+.operon-workflow-inspector-output-empty,
+.operon-workflow-inspector-output-loading {
+  color: var(--vscode-descriptionforeground, inherit);
+  font-style: italic;
+  max-height: none;
+}
+.operon-workflow-inspector-output-error {
+  color: var(--vscode-errorforeground, #f48771);
+  max-height: none;
 }
 
 .operon-workflow-json {
