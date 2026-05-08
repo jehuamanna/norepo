@@ -351,6 +351,39 @@ pub fn CompanionChat() -> Element {
         });
     }
 
+    // Auto-scroll the chat transcript to the bottom whenever new
+    // items are appended (or the poll loop replaces the list).
+    // Without this, runner-driven sessions look frozen at the user
+    // prompt because the giant prompt fills the visible area and
+    // tool_use cards / later assistant text live below the fold.
+    // The eval is a tiny querySelector + scrollIntoView; the
+    // selector is stable via `data-testid="companion-transcript"`
+    // on the container (above).
+    {
+        let transcript_for_scroll = transcript;
+        use_effect(move || {
+            let _len = transcript_for_scroll.read().len();
+            // Subscribing to len means this effect re-fires on every
+            // transcript mutation. Skip the no-op zero-length case
+            // on first mount.
+            if _len == 0 {
+                return;
+            }
+            let _ = dioxus::document::eval(
+                "(function() { \
+                  const root = document.querySelector('[data-testid=\"companion-transcript\"]'); \
+                  if (!root) return; \
+                  const last = root.lastElementChild; \
+                  if (last && typeof last.scrollIntoView === 'function') { \
+                    last.scrollIntoView({ behavior: 'smooth', block: 'end' }); \
+                  } else { \
+                    root.scrollTop = root.scrollHeight; \
+                  } \
+                })();",
+            );
+        });
+    }
+
     let active_session = *session_signal.read();
     let has_session = active_session.is_some();
     let has_cwd = cwd_for_scope.read().is_some();

@@ -559,9 +559,6 @@ fn spawn_runner(
     active_session: &mut Signal<Option<Uuid>>,
     active_scope: &mut Signal<operon_store::repos::ChatScope>,
 ) {
-    eprintln!(
-        "operon: spawn_runner CALLED source={source_note_id} skill={skill_note_id}"
-    );
     // Resolve repo path up front so a missing binding fails loudly
     // rather than silently no-op'ing inside the spawned task.
     let projects = match project_repo.list() {
@@ -644,7 +641,6 @@ fn spawn_runner(
     // attached to the picker's scope and dropped before the
     // executor polls it.
     dioxus::core::spawn_forever(async move {
-        eprintln!("operon: spawn_runner async task START");
         let result = crate::plugins::artifact::run_skill_on_source(
             &note_repo,
             &project_repo,
@@ -660,13 +656,9 @@ fn spawn_runner(
         // don't trigger `__copy_value_hoisted` warnings. The
         // artifact view subscribes to the map and re-renders the
         // status pill automatically.
-        eprintln!("operon: spawn_runner async task RETURNED ok={}", result.is_ok());
         match result {
             Ok(outcome) => {
                 let n = outcome.created_artifact_ids.len();
-                eprintln!(
-                    "operon: spawn_runner produced {n} artifact(s) for source={source_note_id}"
-                );
                 ARTIFACT_RUN_STATE.with_mut(|m| {
                     m.insert(
                         source_note_id,
