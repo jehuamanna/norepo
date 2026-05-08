@@ -495,6 +495,14 @@ pub fn provide_local_app_signals() {
     use_context_provider(|| {
         crate::shell::companion_state::ChatSessionVersion(chat_session_version)
     });
+    // Phase D: bumped by background drainers (artifact runner) when
+    // they append to `chat_message`. Lets the companion's load
+    // effect re-fetch the transcript so live streaming is visible
+    // even when the companion isn't the one draining the stream.
+    let chat_message_version: Signal<u64> = use_signal(|| 0);
+    use_context_provider(|| {
+        crate::shell::companion_state::ChatMessageVersion(chat_message_version)
+    });
     let companion_composer_inbox: Signal<Option<String>> = use_signal(|| None);
     use_context_provider(|| {
         crate::shell::companion_state::CompanionComposerInbox(companion_composer_inbox)

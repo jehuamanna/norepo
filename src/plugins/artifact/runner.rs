@@ -12,6 +12,7 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use dioxus::prelude::{Signal, WritableExt};
 use futures::StreamExt;
 use operon_plugins_claude_code::{ClaudeCodeChatPlugin, ClaudeCodeEvent};
 use operon_store::repos::{
@@ -72,6 +73,13 @@ pub struct RunOutcome {
 /// claude plugin to `chat_session_id` against the project's repo
 /// path before invoking this — same convention as the workflow
 /// executor.
+///
+/// `chat_message_version` (Phase D): when present, the runner bumps
+/// it after each `chat_message` append. The companion's transcript
+/// load-effect watches this signal and re-fetches, giving the user
+/// a live view of Claude's stream. Pass `None` for callers that
+/// don't want that wiring (the runner's behavior is otherwise
+/// unchanged).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_skill_on_source(
     note_repo: &Arc<dyn LocalNoteRepository>,
@@ -79,6 +87,7 @@ pub async fn run_skill_on_source(
     persistence: &Arc<dyn Persistence>,
     plugin: &Arc<ClaudeCodeChatPlugin>,
     chat_repo: Option<&Arc<dyn ChatMessageRepository>>,
+    chat_message_version: Option<Signal<u64>>,
     chat_session_id: Uuid,
     source_note_id: Uuid,
     skill_note_id: Uuid,
@@ -142,6 +151,7 @@ pub async fn run_skill_on_source(
             None,
             &serde_json::json!({ "text": prompt.clone() }),
         );
+        bump_message_version(chat_message_version);
     }
 
     // 8. Run claude. The runner forces `acceptEdits` on this
@@ -167,7 +177,10 @@ pub async fn run_skill_on_source(
         // Persist event to the rail's chat_message (mirroring the
         // workflow executor's pattern).
         if let Some(repo) = chat_repo {
-            persist_event(repo, chat_session_id, &ev, &mut assistant_buf);
+            let appended = persist_event(repo, chat_session_id, &ev, &mut assistant_buf);
+            if appended {
+                bump_message_version(chat_message_version);
+            }
         }
         match ev {
             ClaudeCodeEvent::Done { .. } => break,
@@ -179,6 +192,7 @@ pub async fn run_skill_on_source(
                         None,
                         &serde_json::json!({ "text": format!("error: {msg}") }),
                     );
+                    bump_message_version(chat_message_version);
                 }
                 return Err(RunnerError::Plugin(msg));
             }
@@ -194,6 +208,7 @@ pub async fn run_skill_on_source(
                 None,
                 &serde_json::json!({ "text": std::mem::take(&mut assistant_buf) }),
             );
+            bump_message_version(chat_message_version);
         }
     }
 
@@ -386,17 +401,19 @@ fn scan_produced_files(
 /// the rail entry reads the same as a regular companion chat:
 /// User → Assistant → ToolCall → ToolResult flow. Text deltas are
 /// buffered into a single Assistant row per turn (caller flushes
-/// after the loop ends).
+/// after the loop ends). Returns `true` when this call resulted in
+/// at least one row mutation (append or update_tool_result), so the
+/// caller knows to bump the live-transcript version signal.
 fn persist_event(
     repo: &Arc<dyn ChatMessageRepository>,
     chat_session_id: Uuid,
     ev: &ClaudeCodeEvent,
     assistant_buf: &mut String,
-) {
+) -> bool {
     use ClaudeCodeEvent::*;
-    let flush = |buf: &mut String| {
+    let flush = |buf: &mut String| -> bool {
         if buf.is_empty() {
-            return;
+            return false;
         }
         let _ = repo.append(
             chat_session_id,
@@ -404,20 +421,26 @@ fn persist_event(
             None,
             &serde_json::json!({ "text": std::mem::take(buf) }),
         );
+        true
     };
     match ev {
-        Text(t) => assistant_buf.push_str(t),
+        Text(t) => {
+            assistant_buf.push_str(t);
+            // Buffered only — no DB write yet.
+            false
+        }
         Thinking(t) => {
-            flush(assistant_buf);
+            let flushed = flush(assistant_buf);
             let _ = repo.append(
                 chat_session_id,
                 ChatMessageKind::Thinking,
                 None,
                 &serde_json::json!({ "text": t }),
             );
+            flushed || true
         }
         ToolUse { id, name, input } => {
-            flush(assistant_buf);
+            let flushed = flush(assistant_buf);
             let _ = repo.append(
                 chat_session_id,
                 ChatMessageKind::ToolCall,
@@ -429,6 +452,7 @@ fn persist_event(
                     "result": serde_json::Value::Null,
                 }),
             );
+            flushed || true
         }
         ToolResult {
             tool_use_id,
@@ -443,10 +467,17 @@ fn persist_event(
                     "result": { "content": content, "is_error": is_error },
                 }),
             );
+            true
         }
-        Done { .. } | Error(_) => {
-            flush(assistant_buf);
-        }
+        Done { .. } | Error(_) => flush(assistant_buf),
+    }
+}
+
+/// Bump the optional live-transcript version signal so the
+/// companion's load-effect re-fetches `chat_message`.
+fn bump_message_version(sig: Option<Signal<u64>>) {
+    if let Some(mut s) = sig {
+        s.with_mut(|v| *v = v.saturating_add(1));
     }
 }
 

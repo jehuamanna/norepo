@@ -48,6 +48,19 @@ pub struct ChatMessageRepo(pub Arc<dyn ChatMessageRepository>);
 #[derive(Clone, Copy)]
 pub struct ChatSessionVersion(pub Signal<u64>);
 
+/// Bumped by background drainers (the artifact runner, the workflow
+/// cascade) every time they `repo.append` to `chat_message`. The
+/// companion's transcript-load `use_effect` watches this in addition
+/// to `ActiveChatSession` so a viewer sees streaming events from a
+/// run that another component is driving — without it, the load
+/// effect only fires on session change and the transcript stays
+/// frozen at whatever was persisted at switch time. Regular
+/// companion chats DON'T bump this signal (their drainer updates the
+/// in-memory transcript directly), so adding the watcher here is
+/// safe.
+#[derive(Clone, Copy)]
+pub struct ChatMessageVersion(pub Signal<u64>);
+
 /// One-shot inbox the companion's composer subscribes to. When a remote
 /// caller (e.g., the skill plugin's Play button) writes `Some(prompt)`,
 /// the companion swaps that text into its composer field on the next

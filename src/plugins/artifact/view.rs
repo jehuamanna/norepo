@@ -19,7 +19,8 @@ use crate::plugins::artifact::frontmatter::{
 };
 use crate::plugins::markdown::MarkdownView;
 use crate::shell::companion_state::{
-    ChatMessageRepo, ChatSessionRepo, ChatSessionVersion, ClaudeCodePluginCtx,
+    ChatMessageRepo, ChatMessageVersion, ChatSessionRepo, ChatSessionVersion,
+    ClaudeCodePluginCtx,
 };
 
 #[derive(Props, Clone, PartialEq)]
@@ -359,6 +360,7 @@ fn SkillPickerPanel(props: SkillPickerPanelProps) -> Element {
     let ChatMessageRepo(chat_message_repo) = use_context();
     let LocalNoteVersion(note_version) = use_context();
     let ChatSessionVersion(chat_session_version) = use_context();
+    let ChatMessageVersion(chat_message_version) = use_context();
     // Phase B: auto-switch the rail to the runner's session so the
     // user immediately sees Claude's transcript stream in real time.
     // Mirrors the pattern in `play_skill` at
@@ -448,6 +450,7 @@ fn SkillPickerPanel(props: SkillPickerPanelProps) -> Element {
                             let mut status_setter = last_status;
                             let mut note_version_setter = note_version;
                             let mut chat_session_version_setter = chat_session_version;
+                            let chat_message_version_setter = chat_message_version;
                             let mut active_session_setter = active_session;
                             let mut active_scope_setter = active_scope;
                             let on_dismiss = props.on_dismiss;
@@ -472,6 +475,7 @@ fn SkillPickerPanel(props: SkillPickerPanelProps) -> Element {
                                                 chat_message_repo_for_run.clone(),
                                                 &mut note_version_setter,
                                                 &mut chat_session_version_setter,
+                                                chat_message_version_setter,
                                                 &mut active_session_setter,
                                                 &mut active_scope_setter,
                                                 &mut status_setter,
@@ -567,6 +571,7 @@ fn spawn_runner(
     chat_message_repo: Arc<dyn operon_store::repos::ChatMessageRepository>,
     note_version: &mut Signal<u64>,
     chat_session_version: &mut Signal<u64>,
+    chat_message_version: Signal<u64>,
     active_session: &mut Signal<Option<Uuid>>,
     active_scope: &mut Signal<operon_store::repos::ChatScope>,
     status: &mut Signal<Option<Result<String, String>>>,
@@ -636,6 +641,7 @@ fn spawn_runner(
             &persistence,
             &plugin,
             Some(&chat_message_repo),
+            Some(chat_message_version),
             chat_session_id,
             source_note_id,
             skill_note_id,
