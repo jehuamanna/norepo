@@ -629,19 +629,13 @@ fn spawn_runner(
     // feedback even before Claude starts streaming. Final status
     // (success / failure) overwrites this once the runner returns.
     status_setter.set(Some(Ok("Running\u{2026} (transcript visible in the rail)".into())));
-    eprintln!(
-        "operon: spawn_runner about to spawn async task source={source_note_id} skill={skill_note_id}"
-    );
     // `spawn_forever` (NOT plain `spawn`) attaches the task to the
     // root scope. We need this because the SkillPickerPanel that
     // owns this click handler is dismissed immediately after via
     // `on_dismiss.call(())` — with plain `spawn`, the task would be
     // attached to the picker's scope and dropped before the
-    // executor polls it. The runner would never start, which is
-    // exactly the symptom user dogfooding hit (`spawn_runner about
-    // to spawn` logged but `async task START` never did).
+    // executor polls it.
     dioxus::core::spawn_forever(async move {
-        eprintln!("operon: spawn_runner async task START");
         let result = crate::plugins::artifact::run_skill_on_source(
             &note_repo,
             &project_repo,
@@ -653,7 +647,6 @@ fn spawn_runner(
             skill_note_id,
         )
         .await;
-        eprintln!("operon: spawn_runner async task RETURNED ok={}", result.is_ok());
         match result {
             Ok(outcome) => {
                 let n = outcome.created_artifact_ids.len();

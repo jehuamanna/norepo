@@ -90,62 +90,33 @@ pub async fn run_skill_on_source(
     source_note_id: Uuid,
     skill_note_id: Uuid,
 ) -> Result<RunOutcome, RunnerError> {
-    eprintln!(
-        "operon: artifact runner ENTER source={source_note_id} skill={skill_note_id} chat={chat_session_id}"
-    );
     // 1. Resolve project + repo_path.
     let project_id = note_repo
         .find_project_for_note(source_note_id)
-        .map_err(|e| {
-            eprintln!("operon: artifact runner step1 find_project_for_note ERR: {e}");
-            RunnerError::Plugin(format!("find_project: {e}"))
-        })?
+        .map_err(|e| RunnerError::Plugin(format!("find_project: {e}")))?
         .ok_or_else(|| {
-            eprintln!("operon: artifact runner step1 source note has no project");
             RunnerError::NotFound(format!("source note {source_note_id} has no project"))
         })?;
-    eprintln!("operon: artifact runner step1 OK project_id={project_id}");
     let repo_path: PathBuf = project_repo
         .list()
-        .map_err(|e| {
-            eprintln!("operon: artifact runner step2 list_projects ERR: {e}");
-            RunnerError::Plugin(format!("list projects: {e}"))
-        })?
+        .map_err(|e| RunnerError::Plugin(format!("list projects: {e}")))?
         .into_iter()
         .find(|p| p.id == project_id)
-        .ok_or_else(|| {
-            eprintln!("operon: artifact runner step2 project not found in list");
-            RunnerError::NotFound(format!("project {project_id}"))
-        })?
+        .ok_or_else(|| RunnerError::NotFound(format!("project {project_id}")))?
         .repo_path
-        .ok_or_else(|| {
-            eprintln!("operon: artifact runner step2 project has no repo_path bound");
-            RunnerError::InvalidPath("project has no repo_path bound".into())
-        })?;
-    eprintln!("operon: artifact runner step2 OK repo_path={}", repo_path.display());
+        .ok_or_else(|| RunnerError::InvalidPath("project has no repo_path bound".into()))?;
 
     // 2. Load source body + skill body from persistence.
     let source_bytes = persistence
         .load(&source_note_id.to_string())
         .await
-        .map_err(|e| {
-            eprintln!(
-                "operon: artifact runner step3 load source body ERR (likely the artifact \
-                 hasn't been saved to persistence yet): {e}"
-            );
-            RunnerError::NotFound(format!("source body: {e}"))
-        })?;
-    eprintln!("operon: artifact runner step3 OK loaded source body ({} bytes)", source_bytes.len());
+        .map_err(|e| RunnerError::NotFound(format!("source body: {e}")))?;
     let source_body =
         String::from_utf8(source_bytes).map_err(|e| RunnerError::Plugin(format!("utf8: {e}")))?;
     let skill_bytes = persistence
         .load(&skill_note_id.to_string())
         .await
-        .map_err(|e| {
-            eprintln!("operon: artifact runner step4 load skill body ERR: {e}");
-            RunnerError::NotFound(format!("skill body: {e}"))
-        })?;
-    eprintln!("operon: artifact runner step4 OK loaded skill body ({} bytes)", skill_bytes.len());
+        .map_err(|e| RunnerError::NotFound(format!("skill body: {e}")))?;
     let skill_body =
         String::from_utf8(skill_bytes).map_err(|e| RunnerError::Plugin(format!("utf8: {e}")))?;
 
@@ -174,30 +145,19 @@ pub async fn run_skill_on_source(
 
     // 7. Persist the prompt as a User message (transcript visibility).
     if let Some(repo) = chat_repo {
-        match repo.append(
+        if let Err(e) = repo.append(
             chat_session_id,
             ChatMessageKind::User,
             None,
             &serde_json::json!({ "text": prompt.clone() }),
         ) {
-            Ok(_) => {
-                eprintln!(
-                    "operon: artifact runner persisted user prompt ({} bytes) to session {chat_session_id}",
-                    prompt.len()
-                );
-                bump_message_version();
-            }
-            Err(e) => {
-                eprintln!(
-                    "operon: artifact runner FAILED to persist user prompt to session \
-                     {chat_session_id}: {e:?}"
-                );
-            }
+            tracing::warn!(
+                target: "operon::artifact",
+                "persist user prompt to {chat_session_id}: {e:?}"
+            );
+        } else {
+            bump_message_version();
         }
-    } else {
-        eprintln!(
-            "operon: artifact runner WARNING — no chat_repo provided, transcript will be empty"
-        );
     }
 
     // 8. Run claude. The runner forces `acceptEdits` on this
@@ -207,29 +167,18 @@ pub async fn run_skill_on_source(
     //    chats keep using whatever the user picked, since they
     //    don't set a per-session override.
     plugin.set_session_permission_mode(chat_session_id, Some("acceptEdits".into()));
-    eprintln!(
-        "operon: artifact runner start source={source_note_id} skill={skill_note_id} \
-         dir={} prompt_len={}",
-        artifacts_dir.display(),
-        prompt.len(),
-    );
     let ct = CancellationToken::new();
     let mut rx = plugin
         .send_rich(prompt, chat_session_id, ct)
         .await
         .map_err(|e| RunnerError::Plugin(format!("send_rich: {e}")))?;
     let mut assistant_buf = String::new();
-    let mut total_appended = 0usize;
     while let Some(ev) = rx.next().await {
         // Persist event to the rail's chat_message (mirroring the
         // workflow executor's pattern).
         if let Some(repo) = chat_repo {
             let appended = persist_event(repo, chat_session_id, &ev, &mut assistant_buf);
             if appended {
-                total_appended += 1;
-                eprintln!(
-                    "operon: artifact runner persisted event #{total_appended} to chat_message"
-                );
                 bump_message_version();
             }
         }
@@ -267,11 +216,6 @@ pub async fn run_skill_on_source(
     //    have an mtime past `run_started_at` (claude may have
     //    overwritten an existing file on a re-run).
     let produced = scan_produced_files(&artifacts_dir, &existing, run_started_at);
-    eprintln!(
-        "operon: artifact runner produced {} file(s) in {}",
-        produced.len(),
-        artifacts_dir.display()
-    );
 
     // 10. Import each produced file as an Artifact note under the
     //     source. Body is read from disk; frontmatter is patched so
@@ -525,19 +469,16 @@ fn persist_event(
 }
 
 /// Bump the global live-transcript version so the companion's
-/// load-effect re-fetches `chat_message`. Uses the application-wide
+/// poll loop re-fetches `chat_message`. Uses the application-wide
 /// `CHAT_MESSAGE_VERSION` `GlobalSignal` rather than a
 /// context-provided `Signal` — the runner's task lives in the
 /// virtual root scope (via `spawn_forever`), and writes from there
 /// to a scope-bound signal are silently dropped (Dioxus emits a
 /// `__copy_value_hoisted` warning).
 fn bump_message_version() {
-    let mut next = 0u64;
     crate::shell::companion_state::CHAT_MESSAGE_VERSION.with_mut(|v| {
         *v = v.saturating_add(1);
-        next = *v;
     });
-    eprintln!("operon: artifact runner bumped CHAT_MESSAGE_VERSION -> {next}");
 }
 
 #[cfg(test)]

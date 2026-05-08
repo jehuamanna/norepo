@@ -329,61 +329,22 @@ pub fn CompanionChat() -> Element {
             let repo = repo.clone();
             async move {
                 use std::time::Duration;
-                eprintln!("operon: companion poll loop STARTED");
                 let mut last_seen_version: u64 = 0;
-                let mut tick: u64 = 0;
                 loop {
                     futures_timer::Delay::new(Duration::from_millis(500)).await;
-                    tick = tick.wrapping_add(1);
-                    let sid = *session.peek();
                     let cur_version = *CHAT_MESSAGE_VERSION.peek();
-                    // Heartbeat every ~2s OR whenever the version
-                    // changed, so the dx-serve terminal proves the
-                    // loop is alive even when no run is in flight.
-                    if tick % 4 == 0 || cur_version != last_seen_version {
-                        eprintln!(
-                            "operon: companion poll tick={tick} session={sid:?} \
-                             version={cur_version} last_seen={last_seen_version}"
-                        );
-                    }
                     if cur_version == last_seen_version {
                         continue;
                     }
                     last_seen_version = cur_version;
-                    let Some(id) = sid else {
-                        eprintln!("operon: companion poll skipped — session=None");
-                        continue;
-                    };
-                    match repo.list(id) {
-                        Ok(rows) => {
-                            eprintln!(
-                                "operon: companion poll got {} row(s) for session {id}",
-                                rows.len()
-                            );
-                            let restored: Vec<TranscriptItem> = rows
-                                .iter()
-                                .filter_map(transcript_item_from_message)
-                                .collect();
-                            let len_before = transcript_setter.peek().len();
-                            if restored != *transcript_setter.peek() {
-                                let len_after = restored.len();
-                                transcript_setter.set(restored);
-                                eprintln!(
-                                    "operon: companion poll wrote transcript ({} -> {} items)",
-                                    len_before, len_after
-                                );
-                            } else {
-                                eprintln!(
-                                    "operon: companion poll no-op (transcript already at {} items)",
-                                    len_before
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "operon: companion poll repo.list({id}) ERR: {e:?}"
-                            );
-                        }
+                    let Some(id) = *session.peek() else { continue };
+                    let Ok(rows) = repo.list(id) else { continue };
+                    let restored: Vec<TranscriptItem> = rows
+                        .iter()
+                        .filter_map(transcript_item_from_message)
+                        .collect();
+                    if restored != *transcript_setter.peek() {
+                        transcript_setter.set(restored);
                     }
                 }
             }
