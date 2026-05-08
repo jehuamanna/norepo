@@ -293,17 +293,30 @@ pub fn CompanionChat() -> Element {
         let mut pending_setter = pending_assistant;
         let repo = message_repo.clone();
         use_effect(move || {
-            let sid = *session.read();
             // Subscribe to GlobalSignal bumps so this effect re-runs
             // on background appends from the artifact runner.
-            let _ = *CHAT_MESSAGE_VERSION.read();
+            let version_now = *CHAT_MESSAGE_VERSION.read();
+            let sid = *session.read();
+            eprintln!(
+                "operon: companion transcript-load effect FIRED \
+                 session={:?} chat_msg_version={version_now}",
+                sid
+            );
             usage_setter.set(Usage::default());
             pending_setter.set(false);
             match sid {
                 Some(id) => match repo.list(id) {
                     Ok(rows) => {
+                        eprintln!(
+                            "operon: companion transcript-load loaded {} row(s) for session {id}",
+                            rows.len()
+                        );
                         let restored: Vec<TranscriptItem> =
                             rows.iter().filter_map(transcript_item_from_message).collect();
+                        eprintln!(
+                            "operon: companion transcript-load mapped {} TranscriptItem(s)",
+                            restored.len()
+                        );
                         transcript_setter.set(restored);
                     }
                     Err(e) => {
