@@ -20,6 +20,16 @@ use keyboard_types::Modifiers;
 use super::{Tab, TabId, TabManager};
 use crate::ui::Icon;
 
+/// Open right-click context-menu state. `None` when the menu is
+/// closed; otherwise the tuple holds the target tab id and the
+/// cursor position (CSS px) where the menu should anchor.
+#[derive(Clone, Copy, PartialEq)]
+struct ContextMenuState {
+    tab_id: TabId,
+    x: f64,
+    y: f64,
+}
+
 #[component]
 pub fn TabStrip() -> Element {
     let mut tabs: Signal<TabManager> = use_context();
@@ -27,6 +37,10 @@ pub fn TabStrip() -> Element {
     // Source tab id while a drag is in flight. Cleared on drop or
     // dragend. Kept local to the strip — no other component needs it.
     let drag_source: Signal<Option<TabId>> = use_signal(|| None);
+    // Right-click context menu position + target tab. Closed by
+    // clicking outside (a transparent backdrop catches the click) or
+    // selecting any item.
+    let mut context_menu: Signal<Option<ContextMenuState>> = use_signal(|| None);
     let snapshot = tabs.read();
     let active_id = snapshot.active_id();
     let view: Vec<(TabId, String, String, bool)> = snapshot
@@ -45,6 +59,77 @@ pub fn TabStrip() -> Element {
             class: "operon-tab-strip",
             role: "tablist",
             "aria-label": "Open tabs",
+            // Right-click context menu — rendered before the tab
+            // buttons (lower z-index siblings) so the menu floats
+            // above. State lives in `context_menu`; `None` means
+            // closed. Anchored to the cursor's client coordinates.
+            if let Some(state) = *context_menu.read() {
+                {
+                    let tab_id = state.tab_id;
+                    let x = state.x;
+                    let y = state.y;
+                    // "Close tabs to the right" is meaningful only when
+                    // there's at least one tab strictly to the right of
+                    // the right-clicked tab. Compute once per render so
+                    // the menu reflects the live tab order.
+                    let snap = tabs.read();
+                    let total = snap.iter().count();
+                    let pivot_idx = snap.iter().position(|t| t.id == tab_id).unwrap_or(total);
+                    drop(snap);
+                    let has_right = pivot_idx + 1 < total;
+                    let menu_style = format!("top: {}px; left: {}px;", y, x);
+                    rsx! {
+                        div {
+                            class: "operon-tab-context-menu-backdrop",
+                            "data-testid": "tab-context-menu-backdrop",
+                            onclick: move |_| { context_menu.set(None); },
+                            oncontextmenu: move |evt| {
+                                evt.prevent_default();
+                                context_menu.set(None);
+                            },
+                        }
+                        div {
+                            class: "operon-tab-context-menu",
+                            "data-testid": "tab-context-menu",
+                            style: "{menu_style}",
+                            onclick: move |evt: dioxus::events::MouseEvent| {
+                                evt.stop_propagation();
+                            },
+                            button {
+                                r#type: "button",
+                                class: "operon-tab-context-menu-item",
+                                "data-testid": "tab-context-close",
+                                onclick: move |_| {
+                                    tabs.write().close(tab_id);
+                                    context_menu.set(None);
+                                },
+                                "Close"
+                            }
+                            button {
+                                r#type: "button",
+                                class: "operon-tab-context-menu-item",
+                                "data-testid": "tab-context-close-right",
+                                disabled: !has_right,
+                                onclick: move |_| {
+                                    tabs.write().close_to_right(tab_id);
+                                    context_menu.set(None);
+                                },
+                                "Close tabs to the right"
+                            }
+                            button {
+                                r#type: "button",
+                                class: "operon-tab-context-menu-item",
+                                "data-testid": "tab-context-close-all",
+                                onclick: move |_| {
+                                    tabs.write().close_all();
+                                    context_menu.set(None);
+                                },
+                                "Close all tabs"
+                            }
+                        }
+                    }
+                }
+            }
             for (id, note_id, title, dirty) in view {
                 {
                     let is_active = active_id == Some(id);
@@ -73,6 +158,22 @@ pub fn TabStrip() -> Element {
                             onclick: {
                                 let note_id = note_id_for_click.clone();
                                 move |_| activate(id, note_id.clone(), focus_request, tabs)
+                            },
+                            // Right-click opens the per-tab context
+                            // menu (Close / Close to the right /
+                            // Close all). `prevent_default` keeps the
+                            // browser's native menu from showing on
+                            // top of ours; the cursor's client coords
+                            // are what we anchor to.
+                            oncontextmenu: move |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                                let coords = evt.client_coordinates();
+                                context_menu.set(Some(ContextMenuState {
+                                    tab_id: id,
+                                    x: coords.x,
+                                    y: coords.y,
+                                }));
                             },
                             ondragstart: {
                                 let mut drag_source = drag_source;
@@ -174,9 +275,25 @@ pub fn TabStrip() -> Element {
                                 role: "button",
                                 tabindex: "-1",
                                 "aria-label": "{close_label}",
+                                // Use onmousedown so the close fires
+                                // *before* the browser dispatches the
+                                // outer button's click (which would
+                                // re-activate the tab we're trying to
+                                // close). stop_propagation here keeps
+                                // the activate handler from running
+                                // even if the click slips through.
+                                // The redundant onclick swallow is
+                                // belt-and-suspenders for keyboard
+                                // activation (Enter on a focused
+                                // role=button span).
+                                onmousedown: move |evt| {
+                                    evt.stop_propagation();
+                                    evt.prevent_default();
+                                    tabs.write().close(id);
+                                },
                                 onclick: move |evt| {
                                     evt.stop_propagation();
-                                    tabs.write().close(id);
+                                    evt.prevent_default();
                                 },
                                 if dirty {
                                     Icon { name: "circle-dot".to_string() , size: 12 }

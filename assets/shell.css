@@ -778,6 +778,14 @@ html, body {
   border-bottom: 1px solid var(--vscode-panel-border);
   flex: 0 0 auto;
   height: 32px;
+  /* Hide the horizontal scrollbar — the strip is still scrollable
+     via wheel/trackpad/keyboard, but the visible bar wastes a row of
+     vertical space and clashes with the OS chrome. */
+  scrollbar-width: none;          /* Firefox */
+  -ms-overflow-style: none;       /* legacy IE/Edge */
+}
+.operon-tab-strip::-webkit-scrollbar {
+  display: none;                  /* Chromium / WebKit */
 }
 
 .operon-tab {
@@ -815,15 +823,67 @@ html, body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
   border-radius: 3px;
   font-size: 12px;
   line-height: 1;
+  /* The tab body has cursor: pointer for the activate-on-click
+     surface; flip to default here so the X reads as a distinct
+     affordance, and so the user gets the right cursor at the click
+     target. */
+  cursor: default;
+}
+/* Ensure the SVG inside the close span never steals the click — the
+   onclick lives on the span, and an SVG path is otherwise the
+   topmost hit-target inside its bounding box. */
+.operon-tab-close svg,
+.operon-tab-marker svg {
+  pointer-events: none;
 }
 
 .operon-tab-close:hover {
   background: var(--vscode-panel-border);
+  cursor: pointer;
+}
+
+/* Tab right-click context menu. Floats absolutely above the strip,
+   anchored to the cursor position via inline `top` / `left`. */
+.operon-tab-context-menu {
+  position: fixed;
+  z-index: 200;
+  min-width: 180px;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background, #1e1e1e));
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+  padding: 4px 0;
+  font-size: 12px;
+}
+.operon-tab-context-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 199;
+  background: transparent;
+  cursor: default;
+}
+.operon-tab-context-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--vscode-editor-foreground);
+  padding: 6px 14px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.operon-tab-context-menu-item:hover {
+  background: var(--vscode-list-hoverbackground, rgba(127, 127, 127, 0.15));
+}
+.operon-tab-context-menu-item[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .operon-main-body {

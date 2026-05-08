@@ -37,7 +37,12 @@ impl Default for LayoutState {
             panel_height: PANEL_DEFAULT,
             sidebar_collapsed: false,
             companion_collapsed: false,
-            panel_collapsed: false,
+            // Bottom panel hidden by default — most users only need it
+            // for terminal/logs investigation. The toggle button on the
+            // menubar (and the splitter's snap-to-edge) brings it back
+            // when needed; `last_panel_height` retains the default
+            // height so the first un-collapse opens at PANEL_DEFAULT.
+            panel_collapsed: true,
             last_sidebar_width: SIDEBAR_DEFAULT,
             last_companion_width: COMPANION_DEFAULT,
             last_panel_height: PANEL_DEFAULT,
@@ -171,7 +176,8 @@ mod tests {
         assert_eq!(s.panel_height, PANEL_DEFAULT);
         assert!(!s.sidebar_collapsed);
         assert!(!s.companion_collapsed);
-        assert!(!s.panel_collapsed);
+        // Bottom panel hidden by default.
+        assert!(s.panel_collapsed);
         assert_eq!(s.last_sidebar_width, SIDEBAR_DEFAULT);
         assert_eq!(s.last_companion_width, COMPANION_DEFAULT);
         assert_eq!(s.last_panel_height, PANEL_DEFAULT);
@@ -231,7 +237,15 @@ mod tests {
 
     #[test]
     fn toggle_panel_round_trip() {
+        // Default is collapsed now — first toggle expands, second
+        // re-collapses. Exercise both transitions starting from the
+        // default state.
         let mut s = LayoutState::default();
+        assert!(s.panel_collapsed);
+        s.toggle_panel();
+        assert!(!s.panel_collapsed);
+        // Set a new height while open, then collapse and re-open;
+        // re-open should restore that height.
         s.set_panel_height(150);
         s.toggle_panel();
         assert!(s.panel_collapsed);
@@ -252,7 +266,12 @@ mod tests {
 
     #[test]
     fn three_way_independence() {
+        // Start from a fully-open layout (panel default is now
+        // collapsed; expand it explicitly so the test asserts that
+        // toggling the companion doesn't affect the other two).
         let mut s = LayoutState::default();
+        s.toggle_panel();
+        assert!(!s.panel_collapsed);
         s.toggle_companion();
         assert!(s.companion_collapsed);
         assert!(!s.sidebar_collapsed);
@@ -333,6 +352,9 @@ mod tests {
     #[test]
     fn drag_panel_below_min_snaps_to_collapsed() {
         let mut s = LayoutState::default();
+        // Default is collapsed; expand first so the snap-to-collapse
+        // path actually has work to do.
+        s.toggle_panel();
         s.set_panel_height(180);
         s.drag_panel(PANEL_MIN.saturating_sub(1));
         assert!(s.panel_collapsed);

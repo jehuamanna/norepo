@@ -202,15 +202,19 @@ pub async fn run_node(
 
     // Stamp the global run-state map so the companion's
     // "Claude is thinking…" loader renders for the entire duration
-    // of this Claude subprocess. The companion's match arms read
-    // ARTIFACT_RUN_STATE keyed on the chat session id (which is the
-    // same as `operon_session` here for workflow runs) and surface
-    // the spinner whenever the entry is `Running`. We always either
-    // mutate to `Done` (Ok path) or `Failed` (every error path after
-    // this point) so the loader doesn't get stuck.
+    // of this Claude subprocess. We always either mutate to `Done`
+    // (Ok path) or `Failed` (every error path) before returning;
+    // `RunStateGuard` provides a Drop-time fallback so the loader
+    // also clears if the spawn'd task is cancelled mid-await
+    // (component unmounted, tab closed, app shutting down). Without
+    // the guard, a dropped task leaves `Running` stuck in the
+    // GlobalSignal map until the next run on the same session
+    // overwrites it — that's exactly the "Claude still thinking 5
+    // minutes after the subprocess exited" symptom.
     ARTIFACT_RUN_STATE.with_mut(|m| {
         m.insert(operon_session, ArtifactRunState::Running);
     });
+    let mut run_state_guard = RunStateGuard::armed(operon_session);
 
     // Run claude.
     eprintln!(
@@ -224,9 +228,7 @@ pub async fn run_node(
         Ok(rx) => rx,
         Err(e) => {
             let reason = format!("send_rich: {e}");
-            ARTIFACT_RUN_STATE.with_mut(|m| {
-                m.insert(operon_session, ArtifactRunState::Failed { reason: reason.clone() });
-            });
+            run_state_guard.disarm_with(ArtifactRunState::Failed { reason: reason.clone() });
             return Err(ExecError::Plugin(reason));
         }
     };
@@ -379,12 +381,8 @@ pub async fn run_node(
                     );
                     bump_message_version();
                 }
-                ARTIFACT_RUN_STATE.with_mut(|m| {
-                    m.insert(
-                        operon_session,
-                        ArtifactRunState::Failed { reason: msg.clone() },
-                    );
-                });
+                run_state_guard
+                    .disarm_with(ArtifactRunState::Failed { reason: msg.clone() });
                 return Err(ExecError::Plugin(msg));
             }
         }
@@ -410,16 +408,11 @@ pub async fn run_node(
         std::thread::sleep(std::time::Duration::from_millis(80));
     }
     if produced.is_empty() {
-        ARTIFACT_RUN_STATE.with_mut(|m| {
-            m.insert(
-                operon_session,
-                ArtifactRunState::Failed {
-                    reason: format!(
-                        "claude finished but no .md files appeared in {}",
-                        out_dir.display()
-                    ),
-                },
-            );
+        run_state_guard.disarm_with(ArtifactRunState::Failed {
+            reason: format!(
+                "claude finished but no .md files appeared in {}",
+                out_dir.display()
+            ),
         });
         return Err(ExecError::OutputMissing(out_dir.clone()));
     }
@@ -430,13 +423,8 @@ pub async fn run_node(
         .first()
         .cloned()
         .expect("non-empty by guard above");
-    ARTIFACT_RUN_STATE.with_mut(|m| {
-        m.insert(
-            operon_session,
-            ArtifactRunState::Done {
-                artifact_count: produced.len(),
-            },
-        );
+    run_state_guard.disarm_with(ArtifactRunState::Done {
+        artifact_count: produced.len(),
     });
     Ok(RunArtifact {
         output_path,
@@ -444,6 +432,47 @@ pub async fn run_node(
         input_hash,
         produced,
     })
+}
+
+/// Drop-guard that ensures `ARTIFACT_RUN_STATE` always transitions
+/// out of `Running` for a session, even if the spawn'd task is
+/// cancelled mid-await (component unmount, tab close, app shutdown).
+///
+/// `armed` returns a guard that — on drop — stamps the session as
+/// `Failed` with a generic "task cancelled" reason. The happy path
+/// calls `disarm_with(Done | Failed)` to set a specific final state;
+/// after disarm, dropping the guard is a no-op.
+struct RunStateGuard {
+    session: Option<Uuid>,
+}
+
+impl RunStateGuard {
+    fn armed(session: Uuid) -> Self {
+        Self { session: Some(session) }
+    }
+
+    fn disarm_with(&mut self, final_state: ArtifactRunState) {
+        if let Some(session) = self.session.take() {
+            ARTIFACT_RUN_STATE.with_mut(|m| {
+                m.insert(session, final_state);
+            });
+        }
+    }
+}
+
+impl Drop for RunStateGuard {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            ARTIFACT_RUN_STATE.with_mut(|m| {
+                m.insert(
+                    session,
+                    ArtifactRunState::Failed {
+                        reason: "run cancelled (task dropped before completion)".into(),
+                    },
+                );
+            });
+        }
+    }
 }
 
 /// List `.md` files in `dir` (top-level only). Returns absolute

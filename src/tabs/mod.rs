@@ -178,6 +178,32 @@ impl TabManager {
         }
     }
 
+    /// Close every tab whose position is to the right of `id`. The
+    /// pivot tab itself is preserved. No-op when `id` is not open or
+    /// is already the rightmost tab. The active tab is reassigned to
+    /// the pivot when it would otherwise be lost.
+    pub fn close_to_right(&mut self, id: TabId) {
+        let Some(pivot) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        // Truncate everything past the pivot. `truncate` preserves the
+        // first `pivot + 1` elements (the pivot included).
+        self.tabs.truncate(pivot + 1);
+        // If the active tab was among the closed ones, fall back to
+        // the pivot.
+        if let Some(active) = self.active {
+            if !self.tabs.iter().any(|t| t.id == active) {
+                self.active = Some(id);
+            }
+        }
+    }
+
+    /// Close every tab. Active resets to None.
+    pub fn close_all(&mut self) {
+        self.tabs.clear();
+        self.active = None;
+    }
+
     /// Make the given tab active. No-op if it doesn't exist.
     pub fn activate(&mut self, id: TabId) {
         if self.tabs.iter().any(|t| t.id == id) {
@@ -366,6 +392,46 @@ mod tests {
         let len_before = tm.iter().count();
         tm.close(TabId(9999));
         assert_eq!(tm.iter().count(), len_before);
+    }
+
+    #[test]
+    fn close_to_right_keeps_pivot_drops_rest() {
+        let mut tm = TabManager::new();
+        let n1 = open_md(&mut tm, "n1", "T1");
+        let _n2 = open_md(&mut tm, "n2", "T2");
+        let _n3 = open_md(&mut tm, "n3", "T3");
+        tm.close_to_right(n1);
+        assert_eq!(tm.iter().count(), 1);
+        assert_eq!(tm.active_id(), Some(n1));
+    }
+
+    #[test]
+    fn close_to_right_on_rightmost_tab_is_noop() {
+        let mut tm = TabManager::new();
+        let _n1 = open_md(&mut tm, "n1", "T1");
+        let n2 = open_md(&mut tm, "n2", "T2");
+        let len_before = tm.iter().count();
+        tm.close_to_right(n2);
+        assert_eq!(tm.iter().count(), len_before);
+    }
+
+    #[test]
+    fn close_to_right_unknown_id_is_noop() {
+        let mut tm = TabManager::new();
+        let _n1 = open_md(&mut tm, "n1", "T1");
+        let len_before = tm.iter().count();
+        tm.close_to_right(TabId(9999));
+        assert_eq!(tm.iter().count(), len_before);
+    }
+
+    #[test]
+    fn close_all_empties_strip_and_clears_active() {
+        let mut tm = TabManager::new();
+        open_md(&mut tm, "n1", "T1");
+        open_md(&mut tm, "n2", "T2");
+        tm.close_all();
+        assert_eq!(tm.iter().count(), 0);
+        assert!(tm.active_id().is_none());
     }
 
     #[test]
