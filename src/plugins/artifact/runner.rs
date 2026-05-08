@@ -200,13 +200,17 @@ pub async fn run_skill_on_source(
         }
     }
     // Flush any leftover assistant text the persist helper buffered.
+    // Body shape MUST match what `transcript_item_from_message`
+    // expects for Assistant kind: `{ "body": "<text>" }`. Earlier we
+    // wrote `{ "text": ... }` and every assistant message was
+    // silently filtered out of the rail's transcript.
     if let Some(repo) = chat_repo {
         if !assistant_buf.is_empty() {
             let _ = repo.append(
                 chat_session_id,
                 ChatMessageKind::Assistant,
                 None,
-                &serde_json::json!({ "text": std::mem::take(&mut assistant_buf) }),
+                &serde_json::json!({ "body": std::mem::take(&mut assistant_buf) }),
             );
             bump_message_version();
         }
@@ -410,11 +414,13 @@ fn persist_event(
         if buf.is_empty() {
             return false;
         }
+        // Body shape MUST be `{ "body": "<text>" }` to match the
+        // companion's transcript_item_from_message Assistant case.
         let _ = repo.append(
             chat_session_id,
             ChatMessageKind::Assistant,
             None,
-            &serde_json::json!({ "text": std::mem::take(buf) }),
+            &serde_json::json!({ "body": std::mem::take(buf) }),
         );
         true
     };

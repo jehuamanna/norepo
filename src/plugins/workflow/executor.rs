@@ -203,11 +203,16 @@ pub async fn run_node(
             return;
         }
         if let Some(sink) = transcript_sink.as_ref() {
+            // Body shape MUST be `{ "body": "<text>" }` to match
+            // `transcript_item_from_message`'s Assistant case in
+            // `companion_chat`. The earlier `{ "text": ... }` shape
+            // caused every assistant message to be filtered out of
+            // the rail's transcript.
             let _ = sink.chat_repo.append(
                 sink.chat_session_id,
                 ChatMessageKind::Assistant,
                 None,
-                &serde_json::json!({ "text": std::mem::take(buf) }),
+                &serde_json::json!({ "body": std::mem::take(buf) }),
             );
         } else {
             buf.clear();
