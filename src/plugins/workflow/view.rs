@@ -1760,6 +1760,7 @@ fn spawn_run_cascade(
                             project_id,
                             &mut graph,
                             node_id,
+                            skill_note_id,
                             &produced,
                         )
                         .await
@@ -1906,6 +1907,7 @@ fn spawn_run_node(
                         project_id,
                         &mut graph,
                         node_id,
+                        skill_note_id,
                         &produced,
                     )
                     .await
@@ -2113,8 +2115,13 @@ async fn upsert_output_notes(
     project_id: Uuid,
     graph: &mut WorkflowGraph,
     node_id: NodeId,
+    skill_note_id: Uuid,
     produced: &[(std::path::PathBuf, String)],
 ) -> Result<Vec<Uuid>, String> {
+    use crate::plugins::artifact::frontmatter::{
+        parse as parse_artifact_fm, rewrite as rewrite_artifact_fm, ArtifactKind, ArtifactStatus,
+    };
+
     // 1. One project-scoped Outputs folder. Found by title at root —
     //    co-opts a user-created folder if one exists with the same
     //    name; otherwise created.
@@ -2122,17 +2129,22 @@ async fn upsert_output_notes(
 
     // 2. One Outputs note per produced file. Title is the file's stem
     //    (e.g. `epic-01-core-timer-engine.md` → `epic-01-core-timer-engine`).
-    //    Existing siblings under the Outputs folder with the same title
-    //    are reused — body overwritten — so re-runs don't pile up
-    //    duplicates. The lead file's note id is also stamped on
-    //    `cached_output_note_id` so the inspector's "View in tab"
-    //    button still has a single anchor.
+    //    Note kind depends on the file's declared `artifact_kind`:
+    //    Summary outputs land as `Markdown` notes (read-only narrative
+    //    that the user reads top-to-bottom), every other kind
+    //    (epic / feature / story / task / plan / implementation /
+    //    test_cases / test_results) lands as `Artifact` so the artifact
+    //    UI can pick them up — gate them by status, run downstream
+    //    skills, surface kind chips, etc. Existing siblings of EITHER
+    //    kind are reused on re-runs so the user doesn't accumulate
+    //    duplicates if the kind contract changes.
     let existing_outputs: Vec<LocalNote> = note_repo
         .list_for_project(project_id)
         .unwrap_or_default()
         .into_iter()
         .filter(|n| {
-            n.parent_id == Some(folder_id) && matches!(n.kind, NoteKind::Markdown)
+            n.parent_id == Some(folder_id)
+                && matches!(n.kind, NoteKind::Markdown | NoteKind::Artifact)
         })
         .collect();
 
@@ -2143,23 +2155,53 @@ async fn upsert_output_notes(
             .and_then(|s| s.to_str())
             .unwrap_or("output")
             .to_string();
+
+        // Parse the produced file's own frontmatter to decide the note
+        // kind. The runtime prompt instructs Claude to start every
+        // output with `artifact_kind: <kind>` matching the skill's
+        // `output_kind`, so this read is well-defined for every seed
+        // skill. Files missing frontmatter (a misbehaving skill) fall
+        // through to `Artifact` so the user can fix them in-place
+        // rather than getting an inert Markdown note.
+        let fm = parse_artifact_fm(body);
+        let is_summary = matches!(fm.artifact_kind, Some(ArtifactKind::Summary));
+        let target_kind = if is_summary { NoteKind::Markdown } else { NoteKind::Artifact };
+
         let existing_id = existing_outputs.iter().find(|n| n.title == title).map(|n| n.id);
         let row_id = match existing_id {
             Some(id) => id,
             None => {
                 let row = note_repo
-                    .create_with_kind(
-                        project_id,
-                        Some(folder_id),
-                        &title,
-                        NoteKind::Markdown,
-                    )
+                    .create_with_kind(project_id, Some(folder_id), &title, target_kind)
                     .map_err(|e| format!("create output note '{title}': {e}"))?;
                 row.id
             }
         };
+
+        // For Artifact-kind outputs, patch the frontmatter so the
+        // engine's view fields are authoritative regardless of what
+        // the skill wrote: ensure `status: approved` (workflow runs
+        // are user-driven and don't gate downstream skills here),
+        // stamp `source_skill_id` so the artifact view's chips can
+        // link back, and let `artifact_kind` fall through if missing.
+        // Summary outputs save the body verbatim — no frontmatter
+        // patching since they render as plain Markdown.
+        let body_to_save = if is_summary {
+            body.clone()
+        } else {
+            let mut fm_patched = fm;
+            if fm_patched.artifact_kind.is_none() {
+                // Preserve a hint for downstream readers — if the skill
+                // forgot frontmatter entirely, the artifact_kind will
+                // still be None and the view falls back to "Artifact".
+            }
+            fm_patched.status = ArtifactStatus::Approved;
+            fm_patched.source_skill_id = Some(skill_note_id);
+            rewrite_artifact_fm(body, &fm_patched)
+        };
+
         persistence
-            .save(&row_id.to_string(), body.as_bytes())
+            .save(&row_id.to_string(), body_to_save.as_bytes())
             .await
             .map_err(|e| format!("save output body for '{title}': {e}"))?;
         imported.push(row_id);
