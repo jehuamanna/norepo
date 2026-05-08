@@ -38,7 +38,8 @@ use crate::local_mode::explorer::LocalProjectVersion;
 use crate::plugins::markdown::MarkdownView;
 use crate::shell::companion_state::{
     ActiveChatScope, ActiveChatSession, ActiveRepoPath, ChatMessage, ChatMessageKind,
-    ChatMessageRepo, ChatScope, ChatSessionRepo, CompanionComposerInbox, CHAT_MESSAGE_VERSION,
+    ArtifactRunState, ChatMessageRepo, ChatScope, ChatSessionRepo, CompanionComposerInbox,
+    ARTIFACT_RUN_STATE, CHAT_MESSAGE_VERSION, INPROGRESS_ASSISTANT,
 };
 use crate::shell::session_rail::SessionRail;
 use crate::shell::tool_card::{ToolCard, ToolResultBody};
@@ -504,6 +505,51 @@ pub fn CompanionChat() -> Element {
                     }
                     for (i, item) in transcript.read().iter().enumerate() {
                         {render_item(i, item)}
+                    }
+                    // Streaming surface (Phase G): live letter-by-
+                    // letter Claude text + "Claude is thinking…"
+                    // loader. Both subscribe to GlobalSignals so
+                    // they re-render on every delta from the runner
+                    // (or any background drainer).
+                    {
+                        let sid_now = *session_signal.read();
+                        let inprogress: Option<String> = sid_now
+                            .and_then(|id| {
+                                INPROGRESS_ASSISTANT.read().get(&id).cloned()
+                            })
+                            .filter(|s| !s.is_empty());
+                        let is_running = sid_now
+                            .map(|id| {
+                                matches!(
+                                    ARTIFACT_RUN_STATE.read().get(&id),
+                                    Some(ArtifactRunState::Running)
+                                )
+                            })
+                            .unwrap_or(false);
+                        match (inprogress, is_running) {
+                            (Some(text), _) => rsx! {
+                                div {
+                                    class: "operon-companion-msg operon-companion-msg-assistant operon-companion-msg-assistant-streaming",
+                                    "data-testid": "companion-streaming",
+                                    "{text}"
+                                    span {
+                                        class: "operon-companion-streaming-cursor",
+                                        "\u{258B}"
+                                    }
+                                }
+                            },
+                            (None, true) => rsx! {
+                                div {
+                                    class: "operon-companion-msg operon-companion-msg-thinking",
+                                    "data-testid": "companion-thinking",
+                                    span { class: "operon-companion-thinking-spinner" }
+                                    span { class: "operon-companion-thinking-label",
+                                        "Claude is thinking\u{2026}"
+                                    }
+                                }
+                            },
+                            (None, false) => rsx! {},
+                        }
                     }
                 }
                 {

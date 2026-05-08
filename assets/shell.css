@@ -1442,6 +1442,51 @@ html, body {
   overflow-x: auto;
 }
 
+/* Live-streaming assistant block: same look as the persisted one,
+   plus a blinking cursor at the end so the reader can see typing
+   in progress (ChatGPT-style). */
+.operon-companion-msg-assistant-streaming {
+  white-space: pre-wrap;
+}
+.operon-companion-streaming-cursor {
+  display: inline-block;
+  margin-left: 2px;
+  color: var(--operon-accent);
+  animation: operon-blink 1s steps(2, start) infinite;
+}
+@keyframes operon-blink {
+  to { visibility: hidden; }
+}
+
+/* "Claude is thinking…" placeholder shown when an artifact run is
+   in flight but Claude hasn't streamed any text yet. Disappears
+   the moment the first Text event lands and the streaming block
+   takes over. */
+.operon-companion-msg-thinking {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+  background: var(--vscode-editorWidget-background, rgba(127, 127, 127, 0.06));
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 12px;
+}
+.operon-companion-thinking-spinner {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--vscode-panel-border);
+  border-top-color: var(--operon-accent);
+  animation: operon-spin 0.9s linear infinite;
+}
+@keyframes operon-spin {
+  to { transform: rotate(360deg); }
+}
+
 /* ------------ Thinking block (collapsible, dim italic) ------------ */
 .operon-companion-thinking {
   align-self: stretch;

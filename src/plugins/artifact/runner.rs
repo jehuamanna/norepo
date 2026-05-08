@@ -412,6 +412,11 @@ fn persist_event(
     use ClaudeCodeEvent::*;
     let flush = |buf: &mut String| -> bool {
         if buf.is_empty() {
+            // Still clear the in-progress entry so the streaming
+            // block disappears even when there's nothing to flush.
+            crate::shell::companion_state::INPROGRESS_ASSISTANT.with_mut(|m| {
+                m.remove(&chat_session_id);
+            });
             return false;
         }
         // Body shape MUST be `{ "body": "<text>" }` to match the
@@ -422,12 +427,28 @@ fn persist_event(
             None,
             &serde_json::json!({ "body": std::mem::take(buf) }),
         );
+        // Clear the streaming entry — the persisted row is now the
+        // canonical surface for this assistant block.
+        crate::shell::companion_state::INPROGRESS_ASSISTANT.with_mut(|m| {
+            m.remove(&chat_session_id);
+        });
         true
     };
     match ev {
         Text(t) => {
             assistant_buf.push_str(t);
-            // Buffered only — no DB write yet.
+            // Live-stream this delta into the in-progress map. The
+            // companion's render reads `INPROGRESS_ASSISTANT` and
+            // renders the entry as a transient block at the bottom
+            // of the transcript with a blinking cursor — letter-
+            // by-letter streaming UX without DB churn.
+            crate::shell::companion_state::INPROGRESS_ASSISTANT.with_mut(|m| {
+                m.entry(chat_session_id).or_default().push_str(t);
+            });
+            // Returning false so the outer loop doesn't bump
+            // CHAT_MESSAGE_VERSION (no chat_message row yet); the
+            // GlobalSignal write above re-renders the streaming
+            // surface directly.
             false
         }
         Thinking(t) => {

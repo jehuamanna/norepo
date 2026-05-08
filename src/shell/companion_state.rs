@@ -95,6 +95,20 @@ pub enum ArtifactRunState {
 pub static ARTIFACT_RUN_STATE: GlobalSignal<HashMap<Uuid, ArtifactRunState>> =
     Signal::global(HashMap::new);
 
+/// Live letter-by-letter streaming buffer for in-progress Claude
+/// assistant text, keyed on `chat_session_id`. The runner appends
+/// each `Text` event delta to the entry and clears it on flush
+/// (when a non-Text event fires or the run completes). The
+/// companion renders the entry as a transient streaming block at
+/// the end of the transcript — same role as ChatGPT's "typing"
+/// effect. Once flushed, the text moves into a regular Assistant
+/// `chat_message` row and the map entry is cleared.
+///
+/// Map (rather than a single `Option<String>`) so multiple sessions
+/// streaming concurrently don't trample each other.
+pub static INPROGRESS_ASSISTANT: GlobalSignal<HashMap<Uuid, String>> =
+    Signal::global(HashMap::new);
+
 /// One-shot inbox the companion's composer subscribes to. When a remote
 /// caller (e.g., the skill plugin's Play button) writes `Some(prompt)`,
 /// the companion swaps that text into its composer field on the next

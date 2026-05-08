@@ -199,21 +199,21 @@ pub async fn run_node(
     // the regular companion's `flush_pending_assistant` behavior).
     let mut assistant_buf = String::new();
     let flush_assistant = |buf: &mut String| {
-        if buf.is_empty() {
-            return;
-        }
         if let Some(sink) = transcript_sink.as_ref() {
-            // Body shape MUST be `{ "body": "<text>" }` to match
-            // `transcript_item_from_message`'s Assistant case in
-            // `companion_chat`. The earlier `{ "text": ... }` shape
-            // caused every assistant message to be filtered out of
-            // the rail's transcript.
-            let _ = sink.chat_repo.append(
-                sink.chat_session_id,
-                ChatMessageKind::Assistant,
-                None,
-                &serde_json::json!({ "body": std::mem::take(buf) }),
-            );
+            if !buf.is_empty() {
+                let _ = sink.chat_repo.append(
+                    sink.chat_session_id,
+                    ChatMessageKind::Assistant,
+                    None,
+                    &serde_json::json!({ "body": std::mem::take(buf) }),
+                );
+            }
+            // Always clear the streaming entry on flush so the
+            // transient block disappears even when there's no text
+            // to persist (e.g., flush before a Thinking block).
+            crate::shell::companion_state::INPROGRESS_ASSISTANT.with_mut(|m| {
+                m.remove(&sink.chat_session_id);
+            });
         } else {
             buf.clear();
         }
@@ -235,6 +235,14 @@ pub async fn run_node(
         match ev {
             ClaudeCodeEvent::Text(t) => {
                 assistant_buf.push_str(&t);
+                // Stream the delta into the in-progress map so the
+                // companion's render shows letter-by-letter typing.
+                if let Some(sink) = transcript_sink.as_ref() {
+                    let chat_session_id = sink.chat_session_id;
+                    crate::shell::companion_state::INPROGRESS_ASSISTANT.with_mut(|m| {
+                        m.entry(chat_session_id).or_default().push_str(&t);
+                    });
+                }
             }
             ClaudeCodeEvent::Thinking(t) => {
                 flush_assistant(&mut assistant_buf);
