@@ -39,6 +39,7 @@ pub fn Dropdown(menu: MenuId) -> Element {
     let empty = items.is_empty();
     let label = menu.label();
 
+    let label_for_mounted = label.to_string();
     rsx! {
         div {
             class: "operon-dropdown-backdrop",
@@ -47,9 +48,83 @@ pub fn Dropdown(menu: MenuId) -> Element {
         ul {
             class: "operon-dropdown",
             "data-menu": "{label}",
+            role: "menu",
+            "aria-label": "{label}",
+            tabindex: "-1",
             onclick: move |evt| { evt.stop_propagation(); },
+            onkeydown: move |evt| {
+                let key = evt.key().to_string();
+                if key == "Escape" {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    open_menu.set(None);
+                } else if key == "ArrowDown" || key == "ArrowUp" {
+                    evt.prevent_default();
+                    let dir = if key == "ArrowDown" { 1i32 } else { -1i32 };
+                    let script = format!(
+                        r#"
+                        (function() {{
+                            var dd = document.querySelector('.operon-dropdown[data-menu="{label}"]');
+                            if (!dd) return;
+                            var nodes = Array.prototype.slice.call(dd.querySelectorAll('[role="menuitem"]'));
+                            if (!nodes.length) return;
+                            var cur = document.activeElement;
+                            var idx = nodes.indexOf(cur);
+                            if (idx < 0) idx = -1;
+                            var next = idx + ({dir});
+                            if (next < 0) next = nodes.length - 1;
+                            if (next >= nodes.length) next = 0;
+                            nodes[next].focus();
+                        }})();
+                        "#
+                    );
+                    document::eval(&script);
+                } else if key == "Home" {
+                    evt.prevent_default();
+                    let script = format!(
+                        r#"
+                        (function() {{
+                            var dd = document.querySelector('.operon-dropdown[data-menu="{label}"]');
+                            if (!dd) return;
+                            var first = dd.querySelector('[role="menuitem"]');
+                            if (first) first.focus();
+                        }})();
+                        "#
+                    );
+                    document::eval(&script);
+                } else if key == "End" {
+                    evt.prevent_default();
+                    let script = format!(
+                        r#"
+                        (function() {{
+                            var dd = document.querySelector('.operon-dropdown[data-menu="{label}"]');
+                            if (!dd) return;
+                            var nodes = dd.querySelectorAll('[role="menuitem"]');
+                            if (nodes.length) nodes[nodes.length - 1].focus();
+                        }})();
+                        "#
+                    );
+                    document::eval(&script);
+                }
+            },
+            // Auto-focus the first menuitem when the dropdown opens so the
+            // user can immediately ArrowDown/ArrowUp through it.
+            onmounted: move |_| {
+                let script = format!(
+                    r#"
+                    (function() {{
+                        var dd = document.querySelector('.operon-dropdown[data-menu="{l}"]');
+                        if (!dd) return;
+                        var first = dd.querySelector('[role="menuitem"]');
+                        if (first && typeof first.focus === 'function') first.focus();
+                    }})();
+                    "#,
+                    l = label_for_mounted,
+                );
+                document::eval(&script);
+            },
             if empty {
-                li { class: "operon-dropdown-empty", "(empty)" }
+                li { class: "operon-dropdown-empty", role: "presentation", "(empty)" }
             }
             for (id, title) in items.into_iter() {
                 {
@@ -58,10 +133,16 @@ pub fn Dropdown(menu: MenuId) -> Element {
                     let cmd_reg = cmd_reg.clone();
                     let plugin_reg = plugin_reg.clone();
                     let theme_reg = theme_reg.clone();
+                    let id_for_keys = id.clone();
+                    let cmd_reg_keys = cmd_reg.clone();
+                    let plugin_reg_keys = plugin_reg.clone();
+                    let theme_reg_keys = theme_reg.clone();
                     rsx! {
                         li {
                             class: "operon-dropdown-item",
                             "data-id": "{id_attr}",
+                            role: "menuitem",
+                            tabindex: "-1",
                             onclick: move |_| {
                                 let context = CommandContext {
                                     theme,
@@ -77,6 +158,26 @@ pub fn Dropdown(menu: MenuId) -> Element {
                                 };
                                 let _ = cmd_reg.execute(&id, &context);
                                 open_menu.set(None);
+                            },
+                            onkeydown: move |evt| {
+                                let key = evt.key().to_string();
+                                if key == "Enter" || key == " " {
+                                    evt.prevent_default();
+                                    let context = CommandContext {
+                                        theme,
+                                        tabs,
+                                        active_activity: active,
+                                        last_active_activity: last_active,
+                                        registry: plugin_reg_keys.clone(),
+                                        palette,
+                                        layout,
+                                        theme_registry: theme_reg_keys.clone(),
+                                        about_open,
+                                        local_save: try_consume_context(),
+                                    };
+                                    let _ = cmd_reg_keys.execute(&id_for_keys, &context);
+                                    open_menu.set(None);
+                                }
                             },
                             "{title_text}"
                         }

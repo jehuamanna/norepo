@@ -1,112 +1,486 @@
-//! Companion chat surface — minimal Plans-Phase-4 implementation.
+//! Companion chat surface — rail + chat + tool-card-aware transcript
+//! (M1.5b).
 //!
-//! Wires `EchoChatPlugin` (no API key required) into a single-turn chat UI that
-//! drives `AgentRuntime` and renders the resulting `Step` stream into the
-//! Companion Area.
+//! Wires the Claude Code CLI (`ClaudeCodeChatPlugin`) into a multi-session
+//! chat UI inside the companion area. The left rail (`SessionRail`) is the
+//! scope-tab + per-scope session list. The right side renders one
+//! `TranscriptItem` per visual block: user bubbles, markdown-rendered
+//! assistant text, dim italic thinking blocks, collapsible tool-use
+//! cards, and a footer cost meter.
 //!
-//! Deferred to follow-up: memory inspector, plugin manager, MCP grant modal,
-//! AnthropicChatPlugin wiring, model picker, stream cancellation tests in
-//! Playwright.
+//! Per-turn behaviour:
+//!   - `ClaudeCodeChatPlugin::send_rich(prompt, session, ct)` returns a
+//!     stream of `ClaudeCodeEvent`s. The companion subscribes directly —
+//!     no `AgentRuntime` adapter — so tool_use / tool_result / thinking /
+//!     usage events all reach the UI verbatim.
+//!   - `--resume <session_id>` is reused across turns inside one Operon
+//!     session via the per-Uuid binding map in the plugin.
+//!   - Switching sessions resets the in-memory transcript (persistent
+//!     replay is task #12, deferred).
+//!
+//! Deferred to follow-ups: persistent transcript reload (M1.5b task #12),
+//! composer affordances (M1.5c), model picker + plan mode (M1.5d),
+//! permission prompts (M1.5e).
 
 use dioxus::prelude::*;
 use futures::StreamExt;
+use operon_core::traits::Usage;
+use operon_plugins_claude_code::ClaudeCodeEvent;
+use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::agent::plugins::{EchoChatPlugin, EchoToolPlugin};
-use crate::agent::runtime::{AgentRuntime, Step, StopReason};
-use crate::agent::traits::{ChatPlugin, MemoryPlugin, ToolPlugin};
-use crate::agent::{Budget, CancellationToken, EventBus, InMemoryStore, Scope};
+use crate::agent::plugins::{ClaudeCodeChatPlugin, ClaudeCodeConfig};
+use crate::agent::CancellationToken;
+use crate::local_mode::desktop::CurrentVaultRoot;
+use crate::plugins::markdown::MarkdownView;
+use crate::shell::companion_state::{
+    ActiveChatScope, ActiveChatSession, ActiveRepoPath, ChatMessage, ChatMessageKind,
+    ChatMessageRepo, ChatScope, ChatSessionRepo,
+};
+use crate::shell::session_rail::SessionRail;
+use crate::shell::tool_card::{ToolCard, ToolResultBody};
 
+/// One visible entry in the chat transcript. `AssistantText` holds an
+/// accumulating markdown body that grows as text deltas arrive; tool
+/// cards correlate `ToolResult` events back to their originating
+/// `ToolUse` by id.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DisplayMessage {
-    pub role: DisplayRole,
-    pub text: String,
+pub enum TranscriptItem {
+    UserText(String),
+    AssistantText(String),
+    Thinking(String),
+    ToolCall {
+        id: String,
+        name: String,
+        input: Value,
+        result: Option<ToolResultBody>,
+    },
+    System(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum DisplayRole {
-    User,
-    Assistant,
-    System,
+/// Resolve the path of the `claude` binary at startup. Tries, in order:
+/// 1. `OPERON_CLAUDE_BIN` env override.
+/// 2. `~/.local/bin/claude` — the standalone installer's standard location.
+///    Uses `is_file()` (not `exists()`-style) so a broken symlink falls
+///    through to the next candidate instead of being returned as-is.
+/// 3. Bare `"claude"` — relies on PATH, which Dioxus desktop spawns
+///    inherit from the parent shell.
+fn resolve_claude_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("OPERON_CLAUDE_BIN") {
+        return PathBuf::from(p);
+    }
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let local = home.join(".local/bin/claude");
+    if local.is_file() {
+        return local;
+    }
+    PathBuf::from("claude")
 }
 
 #[component]
 pub fn CompanionChat() -> Element {
-    let messages = use_signal::<Vec<DisplayMessage>>(Vec::new);
+    let plugin: Signal<Arc<ClaudeCodeChatPlugin>> = use_signal(|| {
+        Arc::new(ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
+            claude_bin: resolve_claude_bin(),
+            model: None,
+        }))
+    });
+
+    let transcript = use_signal::<Vec<TranscriptItem>>(Vec::new);
     let mut composer = use_signal(String::new);
     let in_flight = use_signal(|| false);
     let active_ct = use_signal::<Option<CancellationToken>>(|| None);
+    let usage_total = use_signal::<Usage>(Usage::default);
+    // Tracks whether the tail-end AssistantText in `transcript` has been
+    // persisted to chat_message yet. Set true on each Text delta; cleared
+    // by `flush_pending_assistant` after writing to the repo. We persist
+    // on Done (or before any non-text event) to coalesce streaming deltas
+    // into one row per assistant block instead of a write per delta.
+    let pending_assistant = use_signal(|| false);
+
+    // Hotfix: every context lookup uses `try_consume_context` so a missing
+    // provider renders a degraded (but visible) chat surface instead of
+    // panicking and bringing down sibling regions of the Shell tree.
+    let scope_signal = match try_consume_context::<ActiveChatScope>() {
+        Some(ActiveChatScope(s)) => s,
+        None => {
+            return rsx! {
+                section { class: "operon-companion-chat",
+                    div { class: "operon-companion-msg operon-companion-msg-system",
+                        "Companion not available — chat scope context missing."
+                    }
+                }
+            };
+        }
+    };
+    let session_signal = match try_consume_context::<ActiveChatSession>() {
+        Some(ActiveChatSession(s)) => s,
+        None => {
+            return rsx! {
+                section { class: "operon-companion-chat",
+                    div { class: "operon-companion-msg operon-companion-msg-system",
+                        "Companion not available — chat session context missing."
+                    }
+                }
+            };
+        }
+    };
+    let active_repo = match try_consume_context::<ActiveRepoPath>() {
+        Some(ActiveRepoPath(s)) => s,
+        None => {
+            return rsx! {
+                section { class: "operon-companion-chat",
+                    div { class: "operon-companion-msg operon-companion-msg-system",
+                        "Companion not available — repo path context missing."
+                    }
+                }
+            };
+        }
+    };
+    let vault_root = match try_consume_context::<CurrentVaultRoot>() {
+        Some(CurrentVaultRoot(s)) => s,
+        None => {
+            return rsx! {
+                section { class: "operon-companion-chat",
+                    div { class: "operon-companion-msg operon-companion-msg-system",
+                        "Companion not available — vault context missing."
+                    }
+                }
+            };
+        }
+    };
+    let message_repo = match try_consume_context::<ChatMessageRepo>() {
+        Some(ChatMessageRepo(r)) => r,
+        None => {
+            return rsx! {
+                section { class: "operon-companion-chat",
+                    div { class: "operon-companion-msg operon-companion-msg-system",
+                        "Companion not available — message repo missing."
+                    }
+                }
+            };
+        }
+    };
+    let session_repo = match try_consume_context::<ChatSessionRepo>() {
+        Some(ChatSessionRepo(r)) => r,
+        None => {
+            return rsx! {
+                section { class: "operon-companion-chat",
+                    div { class: "operon-companion-msg operon-companion-msg-system",
+                        "Companion not available — session repo missing."
+                    }
+                }
+            };
+        }
+    };
+    let session_version = match try_consume_context::<crate::shell::companion_state::ChatSessionVersion>() {
+        Some(crate::shell::companion_state::ChatSessionVersion(v)) => v,
+        None => {
+            return rsx! {
+                section { class: "operon-companion-chat",
+                    div { class: "operon-companion-msg operon-companion-msg-system",
+                        "Companion not available — session version missing."
+                    }
+                }
+            };
+        }
+    };
+
+    // Resolve cwd for the active scope.
+    let cwd_for_scope = use_memo(move || -> Option<PathBuf> {
+        match *scope_signal.read() {
+            ChatScope::Project(_) => active_repo.read().clone(),
+            ChatScope::Vault => vault_root.read().as_ref().map(|v| v.path.clone()),
+        }
+    });
+
+    // Re-bind the active session whenever cwd or session changes.
+    {
+        let plugin_for_effect = plugin;
+        let session = session_signal;
+        let cwd = cwd_for_scope;
+        use_effect(move || {
+            let plugin = plugin_for_effect.read();
+            let sid = *session.read();
+            let cwd = cwd.read().clone();
+            match (sid, cwd) {
+                (Some(sid), Some(cwd)) => plugin.bind_session(sid, cwd),
+                (Some(sid), None) => plugin.unbind_session(sid),
+                _ => {}
+            }
+        });
+    }
+
+    // Reset transcript + cost on session switch, then replay any
+    // persisted history for the newly-active session. Cost meter doesn't
+    // restore from disk (deferred — needs per-session usage column).
+    {
+        let session = session_signal;
+        let mut transcript_setter = transcript;
+        let mut usage_setter = usage_total;
+        let mut pending_setter = pending_assistant;
+        let repo = message_repo.clone();
+        use_effect(move || {
+            let sid = *session.read();
+            usage_setter.set(Usage::default());
+            pending_setter.set(false);
+            match sid {
+                Some(id) => match repo.list(id) {
+                    Ok(rows) => {
+                        let restored: Vec<TranscriptItem> =
+                            rows.iter().filter_map(transcript_item_from_message).collect();
+                        transcript_setter.set(restored);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "operon::companion",
+                            "load chat history for {id}: {e}"
+                        );
+                        transcript_setter.set(Vec::new());
+                    }
+                },
+                None => transcript_setter.set(Vec::new()),
+            }
+        });
+    }
+
+    let active_session = *session_signal.read();
+    let has_session = active_session.is_some();
+    let has_cwd = cwd_for_scope.read().is_some();
+    let scope_now = *scope_signal.read();
+    let scope_is_project = matches!(scope_now, ChatScope::Project(_));
+    let banner = if !has_cwd {
+        Some(if scope_is_project {
+            "This project has no repository. Right-click the project → Set repository… to enable Claude."
+        } else {
+            "No vault is configured. Pick a vault in Settings → Vault to enable Claude here."
+        })
+    } else {
+        None
+    };
 
     rsx! {
-        div { class: "operon-companion-chat",
-            "data-region": "companion-chat",
-            div { class: "operon-companion-chat-header",
-                span { class: "operon-companion-chat-title", "Companion" }
-                if *in_flight.read() {
-                    button {
-                        class: "operon-companion-chat-stop",
-                        "data-testid": "companion-stop",
-                        onclick: move |_| {
-                            if let Some(ct) = active_ct.read().as_ref() {
-                                ct.cancel();
+        div { class: "operon-companion-chat-grid",
+            SessionRail {}
+            section { class: "operon-companion-chat",
+                "data-region": "companion-chat",
+                div { class: "operon-companion-chat-header",
+                    span { class: "operon-companion-chat-title", "Companion" }
+                    if *in_flight.read() {
+                        button {
+                            class: "operon-companion-chat-stop",
+                            "data-testid": "companion-stop",
+                            onclick: move |_| {
+                                if let Some(ct) = active_ct.read().as_ref() {
+                                    ct.cancel();
+                                }
+                            },
+                            "Stop"
+                        }
+                    }
+                }
+                div { class: "operon-companion-chat-transcript",
+                    "data-testid": "companion-transcript",
+                    if let Some(b) = banner {
+                        div {
+                            class: "operon-companion-msg operon-companion-msg-system",
+                            "data-testid": "companion-no-cwd-banner",
+                            "{b}"
+                        }
+                    }
+                    if !has_session {
+                        div {
+                            class: "operon-companion-msg operon-companion-msg-system",
+                            "data-testid": "companion-no-session",
+                            "No chat selected. Click + to start one."
+                        }
+                    }
+                    for (i, item) in transcript.read().iter().enumerate() {
+                        {render_item(i, item)}
+                    }
+                }
+                {
+                    let u = usage_total.read();
+                    rsx! { CostMeter {
+                        prompt: u.prompt,
+                        prompt_cached: u.prompt_cached,
+                        completion: u.completion,
+                    } }
+                }
+                div { class: "operon-companion-chat-composer",
+                    textarea {
+                        class: "operon-companion-chat-input",
+                        "data-testid": "companion-input",
+                        value: "{composer}",
+                        placeholder: if has_cwd && has_session {
+                            "Type a message... (Cmd/Ctrl+Enter to send)"
+                        } else if !has_session {
+                            "Pick or create a chat to start…"
+                        } else {
+                            "Bind a repository or pick a vault to start…"
+                        },
+                        disabled: !has_cwd || !has_session,
+                        oninput: move |e| composer.set(e.value()),
+                        onkeydown: {
+                            let repo = message_repo.clone();
+                            let srepo = session_repo.clone();
+                            move |e: KeyboardEvent| {
+                                if !has_cwd || !has_session { return; }
+                                if e.key() == Key::Enter && (e.modifiers().ctrl() || e.modifiers().meta()) {
+                                    if let Some(sid) = active_session {
+                                        run_turn(plugin, sid, transcript, composer, in_flight, active_ct, usage_total, pending_assistant, repo.clone(), srepo.clone(), session_version);
+                                    }
+                                }
                             }
                         },
-                        "Stop"
                     }
-                }
-            }
-            div { class: "operon-companion-chat-transcript",
-                "data-testid": "companion-transcript",
-                for (i, msg) in messages.read().iter().enumerate() {
-                    div {
-                        key: "{i}",
-                        class: match msg.role {
-                            DisplayRole::User => "operon-companion-msg operon-companion-msg-user",
-                            DisplayRole::Assistant => "operon-companion-msg operon-companion-msg-assistant",
-                            DisplayRole::System => "operon-companion-msg operon-companion-msg-system",
+                    button {
+                        class: "operon-companion-chat-send",
+                        "data-testid": "companion-send",
+                        disabled: *in_flight.read() || !has_cwd || !has_session,
+                        onclick: {
+                            let repo = message_repo.clone();
+                            let srepo = session_repo.clone();
+                            move |_| {
+                                if let Some(sid) = active_session {
+                                    run_turn(plugin, sid, transcript, composer, in_flight, active_ct, usage_total, pending_assistant, repo.clone(), srepo.clone(), session_version);
+                                }
+                            }
                         },
-                        "data-role": match msg.role {
-                            DisplayRole::User => "user",
-                            DisplayRole::Assistant => "assistant",
-                            DisplayRole::System => "system",
-                        },
-                        "{msg.text}"
+                        "Send"
                     }
-                }
-            }
-            div { class: "operon-companion-chat-composer",
-                textarea {
-                    class: "operon-companion-chat-input",
-                    "data-testid": "companion-input",
-                    value: "{composer}",
-                    placeholder: "Type a message... (Cmd/Ctrl+Enter to send)",
-                    oninput: move |e| composer.set(e.value()),
-                    onkeydown: move |e| {
-                        if e.key() == Key::Enter && (e.modifiers().ctrl() || e.modifiers().meta()) {
-                            run_turn(messages, composer, in_flight, active_ct);
-                        }
-                    },
-                }
-                button {
-                    class: "operon-companion-chat-send",
-                    "data-testid": "companion-send",
-                    disabled: *in_flight.read(),
-                    onclick: move |_| run_turn(messages, composer, in_flight, active_ct),
-                    "Send"
                 }
             }
         }
     }
 }
 
-/// Take the current composer text, append it to the transcript, spawn the
-/// agent loop, and stream `Step`s into the transcript signal.
+fn render_item(i: usize, item: &TranscriptItem) -> Element {
+    let key = format!("{i}");
+    match item {
+        TranscriptItem::UserText(t) => rsx! {
+            div {
+                key: "{key}",
+                class: "operon-companion-msg operon-companion-msg-user",
+                "data-role": "user",
+                "{t}"
+            }
+        },
+        TranscriptItem::AssistantText(body) => rsx! {
+            div {
+                key: "{key}",
+                class: "operon-companion-msg operon-companion-msg-assistant",
+                "data-role": "assistant",
+                MarkdownView { content: body.clone() }
+            }
+        },
+        TranscriptItem::Thinking(t) => rsx! {
+            details {
+                key: "{key}",
+                class: "operon-companion-thinking",
+                "data-role": "thinking",
+                summary { "Thinking" }
+                pre { class: "operon-companion-thinking-body", "{t}" }
+            }
+        },
+        TranscriptItem::ToolCall { id, name, input, result } => rsx! {
+            ToolCard {
+                key: "{key}",
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+                result: result.clone(),
+            }
+        },
+        TranscriptItem::System(t) => rsx! {
+            div {
+                key: "{key}",
+                class: "operon-companion-msg operon-companion-msg-system",
+                "data-role": "system",
+                "{t}"
+            }
+        },
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct CostMeterProps {
+    prompt: u64,
+    prompt_cached: u64,
+    completion: u64,
+}
+
+#[component]
+fn CostMeter(props: CostMeterProps) -> Element {
+    if props.prompt == 0 && props.completion == 0 {
+        return rsx! { div { class: "operon-companion-cost-meter operon-companion-cost-meter-empty" } };
+    }
+    let cache_pct = if props.prompt > 0 {
+        (props.prompt_cached as f64 / props.prompt as f64) * 100.0
+    } else {
+        0.0
+    };
+    let cost = estimate_cost_usd(props.prompt, props.prompt_cached, props.completion);
+    let prompt_total = props.prompt;
+    let completion = props.completion;
+    rsx! {
+        div { class: "operon-companion-cost-meter",
+            "data-testid": "companion-cost-meter",
+            span { class: "operon-companion-cost-segment",
+                "{prompt_total} in"
+            }
+            span { class: "operon-companion-cost-segment",
+                "{completion} out"
+            }
+            span { class: "operon-companion-cost-segment",
+                "{cache_pct:.0}% cached"
+            }
+            span { class: "operon-companion-cost-segment operon-companion-cost-cost",
+                "${cost:.4}"
+            }
+        }
+    }
+}
+
+/// Rough per-token cost estimate. USD per 1M tokens for the default Claude
+/// model family (Opus-tier). Close enough to give the user a running "this
+/// turn cost X" feel without claiming to be billing-accurate.
+fn estimate_cost_usd(prompt: u64, prompt_cached: u64, completion: u64) -> f64 {
+    let in_full_per_mtok = 15.0;
+    let in_cache_per_mtok = 1.5;
+    let out_per_mtok = 75.0;
+    let uncached = prompt.saturating_sub(prompt_cached);
+    let in_cost =
+        (uncached as f64 / 1_000_000.0) * in_full_per_mtok
+            + (prompt_cached as f64 / 1_000_000.0) * in_cache_per_mtok;
+    let out_cost = (completion as f64 / 1_000_000.0) * out_per_mtok;
+    in_cost + out_cost
+}
+
+/// Take the current composer text, append it to the transcript, persist
+/// the user line, and stream the plugin's `ClaudeCodeEvent`s into the
+/// transcript signal (also persisting each event). The Operon session
+/// UUID is the active rail-selected one; the plugin reads its per-session
+/// binding to spawn `claude` with the right cwd + `--resume`.
+///
+/// On the first user message of a session whose label is still "New chat",
+/// derives a label from the message and renames the session — same pattern
+/// the VS Code extension uses to keep the rail readable.
+#[allow(clippy::too_many_arguments)]
 fn run_turn(
-    mut messages: Signal<Vec<DisplayMessage>>,
+    plugin: Signal<Arc<ClaudeCodeChatPlugin>>,
+    chat_session: Uuid,
+    mut transcript: Signal<Vec<TranscriptItem>>,
     mut composer: Signal<String>,
     mut in_flight: Signal<bool>,
     mut active_ct: Signal<Option<CancellationToken>>,
+    mut usage_total: Signal<Usage>,
+    mut pending_assistant: Signal<bool>,
+    repo: Arc<dyn crate::shell::companion_state::ChatMessageRepository>,
+    session_repo: Arc<dyn crate::shell::companion_state::ChatSessionRepository>,
+    mut session_version: Signal<u64>,
 ) {
     if *in_flight.read() {
         return;
@@ -116,64 +490,321 @@ fn run_turn(
         return;
     }
     composer.set(String::new());
-    messages.write().push(DisplayMessage {
-        role: DisplayRole::User,
-        text: text.clone(),
-    });
-    messages.write().push(DisplayMessage {
-        role: DisplayRole::Assistant,
-        text: String::new(),
-    });
+    transcript
+        .write()
+        .push(TranscriptItem::UserText(text.clone()));
+    if let Err(e) = repo.append(
+        chat_session,
+        ChatMessageKind::User,
+        None,
+        &serde_json::json!({ "text": text }),
+    ) {
+        tracing::warn!(target: "operon::companion", "persist user text: {e}");
+    }
+    // Auto-rename the session from the first user message if the label is
+    // still the default "New chat". Manual renames in the rail set the
+    // label to anything else and disable this path automatically.
+    auto_rename_if_default(&session_repo, chat_session, &text, &mut session_version);
     in_flight.set(true);
     let ct = CancellationToken::new();
     active_ct.set(Some(ct.clone()));
 
+    let plugin_arc: Arc<ClaudeCodeChatPlugin> = plugin.read().clone();
+    let repo_for_task = repo.clone();
     spawn(async move {
-        let reply = format!("echo: {text}");
-        let chat: Arc<dyn ChatPlugin> = Arc::new(EchoChatPlugin::new(
-            "echo-companion",
-            vec![EchoChatPlugin::turn_done(&reply)],
-        ));
-        let tool: Arc<dyn ToolPlugin> = Arc::new(EchoToolPlugin::new("echo"));
-        let memory: Arc<dyn MemoryPlugin> = Arc::new(InMemoryStore::new());
-        let bus = EventBus::new(64);
-        let runtime = Arc::new(AgentRuntime::new(chat, vec![tool], memory, bus));
-        let session = Uuid::new_v4();
-        let mut stream = runtime.run(
-            session,
-            Scope::User,
-            text,
-            Budget::unlimited(),
-            ct,
-        );
-        while let Some(step) = stream.next().await {
-            match step {
-                Step::StreamDelta(t) => {
-                    let mut m = messages.write();
-                    if let Some(last) = m.last_mut() {
-                        if last.role == DisplayRole::Assistant {
-                            last.text.push_str(&t);
-                        }
-                    }
-                }
-                Step::Done(reason) => {
-                    if let StopReason::Cancelled = reason {
-                        messages.write().push(DisplayMessage {
-                            role: DisplayRole::System,
-                            text: "(cancelled)".into(),
-                        });
-                    } else if let StopReason::Error(e) = reason {
-                        messages.write().push(DisplayMessage {
-                            role: DisplayRole::System,
-                            text: format!("error: {e}"),
-                        });
-                    }
-                    break;
-                }
-                _ => {}
+        let mut rx = match plugin_arc.send_rich(text, chat_session, ct).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                let msg = format!("error: {e}");
+                transcript
+                    .write()
+                    .push(TranscriptItem::System(msg.clone()));
+                let _ = repo_for_task.append(
+                    chat_session,
+                    ChatMessageKind::System,
+                    None,
+                    &serde_json::json!({ "text": msg }),
+                );
+                in_flight.set(false);
+                active_ct.set(None);
+                return;
             }
+        };
+        while let Some(ev) = rx.next().await {
+            apply_event(
+                &mut transcript,
+                &mut usage_total,
+                &mut pending_assistant,
+                chat_session,
+                &repo_for_task,
+                ev,
+            );
         }
+        // Whatever the loop ended with, make sure any in-progress
+        // assistant text gets a row before we go quiet.
+        flush_pending_assistant(&mut transcript, &mut pending_assistant, chat_session, &repo_for_task);
         in_flight.set(false);
         active_ct.set(None);
     });
+}
+
+fn apply_event(
+    transcript: &mut Signal<Vec<TranscriptItem>>,
+    usage_total: &mut Signal<Usage>,
+    pending_assistant: &mut Signal<bool>,
+    chat_session: Uuid,
+    repo: &Arc<dyn crate::shell::companion_state::ChatMessageRepository>,
+    ev: ClaudeCodeEvent,
+) {
+    match ev {
+        ClaudeCodeEvent::Text(t) => {
+            let mut tx = transcript.write();
+            if let Some(TranscriptItem::AssistantText(body)) = tx.last_mut() {
+                body.push_str(&t);
+            } else {
+                tx.push(TranscriptItem::AssistantText(t));
+            }
+            pending_assistant.set(true);
+        }
+        ClaudeCodeEvent::Thinking(t) => {
+            // Any prior assistant block is now "complete" — flush before
+            // we shift the tail of the transcript away from it.
+            flush_pending_assistant(transcript, pending_assistant, chat_session, repo);
+            transcript.write().push(TranscriptItem::Thinking(t.clone()));
+            if let Err(e) = repo.append(
+                chat_session,
+                ChatMessageKind::Thinking,
+                None,
+                &serde_json::json!({ "text": t }),
+            ) {
+                tracing::warn!(target: "operon::companion", "persist thinking: {e}");
+            }
+        }
+        ClaudeCodeEvent::ToolUse { id, name, input } => {
+            flush_pending_assistant(transcript, pending_assistant, chat_session, repo);
+            transcript.write().push(TranscriptItem::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+                result: None,
+            });
+            let body = serde_json::json!({
+                "id": id,
+                "name": name,
+                "input": input,
+                "result": serde_json::Value::Null,
+            });
+            if let Err(e) =
+                repo.append(chat_session, ChatMessageKind::ToolCall, Some(&id), &body)
+            {
+                tracing::warn!(target: "operon::companion", "persist tool_use: {e}");
+            }
+        }
+        ClaudeCodeEvent::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => {
+            // Patch in-memory.
+            let mut tx = transcript.write();
+            let mut patched: Option<(String, serde_json::Value)> = None;
+            for item in tx.iter_mut() {
+                if let TranscriptItem::ToolCall {
+                    id,
+                    name,
+                    input,
+                    result,
+                } = item
+                {
+                    if *id == tool_use_id {
+                        *result = Some(ToolResultBody {
+                            content: content.clone(),
+                            is_error,
+                        });
+                        patched = Some((
+                            id.clone(),
+                            serde_json::json!({
+                                "id": id,
+                                "name": name,
+                                "input": input,
+                                "result": {
+                                    "content": content,
+                                    "is_error": is_error,
+                                },
+                            }),
+                        ));
+                        break;
+                    }
+                }
+            }
+            drop(tx);
+            if let Some((_, body)) = patched {
+                if let Err(e) = repo.update_tool_result(chat_session, &tool_use_id, &body) {
+                    tracing::warn!(target: "operon::companion", "patch tool_result: {e}");
+                }
+            }
+        }
+        ClaudeCodeEvent::Done { stop_reason: _, usage } => {
+            flush_pending_assistant(transcript, pending_assistant, chat_session, repo);
+            if let Some(u) = usage {
+                let mut total = usage_total.write();
+                total.prompt += u.prompt;
+                total.prompt_cached += u.prompt_cached;
+                total.completion += u.completion;
+            }
+        }
+        ClaudeCodeEvent::Error(msg) => {
+            flush_pending_assistant(transcript, pending_assistant, chat_session, repo);
+            let line = format!("error: {msg}");
+            transcript.write().push(TranscriptItem::System(line.clone()));
+            if let Err(e) = repo.append(
+                chat_session,
+                ChatMessageKind::System,
+                None,
+                &serde_json::json!({ "text": line }),
+            ) {
+                tracing::warn!(target: "operon::companion", "persist error: {e}");
+            }
+        }
+    }
+}
+
+fn flush_pending_assistant(
+    transcript: &mut Signal<Vec<TranscriptItem>>,
+    pending: &mut Signal<bool>,
+    chat_session: Uuid,
+    repo: &Arc<dyn crate::shell::companion_state::ChatMessageRepository>,
+) {
+    if !*pending.read() {
+        return;
+    }
+    let body_to_persist: Option<String> = {
+        let tx = transcript.read();
+        tx.iter().rev().find_map(|item| match item {
+            TranscriptItem::AssistantText(b) => Some(b.clone()),
+            // Only the latest contiguous run matters — once we hit a
+            // non-text item from a prior block, stop searching.
+            _ => None,
+        })
+    };
+    if let Some(body) = body_to_persist {
+        if let Err(e) = repo.append(
+            chat_session,
+            ChatMessageKind::Assistant,
+            None,
+            &serde_json::json!({ "body": body }),
+        ) {
+            tracing::warn!(target: "operon::companion", "persist assistant: {e}");
+        }
+    }
+    pending.set(false);
+}
+
+/// If the session's current label is still the default "New chat",
+/// generate a label from the user's first message text and rename. The
+/// derived label is the first line of the message, trimmed and capped at
+/// ~40 visible chars on a word boundary. No-op for sessions that have
+/// already been auto- or manually-renamed.
+fn auto_rename_if_default(
+    session_repo: &Arc<dyn crate::shell::companion_state::ChatSessionRepository>,
+    chat_session: Uuid,
+    user_text: &str,
+    session_version: &mut Signal<u64>,
+) {
+    let row = match session_repo.get(chat_session) {
+        Ok(Some(r)) => r,
+        _ => return,
+    };
+    if row.label != "New chat" {
+        return;
+    }
+    let label = derive_session_label(user_text);
+    if label.is_empty() {
+        return;
+    }
+    if let Err(e) = session_repo.rename(chat_session, &label) {
+        tracing::warn!(
+            target: "operon::companion",
+            "auto-rename session {chat_session}: {e}"
+        );
+        return;
+    }
+    session_version.with_mut(|v| *v += 1);
+}
+
+/// Squeeze a chat-session label out of a free-form user message. First
+/// line, trim, collapse whitespace, cap at ~40 chars on a word boundary,
+/// append `…` when truncated.
+fn derive_session_label(text: &str) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        return String::new();
+    }
+    let collapsed: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX: usize = 40;
+    if collapsed.chars().count() <= MAX {
+        return collapsed;
+    }
+    // Truncate to MAX chars on a word boundary, append ellipsis.
+    let mut head: String = collapsed.chars().take(MAX).collect();
+    if let Some(idx) = head.rfind(' ') {
+        if idx > MAX / 2 {
+            head.truncate(idx);
+        }
+    }
+    head.push('\u{2026}');
+    head
+}
+
+fn transcript_item_from_message(m: &ChatMessage) -> Option<TranscriptItem> {
+    match m.kind {
+        ChatMessageKind::User => m
+            .body
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(|s| TranscriptItem::UserText(s.to_string())),
+        ChatMessageKind::Assistant => m
+            .body
+            .get("body")
+            .and_then(|v| v.as_str())
+            .map(|s| TranscriptItem::AssistantText(s.to_string())),
+        ChatMessageKind::Thinking => m
+            .body
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(|s| TranscriptItem::Thinking(s.to_string())),
+        ChatMessageKind::ToolCall => {
+            let id = m.body.get("id")?.as_str()?.to_string();
+            let name = m.body.get("name")?.as_str()?.to_string();
+            let input = m
+                .body
+                .get("input")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let result = match m.body.get("result") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(r) => {
+                    let content = r
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let is_error =
+                        r.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                    Some(ToolResultBody { content, is_error })
+                }
+            };
+            Some(TranscriptItem::ToolCall {
+                id,
+                name,
+                input,
+                result,
+            })
+        }
+        ChatMessageKind::System => m
+            .body
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(|s| TranscriptItem::System(s.to_string())),
+    }
 }

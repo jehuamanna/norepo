@@ -112,6 +112,47 @@ pub(super) fn all_siblings(
     iter.all(|g| g == first)
 }
 
+/// Shift+ArrowUp/Down extension: grow (or shrink) the multi-selection by
+/// one row in `dir` direction (`+1` for down, `-1` for up). Anchor is the
+/// last clicked row; the new selection is the inclusive range from anchor
+/// to the row one step past `current` in the visible flat list. No-op if
+/// `current` isn't in `visible_flat` or `dir` walks past the edge.
+pub(super) fn extend_keyboard_selection(
+    current: NodeKey,
+    dir: i32,
+    multi_selected: &mut dioxus::prelude::Signal<std::collections::BTreeSet<NodeKey>>,
+    last_clicked: &dioxus::prelude::Signal<Option<NodeKey>>,
+    visible_flat: &dioxus::prelude::Signal<Vec<NodeKey>>,
+) {
+    let flat = visible_flat.read().clone();
+    let cur_pos = match flat.iter().position(|k| k == &current) {
+        Some(p) => p,
+        None => return,
+    };
+    let next_pos = if dir > 0 {
+        cur_pos.checked_add(1).filter(|&i| i < flat.len())
+    } else {
+        cur_pos.checked_sub(1)
+    };
+    let next_idx = match next_pos {
+        Some(p) => p,
+        None => return,
+    };
+    let anchor = (*last_clicked.read()).unwrap_or(current);
+    let anchor_pos = flat.iter().position(|k| k == &anchor).unwrap_or(cur_pos);
+    let (lo, hi) = if anchor_pos <= next_idx {
+        (anchor_pos, next_idx)
+    } else {
+        (next_idx, anchor_pos)
+    };
+    let mut set = multi_selected.read().clone();
+    set.clear();
+    for k in &flat[lo..=hi] {
+        set.insert(*k);
+    }
+    multi_selected.set(set);
+}
+
 /// Track the most recently clicked row so Shift+click can compute a range
 /// over the visible flattened tree.
 #[derive(Clone, Copy)]
@@ -130,7 +171,7 @@ pub struct VisibleFlat(pub Signal<Vec<NodeKey>>);
 /// result populates `DragDescendants` so subsequent `ondragover` events
 /// can reject cycle-creating drops without retraversing.
 #[derive(Clone, Copy)]
-pub struct NotesByProjectCtx(pub Signal<HashMap<Uuid, Vec<LocalNote>>>);
+pub struct NotesByProjectCtx(pub Memo<HashMap<Uuid, Vec<LocalNote>>>);
 
 /// Plans-Phase-8-explorer-undo: panel-scope handle to the explorer's
 /// undo stack and the callback that pops + applies the latest inverse.
@@ -318,39 +359,48 @@ pub fn ExplorerPanel() -> Element {
     let WorkspaceOpenMap(workspace_open) = use_context();
     let WorkspaceTreeQueueCtx(tree_queue) = use_context();
 
-    // Re-fetch project list when version bumps.
-    let projects: Signal<Vec<LocalProject>> = use_signal(Vec::new);
-    let mut projects_setter = projects;
-    {
+    // Hotfix-v2: use_memo is read-driven and fires reliably under Dioxus
+    // 0.7's render scope; use_effect was registering but never invoking
+    // its closure, so mutations (rename, create, delete) bumped
+    // `project_version` to no effect on the UI. Memos auto-recompute on
+    // dependency change. Load failures surface as a visible banner via
+    // `project_load_error` (rendered in the empty-state branch below).
+    let project_load_error: Signal<Option<String>> = use_signal(|| None);
+    let mut error_setter = project_load_error;
+    let projects: Memo<Vec<LocalProject>> = {
         let repo = project_repo.clone();
-        use_effect(move || {
-            let _ = project_version.read();
+        use_memo(move || {
+            let v = *project_version.read();
             match repo.list() {
-                Ok(rows) => projects_setter.set(rows),
-                Err(e) => eprintln!("operon: list local_project failed: {e}"),
+                Ok(rows) => {
+                    eprintln!(
+                        "operon::explorer: projects memo recomputed, version={v}, {} row(s)",
+                        rows.len()
+                    );
+                    error_setter.set(None);
+                    rows
+                }
+                Err(e) => {
+                    let msg = format!("Could not load projects: {e}");
+                    eprintln!("operon::explorer: {msg}");
+                    error_setter.set(Some(msg));
+                    Vec::new()
+                }
             }
-        });
-    }
+        })
+    };
 
     // Workspace-scope tree-state snapshot (which projects are open) lives in
     // app scope (`WorkspaceOpenMap`) so the dedicated search panel shares it.
     // Hydration also lives in app scope; the explorer just reads.
 
-    // Per-project note lists, keyed by project_id. Re-fetched on note_version bump.
-    let notes_by_project: Signal<HashMap<Uuid, Vec<LocalNote>>> = use_signal(HashMap::new);
-    // Plans-Phase-3-explorer-drag-drop-feedback: expose the same signal as
-    // a context so descendant-aware DnD validation lives in NoteRow without
-    // having to thread the snapshot through twenty props.
-    use_context_provider(|| NotesByProjectCtx(notes_by_project));
-    // Plans-Phase-4-explorer-undo-stack: panel-scope undo history. Capacity
-    // 100; wrapped handlers below push inverses before each commit.
-    let mut history: Signal<history::ExplorerHistory> =
-        use_signal(history::ExplorerHistory::default);
-    let mut notes_setter = notes_by_project;
-    {
+    // Hotfix-v2: per-project note lists as a Memo so note_version bumps
+    // (create/rename/delete) drive an automatic re-fetch. Same rationale
+    // as `projects` above — use_effect wasn't firing in this scope.
+    let notes_by_project: Memo<HashMap<Uuid, Vec<LocalNote>>> = {
         let repo = note_repo.clone();
-        use_effect(move || {
-            let _ = note_version.read();
+        use_memo(move || {
+            let v = *note_version.read();
             let project_list = projects.read().clone();
             let mut map = HashMap::new();
             for p in project_list.iter() {
@@ -361,9 +411,21 @@ pub fn ExplorerPanel() -> Element {
                     Err(e) => eprintln!("operon: list_for_project {} failed: {e}", p.id),
                 }
             }
-            notes_setter.set(map);
-        });
-    }
+            eprintln!(
+                "operon::explorer: notes_by_project memo recomputed, version={v}, {} project(s)",
+                map.len()
+            );
+            map
+        })
+    };
+    // Plans-Phase-3-explorer-drag-drop-feedback: expose the same memo as
+    // a context so descendant-aware DnD validation lives in NoteRow without
+    // having to thread the snapshot through twenty props.
+    use_context_provider(|| NotesByProjectCtx(notes_by_project));
+    // Plans-Phase-4-explorer-undo-stack: panel-scope undo history. Capacity
+    // 100; wrapped handlers below push inverses before each commit.
+    let mut history: Signal<history::ExplorerHistory> =
+        use_signal(history::ExplorerHistory::default);
 
     // Per-project note open/closed snapshots, lazily hydrated when a project opens.
     let project_note_open: Signal<HashMap<Uuid, HashMap<String, bool>>> = use_signal(HashMap::new);
@@ -454,13 +516,23 @@ pub fn ExplorerPanel() -> Element {
     });
 
     let project_repo_for_create = project_repo.clone();
-    let on_add_project = move |_| match project_repo_for_create.create("") {
-        Ok(p) => {
-            project_version.with_mut(|v| *v += 1);
-            selected_project.set(Some(p.id));
-            renaming_project_setter.set(Some(p.id));
+    let mut error_setter_for_create = project_load_error;
+    let on_add_project = move |_| {
+        eprintln!("operon::explorer: on_add_project fired");
+        match project_repo_for_create.create("") {
+            Ok(p) => {
+                eprintln!("operon::explorer: created project {} ({})", p.id, p.name);
+                project_version.with_mut(|v| *v += 1);
+                selected_project.set(Some(p.id));
+                renaming_project_setter.set(Some(p.id));
+                error_setter_for_create.set(None);
+            }
+            Err(e) => {
+                let msg = format!("Could not create project: {e}");
+                eprintln!("operon::explorer: {msg}");
+                error_setter_for_create.set(Some(msg));
+            }
         }
-        Err(e) => eprintln!("operon: create local_project failed: {e}"),
     };
 
     let project_repo_for_rename = project_repo.clone();
@@ -488,6 +560,21 @@ pub fn ExplorerPanel() -> Element {
         pending_delete_project_setter.set(Some(id));
     });
     let on_delete_project_noop = use_callback(move |_id: Uuid| {});
+
+    // M1-companion-claude-code: bind / clear the project's git repository
+    // path. Persists to SQL and bumps `project_version` so the explorer +
+    // companion-pane subscribers refresh.
+    let project_repo_for_set_repo = project_repo.clone();
+    let on_set_repo_path = use_callback(
+        move |(id, new_path): (Uuid, Option<std::path::PathBuf>)| {
+            match project_repo_for_set_repo.set_repo_path(id, new_path.as_deref()) {
+                Ok(()) => {
+                    project_version.with_mut(|v| *v += 1);
+                }
+                Err(e) => eprintln!("operon: set repo_path failed: {e}"),
+            }
+        },
+    );
 
     // Toggle project open/closed; persists via the debounce queue.
     let queue_for_project_toggle = tree_queue;
@@ -1982,12 +2069,14 @@ pub fn ExplorerPanel() -> Element {
     });
 
     // Plans-Phase-4-multiselect-aria: maintain a global visible-flat tree
-    // signal so Shift+click can compute true ranges. Recomputed on every
-    // ExplorerPanel render — Dioxus signals are cheap and the inputs
-    // already drive a re-render of the tree.
+    // signal so Shift+click can compute true ranges. Computed via use_memo
+    // (read-driven, fires reliably even when sibling use_effects don't),
+    // then synced into the context Signal so child rows can read it. The
+    // peek+set guard avoids infinite render loops when the computed value
+    // is unchanged.
     let visible_flat: Signal<Vec<NodeKey>> = use_context::<VisibleFlat>().0;
     let mut visible_flat_setter = visible_flat;
-    use_effect(move || {
+    let visible_flat_memo: Memo<Vec<NodeKey>> = use_memo(move || {
         let projects_snap = projects.read().clone();
         let workspace_snap = workspace_open.read().clone();
         let notes_snap = notes_by_project.read().clone();
@@ -2013,8 +2102,17 @@ pub fn ExplorerPanel() -> Element {
                 out.push(NodeKey::Note(n.id));
             }
         }
-        visible_flat_setter.set(out);
+        out
     });
+    // Sync inline on every render so shift+click sees a fresh list even
+    // if the use_effect path is delayed. The peek+set guard prevents
+    // re-render loops when the value is unchanged.
+    {
+        let next = visible_flat_memo.read().clone();
+        if visible_flat_setter.peek().clone() != next {
+            visible_flat_setter.set(next);
+        }
+    }
 
     // ===== Render =====
     let projects_snapshot = projects.read().clone();
@@ -2263,7 +2361,14 @@ pub fn ExplorerPanel() -> Element {
                         }
                     }
                 },
-                if projects_snapshot.is_empty() {
+                if let Some(err) = project_load_error.read().as_ref() {
+                    div {
+                        class: "px-3 py-6 text-xs text-rose-500 text-center",
+                        "data-testid": "explorer-load-error",
+                        role: "alert",
+                        "{err}"
+                    }
+                } else if projects_snapshot.is_empty() {
                     div {
                         class: "px-3 py-6 text-xs opacity-60 text-center",
                         "data-testid": "explorer-empty",
@@ -2326,6 +2431,7 @@ pub fn ExplorerPanel() -> Element {
                             on_bulk_cut: on_bulk_cut,
                             on_bulk_copy: on_bulk_copy,
                             on_bulk_request_delete: on_bulk_request_delete,
+                            on_set_repo_path: on_set_repo_path,
                         }
                     }
                 }
@@ -2580,6 +2686,8 @@ struct ProjectSubtreeProps {
     on_bulk_cut: Callback<()>,
     on_bulk_copy: Callback<()>,
     on_bulk_request_delete: Callback<()>,
+    /// M1-companion-claude-code: bind / clear the project's git repository.
+    on_set_repo_path: Callback<(Uuid, Option<std::path::PathBuf>)>,
 }
 
 #[component]
@@ -2658,6 +2766,7 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
             on_bulk_cut: props.on_bulk_cut,
             on_bulk_copy: props.on_bulk_copy,
             on_bulk_request_delete: props.on_bulk_request_delete,
+            on_set_repo_path: props.on_set_repo_path,
         }
         for note in visible.into_iter() {
             {

@@ -207,6 +207,72 @@ impl TabManager {
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
     }
+
+    pub fn len(&self) -> usize {
+        self.tabs.len()
+    }
+
+    /// Activate the tab whose 0-based index in the strip matches `index`.
+    /// No-op when out of bounds.
+    pub fn activate_index(&mut self, index: usize) {
+        if let Some(t) = self.tabs.get(index) {
+            self.active = Some(t.id);
+        }
+    }
+
+    /// Activate the tab to the right of the active one. Wraps to the first
+    /// tab when the active tab is the last one. No-op when empty or when
+    /// no tab is active.
+    pub fn activate_next(&mut self) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let cur = self
+            .active
+            .and_then(|id| self.tabs.iter().position(|t| t.id == id))
+            .unwrap_or(0);
+        let next = (cur + 1) % self.tabs.len();
+        self.active = Some(self.tabs[next].id);
+    }
+
+    /// Reorder `from_id` next to `to_id`. `place_before == true` puts it
+    /// at the slot occupied by `to_id` (pushing the target one slot to
+    /// the right); `place_before == false` puts it after the target. The
+    /// active tab id is preserved across the move. No-op if either id is
+    /// missing or `from_id == to_id`.
+    pub fn reorder(&mut self, from_id: TabId, to_id: TabId, place_before: bool) {
+        if from_id == to_id {
+            return;
+        }
+        let Some(from_idx) = self.tabs.iter().position(|t| t.id == from_id) else {
+            return;
+        };
+        let tab = self.tabs.remove(from_idx);
+        let Some(mut to_idx) = self.tabs.iter().position(|t| t.id == to_id) else {
+            // Target disappeared between the drag and the drop — restore.
+            self.tabs.insert(from_idx.min(self.tabs.len()), tab);
+            return;
+        };
+        if !place_before {
+            to_idx += 1;
+        }
+        let dest = to_idx.min(self.tabs.len());
+        self.tabs.insert(dest, tab);
+    }
+
+    /// Activate the tab to the left of the active one. Wraps to the last
+    /// tab when the active tab is the first one.
+    pub fn activate_prev(&mut self) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let cur = self
+            .active
+            .and_then(|id| self.tabs.iter().position(|t| t.id == id))
+            .unwrap_or(0);
+        let prev = if cur == 0 { self.tabs.len() - 1 } else { cur - 1 };
+        self.active = Some(self.tabs[prev].id);
+    }
 }
 
 #[cfg(test)]
@@ -308,6 +374,90 @@ mod tests {
         let id = open_md(&mut tm, "n1", "T");
         let t = tm.get(id).unwrap();
         assert!(!t.manual_save);
+    }
+
+    #[test]
+    fn activate_next_wraps_around() {
+        let mut tm = TabManager::new();
+        let n1 = open_md(&mut tm, "n1", "T1");
+        let n2 = open_md(&mut tm, "n2", "T2");
+        tm.activate(n1);
+        tm.activate_next();
+        assert_eq!(tm.active_id(), Some(n2));
+        tm.activate_next();
+        assert_eq!(tm.active_id(), Some(n1));
+    }
+
+    #[test]
+    fn activate_prev_wraps_around() {
+        let mut tm = TabManager::new();
+        let n1 = open_md(&mut tm, "n1", "T1");
+        let n2 = open_md(&mut tm, "n2", "T2");
+        tm.activate(n1);
+        tm.activate_prev();
+        assert_eq!(tm.active_id(), Some(n2));
+        tm.activate_prev();
+        assert_eq!(tm.active_id(), Some(n1));
+    }
+
+    #[test]
+    fn reorder_moves_before_target() {
+        let mut tm = TabManager::new();
+        let n1 = open_md(&mut tm, "n1", "T1");
+        let n2 = open_md(&mut tm, "n2", "T2");
+        let n3 = open_md(&mut tm, "n3", "T3");
+        tm.reorder(n3, n1, true);
+        let order: Vec<_> = tm.iter().map(|t| t.id).collect();
+        assert_eq!(order, vec![n3, n1, n2]);
+    }
+
+    #[test]
+    fn reorder_moves_after_target() {
+        let mut tm = TabManager::new();
+        let n1 = open_md(&mut tm, "n1", "T1");
+        let n2 = open_md(&mut tm, "n2", "T2");
+        let n3 = open_md(&mut tm, "n3", "T3");
+        tm.reorder(n1, n3, false);
+        let order: Vec<_> = tm.iter().map(|t| t.id).collect();
+        assert_eq!(order, vec![n2, n3, n1]);
+    }
+
+    #[test]
+    fn reorder_preserves_active_id() {
+        let mut tm = TabManager::new();
+        let n1 = open_md(&mut tm, "n1", "T1");
+        let n2 = open_md(&mut tm, "n2", "T2");
+        tm.activate(n1);
+        tm.reorder(n1, n2, false);
+        assert_eq!(tm.active_id(), Some(n1));
+    }
+
+    #[test]
+    fn reorder_self_is_noop() {
+        let mut tm = TabManager::new();
+        let n1 = open_md(&mut tm, "n1", "T1");
+        let n2 = open_md(&mut tm, "n2", "T2");
+        tm.reorder(n1, n1, true);
+        let order: Vec<_> = tm.iter().map(|t| t.id).collect();
+        assert_eq!(order, vec![n1, n2]);
+    }
+
+    #[test]
+    fn reorder_unknown_target_keeps_order() {
+        let mut tm = TabManager::new();
+        let n1 = open_md(&mut tm, "n1", "T1");
+        let n2 = open_md(&mut tm, "n2", "T2");
+        tm.reorder(n1, TabId(9999), false);
+        let order: Vec<_> = tm.iter().map(|t| t.id).collect();
+        assert_eq!(order, vec![n1, n2]);
+    }
+
+    #[test]
+    fn activate_index_clamps_silently() {
+        let mut tm = TabManager::new();
+        let n1 = open_md(&mut tm, "n1", "T1");
+        tm.activate_index(99);
+        assert_eq!(tm.active_id(), Some(n1));
     }
 
     #[test]

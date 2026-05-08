@@ -301,11 +301,17 @@
   .w-screen {
     width: 100vw;
   }
+  .min-w-0 {
+    min-width: calc(var(--spacing) * 0);
+  }
   .flex-1 {
     flex: 1;
   }
   .shrink-0 {
     flex-shrink: 0;
+  }
+  .grow {
+    flex-grow: 1;
   }
   .transform {
     transform: var(--tw-rotate-x,) var(--tw-rotate-y,) var(--tw-rotate-z,) var(--tw-skew-x,) var(--tw-skew-y,);
@@ -321,6 +327,9 @@
   }
   .flex-wrap {
     flex-wrap: wrap;
+  }
+  .items-baseline {
+    align-items: baseline;
   }
   .items-center {
     align-items: center;
@@ -454,6 +463,9 @@
   }
   .text-inherit {
     color: inherit;
+  }
+  .text-rose-500 {
+    color: var(--color-rose-500);
   }
   .lowercase {
     text-transform: lowercase;

@@ -5161,6 +5161,7 @@ dependencies = [
  "notify",
  "operon-core",
  "operon-plugins-anthropic",
+ "operon-plugins-claude-code",
  "operon-plugins-mcp",
  "operon-store",
  "png 0.17.16",
@@ -5225,6 +5226,21 @@ dependencies = [
  "futures",
  "operon-core",
  "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "operon-plugins-claude-code"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "operon-core",
  "serde",
  "serde_json",
  "tempfile",

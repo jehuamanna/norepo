@@ -3,6 +3,7 @@
 use dioxus::prelude::*;
 use dioxus::html::HasFileData;
 use operon_store::repos::LocalProject;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 use operon_store::repos::NoteKind;
@@ -60,6 +61,10 @@ pub struct ProjectRowProps {
     pub on_bulk_cut: Callback<()>,
     pub on_bulk_copy: Callback<()>,
     pub on_bulk_request_delete: Callback<()>,
+    /// M1-companion-claude-code: bind / clear the project's git repository
+    /// path. The companion-pane Claude session runs with cwd=repo_path.
+    /// Tuple is (project_id, new_path | None).
+    pub on_set_repo_path: Callback<(Uuid, Option<PathBuf>)>,
 }
 
 #[component]
@@ -94,6 +99,10 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     let id = project.id;
     let id_str = id.to_string();
     let name = project.name.clone();
+    let repo_subtitle = project
+        .repo_path
+        .as_ref()
+        .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()));
 
     let in_multi = multi_selected.read().contains(&NodeKey::Project(id));
     let bulk_count = multi_selected.read().len();
@@ -121,6 +130,8 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     let on_bulk_cut = props.on_bulk_cut;
     let on_bulk_copy = props.on_bulk_copy;
     let on_bulk_request_delete = props.on_bulk_request_delete;
+    let on_set_repo_path = props.on_set_repo_path;
+    let has_repo = project.repo_path.is_some();
 
     let mut row_class = if selected {
         String::from("notes-explorer-row notes-explorer-row-project notes-explorer-row-active group")
@@ -164,6 +175,29 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     );
     paste_item.enabled = has_clip_note;
 
+    // M1-companion-claude-code: open the OS folder picker, then route the
+    // selection (or a None on Clear) through `on_set_repo_path`.
+    let pick_repo = {
+        let on_set_repo_path = on_set_repo_path;
+        Callback::new(move |_| {
+            spawn(async move {
+                let folder = rfd::AsyncFileDialog::new()
+                    .set_title("Select repository folder for this project")
+                    .pick_folder()
+                    .await;
+                if let Some(handle) = folder {
+                    on_set_repo_path.call((id, Some(handle.path().to_path_buf())));
+                }
+            });
+        })
+    };
+    let clear_repo = {
+        let on_set_repo_path = on_set_repo_path;
+        Callback::new(move |_| {
+            on_set_repo_path.call((id, None));
+        })
+    };
+
     let menu_items: Vec<ContextMenuItem> = vec![
         ContextMenuItem::new(
             "Rename",
@@ -171,6 +205,19 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
                 on_request_rename.call(id);
             }),
         ),
+        ContextMenuItem::new(
+            if has_repo {
+                "Change repository\u{2026}"
+            } else {
+                "Set repository\u{2026}"
+            },
+            pick_repo,
+        ),
+        {
+            let mut item = ContextMenuItem::new("Clear repository", clear_repo);
+            item.enabled = has_repo;
+            item
+        },
         ContextMenuItem::submenu(
             "Add note",
             NoteKind::all_creatable()
@@ -278,7 +325,94 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
             "aria-level": "1",
             "aria-selected": if selected { "true" } else { "false" },
             "aria-expanded": if is_open { "true" } else { "false" },
+            tabindex: "0",
             draggable: "true",
+            onkeydown: move |evt| {
+                let key = evt.key().to_string();
+                let mods = evt.modifiers();
+                let with_meta = mods.contains(Modifiers::META)
+                    || mods.contains(Modifiers::CONTROL);
+                if with_meta && mods.contains(Modifiers::SHIFT)
+                    && !mods.contains(Modifiers::ALT)
+                    && key.eq_ignore_ascii_case("c")
+                {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    crate::util::clipboard::copy_text(&id.to_string());
+                    return;
+                }
+                if key == "ArrowDown" && mods.contains(Modifiers::SHIFT) {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    crate::local_mode::explorer::extend_keyboard_selection(
+                        NodeKey::Project(id),
+                        1,
+                        &mut multi_selected,
+                        &last_clicked,
+                        &visible_flat,
+                    );
+                    super::note_row::focus_explorer_sibling(1);
+                } else if key == "ArrowUp" && mods.contains(Modifiers::SHIFT) {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    crate::local_mode::explorer::extend_keyboard_selection(
+                        NodeKey::Project(id),
+                        -1,
+                        &mut multi_selected,
+                        &last_clicked,
+                        &visible_flat,
+                    );
+                    super::note_row::focus_explorer_sibling(-1);
+                } else if key == "ArrowDown" {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    super::note_row::focus_explorer_sibling(1);
+                } else if key == "ArrowUp" {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    super::note_row::focus_explorer_sibling(-1);
+                } else if key == "ArrowRight" {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    if !is_open {
+                        on_toggle.call(id);
+                    } else {
+                        super::note_row::focus_explorer_sibling(1);
+                    }
+                } else if key == "ArrowLeft" {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    if is_open {
+                        on_toggle.call(id);
+                    }
+                } else if key == "Home" {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    super::note_row::focus_explorer_edge(true);
+                } else if key == "End" {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    super::note_row::focus_explorer_edge(false);
+                } else if key == "Enter" {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    on_select.call(id);
+                } else if key == " " {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    on_toggle.call(id);
+                } else if key == "F2" {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    on_request_rename.call(id);
+                } else if (key == "Delete" || key == "Backspace")
+                    && multi_selected.read().len() < 2
+                {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    on_request_delete.call(id);
+                }
+            },
             onclick: move |evt| {
                 evt.stop_propagation();
                 let mods = evt.modifiers();
@@ -508,9 +642,17 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
                 }
             } else {
                 span {
-                    class: "truncate flex-1",
+                    class: "truncate flex-1 flex items-baseline gap-2 min-w-0",
                     "data-testid": "project-row-name",
-                    "{name}"
+                    span { class: "truncate", "{name}" }
+                    if let Some(sub) = repo_subtitle.clone() {
+                        span {
+                            class: "text-xs opacity-60 truncate font-mono",
+                            "data-testid": "project-row-repo-subtitle",
+                            title: project.repo_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+                            "{sub}"
+                        }
+                    }
                 }
                 button {
                     r#type: "button",

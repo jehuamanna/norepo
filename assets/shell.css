@@ -5,6 +5,58 @@
  * root via the data-theme attribute (source of truth: src/theme/defaults.rs).
  */
 
+/* Accessibility: a single, consistent focus ring across every interactive
+ * shell affordance. Only fires for keyboard focus (focus-visible), so mouse
+ * clicks don't leave a stray outline. Uses --vscode-focusborder so it
+ * always picks up the active theme's accent. */
+.operon-shell-grid :focus-visible,
+.operon-shell-grid [tabindex]:focus-visible,
+.operon-tab:focus-visible,
+.operon-activity-item:focus-visible,
+.operon-activity-toggle:focus-visible,
+.operon-toggle-btn:focus-visible,
+.operon-menubar-button:focus-visible,
+.operon-dropdown-item:focus-visible,
+.operon-splitter:focus-visible,
+.notes-explorer-row:focus-visible,
+.notes-explorer-toolbar-add:focus-visible {
+  outline: 2px solid var(--vscode-focusborder, #007fd4);
+  outline-offset: -2px;
+  z-index: 1;
+  position: relative;
+}
+
+.operon-splitter:focus-visible {
+  background: var(--vscode-focusborder, #007fd4);
+  opacity: 0.5;
+}
+
+/* Keyboard-activated tab/treeitem rows get a clearer marker since the
+ * outline-offset would otherwise hide behind the row's left accent. */
+.notes-explorer-row:focus-visible,
+.operon-dropdown-item:focus-visible {
+  outline-offset: -1px;
+}
+
+/* Skip link: visually hidden until focused so a keyboard user lands on it
+ * first and can jump to the main editor area. */
+.operon-skip-link {
+  position: absolute;
+  left: -9999px;
+  top: -9999px;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-editor-foreground);
+  padding: 6px 10px;
+  border: 1px solid var(--vscode-focusborder, #007fd4);
+  border-radius: 4px;
+  z-index: 10000;
+  font-size: 13px;
+}
+.operon-skip-link:focus {
+  left: 8px;
+  top: 8px;
+}
+
 html, body {
   margin: 0;
   padding: 0;
@@ -885,6 +937,35 @@ html, body {
   gap: 12px;
 }
 
+/* Each metadata segment in the status bar gets a faint vertical separator
+ * on its left edge so they read as discrete pills without committing to
+ * boxes. Skipped on the brand label (first child). */
+.operon-status-section {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px;
+  border-left: 1px solid var(--vscode-panel-border);
+  white-space: nowrap;
+  max-width: 28ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: default;
+}
+
+.operon-status-title {
+  font-weight: 600;
+  max-width: 32ch;
+}
+
+.operon-status-dirty[data-dirty="true"] {
+  color: var(--vscode-focusborder, #007fd4);
+}
+
+.operon-status-kind[data-note-kind="image"] {
+  font-style: italic;
+}
+
 /* ============================================================
  * Explorer drag-and-drop polish.
  *
@@ -1014,3 +1095,423 @@ html, body {
     transition: left 0ms, height 0ms, opacity 0ms;
   }
 }
+
+/* ============================================================
+ * Companion pane: rail + chat grid (M1.5a)
+ *
+ * The companion area now hosts a session rail on the left and the
+ * existing chat surface on the right. The rail's tabs flip between
+ * Project / Vault scope; the list shows the chat_session rows for
+ * that scope (most-recently-used first); + creates a new chat.
+ * ============================================================ */
+
+/* Override the bare-bones M1 padding; the rail handles its own insets
+ * and the chat surface needs full width. The rail+chat grid lives on
+ * `.operon-companion-chat-grid` (the only child of CompanionChat). */
+.operon-companion-area {
+  padding: 0;
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.operon-companion-chat-grid {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: var(--operon-companion-rail-width, 180px) 1fr;
+  min-width: 0;
+  min-height: 0;
+}
+
+.operon-companion-rail {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-sidebar-background, var(--vscode-panel-background));
+  min-width: 0;
+}
+
+.operon-companion-rail-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.operon-companion-rail-tab {
+  flex: 1 1 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 6px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--vscode-tab-inactiveforeground, var(--vscode-editor-foreground));
+  background: transparent;
+  border: none;
+  border-right: 1px solid var(--vscode-panel-border);
+  cursor: pointer;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.operon-companion-rail-tab:last-child {
+  border-right: none;
+}
+
+.operon-companion-rail-tab[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.operon-companion-rail-tab:hover:not([disabled]) {
+  background: var(--vscode-list-hoverbackground, rgba(127, 127, 127, 0.1));
+}
+
+.operon-companion-rail-tab-active {
+  color: var(--vscode-tab-activeforeground, var(--vscode-editor-foreground));
+  background: var(--vscode-tab-activebackground, transparent);
+  box-shadow: inset 0 -2px 0 var(--operon-accent);
+}
+
+.operon-companion-rail-new {
+  margin: 8px;
+  padding: 6px 8px;
+  font-size: 12px;
+  text-align: left;
+  color: var(--vscode-button-foreground, var(--vscode-editor-foreground));
+  background: var(--vscode-button-background, transparent);
+  border: 1px dashed var(--vscode-panel-border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.operon-companion-rail-new:hover {
+  background: var(--vscode-button-hoverbackground, var(--vscode-list-hoverbackground, rgba(127, 127, 127, 0.15)));
+}
+
+.operon-companion-rail-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.operon-companion-rail-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--vscode-foreground, var(--vscode-editor-foreground));
+  cursor: pointer;
+  border-left: 2px solid transparent;
+}
+
+.operon-companion-rail-item:hover {
+  background: var(--vscode-list-hoverbackground, rgba(127, 127, 127, 0.1));
+}
+
+.operon-companion-rail-item-active {
+  background: var(--vscode-list-activeselectionbackground, rgba(127, 127, 127, 0.2));
+  border-left-color: var(--operon-accent);
+}
+
+.operon-companion-rail-item-label {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.operon-companion-rail-item-delete {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+  cursor: pointer;
+  padding: 0 4px;
+  font-size: 11px;
+  opacity: 0;
+  transition: opacity 80ms ease-out;
+}
+
+.operon-companion-rail-item:hover .operon-companion-rail-item-delete,
+.operon-companion-rail-item-active .operon-companion-rail-item-delete {
+  opacity: 1;
+}
+
+.operon-companion-rail-item-delete:hover {
+  color: var(--vscode-errorforeground, #f48771);
+}
+
+.operon-companion-rail-empty {
+  padding: 12px;
+  font-size: 11px;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+  font-style: italic;
+}
+
+/* The chat surface fills the right-hand column of the companion grid. */
+.operon-companion-chat {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  padding: 8px 12px;
+  gap: 8px;
+}
+
+.operon-companion-chat-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.operon-companion-chat-transcript {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.operon-companion-chat-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.operon-companion-chat-input {
+  width: 100%;
+  min-height: 64px;
+  resize: vertical;
+  font: inherit;
+  padding: 6px 8px;
+  background: var(--vscode-input-background, transparent);
+  color: var(--vscode-input-foreground, var(--vscode-editor-foreground));
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  border-radius: 4px;
+}
+
+.operon-companion-chat-input:disabled {
+  opacity: 0.5;
+}
+
+.operon-companion-chat-send,
+.operon-companion-chat-stop {
+  align-self: flex-end;
+  padding: 4px 12px;
+  font-size: 12px;
+  background: var(--vscode-button-background, transparent);
+  color: var(--vscode-button-foreground, var(--vscode-editor-foreground));
+  border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.operon-companion-chat-send:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.operon-companion-msg {
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.operon-companion-msg-user {
+  align-self: flex-end;
+  max-width: 90%;
+  background: var(--vscode-list-activeselectionbackground, rgba(127, 127, 127, 0.18));
+}
+
+.operon-companion-msg-assistant {
+  align-self: flex-start;
+  max-width: 100%;
+  background: transparent;
+}
+
+.operon-companion-msg-system {
+  align-self: stretch;
+  background: var(--vscode-editorinfo-background, rgba(127, 127, 127, 0.08));
+  font-style: italic;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+}
+
+/* The assistant bubble holds a `markdown-prose` article; reset its
+ * default block margins so the bubble is compact in the chat list. */
+.operon-companion-msg-assistant .markdown-prose > :first-child {
+  margin-top: 0;
+}
+.operon-companion-msg-assistant .markdown-prose > :last-child {
+  margin-bottom: 0;
+}
+.operon-companion-msg-assistant .markdown-prose pre {
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
+/* ------------ Thinking block (collapsible, dim italic) ------------ */
+.operon-companion-thinking {
+  align-self: stretch;
+  font-size: 12px;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+  opacity: 0.75;
+  border-left: 2px solid var(--vscode-panel-border);
+  padding: 2px 8px;
+}
+.operon-companion-thinking summary {
+  cursor: pointer;
+  font-style: italic;
+  user-select: none;
+}
+.operon-companion-thinking-body {
+  margin: 4px 0 0 0;
+  white-space: pre-wrap;
+  font-family: inherit;
+  font-style: italic;
+}
+
+/* ------------ Tool-use card (collapsible, per-tool body) ------------ */
+.operon-tool-card {
+  align-self: stretch;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  background: var(--vscode-editorWidget-background, rgba(127, 127, 127, 0.04));
+  font-size: 12px;
+  overflow: hidden;
+}
+.operon-tool-card[data-pending="true"] {
+  border-color: var(--operon-accent);
+}
+.operon-tool-card[data-error="true"] {
+  border-color: var(--vscode-errorforeground, #f48771);
+}
+.operon-tool-card-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+.operon-tool-card-summary::-webkit-details-marker { display: none; }
+.operon-tool-card-summary::marker { content: ''; }
+.operon-tool-card-icon {
+  flex: 0 0 auto;
+}
+.operon-tool-card-name {
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+.operon-tool-card-arg {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+}
+.operon-tool-card-status {
+  flex: 0 0 auto;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.operon-tool-card-status-pending {
+  background: var(--operon-accent);
+  color: var(--vscode-button-foreground, white);
+}
+.operon-tool-card-status-ok {
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+}
+.operon-tool-card-status-error {
+  background: var(--vscode-errorforeground, #f48771);
+  color: var(--vscode-button-foreground, white);
+}
+.operon-tool-card-body {
+  padding: 6px 8px;
+  border-top: 1px solid var(--vscode-panel-border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.operon-tool-card-meta {
+  font-size: 11px;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.operon-tool-card-pre {
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--vscode-textCodeBlock-background, rgba(127, 127, 127, 0.08));
+  border-radius: 4px;
+  white-space: pre-wrap;
+  overflow-x: auto;
+  max-height: 320px;
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  font-size: 11px;
+}
+.operon-tool-card-result-pending {
+  font-style: italic;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+}
+.operon-tool-card-result-error {
+  border-left: 2px solid var(--vscode-errorforeground, #f48771);
+}
+.operon-tool-card-result-ok {
+  border-left: 2px solid var(--operon-accent);
+}
+.operon-tool-card-diff {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.operon-tool-card-diff-old {
+  border-left: 2px solid #d36464;
+  background: rgba(211, 100, 100, 0.06);
+}
+.operon-tool-card-diff-new {
+  border-left: 2px solid #6cb56c;
+  background: rgba(108, 181, 108, 0.06);
+}
+
+/* ------------ Cost meter footer ------------ */
+.operon-companion-cost-meter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 8px;
+  font-size: 11px;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+  border-top: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-editorWidget-background, rgba(127, 127, 127, 0.04));
+  min-height: 22px;
+  flex: 0 0 auto;
+}
+.operon-companion-cost-meter-empty {
+  /* Reserve the slot when there's no usage yet so the composer doesn't
+   * jump on the first turn. */
+  visibility: hidden;
+}
+.operon-companion-cost-segment {
+  font-variant-numeric: tabular-nums;
+}
+.operon-companion-cost-cost {
+  margin-left: auto;
+  font-weight: 600;
+  color: var(--vscode-foreground, var(--vscode-editor-foreground));
+}
+

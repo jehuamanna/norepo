@@ -45,6 +45,16 @@ pub fn LocalStateProvider(children: Element) -> Element {
         Arc::new(SqliteLocalTreeStateRepository::new(store.clone()));
     let link_repo: Arc<dyn LocalNoteLinkRepository> =
         Arc::new(SqliteLocalNoteLinkRepository::new(store.clone()));
+    let chat_session_repo: Arc<
+        dyn operon_store::repos::ChatSessionRepository,
+    > = Arc::new(operon_store::repos::SqliteChatSessionRepository::new(
+        store.clone(),
+    ));
+    let chat_message_repo: Arc<
+        dyn operon_store::repos::ChatMessageRepository,
+    > = Arc::new(operon_store::repos::SqliteChatMessageRepository::new(
+        store.clone(),
+    ));
     let search_repo: Arc<dyn LocalSearchRepository> =
         Arc::new(SqliteLocalSearchRepository::new(store));
     use_context_provider(|| LocalUserRepo(user_repo));
@@ -54,6 +64,8 @@ pub fn LocalStateProvider(children: Element) -> Element {
     use_context_provider(|| LocalTreeStateRepo(tree_repo));
     use_context_provider(|| LocalNoteLinkRepo(link_repo));
     use_context_provider(|| ExplorerSearchRepo(search_repo));
+    use_context_provider(|| crate::shell::companion_state::ChatSessionRepo(chat_session_repo));
+    use_context_provider(|| crate::shell::companion_state::ChatMessageRepo(chat_message_repo));
     rsx! { {children} }
 }
 
@@ -120,6 +132,16 @@ pub fn provide_local_state() {
         Arc::new(SqliteLocalTreeStateRepository::new(store.clone()));
     let link_repo: Arc<dyn LocalNoteLinkRepository> =
         Arc::new(SqliteLocalNoteLinkRepository::new(store.clone()));
+    let chat_session_repo: Arc<
+        dyn operon_store::repos::ChatSessionRepository,
+    > = Arc::new(operon_store::repos::SqliteChatSessionRepository::new(
+        store.clone(),
+    ));
+    let chat_message_repo: Arc<
+        dyn operon_store::repos::ChatMessageRepository,
+    > = Arc::new(operon_store::repos::SqliteChatMessageRepository::new(
+        store.clone(),
+    ));
     let search_repo: Arc<dyn LocalSearchRepository> =
         Arc::new(SqliteLocalSearchRepository::new(store));
     use_context_provider(|| LocalUserRepo(user_repo));
@@ -129,6 +151,8 @@ pub fn provide_local_state() {
     use_context_provider(|| LocalTreeStateRepo(tree_repo));
     use_context_provider(|| LocalNoteLinkRepo(link_repo));
     use_context_provider(|| ExplorerSearchRepo(search_repo));
+    use_context_provider(|| crate::shell::companion_state::ChatSessionRepo(chat_session_repo));
+    use_context_provider(|| crate::shell::companion_state::ChatMessageRepo(chat_message_repo));
 }
 
 fn open_local_store() -> Store {
@@ -448,6 +472,29 @@ pub fn provide_local_app_signals() {
     use_context_provider(|| LocalNoteVersion(note_version));
     let selected_project: Signal<Option<Uuid>> = use_signal(|| None);
     use_context_provider(|| SelectedProject(selected_project));
+    // M1-companion-claude-code: expose the active project's repo_path as a
+    // shared signal so the companion-pane Claude session can rebind its cwd.
+    let active_repo_path: Signal<Option<std::path::PathBuf>> = use_signal(|| None);
+    use_context_provider(|| {
+        crate::shell::companion_state::ActiveRepoPath(active_repo_path)
+    });
+    // M1.5a-multi-session: companion-pane scope tab + currently-open chat
+    // session. Default scope: Vault (companion can chat against the vault
+    // even before any project is selected). The session rail flips this
+    // when the user clicks the Project / Global tab.
+    let active_chat_scope: Signal<crate::shell::companion_state::ChatScope> =
+        use_signal(|| crate::shell::companion_state::ChatScope::Vault);
+    use_context_provider(|| {
+        crate::shell::companion_state::ActiveChatScope(active_chat_scope)
+    });
+    let active_chat_session: Signal<Option<Uuid>> = use_signal(|| None);
+    use_context_provider(|| {
+        crate::shell::companion_state::ActiveChatSession(active_chat_session)
+    });
+    let chat_session_version: Signal<u64> = use_signal(|| 0);
+    use_context_provider(|| {
+        crate::shell::companion_state::ChatSessionVersion(chat_session_version)
+    });
     let selected_note: Signal<Option<Uuid>> = use_signal(|| None);
     use_context_provider(|| SelectedNote(selected_note));
     // Plans-Phase-4-multiselect-aria: parallel multi-selection set.
@@ -496,6 +543,29 @@ pub fn provide_local_app_signals() {
                 Ok(snap) => workspace_open_setter.set(snap),
                 Err(e) => eprintln!("operon: tree-state snapshot failed: {e}"),
             }
+        });
+    }
+
+    // M1-companion-claude-code: keep `active_repo_path` in sync with the
+    // currently-selected project. Re-runs on project selection changes AND on
+    // any project mutation (project_version) so a "Set Repository…" click
+    // immediately reaches the companion plugin.
+    {
+        let LocalProjectRepo(project_repo_for_active) =
+            use_context::<LocalProjectRepo>();
+        let mut active_setter = active_repo_path;
+        let selected = selected_project;
+        use_effect(move || {
+            let pid = *selected.read();
+            let _ = project_version.read();
+            let next = pid.and_then(|id| {
+                project_repo_for_active
+                    .list()
+                    .ok()
+                    .and_then(|projects| projects.into_iter().find(|p| p.id == id))
+                    .and_then(|p| p.repo_path)
+            });
+            active_setter.set(next);
         });
     }
 

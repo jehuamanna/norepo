@@ -2,6 +2,8 @@
 
 pub mod attachment;
 pub mod audit;
+pub mod chat_message;
+pub mod chat_session;
 pub mod department;
 pub mod invite;
 pub mod local_note;
@@ -24,6 +26,12 @@ pub mod user;
 
 pub use attachment::{Attachment, AttachmentRepository, SqliteAttachmentRepository};
 pub use audit::{AuditEntry, AuditLogRepository, AuditOutcome, SqliteAuditLogRepository};
+pub use chat_message::{
+    ChatMessage, ChatMessageKind, ChatMessageRepository, SqliteChatMessageRepository,
+};
+pub use chat_session::{
+    ChatScope, ChatSession, ChatSessionRepository, SqliteChatSessionRepository,
+};
 pub use department::{Department, DepartmentRepository, SqliteDepartmentRepository};
 pub use invite::{Invite, InviteRepository, SqliteInviteRepository};
 pub use local_note::{

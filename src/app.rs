@@ -226,12 +226,23 @@ pub fn App() -> Element {
             if (!window.__operonDndShimInstalled) {
                 window.__operonDndShimInstalled = true;
                 document.addEventListener('dragstart', function(e) {
-                    var t = e.target && e.target.closest
-                        ? e.target.closest('[data-explorer="true"][draggable="true"]')
-                        : null;
-                    if (!t || !e.dataTransfer) return;
+                    if (!e.target || !e.dataTransfer) return;
+                    var closest = e.target.closest;
+                    if (!closest) return;
+                    // Cover the explorer tree and the tab strip together.
+                    // webkit2gtk silently aborts a dragstart whose handler
+                    // didn't populate dataTransfer; without this shim
+                    // ondragover / ondrop never fire on the receiving side.
+                    var t = closest.call(e.target,
+                        '[data-explorer="true"][draggable="true"], ' +
+                        '.operon-tab[draggable="true"]'
+                    );
+                    if (!t) return;
                     e.dataTransfer.effectAllowed = 'move';
-                    var id = t.dataset.noteId || t.dataset.projectId || 'operon-row';
+                    var id = t.dataset.noteId
+                        || t.dataset.projectId
+                        || t.dataset.tabId
+                        || 'operon-row';
                     try { e.dataTransfer.setData('text/plain', id); } catch (_) {}
                 }, true);
             }

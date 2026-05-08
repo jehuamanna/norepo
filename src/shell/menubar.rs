@@ -57,6 +57,8 @@ pub fn Menubar() -> Element {
         section {
             "data-region": "menubar",
             class: "operon-menubar",
+            role: "menubar",
+            "aria-label": "Application menu",
             OperonBrand {}
             div { class: "operon-menubar-items",
                 for menu in MenuId::ALL.iter().copied() {
@@ -72,8 +74,13 @@ pub fn Menubar() -> Element {
                             div {
                                 class: "operon-menubar-button-wrapper",
                                 button {
+                                    r#type: "button",
                                     class: "{cls}",
                                     "data-menu": "{label}",
+                                    role: "menuitem",
+                                    "aria-haspopup": "menu",
+                                    "aria-expanded": if is_open { "true" } else { "false" },
+                                    "aria-label": "{label}",
                                     onclick: move |evt| {
                                         evt.stop_propagation();
                                         let cur = open_menu.read().as_ref().copied();
@@ -81,6 +88,32 @@ pub fn Menubar() -> Element {
                                             open_menu.set(None);
                                         } else {
                                             open_menu.set(Some(menu));
+                                        }
+                                    },
+                                    onkeydown: move |evt| {
+                                        let key = evt.key().to_string();
+                                        if key == "ArrowDown" || key == "Enter" || key == " " {
+                                            evt.prevent_default();
+                                            open_menu.set(Some(menu));
+                                        } else if key == "ArrowLeft" || key == "ArrowRight" {
+                                            evt.prevent_default();
+                                            let dir = if key == "ArrowRight" { 1i32 } else { -1i32 };
+                                            let script = format!(
+                                                r#"
+                                                (function() {{
+                                                    var nodes = Array.prototype.slice.call(document.querySelectorAll('.operon-menubar-button'));
+                                                    if (!nodes.length) return;
+                                                    var cur = document.activeElement;
+                                                    var idx = nodes.indexOf(cur);
+                                                    if (idx < 0) idx = 0;
+                                                    var next = idx + ({dir});
+                                                    if (next < 0) next = nodes.length - 1;
+                                                    if (next >= nodes.length) next = 0;
+                                                    nodes[next].focus();
+                                                }})();
+                                                "#
+                                            );
+                                            document::eval(&script);
                                         }
                                     },
                                     "{label}"
@@ -93,16 +126,20 @@ pub fn Menubar() -> Element {
             }
             div { class: "operon-menubar-right",
                 button {
+                    r#type: "button",
                     class: "operon-toggle-btn",
                     "data-action": "toggle-panel",
                     title: "Toggle Panel",
+                    "aria-label": "Toggle bottom panel",
                     onclick: move |_| { layout.with_mut(|s| s.toggle_panel()); },
                     Icon { name: "panel".to_string() }
                 }
                 button {
+                    r#type: "button",
                     class: "operon-toggle-btn",
                     "data-action": "toggle-companion",
                     title: "Toggle Companion",
+                    "aria-label": "Toggle companion panel",
                     onclick: move |_| { layout.with_mut(|s| s.toggle_companion()); },
                     Icon { name: "sidebar-right".to_string() }
                 }

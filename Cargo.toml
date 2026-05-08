@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "tests-wasm", "crates/operon-core", "crates/operon-plugins-anthropic", "crates/operon-plugins-mcp", "crates/operon-store", "crates/operon-auth", "crates/operon-api-server", "crates/operon-notes", "crates/operon-export"]
+members = [".", "tests-wasm", "crates/operon-core", "crates/operon-plugins-anthropic", "crates/operon-plugins-claude-code", "crates/operon-plugins-mcp", "crates/operon-store", "crates/operon-auth", "crates/operon-api-server", "crates/operon-notes", "crates/operon-export"]
 default-members = ["."]
 
 [package]
@@ -26,6 +26,10 @@ web-time = "1"
 operon-core = { path = "crates/operon-core" }
 operon-plugins-anthropic = { path = "crates/operon-plugins-anthropic" }
 operon-plugins-mcp = { path = "crates/operon-plugins-mcp" }
+# M1-companion-claude-code: ChatPlugin that drives the `claude` CLI as a
+# subprocess so the companion pane runs real Claude Code against the
+# active project's bound repository (cwd = LocalProject.repo_path).
+operon-plugins-claude-code = { path = "crates/operon-plugins-claude-code" }
 
 # === Agent-runtime support deps (re-exported / used by integration tests) ===
 async-trait = "0.1"

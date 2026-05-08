@@ -10,7 +10,8 @@ use uuid::Uuid;
 
 use crate::editor::EditorMode;
 use crate::local_mode::explorer::{
-    ExplorerUndoCtx, LastClicked, MultiSelected, NodeKey, NotesByProjectCtx, VisibleFlat,
+    extend_keyboard_selection, ExplorerUndoCtx, LastClicked, MultiSelected, NodeKey,
+    NotesByProjectCtx, VisibleFlat,
 };
 use crate::local_mode::ui::{
     classify_drop_position, ContextMenu, ContextMenuItem, DragDescendants, DragKind, DragSession,
@@ -128,6 +129,11 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let MultiSelected(mut multi_selected) = use_context();
     let LastClicked(mut last_clicked) = use_context();
     let VisibleFlat(visible_flat) = use_context();
+    // Space = open without focus shift. We need a handle to the focus
+    // request signal so the Space keydown branch can clear it after
+    // on_select sets it (see the Space handler below).
+    let crate::editor::RequestEditorFocus(focus_request_for_space) =
+        use_context();
 
     let note = props.note.clone();
     let id = note.id;
@@ -551,6 +557,102 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                         evt.prevent_default();
                         evt.stop_propagation();
                         on_move_down.call(id);
+                    } else if key == "ArrowDown" && mods.contains(Modifiers::SHIFT) {
+                        // Shift+ArrowDown: extend the multi-selection one row
+                        // downward from the current anchor (last_clicked).
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        extend_keyboard_selection(
+                            NodeKey::Note(id),
+                            1,
+                            &mut multi_selected,
+                            &last_clicked,
+                            &visible_flat,
+                        );
+                        focus_explorer_sibling(1);
+                    } else if key == "ArrowUp" && mods.contains(Modifiers::SHIFT) {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        extend_keyboard_selection(
+                            NodeKey::Note(id),
+                            -1,
+                            &mut multi_selected,
+                            &last_clicked,
+                            &visible_flat,
+                        );
+                        focus_explorer_sibling(-1);
+                    } else if key == "ArrowDown" {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        focus_explorer_sibling(1);
+                    } else if key == "ArrowUp" {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        focus_explorer_sibling(-1);
+                    } else if key == "ArrowRight" {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        if has_children {
+                            if !is_open {
+                                on_toggle_open.call(id);
+                            } else {
+                                focus_explorer_sibling(1);
+                            }
+                        }
+                    } else if key == "ArrowLeft" {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        if has_children && is_open {
+                            on_toggle_open.call(id);
+                        } else {
+                            focus_explorer_parent();
+                        }
+                    } else if key == "Home" {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        focus_explorer_edge(true);
+                    } else if key == "End" {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        focus_explorer_edge(false);
+                    } else if key == "Enter" {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        // Enter = open + focus. `on_select` already writes
+                        // `RequestEditorFocus`; the desktop MonacoEditorHost
+                        // (editor_host.rs) and the wasm path both consume
+                        // it after mount.
+                        on_select.call(id);
+                    } else if key == " " {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        if has_children {
+                            on_toggle_open.call(id);
+                        } else {
+                            // Space = open WITHOUT shifting focus. We let
+                            // on_select run (so the tab opens / activates),
+                            // then immediately clear the focus request so
+                            // the editor host's use_effect sees `None` and
+                            // skips its focus dispatch. Both writes happen
+                            // in the same render tick — Dioxus collapses
+                            // them and the effect reads only the final
+                            // value.
+                            let mut focus_req = focus_request_for_space;
+                            on_select.call(id);
+                            focus_req.set(None);
+                        }
+                    } else if key == "F2" {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        on_request_rename.call(id);
+                    } else if (key == "Delete" || key == "Backspace")
+                        && multi_selected.read().len() < 2
+                    {
+                        // Single-row delete via keyboard. The bulk path is
+                        // handled at the panel root for selection size >= 2.
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        on_request_delete.call(id);
                     }
                 }
             },
@@ -980,6 +1082,76 @@ fn DropIndicator(position: DropPosition, snapped: bool, depth: i64) -> Element {
             "data-drop-depth": "{depth}",
         }
     }
+}
+
+/// Move keyboard focus to the next or previous explorer row (project or
+/// note) in document order. `dir` is `1` for down, `-1` for up. Wraps at
+/// the ends. Implemented via a small JS shim because focus is a DOM-only
+/// concern in Dioxus desktop / web.
+pub(super) fn focus_explorer_sibling(dir: i32) {
+    let script = format!(
+        r#"
+        (function() {{
+            var nodes = Array.prototype.slice.call(document.querySelectorAll(
+                '[data-testid="explorer-panel"] [data-explorer="true"][tabindex="0"], '
+                + '[data-testid="explorer-panel"] [data-explorer="true"][role="treeitem"]'
+            ));
+            if (!nodes.length) return;
+            var cur = document.activeElement;
+            var idx = nodes.indexOf(cur);
+            if (idx < 0) idx = 0;
+            var next = idx + ({dir});
+            if (next < 0) next = nodes.length - 1;
+            if (next >= nodes.length) next = 0;
+            var el = nodes[next];
+            if (el && typeof el.focus === 'function') el.focus();
+        }})();
+        "#
+    );
+    document::eval(&script);
+}
+
+/// Move keyboard focus to the parent of the focused row. For a top-level
+/// row (no parent within the panel) this is a no-op. The parent is
+/// detected by walking back through document order until we find a row
+/// at a lower depth.
+pub(super) fn focus_explorer_parent() {
+    document::eval(
+        r#"
+        (function() {
+            var nodes = Array.prototype.slice.call(document.querySelectorAll(
+                '[data-testid="explorer-panel"] [data-explorer="true"][role="treeitem"]'
+            ));
+            if (!nodes.length) return;
+            var cur = document.activeElement;
+            var idx = nodes.indexOf(cur);
+            if (idx < 0) return;
+            var curLevel = parseInt(cur.getAttribute('aria-level') || '1', 10);
+            for (var i = idx - 1; i >= 0; i--) {
+                var lvl = parseInt(nodes[i].getAttribute('aria-level') || '1', 10);
+                if (lvl < curLevel) { nodes[i].focus(); return; }
+            }
+        })();
+        "#,
+    );
+}
+
+/// Move focus to the first or last explorer row.
+pub(super) fn focus_explorer_edge(first: bool) {
+    let pick = if first { "0" } else { "nodes.length - 1" };
+    let script = format!(
+        r#"
+        (function() {{
+            var nodes = document.querySelectorAll(
+                '[data-testid="explorer-panel"] [data-explorer="true"][role="treeitem"]'
+            );
+            if (!nodes.length) return;
+            var el = nodes[{pick}];
+            if (el && typeof el.focus === 'function') el.focus();
+        }})();
+        "#
+    );
+    document::eval(&script);
 }
 
 /// Plans-Phase-3-explorer-drag-drop-feedback: shown when the dragged note

@@ -4,6 +4,7 @@
 
 use crate::sql::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::error::StoreError;
@@ -19,6 +20,11 @@ pub struct LocalProject {
     pub sibling_index: i64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Absolute path to the git repository this project operates on. The
+    /// companion-pane Claude Code subprocess uses this as cwd. `None` means
+    /// the user hasn't bound a repo yet — chat is disabled until they do.
+    #[serde(default)]
+    pub repo_path: Option<PathBuf>,
 }
 
 pub trait LocalProjectRepository: Send + Sync {
@@ -27,6 +33,9 @@ pub trait LocalProjectRepository: Send + Sync {
     fn rename(&self, id: Uuid, name: &str) -> Result<(), StoreError>;
     fn delete(&self, id: Uuid) -> Result<(), StoreError>;
     fn reorder(&self, id: Uuid, new_sibling_index: i64) -> Result<(), StoreError>;
+    /// Bind/unbind the project's git repository. Pass `None` to clear.
+    fn set_repo_path(&self, id: Uuid, repo_path: Option<&std::path::Path>)
+        -> Result<(), StoreError>;
 }
 
 pub struct SqliteLocalProjectRepository {
@@ -53,12 +62,14 @@ fn invalid_uuid(s: String) -> crate::sql::Error {
 fn row_to_local_project(row: &crate::sql::Row<'_>) -> crate::sql::Result<LocalProject> {
     let id_text: String = row.get(0)?;
     let id = Uuid::parse_str(&id_text).map_err(|_| invalid_uuid(id_text))?;
+    let repo_path: Option<String> = row.get(5).ok();
     Ok(LocalProject {
         id,
         name: row.get(1)?,
         sibling_index: row.get(2)?,
         created_at_ms: row.get(3)?,
         updated_at_ms: row.get(4)?,
+        repo_path: repo_path.map(PathBuf::from),
     })
 }
 
@@ -66,7 +77,7 @@ impl LocalProjectRepository for SqliteLocalProjectRepository {
     fn list(&self) -> Result<Vec<LocalProject>, StoreError> {
         let conn = self.store.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, sibling_index, created_at_ms, updated_at_ms
+            "SELECT id, name, sibling_index, created_at_ms, updated_at_ms, repo_path
              FROM local_project
              ORDER BY sibling_index ASC, created_at_ms ASC",
         )?;
@@ -108,7 +119,26 @@ impl LocalProjectRepository for SqliteLocalProjectRepository {
             sibling_index: next_index,
             created_at_ms: now,
             updated_at_ms: now,
+            repo_path: None,
         })
+    }
+
+    fn set_repo_path(
+        &self,
+        id: Uuid,
+        repo_path: Option<&std::path::Path>,
+    ) -> Result<(), StoreError> {
+        let now = now_ms();
+        let conn = self.store.conn()?;
+        let path_str = repo_path.map(|p| p.to_string_lossy().into_owned());
+        let n = conn.execute(
+            "UPDATE local_project SET repo_path = ?2, updated_at_ms = ?3 WHERE id = ?1",
+            params![id.to_string(), path_str, now],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
     }
 
     fn rename(&self, id: Uuid, name: &str) -> Result<(), StoreError> {
@@ -296,6 +326,33 @@ mod tests {
         repo.delete(Uuid::new_v4()).unwrap();
         let listed = repo.list().unwrap();
         assert_eq!(listed.len(), 1);
+    }
+
+    #[test]
+    fn local_project_set_repo_path_round_trips() {
+        let repo = make_repo();
+        let a = repo.create("alpha").unwrap();
+        // Defaults to None.
+        assert_eq!(repo.list().unwrap()[0].repo_path, None);
+
+        let path: std::path::PathBuf = "/tmp/some/repo".into();
+        repo.set_repo_path(a.id, Some(&path)).unwrap();
+        let listed = repo.list().unwrap();
+        assert_eq!(listed[0].repo_path.as_ref(), Some(&path));
+
+        // Clearing back to None.
+        repo.set_repo_path(a.id, None).unwrap();
+        assert_eq!(repo.list().unwrap()[0].repo_path, None);
+    }
+
+    #[test]
+    fn local_project_set_repo_path_on_unknown_id_errors() {
+        let repo = make_repo();
+        let _ = repo.create("alpha").unwrap();
+        let err = repo
+            .set_repo_path(Uuid::new_v4(), Some(std::path::Path::new("/x")))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound));
     }
 
     #[test]

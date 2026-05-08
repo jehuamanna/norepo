@@ -131,6 +131,16 @@ pub struct LocalNote {
 
 pub trait LocalNoteRepository: Send + Sync {
     fn list_for_project(&self, project_id: Uuid) -> Result<Vec<LocalNote>, StoreError>;
+    /// Single-row lookup for a note's `project_id`. Used by the companion
+    /// rail to resolve "which project does this note belong to?" without
+    /// loading every project's full note list.
+    fn find_project_for_note(&self, _note_id: Uuid) -> Result<Option<Uuid>, StoreError> {
+        // Default impl: linear scan. SQLite override below is O(1) via the
+        // primary key. Trait default keeps non-SQLite implementors working.
+        Err(StoreError::InvalidArgument(
+            "find_project_for_note not implemented for this repo".into(),
+        ))
+    }
     fn create(
         &self,
         project_id: Uuid,
@@ -315,6 +325,21 @@ impl LocalNoteRepository for SqliteLocalNoteRepository {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    fn find_project_for_note(&self, note_id: Uuid) -> Result<Option<Uuid>, StoreError> {
+        let conn = self.store.conn()?;
+        let mut stmt =
+            conn.prepare("SELECT project_id FROM local_note WHERE id = ?1")?;
+        let project_id_text: Option<String> = stmt
+            .query_row(params![note_id.to_string()], |row| row.get::<_, String>(0))
+            .optional()?;
+        match project_id_text {
+            Some(s) => Uuid::parse_str(&s)
+                .map(Some)
+                .map_err(|_| StoreError::InvalidArgument(format!("invalid uuid: {s}"))),
+            None => Ok(None),
+        }
     }
 
     fn create(

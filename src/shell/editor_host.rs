@@ -440,6 +440,48 @@ pub fn MonacoEditorHost(
             }
         }
 
+        // Focus request: explorer Enter (and click) writes the target note
+        // id into the app-scope `RequestEditorFocus` signal. We only react
+        // when both the request matches our note id AND Monaco has mounted
+        // — readiness is gated by the `{type:"mounted"}` handshake. The
+        // wasm path does the same dispatch via `EditorCommand::Focus`
+        // (editor_host.rs:605-624); this is the desktop mirror.
+        //
+        // Two-pronged dispatch — same justification as the prop-mirror
+        // setContent path above: the eval recv queue is unreliable across
+        // multiple sends from the same handle, so we *also* fire a direct
+        // `document::eval` script that grabs `window.__operon_monaco_handles`
+        // and calls `editor.focus()` straight away. Either path landing is
+        // enough for the caret to move into Monaco.
+        let crate::editor::RequestEditorFocus(focus_request) = use_context();
+        {
+            let mut focus_request_setter = focus_request;
+            let note_id_for_focus = note_id.clone();
+            let host_id_for_focus = host_id.clone();
+            let eval_for_focus = eval_handle;
+            use_effect(move || {
+                let ready = *monaco_ready.read();
+                let req = focus_request_setter.read().clone();
+                let Some(target) = req else { return };
+                if !ready || target != note_id_for_focus {
+                    return;
+                }
+                let _ = eval_for_focus.send(serde_json::json!({"type":"focus"}));
+                let host_id_json = serde_json::to_string(&host_id_for_focus)
+                    .unwrap_or_else(|_| String::from("\"\""));
+                let direct_script = format!(
+                    "(function() {{ \
+                        const hid = {host_id_json}; \
+                        const h = (window.__operon_monaco_handles || {{}})[hid]; \
+                        if (!h) {{ console.warn('operon: direct focus: no handle for', hid); return; }} \
+                        try {{ h.dispatch('Focus'); }} catch (e) {{ console.warn('operon: direct focus dispatch threw', hid, e); }} \
+                    }})();",
+                );
+                let _ = document::eval(&direct_script);
+                focus_request_setter.set(None);
+            });
+        }
+
         // Reveal-line request: a click in the LocalSearch panel writes
         // `(note_id, line)` into this signal. Fire whenever the signal is
         // touched AND Monaco is mounted (`monaco_ready`). The mount-handshake
@@ -469,7 +511,17 @@ pub fn MonacoEditorHost(
         // above can finally fire its first push.
         let on_change_for_loop = on_change;
         let mut eval_for_loop = eval_handle;
-        use_future(move || async move {
+        // Cursor-preservation guard: when Monaco is the source of a
+        // change (user typed, or the in-JS splice path re-emitted), we
+        // stamp `last_pushed` to the freshly-typed value before letting
+        // the on_change ripple through tabs.set_content. The next render
+        // sees `*last_pushed.borrow() == content`, so the prop-mirror
+        // above skips its setContent push — and Monaco's caret stays
+        // where the user left it instead of collapsing to position 0.
+        let last_pushed_for_loop = last_pushed.clone();
+        use_future(move || {
+            let last_pushed_for_loop = last_pushed_for_loop.clone();
+            async move {
             loop {
                 let msg: serde_json::Value = match eval_for_loop.recv().await {
                     Ok(v) => v,
@@ -487,6 +539,7 @@ pub fn MonacoEditorHost(
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
+                        *last_pushed_for_loop.borrow_mut() = value.clone();
                         on_change_for_loop.call(value);
                     }
                     Some("keyaction") => {
@@ -505,6 +558,7 @@ pub fn MonacoEditorHost(
                     }
                     _ => {}
                 }
+            }
             }
         });
 

@@ -161,8 +161,11 @@ pub fn MainArea() -> Element {
 
     rsx! {
         section {
+            id: "operon-main-area",
             "data-region": "main-area",
             class: "operon-region operon-main-area",
+            role: "main",
+            "aria-label": "Editor",
             TabStrip {}
             // Local Mode hides the View/Edit/Live Preview/Split toolbar — mode
             // switching happens via the note row's right-click context menu.

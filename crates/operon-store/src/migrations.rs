@@ -58,6 +58,21 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "011_local_note_kind_extend",
         include_str!("../migrations/011_local_note_kind_extend.sql"),
     ),
+    (
+        12,
+        "012_local_project_repo_path",
+        include_str!("../migrations/012_local_project_repo_path.sql"),
+    ),
+    (
+        13,
+        "013_chat_sessions",
+        include_str!("../migrations/013_chat_sessions.sql"),
+    ),
+    (
+        14,
+        "014_chat_messages",
+        include_str!("../migrations/014_chat_messages.sql"),
+    ),
 ];
 
 fn ensure_migrations_table(conn: &Connection) -> Result<(), StoreError> {
@@ -120,8 +135,11 @@ pub fn migrate_down_all(conn: &mut Connection) -> Result<(), StoreError> {
         "teams",
         "departments",
         "orgs",
+        "chat_message",
+        "chat_session",
         "local_app_settings",
         "local_tree_state",
+        "local_note_link",
         "local_note",
         "local_project",
         "local_user",

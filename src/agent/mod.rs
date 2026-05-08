@@ -51,6 +51,8 @@ pub mod plugins {
     pub use operon_core::mock::MockChatPlugin;
     #[cfg(not(target_arch = "wasm32"))]
     pub use operon_plugins_anthropic::{AnthropicChatPlugin, AnthropicConfig};
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use operon_plugins_claude_code::{ClaudeCodeChatPlugin, ClaudeCodeConfig};
 }
 
 pub mod mcp {
