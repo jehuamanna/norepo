@@ -92,31 +92,62 @@ pub async fn run_skill_on_source(
     source_note_id: Uuid,
     skill_note_id: Uuid,
 ) -> Result<RunOutcome, RunnerError> {
+    eprintln!(
+        "operon: artifact runner ENTER source={source_note_id} skill={skill_note_id} chat={chat_session_id}"
+    );
     // 1. Resolve project + repo_path.
     let project_id = note_repo
         .find_project_for_note(source_note_id)
-        .map_err(|e| RunnerError::Plugin(format!("find_project: {e}")))?
-        .ok_or_else(|| RunnerError::NotFound(format!("source note {source_note_id} has no project")))?;
+        .map_err(|e| {
+            eprintln!("operon: artifact runner step1 find_project_for_note ERR: {e}");
+            RunnerError::Plugin(format!("find_project: {e}"))
+        })?
+        .ok_or_else(|| {
+            eprintln!("operon: artifact runner step1 source note has no project");
+            RunnerError::NotFound(format!("source note {source_note_id} has no project"))
+        })?;
+    eprintln!("operon: artifact runner step1 OK project_id={project_id}");
     let repo_path: PathBuf = project_repo
         .list()
-        .map_err(|e| RunnerError::Plugin(format!("list projects: {e}")))?
+        .map_err(|e| {
+            eprintln!("operon: artifact runner step2 list_projects ERR: {e}");
+            RunnerError::Plugin(format!("list projects: {e}"))
+        })?
         .into_iter()
         .find(|p| p.id == project_id)
-        .ok_or_else(|| RunnerError::NotFound(format!("project {project_id}")))?
+        .ok_or_else(|| {
+            eprintln!("operon: artifact runner step2 project not found in list");
+            RunnerError::NotFound(format!("project {project_id}"))
+        })?
         .repo_path
-        .ok_or_else(|| RunnerError::InvalidPath("project has no repo_path bound".into()))?;
+        .ok_or_else(|| {
+            eprintln!("operon: artifact runner step2 project has no repo_path bound");
+            RunnerError::InvalidPath("project has no repo_path bound".into())
+        })?;
+    eprintln!("operon: artifact runner step2 OK repo_path={}", repo_path.display());
 
     // 2. Load source body + skill body from persistence.
     let source_bytes = persistence
         .load(&source_note_id.to_string())
         .await
-        .map_err(|e| RunnerError::NotFound(format!("source body: {e}")))?;
+        .map_err(|e| {
+            eprintln!(
+                "operon: artifact runner step3 load source body ERR (likely the artifact \
+                 hasn't been saved to persistence yet): {e}"
+            );
+            RunnerError::NotFound(format!("source body: {e}"))
+        })?;
+    eprintln!("operon: artifact runner step3 OK loaded source body ({} bytes)", source_bytes.len());
     let source_body =
         String::from_utf8(source_bytes).map_err(|e| RunnerError::Plugin(format!("utf8: {e}")))?;
     let skill_bytes = persistence
         .load(&skill_note_id.to_string())
         .await
-        .map_err(|e| RunnerError::NotFound(format!("skill body: {e}")))?;
+        .map_err(|e| {
+            eprintln!("operon: artifact runner step4 load skill body ERR: {e}");
+            RunnerError::NotFound(format!("skill body: {e}"))
+        })?;
+    eprintln!("operon: artifact runner step4 OK loaded skill body ({} bytes)", skill_bytes.len());
     let skill_body =
         String::from_utf8(skill_bytes).map_err(|e| RunnerError::Plugin(format!("utf8: {e}")))?;
 
