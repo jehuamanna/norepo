@@ -26,7 +26,7 @@ pub mod about;
 pub mod codemirror_host;
 mod companion_area;
 #[cfg(not(target_arch = "wasm32"))]
-mod companion_chat;
+pub mod companion_chat;
 pub mod companion_state;
 #[cfg(not(target_arch = "wasm32"))]
 mod session_rail;

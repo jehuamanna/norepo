@@ -8,11 +8,17 @@
 
 use dioxus::prelude::*;
 use operon_store::repos::{LocalNote, NoteKind};
+use operon_store::repos::{LocalNoteRepository, LocalProjectRepository};
 use std::collections::HashMap;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::local_mode::desktop::{LocalNoteRepo, LocalProjectRepo};
+use crate::persistence::Persistence;
+use crate::plugins::workflow::engine::{propagate_dirty, topo_order_dirty, SkillBag, SkillSnapshot, hash_body};
+use crate::plugins::workflow::executor::{collect_upstream_outputs, run_node, RunArtifact};
 use crate::plugins::workflow::state::{Node, NodeId, NodeStatus, WorkflowGraph};
+use crate::shell::companion_state::ClaudeCodePluginCtx;
 
 const NODE_W: f64 = 180.0;
 const NODE_H: f64 = 64.0;
@@ -28,7 +34,7 @@ pub struct WorkflowEditorProps {
 pub fn WorkflowEditor(props: WorkflowEditorProps) -> Element {
     let initial_graph = parse_or_default(&props.content);
     let initial_text = serialize(&initial_graph);
-    let mut text = use_signal(|| initial_text.clone());
+    let text = use_signal(|| initial_text.clone());
     let on_change = props.on_change;
     let note_id = props.note_id.clone();
 
@@ -44,19 +50,41 @@ pub fn WorkflowEditor(props: WorkflowEditorProps) -> Element {
         .unwrap_or_else(|| initial_graph.clone());
     let parse_error = parse_outcome.err().map(|e| e.to_string());
 
+    // Apply-graph callback: serialize + push through `text` Signal +
+    // fire `on_change`. Used by the toolbar (add-node, cascade) and by
+    // per-node Run buttons.
+    let apply_graph: Callback<WorkflowGraph> = {
+        let mut text_setter = text;
+        let on_change = on_change;
+        Callback::new(move |g: WorkflowGraph| {
+            let s = serialize(&g);
+            text_setter.set(s.clone());
+            on_change.call(s);
+        })
+    };
+
     rsx! {
         div { class: "operon-workflow-surface operon-workflow-surface-edit",
             "data-testid": "workflow-editor",
             WorkflowToolbar {
                 note_id: note_id.clone(),
                 graph_text: snapshot.clone(),
-                on_apply: Callback::new(move |new_text: String| {
-                    text.set(new_text.clone());
-                    on_change.call(new_text);
+                on_apply: Callback::new({
+                    let mut text_setter = text;
+                    let on_change = on_change;
+                    move |new_text: String| {
+                        text_setter.set(new_text.clone());
+                        on_change.call(new_text);
+                    }
                 }),
+                apply_graph: apply_graph,
             }
             div { class: "operon-workflow-pane",
-                WorkflowCanvas { graph: graph_for_canvas }
+                WorkflowCanvas {
+                    graph: graph_for_canvas,
+                    note_id: note_id.clone(),
+                    apply_graph: apply_graph,
+                }
                 div { class: "operon-workflow-json",
                     if let Some(err) = parse_error.as_ref() {
                         div {
@@ -71,7 +99,8 @@ pub fn WorkflowEditor(props: WorkflowEditorProps) -> Element {
                         spellcheck: "false",
                         value: "{text}",
                         oninput: move |e| {
-                            text.set(e.value());
+                            let mut text_setter = text;
+                            text_setter.set(e.value());
                             on_change.call(e.value());
                         },
                     }
@@ -89,10 +118,17 @@ pub struct WorkflowViewProps {
 #[component]
 pub fn WorkflowView(props: WorkflowViewProps) -> Element {
     let graph = parse_or_default(&props.content);
+    // No-op apply for read-only View mode — Run buttons in the canvas
+    // are still rendered but produce no graph mutations.
+    let noop: Callback<WorkflowGraph> = Callback::new(|_| {});
     rsx! {
         div { class: "operon-workflow-surface",
             "data-testid": "workflow-view",
-            WorkflowCanvas { graph }
+            WorkflowCanvas {
+                graph,
+                note_id: String::new(),
+                apply_graph: noop,
+            }
         }
     }
 }
@@ -100,6 +136,8 @@ pub fn WorkflowView(props: WorkflowViewProps) -> Element {
 #[derive(Props, Clone, PartialEq)]
 struct WorkflowCanvasProps {
     graph: WorkflowGraph,
+    note_id: String,
+    apply_graph: Callback<WorkflowGraph>,
 }
 
 #[component]
@@ -173,29 +211,66 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                         }
                     }
                     for n in nodes.iter() {
-                        g {
-                            class: "operon-workflow-node-group",
-                            "data-node-id": "{n.id}",
-                            transform: "translate({n.x}, {n.y})",
-                            rect {
-                                class: status_class(&n.status),
-                                "data-testid": "workflow-node",
-                                width: "{NODE_W}",
-                                height: "{NODE_H}",
-                                rx: "8",
-                                ry: "8",
-                            }
-                            text {
-                                class: "operon-workflow-node-title",
-                                x: "12",
-                                y: "26",
-                                "{n.label}"
-                            }
-                            text {
-                                class: "operon-workflow-node-status",
-                                x: "12",
-                                y: "48",
-                                "{status_label(&n.status)}"
+                        {
+                            let node_id_for_run = n.id;
+                            let note_id_for_run = props.note_id.clone();
+                            let apply_for_run = props.apply_graph;
+                            let graph_for_run = g.clone();
+                            let on_run_node = move |evt: dioxus::events::MouseEvent| {
+                                evt.stop_propagation();
+                                spawn_run_node(
+                                    note_id_for_run.clone(),
+                                    node_id_for_run,
+                                    graph_for_run.clone(),
+                                    apply_for_run,
+                                );
+                            };
+                            rsx! {
+                                g {
+                                    class: "operon-workflow-node-group",
+                                    "data-node-id": "{n.id}",
+                                    transform: "translate({n.x}, {n.y})",
+                                    rect {
+                                        class: status_class(&n.status),
+                                        "data-testid": "workflow-node",
+                                        width: "{NODE_W}",
+                                        height: "{NODE_H}",
+                                        rx: "8",
+                                        ry: "8",
+                                    }
+                                    text {
+                                        class: "operon-workflow-node-title",
+                                        x: "12",
+                                        y: "26",
+                                        "{n.label}"
+                                    }
+                                    text {
+                                        class: "operon-workflow-node-status",
+                                        x: "12",
+                                        y: "48",
+                                        "{status_label(&n.status)}"
+                                    }
+                                    g {
+                                        class: "operon-workflow-node-run",
+                                        "data-testid": "workflow-node-run",
+                                        transform: "translate({NODE_W - 28.0}, 8.0)",
+                                        onclick: on_run_node,
+                                        rect {
+                                            width: "20",
+                                            height: "20",
+                                            rx: "10",
+                                            ry: "10",
+                                            class: "operon-workflow-node-run-bg",
+                                        }
+                                        text {
+                                            x: "10",
+                                            y: "14",
+                                            "text-anchor": "middle",
+                                            class: "operon-workflow-node-run-glyph",
+                                            "\u{25B6}"
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -210,6 +285,7 @@ struct WorkflowToolbarProps {
     note_id: String,
     graph_text: String,
     on_apply: Callback<String>,
+    apply_graph: Callback<WorkflowGraph>,
 }
 
 #[component]
@@ -220,13 +296,21 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
     let on_apply = props.on_apply;
     let graph_text = props.graph_text.clone();
     let note_id_str = props.note_id.clone();
+    let apply_graph = props.apply_graph;
 
     let mut picker_open = use_signal(|| false);
     let mut picker_options: Signal<Vec<LocalNote>> = use_signal(Vec::new);
 
-    // M3c will plug this into the companion. For now the button is a
-    // visible no-op so the layout reads as "this is where Run lives".
-    let on_run_all = move |_| {};
+    // Run-all-dirty: parse current graph, topo-sort dirty nodes, run
+    // each sequentially via the executor, applying the mutated graph
+    // after every node so the canvas reflects progress in real time.
+    let note_id_for_run = note_id_str.clone();
+    let graph_text_for_run = graph_text.clone();
+    let on_run_all = move |_| {
+        let initial = serde_json::from_str::<WorkflowGraph>(&graph_text_for_run)
+            .unwrap_or_default();
+        spawn_run_cascade(note_id_for_run.clone(), initial, apply_graph);
+    };
 
     let open_picker = move |_| {
         let note_uuid = match Uuid::parse_str(&note_id_str) {
@@ -262,8 +346,7 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
                 r#type: "button",
                 class: "operon-workflow-toolbar-button",
                 "data-testid": "workflow-toolbar-run",
-                disabled: true,
-                title: "Cascade execution lands in M3c",
+                title: "Run every Dirty node in topological order",
                 onclick: on_run_all,
                 "\u{25B6} Run all dirty"
             }
@@ -433,6 +516,224 @@ fn append_node_to_graph(graph_text: &str, skill_note_id: Uuid) -> String {
     graph.nodes.insert(id, node);
     graph.version = graph.version.saturating_add(1);
     serialize(&graph)
+}
+
+// ===== executor wiring =====
+
+/// Spawn a cascade run for the workflow at `note_id_str`. Walks dirty
+/// nodes in topological order, applying the mutated `WorkflowGraph`
+/// back to the editor signal after every step so the canvas reflects
+/// each node's lifecycle (Dirty → Running → Fresh / Error).
+fn spawn_run_cascade(
+    note_id_str: String,
+    mut graph: WorkflowGraph,
+    apply_graph: Callback<WorkflowGraph>,
+) {
+    let note_repo = match try_consume_context::<LocalNoteRepo>() {
+        Some(LocalNoteRepo(r)) => r,
+        None => return,
+    };
+    let project_repo = match try_consume_context::<LocalProjectRepo>() {
+        Some(LocalProjectRepo(r)) => r,
+        None => return,
+    };
+    let plugin = match try_consume_context::<ClaudeCodePluginCtx>() {
+        Some(ClaudeCodePluginCtx(p)) => p,
+        None => return,
+    };
+    let persistence = match try_consume_context::<Arc<dyn Persistence>>() {
+        Some(p) => p,
+        None => return,
+    };
+    let workflow_id = match Uuid::parse_str(&note_id_str) {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+    spawn(async move {
+        // 1. Resolve project + repo path.
+        let Some((operon_session, repo_path)) =
+            resolve_project_session(workflow_id, &note_repo, &project_repo)
+        else {
+            return;
+        };
+        plugin.bind_session(operon_session, repo_path.clone());
+
+        // 2. Order the dirty subset.
+        let order = match topo_order_dirty(&graph) {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+
+        for node_id in order {
+            if let Err(e) = run_one_node(
+                &mut graph,
+                node_id,
+                workflow_id,
+                operon_session,
+                &repo_path,
+                plugin.clone(),
+                &persistence,
+            )
+            .await
+            {
+                if let Some(n) = graph.nodes.get_mut(&node_id) {
+                    n.status = NodeStatus::Error(format!("{e}"));
+                }
+                apply_graph.call(graph.clone());
+                break;
+            }
+            apply_graph.call(graph.clone());
+        }
+    });
+}
+
+/// Spawn a single-node run. Same plumbing as cascade but for one node.
+fn spawn_run_node(
+    note_id_str: String,
+    node_id: NodeId,
+    mut graph: WorkflowGraph,
+    apply_graph: Callback<WorkflowGraph>,
+) {
+    let note_repo = match try_consume_context::<LocalNoteRepo>() {
+        Some(LocalNoteRepo(r)) => r,
+        None => return,
+    };
+    let project_repo = match try_consume_context::<LocalProjectRepo>() {
+        Some(LocalProjectRepo(r)) => r,
+        None => return,
+    };
+    let plugin = match try_consume_context::<ClaudeCodePluginCtx>() {
+        Some(ClaudeCodePluginCtx(p)) => p,
+        None => return,
+    };
+    let persistence = match try_consume_context::<Arc<dyn Persistence>>() {
+        Some(p) => p,
+        None => return,
+    };
+    let workflow_id = match Uuid::parse_str(&note_id_str) {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+    spawn(async move {
+        let Some((operon_session, repo_path)) =
+            resolve_project_session(workflow_id, &note_repo, &project_repo)
+        else {
+            return;
+        };
+        plugin.bind_session(operon_session, repo_path.clone());
+        if let Err(e) = run_one_node(
+            &mut graph,
+            node_id,
+            workflow_id,
+            operon_session,
+            &repo_path,
+            plugin.clone(),
+            &persistence,
+        )
+        .await
+        {
+            if let Some(n) = graph.nodes.get_mut(&node_id) {
+                n.status = NodeStatus::Error(format!("{e}"));
+            }
+        }
+        apply_graph.call(graph);
+    });
+}
+
+/// Resolve the workflow's project + a derived operon session UUID +
+/// the bound repo_path. Returns `None` when the project's repo isn't
+/// bound (cascade is a no-op in that case).
+fn resolve_project_session(
+    workflow_id: Uuid,
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    project_repo: &Arc<dyn LocalProjectRepository>,
+) -> Option<(Uuid, std::path::PathBuf)> {
+    let project_id = note_repo.find_project_for_note(workflow_id).ok().flatten()?;
+    let repo_path = project_repo
+        .list()
+        .ok()?
+        .into_iter()
+        .find(|p| p.id == project_id)?
+        .repo_path?;
+    // Reuse the workflow note's UUID as the Operon session id so all
+    // turns through cascade share one claude session (gets `--resume`'d
+    // across nodes — prompt-cache hits compound).
+    Some((workflow_id, repo_path))
+}
+
+async fn run_one_node(
+    graph: &mut WorkflowGraph,
+    node_id: NodeId,
+    workflow_id: Uuid,
+    operon_session: Uuid,
+    repo_path: &std::path::Path,
+    plugin: Arc<operon_plugins_claude_code::ClaudeCodeChatPlugin>,
+    persistence: &Arc<dyn Persistence>,
+) -> Result<(), String> {
+    // Mark Running before the await so the canvas shows the spinner.
+    if let Some(n) = graph.nodes.get_mut(&node_id) {
+        n.status = NodeStatus::Running;
+    }
+
+    // Snapshot the node + load its skill.
+    let node_snapshot = graph
+        .nodes
+        .get(&node_id)
+        .cloned()
+        .ok_or_else(|| format!("node {node_id} missing"))?;
+    let skill_body_bytes = persistence
+        .load(&node_snapshot.skill_note_id.to_string())
+        .await
+        .map_err(|e| format!("load skill {}: {e}", node_snapshot.skill_note_id))?;
+    let skill_body = String::from_utf8(skill_body_bytes)
+        .map_err(|e| format!("skill body utf8: {e}"))?;
+    let (frontmatter, _body) = crate::plugins::skill::frontmatter::split(&skill_body);
+    let skill_version = frontmatter
+        .as_ref()
+        .and_then(|fm| crate::plugins::skill::frontmatter::field(fm, "skill_version"))
+        .unwrap_or("")
+        .to_string();
+
+    // Gather upstream outputs from disk (already-Fresh upstreams have
+    // a `cached_output_path` we can read).
+    let upstream =
+        collect_upstream_outputs(graph, node_id).map_err(|e| format!("upstream: {e}"))?;
+
+    // Snapshot the graph for hashing (the executor's run_node hashes
+    // against this view).
+    let graph_for_hash = graph.clone();
+
+    let artifact: RunArtifact = run_node(
+        plugin,
+        operon_session,
+        repo_path.to_path_buf(),
+        workflow_id,
+        node_id,
+        &node_snapshot,
+        &skill_body,
+        &skill_version,
+        &upstream,
+        &graph_for_hash,
+    )
+    .await
+    .map_err(|e| format!("{e}"))?;
+
+    // Commit results and propagate dirty downstream.
+    if let Some(n) = graph.nodes.get_mut(&node_id) {
+        n.cached_output_path = Some(artifact.output_path);
+        n.cached_input_hash = Some(artifact.input_hash);
+        n.status = NodeStatus::Fresh;
+    }
+    let mut bag = SkillBag::new();
+    bag.insert(
+        node_snapshot.skill_note_id,
+        SkillSnapshot {
+            version: skill_version,
+            body_hash: hash_body(&skill_body),
+        },
+    );
+    let _ = propagate_dirty(node_id, graph, &bag);
+    Ok(())
 }
 
 #[cfg(test)]

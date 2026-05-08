@@ -54,3 +54,14 @@ pub struct ChatSessionVersion(pub Signal<u64>);
 /// render and clears the signal. The user reviews + clicks Send.
 #[derive(Clone, Copy)]
 pub struct CompanionComposerInbox(pub Signal<Option<String>>);
+
+/// Shared `ClaudeCodeChatPlugin` instance — one Arc lives at App scope
+/// so both the companion (interactive chat) and the workflow executor
+/// (cascade Run) talk to the same long-lived `claude` subprocess
+/// driver. Each consumer creates its own Operon session UUIDs and
+/// binds them via `bind_session`.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub struct ClaudeCodePluginCtx(
+    pub std::sync::Arc<operon_plugins_claude_code::ClaudeCodeChatPlugin>,
+);

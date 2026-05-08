@@ -499,6 +499,20 @@ pub fn provide_local_app_signals() {
     use_context_provider(|| {
         crate::shell::companion_state::CompanionComposerInbox(companion_composer_inbox)
     });
+    // M3c: shared Claude Code plugin instance. Companion + workflow
+    // executor both consume this so a workflow cascade reuses claude
+    // session caching without spawning duplicate subprocesses.
+    let claude_plugin = use_hook(|| {
+        std::sync::Arc::new(
+            operon_plugins_claude_code::ClaudeCodeChatPlugin::new(
+                operon_plugins_claude_code::ClaudeCodeConfig {
+                    claude_bin: crate::shell::companion_chat::resolve_claude_bin(),
+                    model: None,
+                },
+            ),
+        )
+    });
+    use_context_provider(|| crate::shell::companion_state::ClaudeCodePluginCtx(claude_plugin));
     let selected_note: Signal<Option<Uuid>> = use_signal(|| None);
     use_context_provider(|| SelectedNote(selected_note));
     // Plans-Phase-4-multiselect-aria: parallel multi-selection set.

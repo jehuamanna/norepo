@@ -1739,6 +1739,20 @@ html, body {
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
+.operon-workflow-node-run { cursor: pointer; }
+.operon-workflow-node-run-bg {
+  fill: var(--operon-accent);
+  stroke: var(--operon-accent);
+  opacity: 0.85;
+}
+.operon-workflow-node-run:hover .operon-workflow-node-run-bg {
+  opacity: 1.0;
+}
+.operon-workflow-node-run-glyph {
+  fill: var(--vscode-button-foreground, white);
+  font-size: 10px;
+  pointer-events: none;
+}
 
 .operon-workflow-json {
   display: flex;

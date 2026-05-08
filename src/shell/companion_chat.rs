@@ -68,7 +68,10 @@ pub enum TranscriptItem {
 ///    through to the next candidate instead of being returned as-is.
 /// 3. Bare `"claude"` — relies on PATH, which Dioxus desktop spawns
 ///    inherit from the parent shell.
-fn resolve_claude_bin() -> PathBuf {
+///
+/// Public so `provide_local_app_signals` can construct the shared
+/// `ClaudeCodeChatPlugin` instance once at App scope.
+pub fn resolve_claude_bin() -> PathBuf {
     if let Ok(p) = std::env::var("OPERON_CLAUDE_BIN") {
         return PathBuf::from(p);
     }
@@ -82,11 +85,18 @@ fn resolve_claude_bin() -> PathBuf {
 
 #[component]
 pub fn CompanionChat() -> Element {
+    // Pull the shared plugin from context (provided in
+    // `provide_local_app_signals`). Falls back to a fresh local instance
+    // for robustness if the context is missing — but in practice the
+    // companion always mounts under the local-mode app root.
     let plugin: Signal<Arc<ClaudeCodeChatPlugin>> = use_signal(|| {
-        Arc::new(ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
-            claude_bin: resolve_claude_bin(),
-            model: None,
-        }))
+        match try_consume_context::<crate::shell::companion_state::ClaudeCodePluginCtx>() {
+            Some(crate::shell::companion_state::ClaudeCodePluginCtx(p)) => p,
+            None => Arc::new(ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
+                claude_bin: resolve_claude_bin(),
+                model: None,
+            })),
+        }
     });
 
     let transcript = use_signal::<Vec<TranscriptItem>>(Vec::new);

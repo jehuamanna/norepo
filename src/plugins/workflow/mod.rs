@@ -7,6 +7,8 @@
 //! No UI; the React Flow canvas + executor wiring land in M3b/M3c.
 
 pub mod engine;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod executor;
 pub mod state;
 mod view;
 
