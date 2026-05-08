@@ -74,10 +74,14 @@ pub struct SkillEditorProps {
 
 #[component]
 pub fn SkillEditor(props: SkillEditorProps) -> Element {
-    let mut value = use_signal(|| props.content.clone());
+    // The parent (`LocalNoteEditor` / its tab buffer) owns the authoritative
+    // content. A local `use_signal` here would only initialize on first
+    // mount, so switching between two open skills (same component instance,
+    // different `note_id`/`content` props) would keep showing the first
+    // skill's body. Bind the textarea to `props.content` directly and let
+    // `on_change` push edits back to the parent.
     let on_change = props.on_change;
-    let snapshot = value.read().clone();
-    let (frontmatter_lines, _body) = frontmatter::split(&snapshot);
+    let (frontmatter_lines, _body) = frontmatter::split(&props.content);
     let skill_name = frontmatter_lines
         .as_ref()
         .and_then(|lines| frontmatter::field(lines, "skill_name").map(str::to_string));
@@ -85,7 +89,8 @@ pub fn SkillEditor(props: SkillEditorProps) -> Element {
         .as_ref()
         .and_then(|lines| frontmatter::field(lines, "skill_version").map(str::to_string));
     let note_id = props.note_id.clone();
-    let content_for_play = snapshot.clone();
+    let content_for_play = props.content.clone();
+    let textarea_value = props.content.clone();
     rsx! {
         div { class: "operon-skill-surface operon-skill-surface-edit",
             "data-testid": "skill-editor",
@@ -99,9 +104,8 @@ pub fn SkillEditor(props: SkillEditorProps) -> Element {
                 class: "operon-skill-textarea",
                 "data-testid": "skill-textarea",
                 spellcheck: "false",
-                value: "{value}",
+                value: "{textarea_value}",
                 oninput: move |e| {
-                    value.set(e.value());
                     on_change.call(e.value());
                 },
             }

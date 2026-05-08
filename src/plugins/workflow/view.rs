@@ -17,7 +17,7 @@ use crate::local_mode::desktop::{LocalNoteRepo, LocalProjectRepo};
 use crate::persistence::Persistence;
 use crate::plugins::workflow::engine::{propagate_dirty, topo_order_dirty, SkillBag, SkillSnapshot, hash_body};
 use crate::plugins::workflow::executor::{collect_upstream_outputs, run_node, RunArtifact};
-use crate::plugins::workflow::state::{Node, NodeId, NodeStatus, WorkflowGraph};
+use crate::plugins::workflow::state::{Edge, EdgeId, Node, NodeId, NodeStatus, WorkflowGraph};
 use crate::shell::companion_state::ClaudeCodePluginCtx;
 
 const NODE_W: f64 = 180.0;
@@ -153,11 +153,32 @@ struct DragState {
     start_node_y: f64,
 }
 
+/// Active edge-creation drag. The user mousedowns on a node's output
+/// handle, the cursor follows in the SVG until they mouseup on a
+/// target node's input handle (commit) or anywhere else (cancel).
+/// Coordinates are tracked the same way `DragState` tracks node drags:
+/// keep the start client position + the source handle's viewBox
+/// coords, then add the client delta on every mousemove to get the
+/// current cursor in approximate viewBox space. Same 1-client-px =
+/// 1-viewBox-unit approximation already in use for node drags.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EdgeDragState {
+    from: NodeId,
+    from_x: f64,
+    from_y: f64,
+    cursor_x: f64,
+    cursor_y: f64,
+    start_client_x: f64,
+    start_client_y: f64,
+}
+
 #[component]
 fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
     let g = props.graph.clone();
     let mut drag = use_signal::<Option<DragState>>(|| None);
+    let mut edge_drag = use_signal::<Option<EdgeDragState>>(|| None);
     let mut selected_node = use_signal::<Option<NodeId>>(|| None);
+    let mut selected_edge = use_signal::<Option<EdgeId>>(|| None);
     // Auto-place nodes whose `position` is exactly (0, 0) — keeps the
     // hand-edited "create a node by adding to JSON" flow usable without
     // having to do math. Stable id-sorted layout.
@@ -180,6 +201,7 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
             let from = nodes.iter().find(|n| n.id == e.from)?;
             let to = nodes.iter().find(|n| n.id == e.to)?;
             Some(EdgeRender {
+                id: e.id,
                 from_x: from.x + NODE_W,
                 from_y: from.y + NODE_H / 2.0,
                 to_x: to.x,
@@ -207,6 +229,7 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                     let skill_id_str = sn.skill_note_id.to_string();
                     let apply = props.apply_graph;
                     let mut graph_for_inspector = g.clone();
+                    let graph_for_delete = g.clone();
                     rsx! {
                         div { class: "operon-workflow-inspector",
                             "data-testid": "workflow-inspector",
@@ -214,6 +237,18 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                             div { class: "operon-workflow-inspector-row",
                                 span { class: "operon-workflow-inspector-label", "skill id" }
                                 code { class: "md-inline-code operon-workflow-inspector-code", "{skill_id_str}" }
+                                button {
+                                    r#type: "button",
+                                    class: "operon-workflow-inspector-delete",
+                                    "data-testid": "workflow-inspector-delete-node",
+                                    title: "Delete this node and any connected edges",
+                                    onclick: move |_| {
+                                        let next = remove_node(&graph_for_delete, sid);
+                                        apply.call(next);
+                                        selected_node.set(None);
+                                    },
+                                    "Delete"
+                                }
                                 button {
                                     r#type: "button",
                                     class: "operon-workflow-inspector-close",
@@ -258,27 +293,48 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                         let apply = props.apply_graph;
                         let mut graph = g.clone();
                         move |e: dioxus::events::MouseEvent| {
-                            let cur = match *drag.read() {
-                                Some(d) => d,
-                                None => return,
-                            };
                             let coords = e.client_coordinates();
-                            let dx = coords.x - cur.start_client_x;
-                            let dy = coords.y - cur.start_client_y;
-                            if let Some(node) = graph.nodes.get_mut(&cur.node) {
-                                node.position = (
-                                    cur.start_node_x + dx,
-                                    cur.start_node_y + dy,
-                                );
+                            // Node-position drag: mutate graph + push.
+                            if let Some(cur) = *drag.read() {
+                                let dx = coords.x - cur.start_client_x;
+                                let dy = coords.y - cur.start_client_y;
+                                if let Some(node) = graph.nodes.get_mut(&cur.node) {
+                                    node.position = (
+                                        cur.start_node_x + dx,
+                                        cur.start_node_y + dy,
+                                    );
+                                }
+                                apply.call(graph.clone());
+                                return;
                             }
-                            apply.call(graph.clone());
+                            // Edge-creation drag: only update ghost
+                            // cursor (no graph mutation until commit).
+                            // Copy the state out of the read borrow
+                            // before calling `set` so we don't hold a
+                            // shared+exclusive borrow at once.
+                            let edge_cur = *edge_drag.read();
+                            if let Some(cur) = edge_cur {
+                                let dx = coords.x - cur.start_client_x;
+                                let dy = coords.y - cur.start_client_y;
+                                edge_drag.set(Some(EdgeDragState {
+                                    cursor_x: cur.from_x + dx,
+                                    cursor_y: cur.from_y + dy,
+                                    ..cur
+                                }));
+                            }
                         }
                     },
                     onmouseup: move |_| {
                         drag.set(None);
+                        // Mouseup on empty SVG cancels any in-flight
+                        // edge drag — input-handle handlers commit
+                        // first via stop_propagation, so reaching this
+                        // path means the user released over nothing.
+                        edge_drag.set(None);
                     },
                     onmouseleave: move |_| {
                         drag.set(None);
+                        edge_drag.set(None);
                     },
                     defs {
                         marker {
@@ -293,10 +349,43 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                         }
                     }
                     for e in edges.iter() {
-                        path {
-                            class: "operon-workflow-edge",
-                            d: "M {e.from_x} {e.from_y} C {e.from_x + 60.0} {e.from_y}, {e.to_x - 60.0} {e.to_y}, {e.to_x} {e.to_y}",
-                            "marker-end": "url(#operon-workflow-arrow)",
+                        {
+                            let edge_id = e.id;
+                            let is_selected_edge = *selected_edge.read() == Some(edge_id);
+                            let edge_class = if is_selected_edge {
+                                "operon-workflow-edge operon-workflow-edge-selected"
+                            } else {
+                                "operon-workflow-edge"
+                            };
+                            // Wider invisible hit-area path layered
+                            // beneath the visible stroke — cubic
+                            // beziers are 2-3 px wide visually but
+                            // need a fatter target so a direct click
+                            // selects reliably.
+                            rsx! {
+                                path {
+                                    class: "operon-workflow-edge-hit",
+                                    "data-testid": "workflow-edge-hit",
+                                    "data-edge-id": "{edge_id}",
+                                    d: "M {e.from_x} {e.from_y} C {e.from_x + 60.0} {e.from_y}, {e.to_x - 60.0} {e.to_y}, {e.to_x} {e.to_y}",
+                                    onmousedown: move |evt: dioxus::events::MouseEvent| {
+                                        evt.stop_propagation();
+                                    },
+                                    onclick: move |evt: dioxus::events::MouseEvent| {
+                                        evt.stop_propagation();
+                                        selected_edge.set(Some(edge_id));
+                                        selected_node.set(None);
+                                    },
+                                }
+                                path {
+                                    class: "{edge_class}",
+                                    "data-testid": "workflow-edge",
+                                    "data-edge-id": "{edge_id}",
+                                    "data-selected": if is_selected_edge { "true" } else { "false" },
+                                    d: "M {e.from_x} {e.from_y} C {e.from_x + 60.0} {e.from_y}, {e.to_x - 60.0} {e.to_y}, {e.to_x} {e.to_y}",
+                                    "marker-end": "url(#operon-workflow-arrow)",
+                                }
+                            }
                         }
                     }
                     for n in nodes.iter() {
@@ -327,6 +416,54 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                     start_node_y: n_y,
                                 }));
                                 selected_node.set(Some(node_id));
+                                selected_edge.set(None);
+                            };
+                            // Output-handle mousedown: start an edge
+                            // drag from this node. stop_propagation so
+                            // the parent node's mousedown doesn't fire
+                            // a node-position drag at the same time.
+                            let on_output_mousedown = move |evt: dioxus::events::MouseEvent| {
+                                evt.stop_propagation();
+                                let coords = evt.client_coordinates();
+                                let from_x = n_x + NODE_W;
+                                let from_y = n_y + NODE_H / 2.0;
+                                edge_drag.set(Some(EdgeDragState {
+                                    from: node_id,
+                                    from_x,
+                                    from_y,
+                                    cursor_x: from_x,
+                                    cursor_y: from_y,
+                                    start_client_x: coords.x,
+                                    start_client_y: coords.y,
+                                }));
+                            };
+                            // Input-handle mouseup: commit the edge if
+                            // an edge_drag is in flight and the source
+                            // is a different node and no duplicate
+                            // (from, to) edge already exists.
+                            let apply_for_edge = props.apply_graph;
+                            let graph_for_edge = g.clone();
+                            let on_input_mouseup = move |evt: dioxus::events::MouseEvent| {
+                                evt.stop_propagation();
+                                let cur = match *edge_drag.read() {
+                                    Some(d) => d,
+                                    None => return,
+                                };
+                                if cur.from == node_id {
+                                    edge_drag.set(None);
+                                    return;
+                                }
+                                let next = add_edge_if_new(&graph_for_edge, cur.from, node_id);
+                                if let Some(g_next) = next {
+                                    apply_for_edge.call(g_next);
+                                }
+                                edge_drag.set(None);
+                            };
+                            // Input-handle mousedown still has to
+                            // stop_propagation so it doesn't trigger
+                            // a node-position drag.
+                            let on_input_mousedown = move |evt: dioxus::events::MouseEvent| {
+                                evt.stop_propagation();
                             };
                             let is_selected = *selected_node.read() == Some(node_id);
                             let group_class = if is_selected {
@@ -361,6 +498,29 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                         y: "48",
                                         "{status_label(&n.status)}"
                                     }
+                                    // Input handle (left edge,
+                                    // mid-height): drop target for an
+                                    // active edge_drag.
+                                    circle {
+                                        class: "operon-workflow-handle operon-workflow-handle-input",
+                                        "data-testid": "workflow-handle-input",
+                                        cx: "0",
+                                        cy: "{NODE_H / 2.0}",
+                                        r: "6",
+                                        onmousedown: on_input_mousedown,
+                                        onmouseup: on_input_mouseup,
+                                    }
+                                    // Output handle (right edge,
+                                    // mid-height): drag-source for new
+                                    // edges.
+                                    circle {
+                                        class: "operon-workflow-handle operon-workflow-handle-output",
+                                        "data-testid": "workflow-handle-output",
+                                        cx: "{NODE_W}",
+                                        cy: "{NODE_H / 2.0}",
+                                        r: "6",
+                                        onmousedown: on_output_mousedown,
+                                    }
                                     g {
                                         class: "operon-workflow-node-run",
                                         "data-testid": "workflow-node-run",
@@ -382,6 +542,64 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                             "text-anchor": "middle",
                                             class: "operon-workflow-node-run-glyph",
                                             "\u{25B6}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Ghost edge — rendered while dragging from an
+                    // output handle. Same cubic-bezier shape as a
+                    // committed edge so the user gets a preview of
+                    // the curvature, but with a dashed stroke so the
+                    // unfinished state reads visually.
+                    if let Some(d) = edge_drag.read().as_ref() {
+                        path {
+                            class: "operon-workflow-edge operon-workflow-edge-ghost",
+                            "data-testid": "workflow-edge-ghost",
+                            d: "M {d.from_x} {d.from_y} C {d.from_x + 60.0} {d.from_y}, {d.cursor_x - 60.0} {d.cursor_y}, {d.cursor_x} {d.cursor_y}",
+                            "marker-end": "url(#operon-workflow-arrow)",
+                        }
+                    }
+                    // Selected-edge delete button — rendered last so
+                    // it draws above any node it overlaps. Only one
+                    // edge can be selected at a time, so a single
+                    // group is sufficient.
+                    if let Some(sel_id) = *selected_edge.read() {
+                        if let Some(e) = edges.iter().find(|e| e.id == sel_id) {
+                            {
+                                let mid_x = (e.from_x + e.to_x) / 2.0;
+                                let mid_y = (e.from_y + e.to_y) / 2.0;
+                                let apply = props.apply_graph;
+                                let graph_for_edge_delete = g.clone();
+                                rsx! {
+                                    g {
+                                        class: "operon-workflow-edge-delete",
+                                        "data-testid": "workflow-edge-delete",
+                                        "data-edge-id": "{sel_id}",
+                                        transform: "translate({mid_x - 10.0}, {mid_y - 10.0})",
+                                        onmousedown: move |evt: dioxus::events::MouseEvent| {
+                                            evt.stop_propagation();
+                                        },
+                                        onclick: move |evt: dioxus::events::MouseEvent| {
+                                            evt.stop_propagation();
+                                            let next = remove_edge(&graph_for_edge_delete, sel_id);
+                                            apply.call(next);
+                                            selected_edge.set(None);
+                                        },
+                                        rect {
+                                            class: "operon-workflow-edge-delete-bg",
+                                            width: "20",
+                                            height: "20",
+                                            rx: "10",
+                                            ry: "10",
+                                        }
+                                        text {
+                                            class: "operon-workflow-edge-delete-glyph",
+                                            x: "10",
+                                            y: "14",
+                                            "text-anchor": "middle",
+                                            "\u{2715}"
                                         }
                                     }
                                 }
@@ -527,6 +745,7 @@ struct NodeRender {
 
 #[derive(Clone, PartialEq)]
 struct EdgeRender {
+    id: EdgeId,
     from_x: f64,
     from_y: f64,
     to_x: f64,
@@ -604,6 +823,48 @@ fn bounds(nodes: &[NodeRender]) -> (f64, f64, f64, f64) {
         max_y = max_y.max(n.y + NODE_H + 20.0);
     }
     (min_x, min_y, max_x, max_y)
+}
+
+/// Remove `node_id` and any incident edges. Bumps the graph version
+/// so cascade-runs see a different fingerprint.
+fn remove_node(graph: &WorkflowGraph, node_id: NodeId) -> WorkflowGraph {
+    let mut next = graph.clone();
+    next.nodes.remove(&node_id);
+    next.edges
+        .retain(|e| e.from != node_id && e.to != node_id);
+    next.version = next.version.saturating_add(1);
+    next
+}
+
+/// Append a `from -> to` edge if it would be safe (no self-loop, not
+/// a duplicate of an existing edge). Returns `None` when the edge is
+/// rejected so the caller can skip the apply round-trip.
+fn add_edge_if_new(graph: &WorkflowGraph, from: NodeId, to: NodeId) -> Option<WorkflowGraph> {
+    if from == to {
+        return None;
+    }
+    if graph.edges.iter().any(|e| e.from == from && e.to == to) {
+        return None;
+    }
+    let mut next = graph.clone();
+    next.edges.push(Edge {
+        id: Uuid::new_v4(),
+        from,
+        from_socket: "default".into(),
+        to,
+        to_socket: "default".into(),
+    });
+    next.version = next.version.saturating_add(1);
+    Some(next)
+}
+
+/// Drop the edge with the given id. No-op (returns the original) when
+/// the id isn't present.
+fn remove_edge(graph: &WorkflowGraph, edge_id: EdgeId) -> WorkflowGraph {
+    let mut next = graph.clone();
+    next.edges.retain(|e| e.id != edge_id);
+    next.version = next.version.saturating_add(1);
+    next
 }
 
 /// Insert a fresh node referencing `skill_note_id` into the JSON-text
@@ -930,6 +1191,116 @@ mod tests {
         let bad = "not actually json";
         let next = append_node_to_graph(bad, Uuid::new_v4());
         assert_eq!(next, bad);
+    }
+
+    #[test]
+    fn remove_node_drops_node_and_incident_edges() {
+        let mut g = WorkflowGraph::new();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        for id in [a, b, c] {
+            g.nodes.insert(
+                id,
+                Node {
+                    id,
+                    skill_note_id: Uuid::new_v4(),
+                    typed_fields: serde_json::Value::Null,
+                    extra_instructions: String::new(),
+                    position: (0.0, 0.0),
+                    cached_output_path: None,
+                    cached_input_hash: None,
+                    status: NodeStatus::Fresh,
+                },
+            );
+        }
+        g.edges.push(Edge {
+            id: Uuid::new_v4(),
+            from: a,
+            from_socket: "default".into(),
+            to: b,
+            to_socket: "default".into(),
+        });
+        g.edges.push(Edge {
+            id: Uuid::new_v4(),
+            from: b,
+            from_socket: "default".into(),
+            to: c,
+            to_socket: "default".into(),
+        });
+        g.edges.push(Edge {
+            id: Uuid::new_v4(),
+            from: a,
+            from_socket: "default".into(),
+            to: c,
+            to_socket: "default".into(),
+        });
+        let prev_version = g.version;
+        let next = remove_node(&g, b);
+        assert!(!next.nodes.contains_key(&b));
+        assert!(next.nodes.contains_key(&a));
+        assert!(next.nodes.contains_key(&c));
+        // Only the a→c edge survives (a→b and b→c both touched b).
+        assert_eq!(next.edges.len(), 1);
+        assert_eq!(next.edges[0].from, a);
+        assert_eq!(next.edges[0].to, c);
+        assert!(next.version > prev_version);
+    }
+
+    #[test]
+    fn add_edge_if_new_rejects_self_loop_and_duplicates() {
+        let mut g = WorkflowGraph::new();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        for id in [a, b] {
+            g.nodes.insert(
+                id,
+                Node {
+                    id,
+                    skill_note_id: Uuid::new_v4(),
+                    typed_fields: serde_json::Value::Null,
+                    extra_instructions: String::new(),
+                    position: (0.0, 0.0),
+                    cached_output_path: None,
+                    cached_input_hash: None,
+                    status: NodeStatus::Fresh,
+                },
+            );
+        }
+        // Self-loop rejected.
+        assert!(add_edge_if_new(&g, a, a).is_none());
+        // First insert succeeds.
+        let g1 = add_edge_if_new(&g, a, b).expect("first insert");
+        assert_eq!(g1.edges.len(), 1);
+        // Duplicate rejected.
+        assert!(add_edge_if_new(&g1, a, b).is_none());
+    }
+
+    #[test]
+    fn remove_edge_drops_only_the_target_edge() {
+        let mut g = WorkflowGraph::new();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let edge_keep = Edge {
+            id: Uuid::new_v4(),
+            from: a,
+            from_socket: "default".into(),
+            to: b,
+            to_socket: "default".into(),
+        };
+        let edge_drop = Edge {
+            id: Uuid::new_v4(),
+            from: b,
+            from_socket: "default".into(),
+            to: a,
+            to_socket: "default".into(),
+        };
+        let drop_id = edge_drop.id;
+        g.edges.push(edge_keep.clone());
+        g.edges.push(edge_drop);
+        let next = remove_edge(&g, drop_id);
+        assert_eq!(next.edges.len(), 1);
+        assert_eq!(next.edges[0].id, edge_keep.id);
     }
 
     #[test]

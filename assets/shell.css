@@ -1841,6 +1841,57 @@ html, body {
   stroke-width: 2;
 }
 
+/* Edge interaction layer: invisible fat hit-area path beneath the
+   visible stroke so a click anywhere near the curve registers, plus
+   selection / delete styling. */
+.operon-workflow-edge-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 14;
+  cursor: pointer;
+}
+.operon-workflow-edge-selected {
+  stroke: var(--operon-accent);
+  stroke-width: 2.5;
+}
+.operon-workflow-edge-ghost {
+  stroke-dasharray: 6 4;
+  opacity: 0.7;
+  pointer-events: none;
+}
+.operon-workflow-edge-delete { cursor: pointer; }
+.operon-workflow-edge-delete-bg {
+  fill: var(--vscode-editor-background, #1e1e1e);
+  stroke: var(--operon-accent);
+  stroke-width: 1.5;
+}
+.operon-workflow-edge-delete:hover .operon-workflow-edge-delete-bg {
+  fill: var(--operon-accent);
+}
+.operon-workflow-edge-delete-glyph {
+  font-size: 11px;
+  fill: var(--operon-accent);
+  pointer-events: none;
+  user-select: none;
+}
+.operon-workflow-edge-delete:hover .operon-workflow-edge-delete-glyph {
+  fill: var(--vscode-editor-background, #1e1e1e);
+}
+
+/* Per-node input / output handles. The output handle is the drag
+   source for new edges; the input handle is the drop target. */
+.operon-workflow-handle {
+  fill: var(--vscode-editor-background, #1e1e1e);
+  stroke: var(--operon-accent);
+  stroke-width: 1.5;
+  cursor: crosshair;
+}
+.operon-workflow-handle:hover {
+  fill: var(--operon-accent);
+}
+.operon-workflow-handle-output { cursor: crosshair; }
+.operon-workflow-handle-input { cursor: cell; }
+
 .operon-workflow-inspector {
   position: absolute;
   left: 12px;
@@ -1883,6 +1934,20 @@ html, body {
   cursor: pointer;
   font-size: 11px;
   color: var(--vscode-descriptionforeground, inherit);
+}
+.operon-workflow-inspector-delete {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 1px solid var(--vscode-errorforeground, #f48771);
+  color: var(--vscode-errorforeground, #f48771);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 3px;
+}
+.operon-workflow-inspector-delete:hover {
+  background: var(--vscode-errorforeground, #f48771);
+  color: var(--vscode-editor-background, #1e1e1e);
 }
 .operon-workflow-inspector-textarea {
   width: 100%;

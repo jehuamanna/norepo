@@ -45,6 +45,13 @@ pub fn InlineRename(props: InlineRenameProps) -> Element {
             },
             oninput: move |evt| value.set(evt.value()),
             onkeydown: move |evt| {
+                // The rename input is a text-editing context; row-level
+                // shortcuts (Backspace=delete, Tab=indent, arrows=move,
+                // Space, F2, …) must not fire while the user is typing.
+                // Stop propagation for every key — Enter / Escape are
+                // handled here, the rest are left to default <input>
+                // behavior (typing characters, native Backspace, etc.).
+                evt.stop_propagation();
                 let key = evt.key().to_string();
                 if key == "Enter" {
                     evt.prevent_default();
