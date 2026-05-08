@@ -81,12 +81,16 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
     let source_uuid = Uuid::parse_str(&props.note_id).ok();
     let source_kind_str = fm.artifact_kind.as_ref().map(|k| k.as_str().to_string());
     // Phase E: read run state from the global `ARTIFACT_RUN_STATE`
-    // map keyed on source artifact id. Reading the GlobalSignal
-    // here subscribes the artifact view to map updates, so the
-    // status pill ticks as the runner progresses (Running → Done /
+    // map. The map is keyed on the runner's deterministic
+    // chat_session_id (so the companion's loader and this view
+    // share one entry), derived from the source artifact id via
+    // `chat_session_id_for_source`. Reading the GlobalSignal here
+    // subscribes the artifact view to map updates, so the status
+    // pill ticks as the runner progresses (Running → Done /
     // Failed) without scope-ownership warnings.
     let run_state_view: Option<ArtifactRunState> = source_uuid
-        .and_then(|id| ARTIFACT_RUN_STATE.read().get(&id).cloned());
+        .map(chat_session_id_for_source)
+        .and_then(|sid| ARTIFACT_RUN_STATE.read().get(&sid).cloned());
     rsx! {
         div { class: "operon-artifact-surface",
             "data-testid": "artifact-surface",
@@ -559,6 +563,14 @@ fn spawn_runner(
     active_session: &mut Signal<Option<Uuid>>,
     active_scope: &mut Signal<operon_store::repos::ChatScope>,
 ) {
+    // Deterministic chat-session id per source artifact: re-runs of
+    // any skill against the same source land in the same rail entry.
+    // Computed up front so all `ARTIFACT_RUN_STATE` writes use it as
+    // the map key — that's the same key the companion uses to look
+    // up "is this session running" for its loader / streaming
+    // surface.
+    let chat_session_id = chat_session_id_for_source(source_note_id);
+
     // Resolve repo path up front so a missing binding fails loudly
     // rather than silently no-op'ing inside the spawned task.
     let projects = match project_repo.list() {
@@ -566,7 +578,7 @@ fn spawn_runner(
         Err(e) => {
             ARTIFACT_RUN_STATE.with_mut(|m| {
                 m.insert(
-                    source_note_id,
+                    chat_session_id,
                     ArtifactRunState::Failed { reason: format!("list projects: {e}") },
                 );
             });
@@ -578,7 +590,7 @@ fn spawn_runner(
         None => {
             ARTIFACT_RUN_STATE.with_mut(|m| {
                 m.insert(
-                    source_note_id,
+                    chat_session_id,
                     ArtifactRunState::Failed {
                         reason: "Set the project's repository (right-click \u{2192} Set repository\u{2026}) before running a skill.".into(),
                     },
@@ -587,13 +599,6 @@ fn spawn_runner(
             return;
         }
     };
-
-    // Deterministic chat-session id per source artifact: re-runs of
-    // any skill against the same source land in the same rail entry.
-    let chat_session_id = Uuid::new_v5(
-        &Uuid::NAMESPACE_OID,
-        format!("operon-artifact-runner:{source_note_id}").as_bytes(),
-    );
 
     // Find or create the chat_session row, then bump the rail's
     // version so the new entry shows up.
@@ -621,11 +626,12 @@ fn spawn_runner(
 
     plugin.bind_session(chat_session_id, repo_path.clone());
 
-    // Show the in-flight indicator immediately. Writing to the
-    // global `ARTIFACT_RUN_STATE` map from this synchronous click
-    // handler is a normal `with_mut` — no scope-ownership warning.
+    // Show the in-flight indicator immediately. Keyed on
+    // chat_session_id so the companion's "Claude is thinking…"
+    // loader (which knows the active chat session, not the source
+    // artifact) can also subscribe to the same state.
     ARTIFACT_RUN_STATE.with_mut(|m| {
-        m.insert(source_note_id, ArtifactRunState::Running);
+        m.insert(chat_session_id, ArtifactRunState::Running);
     });
     // The post-completion `LocalNoteVersion` bump still happens
     // from inside `spawn_forever` and emits a `__copy_value_hoisted`
@@ -661,7 +667,7 @@ fn spawn_runner(
                 let n = outcome.created_artifact_ids.len();
                 ARTIFACT_RUN_STATE.with_mut(|m| {
                     m.insert(
-                        source_note_id,
+                        chat_session_id,
                         ArtifactRunState::Done { artifact_count: n },
                     );
                 });
@@ -674,11 +680,23 @@ fn spawn_runner(
             Err(e) => {
                 ARTIFACT_RUN_STATE.with_mut(|m| {
                     m.insert(
-                        source_note_id,
+                        chat_session_id,
                         ArtifactRunState::Failed { reason: format!("{e}") },
                     );
                 });
             }
         }
     });
+}
+
+/// Public derivation of the deterministic chat-session UUID for an
+/// artifact runner keyed on the source artifact's id. Used by both
+/// `spawn_runner` (to bind the rail entry + ARTIFACT_RUN_STATE) and
+/// the artifact view's render (to look up its current run state by
+/// the same key the companion uses).
+pub fn chat_session_id_for_source(source_note_id: Uuid) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_OID,
+        format!("operon-artifact-runner:{source_note_id}").as_bytes(),
+    )
 }
