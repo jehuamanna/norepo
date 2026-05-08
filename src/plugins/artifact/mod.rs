@@ -9,16 +9,22 @@ use dioxus::prelude::*;
 
 use crate::plugin::{FormatCaps, FormatPlugin, PluginManifest, PluginSurface};
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cascade;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cascade_graph;
 pub mod frontmatter;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod runner;
-mod view;
+pub(crate) mod view;
 
 pub use frontmatter::{
     parse, rewrite, ArtifactFrontmatter, ArtifactKind, ArtifactStatus,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use runner::{run_skill_on_source, RunOutcome, RunnerError};
+#[cfg(not(target_arch = "wasm32"))]
+pub use cascade::{run_cascade, CascadeError, CascadeOutcome, SkillRef};
 
 pub struct ArtifactFormatPlugin {
     manifest: PluginManifest,

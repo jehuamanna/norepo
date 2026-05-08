@@ -67,6 +67,35 @@ pub struct Node {
     /// case the cascade re-creates it on the next run.
     #[serde(default)]
     pub cached_output_note_id: Option<Uuid>,
+    /// Cascade-visualization marker: when `true`, this node is a
+    /// READ-ONLY snapshot of an Artifact note produced by the
+    /// autonomous SDLC cascade (`crate::plugins::artifact::cascade`),
+    /// not a user-editable skill invocation in a hand-crafted DAG.
+    /// The view renders these with a compact "kind badge + title"
+    /// card; the engine/executor skip them during dirty-propagation
+    /// and run since they have nothing to execute. Defaults to
+    /// `false`, so pre-existing graphs round-trip unchanged.
+    #[serde(default)]
+    pub is_artifact_snapshot: bool,
+    /// When `is_artifact_snapshot` is true, this is the Artifact note
+    /// id the snapshot represents. Lets the view link from the
+    /// canvas tile to the artifact's editor tab. None on regular
+    /// skill nodes.
+    #[serde(default)]
+    pub artifact_ref: Option<Uuid>,
+    /// When `is_artifact_snapshot` is true, this is the artifact's
+    /// kind (e.g. "epic") cached for fast badge rendering without
+    /// reloading the artifact's frontmatter on every paint. None on
+    /// regular skill nodes.
+    #[serde(default)]
+    pub artifact_kind_label: Option<String>,
+    /// When `is_artifact_snapshot` is true, this is the artifact
+    /// note's title at snapshot time — what the user sees on the
+    /// canvas tile (e.g. `epic-01-realtime-collaboration`). Cached
+    /// so the canvas renderer doesn't need a `LocalNoteRepository`
+    /// lookup on every paint.
+    #[serde(default)]
+    pub artifact_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -97,6 +126,16 @@ pub struct Edge {
     pub to: NodeId,
     #[serde(default = "default_socket")]
     pub to_socket: String,
+    /// Cascade-visualization marker: distinguishes parent/child edges
+    /// from "Depends on" cross-edges parsed out of artifact bodies.
+    /// `None` (or the default empty string) is the existing skill-DAG
+    /// edge — black. `Some("parent_child")` is the implicit fan-out
+    /// from a parent artifact to its produced children; `Some("depends_on")`
+    /// is a cross-edge between siblings derived from the
+    /// `## Depends on` section in their markdown bodies (rendered amber
+    /// in the canvas).
+    #[serde(default)]
+    pub edge_kind: Option<String>,
 }
 
 fn default_socket() -> String {
@@ -154,6 +193,10 @@ mod tests {
             cached_input_hash: None,
             status: NodeStatus::Fresh,
             cached_output_note_id: None,
+            is_artifact_snapshot: false,
+            artifact_ref: None,
+            artifact_kind_label: None,
+            artifact_title: None,
         }
     }
 
@@ -164,6 +207,7 @@ mod tests {
             from_socket: "default".into(),
             to,
             to_socket: "default".into(),
+            edge_kind: None,
         }
     }
 

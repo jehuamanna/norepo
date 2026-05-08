@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::plugins::workflow::engine::{compute_input_hash, hash_body, SkillBag, SkillSnapshot};
 use crate::plugins::workflow::state::{Node, NodeId, WorkflowGraph};
+use crate::shell::companion_state::{ArtifactRunState, ARTIFACT_RUN_STATE};
 
 /// Phase-4 cascade transcript persistence: when the cascade routes
 /// through a real `chat_session`, the executor records each Claude
@@ -43,18 +44,21 @@ pub fn output_dir(repo_path: &Path) -> PathBuf {
     repo_path.join(".operon").join("outputs")
 }
 
-/// Compute the canonical output file path for a slug.
-pub fn output_file(repo_path: &Path, slug: &str) -> PathBuf {
-    output_dir(repo_path).join(format!("{slug}-output.md"))
-}
-
 /// Result of one successful node run. Caller writes these back into
 /// the node before kicking off the next step in a cascade.
+///
+/// Multi-output support: `produced` lists every `.md` file claude
+/// wrote during this run, in lexicographic order — one element for
+/// `output_count: one` skills, N for `output_count: many`. The legacy
+/// `output_path` / `output_body` fields hold the FIRST produced file
+/// so callers that haven't been ported to iterate `produced` keep
+/// working (they see the lead artifact).
 #[derive(Debug, Clone)]
 pub struct RunArtifact {
     pub output_path: PathBuf,
     pub output_body: String,
     pub input_hash: String,
+    pub produced: Vec<(PathBuf, String)>,
 }
 
 #[derive(Debug)]
@@ -127,29 +131,44 @@ pub async fn run_node(
     if skill_body.trim().is_empty() {
         return Err(ExecError::NoSkillBody(node.skill_note_id));
     }
-    let _ = workflow_id; // Kept for callers that may want it later (cwd subdir, telemetry).
 
-    // Unified output path: one folder per repo, file named after the
-    // skill's slug. See doc-comment on `skill_slug` above for the
-    // overwrite semantics.
-    let out_dir = output_dir(&repo_path);
+    // Per-node output directory: each run's produced .md files are
+    // imported as their own Outputs notes, so multi-output skills
+    // (ba-discover-epics, ba-decompose-features, …) can write N
+    // separate files. Path is keyed on (workflow_id, node_id) so
+    // re-runs on the same node clear and repopulate ONE dir, while
+    // sibling nodes don't collide.
+    let out_dir = output_dir(&repo_path)
+        .join(workflow_id.to_string())
+        .join(node_id.to_string());
+    // Clear stale outputs from any prior run on this node so the
+    // scan-for-produced-files diff has a clean starting state.
+    if out_dir.exists() {
+        for entry in std::fs::read_dir(&out_dir)?.flatten() {
+            let p = entry.path();
+            if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("md") {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
     std::fs::create_dir_all(&out_dir)?;
-    let output_path = out_dir.join(format!("{skill_slug}-output.md"));
+    let _ = skill_slug; // legacy single-file slug naming no longer used
 
-    // Build the prompt.
+    // Pre-snapshot directory state — `scan_produced_files` diffs
+    // against this set + run-start mtime to find the files this run
+    // actually wrote.
+    let pre_existing: std::collections::HashSet<PathBuf> = list_md_files(&out_dir);
+    let run_started_at = std::time::SystemTime::now();
+
+    // Build the prompt — points to the directory, not a single path,
+    // and instructs Claude to use Write ONCE PER ARTIFACT.
     let prompt = build_prompt(
         node,
         skill_body,
         skill_version,
         upstream_outputs,
-        &output_path,
+        &out_dir,
     );
-
-    // Pre-clear any stale output file so we can detect "claude said done
-    // but never wrote anything" with a clean File::exists check.
-    if output_path.exists() {
-        std::fs::remove_file(&output_path)?;
-    }
 
     // Compute the input hash that will be cached on success. The graph
     // snapshot supplied here MUST reflect the current upstream cached
@@ -178,20 +197,39 @@ pub async fn run_node(
             None,
             &serde_json::json!({ "text": format!("{header}\n\n{prompt}") }),
         );
+        bump_message_version();
     }
+
+    // Stamp the global run-state map so the companion's
+    // "Claude is thinking…" loader renders for the entire duration
+    // of this Claude subprocess. The companion's match arms read
+    // ARTIFACT_RUN_STATE keyed on the chat session id (which is the
+    // same as `operon_session` here for workflow runs) and surface
+    // the spinner whenever the entry is `Running`. We always either
+    // mutate to `Done` (Ok path) or `Failed` (every error path after
+    // this point) so the loader doesn't get stuck.
+    ARTIFACT_RUN_STATE.with_mut(|m| {
+        m.insert(operon_session, ArtifactRunState::Running);
+    });
 
     // Run claude.
     eprintln!(
         "operon: executor::run_node [{node_id}] calling plugin.send_rich \
-         (prompt_len={}, output_path={})",
+         (prompt_len={}, out_dir={})",
         prompt.len(),
-        output_path.display()
+        out_dir.display()
     );
     let ct = CancellationToken::new();
-    let mut rx = plugin
-        .send_rich(prompt, operon_session, ct)
-        .await
-        .map_err(|e| ExecError::Plugin(format!("send_rich: {e}")))?;
+    let mut rx = match plugin.send_rich(prompt, operon_session, ct).await {
+        Ok(rx) => rx,
+        Err(e) => {
+            let reason = format!("send_rich: {e}");
+            ARTIFACT_RUN_STATE.with_mut(|m| {
+                m.insert(operon_session, ArtifactRunState::Failed { reason: reason.clone() });
+            });
+            return Err(ExecError::Plugin(reason));
+        }
+    };
     eprintln!("operon: executor::run_node [{node_id}] send_rich returned, draining events");
 
     // Accumulate Text deltas across the turn — claude streams them in
@@ -200,7 +238,8 @@ pub async fn run_node(
     let mut assistant_buf = String::new();
     let flush_assistant = |buf: &mut String| {
         if let Some(sink) = transcript_sink.as_ref() {
-            if !buf.is_empty() {
+            let appended = !buf.is_empty();
+            if appended {
                 let _ = sink.chat_repo.append(
                     sink.chat_session_id,
                     ChatMessageKind::Assistant,
@@ -214,6 +253,9 @@ pub async fn run_node(
             crate::shell::companion_state::INPROGRESS_ASSISTANT.with_mut(|m| {
                 m.remove(&sink.chat_session_id);
             });
+            if appended {
+                bump_message_version();
+            }
         } else {
             buf.clear();
         }
@@ -237,6 +279,10 @@ pub async fn run_node(
                 assistant_buf.push_str(&t);
                 // Stream the delta into the in-progress map so the
                 // companion's render shows letter-by-letter typing.
+                // No CHAT_MESSAGE_VERSION bump needed — the companion
+                // subscribes to INPROGRESS_ASSISTANT directly, and
+                // bumping the version here would force a DB re-fetch
+                // per character (slow + noisy).
                 if let Some(sink) = transcript_sink.as_ref() {
                     let chat_session_id = sink.chat_session_id;
                     crate::shell::companion_state::INPROGRESS_ASSISTANT.with_mut(|m| {
@@ -253,6 +299,7 @@ pub async fn run_node(
                         None,
                         &serde_json::json!({ "text": t }),
                     );
+                    bump_message_version();
                 }
             }
             ClaudeCodeEvent::ToolUse { id, name, input } => {
@@ -269,6 +316,7 @@ pub async fn run_node(
                             "result": serde_json::Value::Null,
                         }),
                     );
+                    bump_message_version();
                     // Phase F: mirror Write tool content into the
                     // rail as a readable Assistant message — same
                     // pattern as the artifact runner.
@@ -292,6 +340,7 @@ pub async fn run_node(
                                 None,
                                 &serde_json::json!({ "body": body }),
                             );
+                            bump_message_version();
                         }
                     }
                 }
@@ -312,6 +361,7 @@ pub async fn run_node(
                             },
                         }),
                     );
+                    bump_message_version();
                 }
             }
             ClaudeCodeEvent::Done { .. } => {
@@ -327,7 +377,14 @@ pub async fn run_node(
                         None,
                         &serde_json::json!({ "text": format!("error: {msg}") }),
                     );
+                    bump_message_version();
                 }
+                ARTIFACT_RUN_STATE.with_mut(|m| {
+                    m.insert(
+                        operon_session,
+                        ArtifactRunState::Failed { reason: msg.clone() },
+                    );
+                });
                 return Err(ExecError::Plugin(msg));
             }
         }
@@ -339,14 +396,123 @@ pub async fn run_node(
         "operon: executor::run_node [{node_id}] event-stream ended, {events} event(s) total"
     );
 
-    // claude's Write tool reports success before fsync; tolerate a
-    // tight retry window.
-    let body = read_with_retry(&output_path, 5)?;
+    // Scan the per-node output dir for files this run produced —
+    // either entirely new (not in pre_existing) or modified after
+    // run_started_at (re-runs that overwrote a stale file). Mirrors
+    // the artifact runner's import semantics. Bounded retries
+    // tolerate the fsync-after-Write race.
+    let mut produced: Vec<(PathBuf, String)> = Vec::new();
+    for _attempt in 0..5 {
+        produced = scan_produced_files(&out_dir, &pre_existing, run_started_at);
+        if !produced.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(80));
+    }
+    if produced.is_empty() {
+        ARTIFACT_RUN_STATE.with_mut(|m| {
+            m.insert(
+                operon_session,
+                ArtifactRunState::Failed {
+                    reason: format!(
+                        "claude finished but no .md files appeared in {}",
+                        out_dir.display()
+                    ),
+                },
+            );
+        });
+        return Err(ExecError::OutputMissing(out_dir.clone()));
+    }
+    // Lead-output backward compat for callers that still read
+    // `output_path` / `output_body` directly (the inspector's
+    // "last output" panel, hash-based dirty propagation).
+    let (output_path, output_body) = produced
+        .first()
+        .cloned()
+        .expect("non-empty by guard above");
+    ARTIFACT_RUN_STATE.with_mut(|m| {
+        m.insert(
+            operon_session,
+            ArtifactRunState::Done {
+                artifact_count: produced.len(),
+            },
+        );
+    });
     Ok(RunArtifact {
         output_path,
-        output_body: body,
+        output_body,
         input_hash,
+        produced,
     })
+}
+
+/// List `.md` files in `dir` (top-level only). Returns absolute
+/// canonicalised paths so the diff against post-run state is stable
+/// regardless of how `dir` was originally constructed.
+fn list_md_files(dir: &Path) -> std::collections::HashSet<PathBuf> {
+    let mut out = std::collections::HashSet::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
+            if let Ok(canon) = path.canonicalize() {
+                out.insert(canon);
+            } else {
+                out.insert(path);
+            }
+        }
+    }
+    out
+}
+
+/// Find files in `dir` that are either NEW (not in `pre_existing`) or
+/// modified after `run_started_at`. Returns `(path, body)` pairs in
+/// lexicographic order so imports are deterministic across re-runs.
+fn scan_produced_files(
+    dir: &Path,
+    pre_existing: &std::collections::HashSet<PathBuf>,
+    run_started_at: std::time::SystemTime,
+) -> Vec<(PathBuf, String)> {
+    let mut out: Vec<(PathBuf, String)> = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !(path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md")) {
+            continue;
+        }
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let is_new = !pre_existing.contains(&canonical);
+        let is_recent = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .map(|t| t >= run_started_at)
+            .unwrap_or(false);
+        if is_new || is_recent {
+            if let Ok(body) = std::fs::read_to_string(&path) {
+                out.push((canonical, body));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Bump the global live-transcript version so the companion's poll
+/// loop re-fetches `chat_message`. Same rationale as the mirror in
+/// `plugins::artifact::runner::bump_message_version`: the executor
+/// task lives in the virtual root scope (via `spawn_forever`),
+/// where writes to a scope-bound `Signal` are silently dropped.
+/// `CHAT_MESSAGE_VERSION` is a `GlobalSignal` so it's safe to
+/// mutate from any scope.
+fn bump_message_version() {
+    crate::shell::companion_state::CHAT_MESSAGE_VERSION.with_mut(|v| {
+        *v = v.saturating_add(1);
+    });
 }
 
 /// Read upstream output bodies for `node_id`. Reads from disk via the
@@ -377,12 +543,23 @@ fn build_prompt(
     skill_body: &str,
     skill_version: &str,
     upstream_outputs: &[(NodeId, String)],
-    output_path: &Path,
+    out_dir: &Path,
 ) -> String {
     let mut buf = String::new();
-    buf.push_str("You are running a workflow node. Follow the skill below and write your\n");
-    buf.push_str("output (markdown body, optionally preceded by YAML frontmatter) to the\n");
-    buf.push_str("path provided at the end of this prompt — using the Write tool.\n\n");
+    buf.push_str(
+        "You are running a workflow node. Follow the skill below and use the\n\
+         Write tool to produce one or more artifact files in the directory\n\
+         given at the end of this prompt.\n\n\
+         **One artifact = one Write call = one file.** If the skill says\n\
+         `output_count: many` and you produce N artifacts, call the Write\n\
+         tool N times — once per artifact, each to its own `.md` file in\n\
+         the directory below. Do NOT concatenate multiple artifacts into a\n\
+         single file with `# filename.md` header separators; the engine\n\
+         imports each `.md` file as its own note, so concatenating loses\n\
+         every artifact except the first. If the skill says\n\
+         `output_count: one`, call Write exactly once with a single `.md`\n\
+         file in the directory.\n\n",
+    );
     buf.push_str(&format!(
         "Skill version: {}\n",
         if skill_version.is_empty() {
@@ -422,23 +599,16 @@ fn build_prompt(
     }
 
     buf.push_str(&format!(
-        "Write your output to (absolute path): {}\n",
-        output_path.display()
+        "Output directory (absolute path): {}\n\n\
+         Use kebab-case filenames that match what the skill body suggests\n\
+         (e.g. `epic-01-core-timer-engine.md`, `feature-02-cycle-workflow.md`).\n\
+         Each file MUST start with YAML frontmatter (`---` block) declaring\n\
+         the artifact_kind the skill produces, then the markdown body. The\n\
+         first heading should match the file's purpose in human-readable\n\
+         form.\n",
+        out_dir.display()
     ));
     buf
-}
-
-/// Re-read the output file with bounded retries to tolerate the
-/// fsync-after-Write-tool race claude has on some platforms. Returns
-/// `OutputMissing` if the file never appears.
-fn read_with_retry(path: &Path, attempts: usize) -> Result<String, ExecError> {
-    for _ in 0..attempts {
-        if path.exists() {
-            return Ok(std::fs::read_to_string(path)?);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(80));
-    }
-    Err(ExecError::OutputMissing(path.to_path_buf()))
 }
 
 #[cfg(test)]
@@ -457,6 +627,10 @@ mod tests {
             cached_input_hash: None,
             cached_output_note_id: None,
             status: NodeStatus::Dirty,
+            is_artifact_snapshot: false,
+            artifact_ref: None,
+            artifact_kind_label: None,
+            artifact_title: None,
         }
     }
 
@@ -509,18 +683,32 @@ mod tests {
     }
 
     #[test]
-    fn read_with_retry_returns_missing_for_absent_file() {
-        let p = std::path::PathBuf::from("/tmp/operon-test-this-should-not-exist-xyz123.md");
-        let err = read_with_retry(&p, 1).unwrap_err();
-        assert!(matches!(err, ExecError::OutputMissing(_)));
+    fn scan_produced_files_picks_up_new_md_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("stale.md");
+        std::fs::write(&stale, "old").unwrap();
+        let pre = list_md_files(dir.path());
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.path().join("epic-01.md"), "alpha").unwrap();
+        std::fs::write(dir.path().join("epic-02.md"), "beta").unwrap();
+        let produced = scan_produced_files(dir.path(), &pre, started);
+        assert_eq!(produced.len(), 2);
+        assert_eq!(produced[0].1, "alpha");
+        assert_eq!(produced[1].1, "beta");
     }
 
     #[test]
-    fn read_with_retry_returns_body_on_existing_file() {
+    fn scan_produced_files_includes_overwritten_pre_existing() {
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("out.md");
-        std::fs::write(&p, "hello world").unwrap();
-        let body = read_with_retry(&p, 1).unwrap();
-        assert_eq!(body, "hello world");
+        let p = dir.path().join("epic-01.md");
+        std::fs::write(&p, "original").unwrap();
+        let pre = list_md_files(dir.path());
+        let started = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&p, "rewritten").unwrap();
+        let produced = scan_produced_files(dir.path(), &pre, started);
+        assert_eq!(produced.len(), 1);
+        assert_eq!(produced[0].1, "rewritten");
     }
 }

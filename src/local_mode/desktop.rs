@@ -470,6 +470,22 @@ pub fn provide_local_app_signals() {
     use_context_provider(|| LocalProjectVersion(project_version));
     let note_version: Signal<u64> = use_signal(|| 0);
     use_context_provider(|| LocalNoteVersion(note_version));
+    // Bridge: detached-scope writers (artifact `spawn_forever` cascade,
+    // workflow executor) bump `LOCAL_NOTE_VERSION` (a `GlobalSignal`)
+    // because writes from the virtual root scope to a component-scope
+    // `Signal` get the `__copy_value_hoisted` warning and may be
+    // silently dropped. This effect mirrors those bumps back into the
+    // local Signal so existing component readers (the explorer's
+    // `notes_by_project` Memo, etc.) re-render without per-call-site
+    // migration. One unified subscriber here, no churn at the dozens
+    // of read sites scattered across the codebase.
+    {
+        let mut local = note_version;
+        use_effect(move || {
+            let _v = *crate::shell::companion_state::LOCAL_NOTE_VERSION.read();
+            local.with_mut(|v| *v = v.saturating_add(1));
+        });
+    }
     let selected_project: Signal<Option<Uuid>> = use_signal(|| None);
     use_context_provider(|| SelectedProject(selected_project));
     // M1-companion-claude-code: expose the active project's repo_path as a

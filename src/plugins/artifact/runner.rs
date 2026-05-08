@@ -15,7 +15,8 @@
 use futures::StreamExt;
 use operon_plugins_claude_code::{ClaudeCodeChatPlugin, ClaudeCodeEvent};
 use operon_store::repos::{
-    ChatMessageKind, ChatMessageRepository, LocalNoteRepository, LocalProjectRepository, NoteKind,
+    ChatMessageKind, ChatMessageRepository, LocalNote, LocalNoteRepository, LocalProjectRepository,
+    NoteKind,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,10 @@ pub enum RunnerError {
     InvalidPath(String),
     Plugin(String),
     Io(std::io::Error),
+    /// Pipeline gate refusal: source artifact is not Approved and is
+    /// not a root seed. The UI gate normally prevents this; the
+    /// runtime check is belt-and-suspenders for non-UI call sites.
+    Gated(String),
 }
 
 impl std::fmt::Display for RunnerError {
@@ -47,6 +52,7 @@ impl std::fmt::Display for RunnerError {
             Self::InvalidPath(s) => write!(f, "invalid path: {s}"),
             Self::Plugin(s) => write!(f, "claude: {s}"),
             Self::Io(e) => write!(f, "io: {e}"),
+            Self::Gated(s) => write!(f, "gated: {s}"),
         }
     }
 }
@@ -113,6 +119,27 @@ pub async fn run_skill_on_source(
         .map_err(|e| RunnerError::NotFound(format!("source body: {e}")))?;
     let source_body =
         String::from_utf8(source_bytes).map_err(|e| RunnerError::Plugin(format!("utf8: {e}")))?;
+
+    // 2a. Pipeline gate: refuse runs when the source is not Approved
+    //     unless it's a root seed (no upstream parent — e.g. a
+    //     user-authored Requirements note). Mirrors the UI-side gate
+    //     in `src/plugins/artifact/view.rs`. Skip the check entirely
+    //     when the source isn't even an Artifact-frontmatter note —
+    //     the workflow canvas reuses some of these paths for plain
+    //     Markdown sources.
+    let source_fm = crate::plugins::artifact::frontmatter::parse(&source_body);
+    if source_fm.artifact_kind.is_some()
+        && source_fm.source_artifact_id.is_some()
+        && source_fm.status != ArtifactStatus::Approved
+    {
+        let path_label =
+            build_artifact_path_label(note_repo, project_repo, project_id, source_note_id);
+        return Err(RunnerError::Gated(format!(
+            "source artifact \"{path_label}\" is {} — approve it before running downstream skills",
+            source_fm.status.as_str()
+        )));
+    }
+
     let skill_bytes = persistence
         .load(&skill_note_id.to_string())
         .await
@@ -225,6 +252,23 @@ pub async fn run_skill_on_source(
     //     source. Body is read from disk; frontmatter is patched so
     //     the engine's view fields (status, source linkage) are
     //     authoritative regardless of what claude wrote.
+    //
+    //     Dedup: if a sibling Artifact note with the same title
+    //     already exists under this source, reuse its row id and
+    //     overwrite the body. Without this, every Re-run / Revise
+    //     cycle would duplicate every child artifact under the same
+    //     parent — making the explorer tree increasingly noisy and
+    //     making "regenerate after editing the Epic" a destructive
+    //     UX (the user would have to manually delete N stale rows).
+    let existing_siblings: Vec<LocalNote> = note_repo
+        .list_for_project(project_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| {
+            n.parent_id == Some(source_note_id) && matches!(n.kind, NoteKind::Artifact)
+        })
+        .collect();
+
     let mut created_ids: Vec<Uuid> = Vec::new();
     for file in produced {
         let body = match std::fs::read_to_string(&file) {
@@ -239,17 +283,24 @@ pub async fn run_skill_on_source(
             .and_then(|s| s.to_str())
             .unwrap_or("artifact")
             .to_string();
-        let row = match note_repo.create_with_kind(
-            project_id,
-            Some(source_note_id),
-            &title,
-            NoteKind::Artifact,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("operon: artifact create_with_kind failed: {e}");
-                continue;
-            }
+        let existing_id = existing_siblings
+            .iter()
+            .find(|n| n.title == title)
+            .map(|n| n.id);
+        let row_id = match existing_id {
+            Some(id) => id,
+            None => match note_repo.create_with_kind(
+                project_id,
+                Some(source_note_id),
+                &title,
+                NoteKind::Artifact,
+            ) {
+                Ok(r) => r.id,
+                Err(e) => {
+                    eprintln!("operon: artifact create_with_kind failed: {e}");
+                    continue;
+                }
+            },
         };
         // Patch the artifact frontmatter so source_artifact_id /
         // source_skill_id / status are always correct, even if the
@@ -273,13 +324,13 @@ pub async fn run_skill_on_source(
         fm.source_skill_id = Some(skill_note_id);
         let final_body = rewrite_artifact_fm(&body, &fm);
         if let Err(e) = persistence
-            .save(&row.id.to_string(), final_body.as_bytes())
+            .save(&row_id.to_string(), final_body.as_bytes())
             .await
         {
             eprintln!("operon: artifact persistence save failed: {e}");
             continue;
         }
-        created_ids.push(row.id);
+        created_ids.push(row_id);
     }
 
     Ok(RunOutcome {
@@ -339,6 +390,52 @@ fn build_prompt(
          you produced is enough.\n",
     );
     buf
+}
+
+/// Build a human-readable WPN-style path for an artifact: `Project /
+/// Parent / This Title`. Used by the gate-refusal error so the user
+/// sees what to approve, not a raw UUID. Falls back to the UUID for
+/// any segment that can't be resolved (missing project row, missing
+/// note row, broken parent chain) — never panics, never blocks the
+/// caller.
+fn build_artifact_path_label(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    project_repo: &Arc<dyn LocalProjectRepository>,
+    project_id: Uuid,
+    artifact_id: Uuid,
+) -> String {
+    let project_name = project_repo
+        .list()
+        .ok()
+        .and_then(|all| all.into_iter().find(|p| p.id == project_id))
+        .map(|p| p.name)
+        .unwrap_or_else(|| project_id.to_string());
+
+    let notes = match note_repo.list_for_project(project_id) {
+        Ok(v) => v,
+        Err(_) => return format!("{project_name} / {artifact_id}"),
+    };
+    let by_id: std::collections::HashMap<Uuid, &LocalNote> =
+        notes.iter().map(|n| (n.id, n)).collect();
+
+    // Walk parent chain, capping the depth to avoid pathological cycles.
+    let mut titles: Vec<String> = Vec::new();
+    let mut current = by_id.get(&artifact_id).copied();
+    let mut steps = 0;
+    while let Some(n) = current {
+        titles.push(n.title.clone());
+        if steps > 32 {
+            break;
+        }
+        current = n.parent_id.and_then(|p| by_id.get(&p).copied());
+        steps += 1;
+    }
+    titles.reverse();
+    if titles.is_empty() {
+        format!("{project_name} / {artifact_id}")
+    } else {
+        format!("{project_name} / {}", titles.join(" / "))
+    }
 }
 
 /// List `.md` files (top-level only — no recursion) in `dir`.

@@ -277,6 +277,10 @@ mod tests {
             cached_input_hash: None,
             cached_output_note_id: None,
             status: NodeStatus::Dirty,
+            is_artifact_snapshot: false,
+            artifact_ref: None,
+            artifact_kind_label: None,
+            artifact_title: None,
         }
     }
 
@@ -287,6 +291,7 @@ mod tests {
             from_socket: "default".into(),
             to,
             to_socket: "default".into(),
+            edge_kind: None,
         }
     }
 

@@ -2,21 +2,26 @@
 
 use dioxus::prelude::*;
 use dioxus::html::HasFileData;
-use operon_store::repos::LocalProject;
-use std::path::PathBuf;
+use operon_store::repos::{LocalNoteRepository, LocalProject};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use operon_store::repos::NoteKind;
 
 use keyboard_types::Modifiers;
 
+use crate::local_mode::desktop::LocalNoteRepo;
 use crate::local_mode::explorer::{
-    ExplorerUndoCtx, LastClicked, MultiSelected, NodeKey, NotesByProjectCtx, VisibleFlat,
+    ExplorerUndoCtx, LastClicked, LocalNoteVersion, MultiSelected, NodeKey, NotesByProjectCtx,
+    VisibleFlat,
 };
 use crate::local_mode::ui::{
     classify_drop_position, ContextMenu, ContextMenuItem, DragKind, DragSession, DropPosition,
     InlineRename,
 };
+use crate::persistence::Persistence;
 
 #[derive(Props, Clone, PartialEq)]
 pub struct ProjectRowProps {
@@ -175,6 +180,46 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     );
     paste_item.enabled = has_clip_note;
 
+    // Bulk-import a folder of `.md` files as `NoteKind::Skill` notes
+    // under this project. Title = file stem; body = full file content
+    // (including frontmatter). Idempotent: existing Skill notes with
+    // the same title are skipped, so re-running the import after a
+    // skill body edit only adds new files. README.md is filtered.
+    let LocalNoteRepo(note_repo_for_import) = use_context();
+    let persistence_for_import: Arc<dyn Persistence> = use_context();
+    let LocalNoteVersion(note_version_for_import) = use_context();
+    let import_skills = {
+        let note_repo = note_repo_for_import.clone();
+        let persistence = persistence_for_import.clone();
+        let mut version_setter = note_version_for_import;
+        Callback::new(move |_| {
+            let note_repo = note_repo.clone();
+            let persistence = persistence.clone();
+            let project_id = id;
+            spawn(async move {
+                let folder = rfd::AsyncFileDialog::new()
+                    .set_title("Pick a folder of .md skill files to import")
+                    .pick_folder()
+                    .await;
+                let Some(handle) = folder else { return };
+                let path = handle.path().to_path_buf();
+                let n = import_skills_from_folder(
+                    &note_repo,
+                    &persistence,
+                    project_id,
+                    &path,
+                )
+                .await;
+                tracing::info!(
+                    target: "operon::explorer",
+                    "imported {n} skill(s) from {}",
+                    path.display()
+                );
+                version_setter.with_mut(|v| *v = v.saturating_add(1));
+            });
+        })
+    };
+
     // M1-companion-claude-code: open the OS folder picker, then route the
     // selection (or a None on Clear) through `on_set_repo_path`.
     let pick_repo = {
@@ -233,6 +278,7 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
                 })
                 .collect(),
         ),
+        ContextMenuItem::new("Import skills\u{2026}", import_skills),
         if is_bulk {
             ContextMenuItem::new(
                 format!("Cut {bulk_count} items"),
@@ -733,4 +779,84 @@ fn ForbiddenIndicator() -> Element {
             "data-testid": "drop-indicator-forbidden",
         }
     }
+}
+
+/// Walk `folder` for top-level `.md` files and create a `NoteKind::Skill`
+/// note under `project_id` for each one. Title = file stem; body = full
+/// file contents. Idempotent: skills with a matching title already
+/// present in the project are left alone, so the user can re-run the
+/// import after pulling new skill files. `README.md` is always
+/// skipped. Returns the number of skill rows actually created.
+async fn import_skills_from_folder(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    persistence: &Arc<dyn Persistence>,
+    project_id: Uuid,
+    folder: &Path,
+) -> usize {
+    let entries = match std::fs::read_dir(folder) {
+        Ok(it) => it,
+        Err(e) => {
+            tracing::warn!(
+                target: "operon::explorer",
+                "import_skills: read_dir({}) failed: {e}",
+                folder.display()
+            );
+            return 0;
+        }
+    };
+
+    let existing_titles: HashSet<String> = note_repo
+        .list_for_project(project_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| matches!(n.kind, NoteKind::Skill))
+        .map(|n| n.title)
+        .collect();
+
+    let mut count = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        if stem.eq_ignore_ascii_case("readme") {
+            continue;
+        }
+        if existing_titles.contains(&stem) {
+            continue;
+        }
+        let body = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "operon: import_skills read failed for {}: {e}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        match note_repo.create_with_kind(project_id, None, &stem, NoteKind::Skill) {
+            Ok(row) => {
+                if let Err(e) = persistence
+                    .save(&row.id.to_string(), body.as_bytes())
+                    .await
+                {
+                    eprintln!("operon: import_skills save failed for {stem}: {e}");
+                    continue;
+                }
+                count += 1;
+            }
+            Err(e) => {
+                eprintln!("operon: import_skills create_with_kind failed for {stem}: {e}");
+            }
+        }
+    }
+    count
 }

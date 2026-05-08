@@ -184,8 +184,15 @@ pub struct ExplorerUndoCtx {
     pub on_redo: Callback<()>,
 }
 
-/// Bumped on every note mutation. The panel re-fetches notes for the
-/// affected project when this changes.
+/// Bumped on every note mutation by component-scope writers (the
+/// explorer's create / rename / delete handlers, the editor's save
+/// scheduler, etc.). Detached-scope writers (`spawn_forever` tasks
+/// — artifact cascade, workflow executor) instead bump
+/// `crate::shell::companion_state::LOCAL_NOTE_VERSION`, which is a
+/// `GlobalSignal` safe to write from any scope. A bridge effect in
+/// `desktop.rs::Workspace` mirrors those global bumps back into this
+/// `Signal`, so component readers see one unified version regardless
+/// of which writer triggered the change.
 #[derive(Clone, Copy)]
 pub struct LocalNoteVersion(pub Signal<u64>);
 

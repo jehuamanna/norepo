@@ -70,6 +70,21 @@ pub struct ChatSessionVersion(pub Signal<u64>);
 /// component's scope, and safe to read/write from anywhere.
 pub static CHAT_MESSAGE_VERSION: GlobalSignal<u64> = Signal::global(|| 0);
 
+/// Application-wide version counter for `local_note` mutations. The
+/// explorer subscribes to this so a change anywhere in the app
+/// (artifact runner / cascade / workflow run / image attach / paste
+/// import) re-fetches the project's note tree.
+///
+/// **Why a `GlobalSignal` and not a context-provided `Signal`:** same
+/// reason as `CHAT_MESSAGE_VERSION` — the artifact cascade uses
+/// `dioxus::core::spawn_forever` to detach work from the click
+/// handler's scope, which means the spawned task runs in the virtual
+/// root scope ("app", ScopeId 0). Writes from there to a
+/// `Workspace`-scope `Signal<u64>` are silently dropped and Dioxus
+/// emits a `__copy_value_hoisted` warning. The `GlobalSignal` is
+/// application-wide, safe to write from any scope.
+pub static LOCAL_NOTE_VERSION: GlobalSignal<u64> = Signal::global(|| 0);
+
 /// State of the most recent artifact-skill run for a given source
 /// artifact. The artifact view reads this to render its inline
 /// status pill (`Running…` / `Created N artifact(s)` / `Run failed:
@@ -93,6 +108,49 @@ pub enum ArtifactRunState {
 }
 
 pub static ARTIFACT_RUN_STATE: GlobalSignal<HashMap<Uuid, ArtifactRunState>> =
+    Signal::global(HashMap::new);
+
+/// Project-level autonomous-cascade state, keyed on the *root*
+/// artifact id (the Requirements / Approved seed the user clicked Play
+/// on). Distinct from `ARTIFACT_RUN_STATE` (per-skill-run): cascades
+/// span many skill runs across the artifact tree, so the Play button
+/// needs its own status surface to know whether to render ▶ or ⏹.
+///
+/// The orchestrator in `src/plugins/artifact/cascade.rs` writes to
+/// this map; the artifact view subscribes to render the morphing
+/// Play button. Multiple cascades (different roots) can be active
+/// simultaneously.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CascadePhase {
+    /// Currently executing. `artifact_id` + `skill_id` identify the
+    /// in-flight skill run; `level` is BFS depth from the root (0 =
+    /// the root itself).
+    Running {
+        artifact_id: Uuid,
+        skill_id: Uuid,
+        level: u32,
+    },
+    Completed {
+        artifacts_produced: usize,
+    },
+    Cancelled,
+    Failed {
+        reason: String,
+    },
+}
+
+pub static CASCADE_STATE: GlobalSignal<HashMap<Uuid, CascadePhase>> =
+    Signal::global(HashMap::new);
+
+/// Cooperative cancellation tokens for active cascades, keyed on the
+/// same root artifact id as `CASCADE_STATE`. The Play button stores a
+/// fresh token here when it spawns; clicking ⏹ calls `.cancel()` on
+/// it; the cascade orchestrator polls this between skill invocations
+/// and exits at the next boundary.
+///
+/// Stored separately from `CASCADE_STATE` because `CancellationToken`
+/// is `Clone`-only (not serializable / not part of phase state).
+pub static CASCADE_CANCEL: GlobalSignal<HashMap<Uuid, tokio_util::sync::CancellationToken>> =
     Signal::global(HashMap::new);
 
 /// Live letter-by-letter streaming buffer for in-progress Claude

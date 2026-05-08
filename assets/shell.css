@@ -1761,6 +1761,18 @@ html, body {
   background: var(--vscode-button-hoverbackground, var(--vscode-list-hoverbackground, rgba(127, 127, 127, 0.15)));
 }
 
+.operon-workflow-skill-picker-backdrop {
+  /* Fixed full-screen layer that catches click-outside on the picker
+     dropdown. Sits below the picker panel (z-index 49 vs 50) but
+     above everything else, so clicks anywhere outside the panel
+     dismiss it. Transparent — the picker shadow does the visual
+     separation. */
+  position: fixed;
+  inset: 0;
+  z-index: 49;
+  background: transparent;
+  cursor: default;
+}
 .operon-workflow-skill-picker {
   position: absolute;
   top: 100%;
@@ -1831,21 +1843,51 @@ html, body {
   overscroll-behavior: contain;
   touch-action: none;
 }
-.operon-workflow-reset-view {
+.operon-workflow-viewport-controls {
   position: absolute;
   top: 8px;
   right: 8px;
   z-index: 5;
+  display: flex;
+  gap: 4px;
+}
+.operon-workflow-viewport-button {
   background: var(--vscode-editor-background, #1e1e1e);
   border: 1px solid var(--vscode-panel-border);
   color: var(--vscode-editor-foreground);
   border-radius: 3px;
-  padding: 2px 8px;
-  font-size: 11px;
+  padding: 2px 10px;
+  font-size: 13px;
+  line-height: 1;
+  min-width: 26px;
   cursor: pointer;
   opacity: 0.7;
 }
-.operon-workflow-reset-view:hover {
+.operon-workflow-viewport-button:hover {
+  opacity: 1;
+}
+.operon-workflow-inspector-status-buttons {
+  display: flex;
+  gap: 4px;
+  margin-left: 8px;
+}
+.operon-workflow-inspector-status-button {
+  background: transparent;
+  border: 1px solid var(--vscode-panel-border);
+  color: var(--vscode-editor-foreground);
+  border-radius: 3px;
+  padding: 1px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0.75;
+}
+.operon-workflow-inspector-status-button:hover {
+  opacity: 1;
+}
+.operon-workflow-inspector-status-button-active {
+  background: var(--vscode-button-background, var(--vscode-list-activeselectionbackground));
+  color: var(--vscode-button-foreground, var(--vscode-list-activeselectionforeground));
+  border-color: transparent;
   opacity: 1;
 }
 .operon-workflow-canvas-empty {
@@ -2164,6 +2206,11 @@ html, body {
   margin-left: auto;
   display: flex;
   gap: 6px;
+  /* `position: relative` so descendant dropdowns anchored with
+     `position: absolute; top: 100%; right: 0;` (the cascade stages
+     panel) align under the toggle row instead of climbing to the
+     page body. */
+  position: relative;
 }
 .operon-artifact-approve,
 .operon-artifact-reject,
@@ -2339,3 +2386,165 @@ html, body {
   color: var(--vscode-editor-foreground);
 }
 
+/* ===== Artifact: Revise / Re-run action buttons ===== */
+.operon-artifact-revise,
+.operon-artifact-rerun {
+  font-size: 11px;
+  padding: 2px 10px;
+  border-radius: 3px;
+  background: transparent;
+  cursor: pointer;
+}
+.operon-artifact-revise {
+  border: 1px solid var(--vscode-descriptionforeground, currentColor);
+  color: var(--vscode-descriptionforeground, inherit);
+}
+.operon-artifact-revise:hover {
+  background: var(--vscode-descriptionforeground, currentColor);
+  color: var(--vscode-editor-background, #1e1e1e);
+}
+.operon-artifact-rerun {
+  border: 1px solid #d99a3c;
+  color: #d99a3c;
+}
+.operon-artifact-rerun:hover:not([disabled]) {
+  background: #d99a3c;
+  color: var(--vscode-editor-background, #1e1e1e);
+}
+.operon-artifact-rerun[disabled] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ===== Cascade: Play button + stages dropdown ===== */
+.operon-artifact-cascade-play,
+.operon-artifact-cascade-stop {
+  font-size: 11px;
+  padding: 2px 10px;
+  border-radius: 3px;
+  background: transparent;
+  cursor: pointer;
+  font-weight: 600;
+}
+.operon-artifact-cascade-play {
+  /* Green for "go" — uses the accent's emerald-ish family if the
+     theme defines one, otherwise falls back to a hard-coded green. */
+  border: 1px solid var(--operon-success, #4caf50);
+  color: var(--operon-success, #4caf50);
+}
+.operon-artifact-cascade-play:hover {
+  background: var(--operon-success, #4caf50);
+  color: var(--vscode-editor-background, #1e1e1e);
+}
+.operon-artifact-cascade-stop {
+  border: 1px solid var(--vscode-errorforeground, #f48771);
+  color: var(--vscode-errorforeground, #f48771);
+  /* Subtle pulse so the user notices the cascade is running. */
+  animation: operon-cascade-pulse 1.6s ease-in-out infinite;
+}
+.operon-artifact-cascade-stop:hover {
+  background: var(--vscode-errorforeground, #f48771);
+  color: var(--vscode-editor-background, #1e1e1e);
+  animation: none;
+}
+@keyframes operon-cascade-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.65; }
+}
+
+.operon-artifact-cascade-stages-toggle {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: transparent;
+  border: 1px solid var(--vscode-panel-border);
+  color: var(--vscode-descriptionforeground, inherit);
+  cursor: pointer;
+}
+.operon-artifact-cascade-stages-toggle:hover {
+  border-color: var(--operon-accent);
+  color: var(--operon-accent);
+}
+
+.operon-artifact-cascade-stages-backdrop {
+  /* Fixed full-screen layer that catches click-outside on the
+     pipeline-stages dropdown. Sits below the panel (z-index 49 vs
+     50) and above everything else so clicks anywhere outside the
+     panel dismiss it. Transparent by design — the panel's shadow
+     does the visual separation. */
+  position: fixed;
+  inset: 0;
+  z-index: 49;
+  background: transparent;
+  cursor: default;
+}
+.operon-artifact-cascade-stages-panel {
+  /* Float as an absolute-positioned dropdown anchored under the
+     "▾ stages" toggle button, instead of inline-flowing into the
+     artifact action row and pushing artifact content sideways. The
+     parent action-row container has `position: relative` set
+     elsewhere; this aligns to its top-right edge. */
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 4px;
+  z-index: 50;
+  width: 260px;
+  max-height: 360px;
+  overflow-y: auto;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  padding: 8px 12px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+}
+/* Reuse the skill-picker list/item layout for the checkbox rows —
+   the StagesDropdown deliberately renders an
+   `.operon-artifact-skill-picker-list` so the compact list styling
+   carries over. The label inside each item gets cursor:pointer
+   inline; the checkbox + text alignment is set inline via flex. */
+
+/* ===== Workflow canvas: artifact-snapshot tile + edge variants ===== */
+.operon-workflow-node-artifact {
+  /* Cascade-snapshot tiles read as "data, not actions": tinted fill,
+     dashed border, no accent stroke unless they fall into a named
+     status (Dirty/Running/Error keep their existing strokes). */
+  fill: var(--vscode-list-hoverBackground, rgba(127, 127, 127, 0.12));
+  stroke: var(--vscode-descriptionforeground, var(--vscode-panel-border));
+  stroke-dasharray: 5 3;
+  stroke-width: 1;
+  opacity: 0.95;
+}
+/* When a snapshot enters Running / Dirty / Error mid-cascade, the
+   later class wins and the dash drops back to a solid stroke. */
+.operon-workflow-node-artifact.operon-workflow-node-running,
+.operon-workflow-node-artifact.operon-workflow-node-dirty,
+.operon-workflow-node-artifact.operon-workflow-node-error {
+  stroke-dasharray: none;
+}
+.operon-workflow-node-kind-badge {
+  fill: var(--operon-accent);
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  pointer-events: none;
+  user-select: none;
+}
+
+.operon-workflow-edge-parent-child {
+  /* Default skill-DAG edges are already plain currentColor; the
+     parent-child variant just thickens slightly so the cascade
+     hierarchy stands out from any hand-drawn skill edges. */
+  stroke-width: 2;
+  opacity: 0.75;
+}
+.operon-workflow-edge-depends-on {
+  /* Amber for sibling Depends-on cross-edges. Dashed so they're
+     visibly distinct from solid parent/child structural edges even
+     in monochrome / dark themes. */
+  stroke: #d99a3c;
+  stroke-width: 1.5;
+  stroke-dasharray: 6 4;
+  opacity: 0.85;
+}
