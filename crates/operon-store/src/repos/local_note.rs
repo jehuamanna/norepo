@@ -112,6 +112,7 @@ impl NoteKind {
             Self::Mdx,
             Self::Code,
             Self::Skill,
+            Self::Workflow,
             Self::Image,
             Self::Kanban,
             Self::Canvas,
