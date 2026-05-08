@@ -61,6 +61,21 @@ pub enum TranscriptItem {
     System(String),
 }
 
+/// Common slash commands surfaced in the composer's "/" popover. The
+/// list is intentionally short — claude maintains its own dynamic
+/// per-install set, but this v1 just gets the user to *the most
+/// common ones* without typing. Selecting a command replaces the
+/// composer text wholesale; the user clicks Send to dispatch it.
+const SLASH_COMMANDS: &[&str] = &[
+    "/help",
+    "/clear",
+    "/compact",
+    "/cost",
+    "/context",
+    "/model",
+    "/login",
+];
+
 /// Resolve the path of the `claude` binary at startup. Tries, in order:
 /// 1. `OPERON_CLAUDE_BIN` env override.
 /// 2. `~/.local/bin/claude` — the standalone installer's standard location.
@@ -101,6 +116,7 @@ pub fn CompanionChat() -> Element {
 
     let transcript = use_signal::<Vec<TranscriptItem>>(Vec::new);
     let mut composer = use_signal(String::new);
+    let mut slash_open = use_signal(|| false);
     let in_flight = use_signal(|| false);
     let active_ct = use_signal::<Option<CancellationToken>>(|| None);
     let usage_total = use_signal::<Usage>(Usage::default);
@@ -314,9 +330,9 @@ pub fn CompanionChat() -> Element {
                     {
                         let plugin_arc = plugin.read().clone();
                         let current_model = plugin_arc.current_default_model();
-                        let current_plan = plugin_arc.current_plan_mode();
+                        let current_perm = plugin_arc.current_permission_mode();
                         let plugin_for_model = plugin_arc.clone();
-                        let plugin_for_plan = plugin_arc.clone();
+                        let plugin_for_perm = plugin_arc.clone();
                         rsx! {
                             label { class: "operon-companion-toolbar-label",
                                 title: "Model used for new turns",
@@ -347,16 +363,34 @@ pub fn CompanionChat() -> Element {
                                     }
                                 }
                             }
-                            button {
-                                r#type: "button",
-                                class: if current_plan { "operon-companion-plan-toggle operon-companion-plan-toggle-on" } else { "operon-companion-plan-toggle" },
-                                "data-testid": "companion-plan-toggle",
-                                "data-active": if current_plan { "true" } else { "false" },
-                                title: "Plan mode \u{2014} claude produces a plan before any tool use",
-                                onclick: move |_| {
-                                    plugin_for_plan.set_plan_mode(!current_plan);
-                                },
-                                if current_plan { "\u{1F5C2} Plan: ON" } else { "\u{1F5C2} Plan" }
+                            label { class: "operon-companion-toolbar-label",
+                                title: "claude --permission-mode",
+                                span { class: "sr-only", "Permission mode" }
+                                select {
+                                    class: "operon-companion-model-picker",
+                                    "data-testid": "companion-permission-picker",
+                                    onchange: move |e| {
+                                        let v = e.value();
+                                        let next = if v == "(default)" { None } else { Some(v) };
+                                        plugin_for_perm.set_permission_mode(next);
+                                    },
+                                    option { value: "(default)",
+                                        selected: current_perm.is_none(),
+                                        "Permissions: default"
+                                    }
+                                    option { value: "acceptEdits",
+                                        selected: current_perm.as_deref() == Some("acceptEdits"),
+                                        "Accept edits"
+                                    }
+                                    option { value: "plan",
+                                        selected: current_perm.as_deref() == Some("plan"),
+                                        "Plan"
+                                    }
+                                    option { value: "bypassPermissions",
+                                        selected: current_perm.as_deref() == Some("bypassPermissions"),
+                                        "Bypass"
+                                    }
+                                }
                             }
                         }
                     }
@@ -402,6 +436,45 @@ pub fn CompanionChat() -> Element {
                     } }
                 }
                 div { class: "operon-companion-chat-composer",
+                    "data-testid": "companion-composer-wrap",
+                    div { class: "operon-companion-composer-toolbar",
+                        button {
+                            r#type: "button",
+                            class: "operon-companion-slash-button",
+                            "data-testid": "companion-slash-button",
+                            title: "Slash commands",
+                            onclick: move |_| {
+                                let next = !*slash_open.read();
+                                slash_open.set(next);
+                            },
+                            "/"
+                        }
+                        if *slash_open.read() {
+                            ul {
+                                class: "operon-companion-slash-popover",
+                                "data-testid": "companion-slash-popover",
+                                for cmd in SLASH_COMMANDS.iter() {
+                                    {
+                                        let cmd = *cmd;
+                                        rsx! {
+                                            li {
+                                                key: "{cmd}",
+                                                button {
+                                                    r#type: "button",
+                                                    class: "operon-companion-slash-item",
+                                                    onclick: move |_| {
+                                                        composer.set(cmd.into());
+                                                        slash_open.set(false);
+                                                    },
+                                                    "{cmd}"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     textarea {
                         class: "operon-companion-chat-input",
                         "data-testid": "companion-input",
