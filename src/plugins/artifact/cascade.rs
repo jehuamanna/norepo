@@ -192,6 +192,33 @@ pub async fn run_cascade(
             if cancel.is_cancelled() {
                 break;
             }
+
+            // Skip-already-produced gate. On a cascade re-run after
+            // the user approved a checkpoint, the seed pops with all
+            // its matching skills (e.g. 01 + 01b) still "matching" —
+            // re-firing them would regenerate Epics, regenerate the
+            // backlog, hit cascade_stop on 01b, and pause forever
+            // without ever reaching downstream tiers. Detect prior
+            // output by walking the source's existing children for
+            // ones whose frontmatter `source_skill_id` matches this
+            // skill. If any exist, treat the (artifact, skill) pair
+            // as already done — enqueue the existing children for
+            // further walking and skip the run.
+            let already_produced = existing_children_with_skill(
+                note_repo,
+                persistence,
+                project_id,
+                art_id,
+                skill.id,
+            )
+            .await;
+            if !already_produced.is_empty() {
+                for child_id in &already_produced {
+                    queue.push_back((*child_id, level + 1));
+                }
+                continue;
+            }
+
             CASCADE_STATE.with_mut(|m| {
                 m.insert(
                     root_artifact_id,
@@ -580,6 +607,44 @@ pub async fn compute_artifact_deps(
     }
 
     deps
+}
+
+/// Find children of `parent_id` whose artifact frontmatter declares
+/// `source_skill_id == skill_id`. Used by the cascade to skip
+/// re-firing a (artifact, skill) pair on resume runs when the skill
+/// has already produced output. Returns ids in title-alphabetical
+/// order so the re-queue is deterministic.
+async fn existing_children_with_skill(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    persistence: &Arc<dyn Persistence>,
+    project_id: Uuid,
+    parent_id: Uuid,
+    skill_id: Uuid,
+) -> Vec<Uuid> {
+    let mut notes = match note_repo.list_for_project(project_id) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    notes.sort_by(|a, b| a.title.cmp(&b.title));
+    let mut out = Vec::new();
+    for note in notes {
+        if note.parent_id != Some(parent_id) || !matches!(note.kind, NoteKind::Artifact) {
+            continue;
+        }
+        let bytes = match persistence.load(&note.id.to_string()).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let body = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let fm = parse_artifact_fm(&body);
+        if fm.source_skill_id == Some(skill_id) {
+            out.push(note.id);
+        }
+    }
+    out
 }
 
 /// All note ids reachable from `seed_id` via the `parent_id` chain
