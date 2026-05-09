@@ -64,11 +64,17 @@ fn split_one(content: &str) -> (Option<Vec<&str>>, &str) {
     };
     // Skip the immediate newline after `---`.
     let after_first_fence = after_first_fence.strip_prefix('\n').unwrap_or(after_first_fence);
-    // Find the closing fence: a line that's exactly `---` (allowing CR).
+    // Find the closing fence: a line whose only non-whitespace content
+    // is `---`. Leading/trailing spaces are tolerated to match the
+    // opening fence's `trim_start` permissiveness, and to handle the
+    // common foot-gun where a paste-with-indent shifts every line two
+    // or four spaces to the right (we observed this live: cascade
+    // produced 0 artifacts because the closing fence read `  ---  `
+    // and our exact-match comparator rejected it).
     let mut frontmatter_end: Option<usize> = None;
     let mut offset = 0usize;
     for line in after_first_fence.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\n', '\r']);
+        let trimmed = line.trim_end_matches(['\n', '\r']).trim();
         if trimmed == "---" {
             frontmatter_end = Some(offset);
             // Body starts after this line's terminator.
@@ -279,6 +285,30 @@ mod tests {
         assert_eq!(field(&fm, "b"), Some("2"));
         assert_eq!(field(&fm, "c"), Some("3"));
         assert_eq!(body, "body");
+    }
+
+    #[test]
+    fn split_tolerates_indented_fences() {
+        // Reproduces the live bug: a paste-with-indent left every
+        // line of the second block shifted two spaces right. Without
+        // tolerant fence matching, the closing fence wasn't found,
+        // the second block was treated as body, and `artifact_kind`
+        // came back None — cascade silently produced 0 artifacts.
+        let s = "---\n\
+            status: approved\n\
+            ---\n\
+            \n\
+              ---\n\
+              artifact_kind: requirements\n\
+              status: approved\n\
+              ---\n\
+            \n\
+            # Requirements: …\n";
+        let (fm, body) = split(s);
+        let fm = fm.expect("frontmatter present");
+        assert_eq!(field(&fm, "artifact_kind"), Some("requirements"));
+        assert_eq!(field(&fm, "status"), Some("approved"));
+        assert!(body.contains("# Requirements"));
     }
 
     #[test]
