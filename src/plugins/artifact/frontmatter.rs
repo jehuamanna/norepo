@@ -322,6 +322,52 @@ mod tests {
     }
 
     #[test]
+    fn parse_handles_double_frontmatter_blocks() {
+        // The exact bug we hit live: user pasted the new body on top
+        // of an existing `---\nstatus: approved\n---` block, ending up
+        // with two consecutive blocks. With the lenient `split`, both
+        // blocks are folded so `artifact_kind` is still discoverable.
+        // Without this, `read_kind` would have returned None and the
+        // cascade would silently process zero skills.
+        let body = "---\n\
+            status: approved\n\
+            ---\n\
+            ---\n\
+            artifact_kind: requirements\n\
+            status: approved\n\
+            ---\n\
+            \n\
+            # Requirements: Pomofocus (web)\n\
+            body here";
+        let fm = parse(body);
+        assert_eq!(fm.artifact_kind, Some(ArtifactKind::Requirements));
+        assert_eq!(fm.status, ArtifactStatus::Approved);
+    }
+
+    #[test]
+    fn rewrite_self_heals_double_frontmatter() {
+        // After parsing a double-block body and rewriting (e.g. via
+        // approve / re-run path), the output collapses back to a
+        // single canonical block. Side effect: any stale double-block
+        // body in the wild gets normalized on its next mutation.
+        let body = "---\n\
+            status: approved\n\
+            ---\n\
+            ---\n\
+            artifact_kind: requirements\n\
+            status: approved\n\
+            ---\n\
+            \n\
+            # Body";
+        let fm = parse(body);
+        let next = rewrite(body, &fm);
+        // Exactly one opening + one closing fence at the top.
+        assert_eq!(next.matches("---").count(), 2);
+        assert!(next.contains("artifact_kind: requirements"));
+        assert!(next.contains("# Body"));
+    }
+
+    #[test]
     fn rewrite_preserves_unknown_fields_and_body() {
         let body = "---\n\
             artifact_kind: epic\n\

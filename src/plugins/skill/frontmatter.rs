@@ -14,10 +14,45 @@
 //! nested objects / arrays for now) so the v1 view can pull `skill_name`
 //! out of the frontmatter without depending on a full YAML crate.
 
-/// Split a skill note's content into `(frontmatter_lines, body)`.
+/// Split a note's content into `(frontmatter_lines, body)`.
 /// Returns `(None, full_content)` when the content doesn't begin with
 /// a `---` fence — every other line stays in the body verbatim.
+///
+/// Lenient to **stacked** frontmatter: if the body after the first
+/// `---...---` block immediately starts with another `---` fence, the
+/// parser folds the second block's lines into the first and so on
+/// until a non-frontmatter line is reached. This handles the
+/// "user-pasted on top of an existing block" foot-gun where a body
+/// ends up with two consecutive frontmatter sections; the artifact
+/// view's `rewrite()` self-heals it on the next save by emitting a
+/// single canonical block.
 pub fn split(content: &str) -> (Option<Vec<&str>>, &str) {
+    let mut all_lines: Vec<&str> = Vec::new();
+    let mut remaining = content;
+    let mut found_any = false;
+    loop {
+        match split_one(remaining) {
+            (Some(block_lines), next_body) => {
+                all_lines.extend(block_lines);
+                remaining = next_body;
+                found_any = true;
+            }
+            (None, _) => break,
+        }
+    }
+    if found_any {
+        (Some(all_lines), remaining)
+    } else {
+        (None, content)
+    }
+}
+
+/// Single-block splitter — extracts exactly one leading `---...---`
+/// frontmatter block from `content` and returns its line slice + the
+/// body that follows. Returns `(None, content)` when no leading block
+/// is present. The public `split` calls this in a loop to support
+/// stacked blocks.
+fn split_one(content: &str) -> (Option<Vec<&str>>, &str) {
     let trimmed_start = content.trim_start_matches('\u{feff}');
     let lookahead = trimmed_start.trim_start();
     if !lookahead.starts_with("---") {
@@ -218,6 +253,47 @@ mod tests {
         let (fm, body) = split(s);
         assert!(fm.is_none());
         assert_eq!(body, s);
+    }
+
+    #[test]
+    fn split_merges_two_consecutive_frontmatter_blocks() {
+        // The exact "user pasted on top of an existing block" foot-gun.
+        // First block has only `status`; second adds `artifact_kind`.
+        // After merge, both keys should be discoverable via `field`.
+        let s = "---\nstatus: approved\n---\n---\nartifact_kind: requirements\nstatus: approved\n---\n\n# Title\nbody here";
+        let (fm, body) = split(s);
+        let fm = fm.expect("frontmatter present");
+        assert_eq!(field(&fm, "artifact_kind"), Some("requirements"));
+        assert_eq!(field(&fm, "status"), Some("approved"));
+        assert!(body.starts_with("# Title"));
+    }
+
+    #[test]
+    fn split_merges_three_consecutive_frontmatter_blocks() {
+        // Pathological but the loop should just keep folding.
+        let s =
+            "---\na: 1\n---\n---\nb: 2\n---\n---\nc: 3\n---\nbody";
+        let (fm, body) = split(s);
+        let fm = fm.expect("frontmatter present");
+        assert_eq!(field(&fm, "a"), Some("1"));
+        assert_eq!(field(&fm, "b"), Some("2"));
+        assert_eq!(field(&fm, "c"), Some("3"));
+        assert_eq!(body, "body");
+    }
+
+    #[test]
+    fn split_does_not_consume_horizontal_rule_in_body() {
+        // A `---` after some markdown content is a horizontal rule,
+        // not a stacked frontmatter block. The single-block parser
+        // requires the next chars to be `---` immediately at the start
+        // of the body (no intervening content), so the loop bails on
+        // the first non-frontmatter line — leaving the HR in body.
+        let s = "---\nkey: value\n---\n\n# Heading\n\n---\n\nMore body";
+        let (fm, body) = split(s);
+        let fm = fm.expect("frontmatter present");
+        assert_eq!(field(&fm, "key"), Some("value"));
+        assert!(body.contains("# Heading"));
+        assert!(body.contains("---")); // HR preserved
     }
 
     #[test]
