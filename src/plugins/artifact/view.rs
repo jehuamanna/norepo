@@ -1411,7 +1411,7 @@ fn spawn_cascade(
         .and_then(|all| all.into_iter().find(|n| n.id == root_artifact_id))
         .map(|n| n.title)
         .unwrap_or_else(|| short_uuid(root_artifact_id));
-    let (graph_note_id, graph_was_created) =
+    let (graph_note_id, _graph_was_created) =
         match crate::plugins::artifact::cascade_graph::ensure_cascade_workflow_note(
             &note_repo,
             project_id,
@@ -1426,36 +1426,18 @@ fn spawn_cascade(
                 (None, false)
             }
         };
-    // Seed a fresh Cascade-for-Requirements workflow with the natural
-    // BA→SA→SDE skill pipeline so the editor opens to a runnable
-    // 7-node DAG instead of an empty canvas. Read the root artifact's
-    // kind here (sync — `read_kind` is async, so we re-load
-    // synchronously via persistence's blocking guarantee for tiny
-    // bodies isn't safe; instead, defer the kind check to the
-    // spawn_forever async block below).
-    let seed_graph_note_id = if graph_was_created { graph_note_id } else { None };
+    // We deliberately do NOT auto-seed the Cascade-for-Requirements
+    // workflow with the natural BA→SA→SDE skill pipeline anymore. The
+    // 15 dirty skill nodes that used to appear were noise: the
+    // artifact-cascade orchestrator never reads them, they belong to a
+    // separate workflow-executor mechanism (`workflow/executor.rs`),
+    // and they cluttered the canvas alongside the artifact-snapshot
+    // nodes the orchestrator actually produces. Users who want the
+    // numbered chain in a workflow can still click `+ Seed pipeline`
+    // on the workflow canvas itself (`workflow/view.rs:1287`).
 
     let note_version_setter = *note_version;
     dioxus::core::spawn_forever(async move {
-        if let Some(gid) = seed_graph_note_id {
-            let kind = crate::plugins::artifact::cascade::read_kind(&persistence, root_artifact_id)
-                .await;
-            if kind.as_deref() == Some("requirements") {
-                if let Err(e) = crate::plugins::artifact::cascade_graph::seed_natural_pipeline(
-                    &note_repo,
-                    &persistence,
-                    project_id,
-                    gid,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        target: "operon::cascade",
-                        "seed_natural_pipeline failed: {e}"
-                    );
-                }
-            }
-        }
         let mut writer = match graph_note_id {
             Some(gid) => Some(
                 crate::plugins::artifact::cascade_graph::CascadeGraphWriter::new_or_load(
