@@ -211,7 +211,17 @@ pub async fn run_skill_on_source(
         }
     }
 
-    // 8. Run claude. The runner forces `acceptEdits` on this
+    // 8. Bind the chat session to the project's repo before sending.
+    //    Single-skill spawn from the artifact view already binds in
+    //    `spawn_runner` (view.rs), but the cascade orchestrator calls
+    //    this fn directly with a fresh per-source-artifact session id
+    //    and skipped the bind — claude's plugin then refused
+    //    `send_rich` with "session is not bound to a repository".
+    //    `bind_session` is idempotent, so binding here covers both
+    //    flows without breaking the single-skill path.
+    plugin.bind_session(chat_session_id, repo_path.clone());
+
+    // 9. Run claude. The runner forces `acceptEdits` on this
     //    session so its automated Write tool calls don't hang
     //    waiting for stdin approval — even when the user's global
     //    permission picker is set to "default". Normal companion
