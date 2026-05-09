@@ -53,9 +53,13 @@ order, exactly these headings — the runtime parses
   `task-01-add-user-table` if you prefer the filename slug). One
   Task per line. Optional rationale after the slug:
   `1. T001 — foundational schema, blocks T003 and T007`.
-- **## Cross-story dependencies** — bullets explaining the inferred
-  edges that go BEYOND each Task's declared `## Depends on`. Format:
-  `T005 → T002 (T005 reads users table created in T002)`.
+- **## Cross-tree dependencies** — bullets explaining the inferred
+  edges that go BEYOND each Task's declared `## Depends on`. Format
+  MUST use one of `->` or `→`:
+  `T005 -> T002 (T005 reads users table created in T002)`. The
+  cascade engine parses this section to augment dep enforcement.
+  Arrows mean "dependent → prerequisite" (the LEFT slug needs the
+  RIGHT slug Approved first).
 - **## Risks / unknowns** — bullets. Anything that looks
   under-specified or that you'd want a human to clarify before code
   starts.

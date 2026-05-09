@@ -62,8 +62,11 @@ about what to build). To create one:
 | Order | Skill | input_kind | output_kind | Persona |
 |---|---|---|---|---|
 | 01 | `01-ba-discover-epics` | requirements | epic | BA |
+| 01b | `01b-pm-prioritize-epics` | requirements (aggregator over `epic`) | prioritized_backlog | PM |
 | 02 | `02-ba-decompose-features` | epic | feature | BA |
+| 02b | `02b-pm-prioritize-features` | epic (aggregator over `feature`) | prioritized_backlog | PM |
 | 03 | `03-ba-decompose-stories` | feature | story | BA |
+| 03b | `03b-pm-prioritize-stories` | feature (aggregator over `story`) | prioritized_backlog | PM |
 | 04 | `04-ba-decompose-tasks` | story | task | BA |
 | 04b | `04b-pm-prioritize-tasks-coarse` | requirements (aggregator over `task`) | prioritized_backlog | PM |
 | 05 | `05-sa-design-feature-hld` | feature | plan | SA |
@@ -92,32 +95,74 @@ parent that hasn't been Approved in the artifact view. The cascade
 auto-approves every produced child, so the chain runs end-to-end
 without manual gating during a Play run.
 
-## Checkpoints (04b and 06b)
+## Per-tier prioritization checkpoints (`Nb` skills)
 
-`04b` and `06b` are **prioritization checkpoints**. They aggregate
-every Task (across every Story under every Feature under every Epic)
-and produce a single Prioritized Backlog artifact plus a sibling
-**Workflow note** that opens to a React Flow canvas with one node
-per Task and amber edges for cross-story `## Depends on`. Two
-frontmatter fields drive the special behavior:
+Five skills carry the `b` suffix and act as **prioritization
+checkpoints** at different tiers:
 
-- `aggregate: task` — the runner walks the seed's descendants and
-  inlines every Task body in the prompt instead of just the seed.
+| Checkpoint | Aggregates | Trigger point in cascade |
+|---|---|---|
+| `01b-pm-prioritize-epics` | every Epic under the seed | seed pop, after `01` |
+| `02b-pm-prioritize-features` | Features under one Epic | each Epic pop, after `02` |
+| `03b-pm-prioritize-stories` | Stories under one Feature | each Feature pop, after `03` |
+| `04b-pm-prioritize-tasks-coarse` | every Task under the seed | manual-only (see caveat) |
+| `06b-pm-prioritize-tasks-refined` | every Task under the seed (with LLDs) | manual-only (see caveat) |
+
+Three frontmatter fields drive the special behavior:
+
+- `aggregate: <kind>` — the runner walks the source's descendants
+  and inlines every artifact of `<kind>` into the prompt instead of
+  just the source body.
 - `cascade_stop: true` — the cascade DOES NOT auto-approve the
   produced backlog. The Play run pauses with a "review the new
   backlog and approve to continue" status; clicking Approve and
   Play again resumes from the next dirty downstream node.
 - `emit_workflow: true` — after the artifact is imported, the
-  runner parses its `## Priority order` list, looks up each Task by
-  title, and writes a `Workflow — Prioritized Backlog (…)` note
-  under the seed so the dependency graph is visual, not just prose.
+  runner parses its `## Priority order` list, looks up each child
+  by title, and writes a `Workflow — Prioritized Backlog (…)` note
+  so the dependency graph is visual, not just prose.
 
-The two checkpoints run at different points: `04b` after Tasks are
-decomposed (so the user can pick what to do at all), `06b` after
-Plans (so the order can be refined with implementation context).
-Skipping either is fine — drop the numeric prefix on the title to
-exclude it from the auto-seeded pipeline; the manual picker still
-offers them.
+**Caveat: `04b` / `06b` cascade triggering.** Both have
+`input_kind: requirements`, so in cascade mode they fire on the
+seed at start-of-run when no Tasks exist yet — the body comes back
+with no aggregated input and the artifact is `Rejected`. To get a
+useful global Task backlog, **invoke `04b` manually on the seed
+after Tasks have been decomposed** (right-click the seed → Run
+skill…). The cascade triggering of these two is a known limitation;
+the `Nb` skills at the higher tiers (`01b`/`02b`/`03b`) work
+correctly in cascade because their inputs are produced by the
+immediately-preceding skill on the same artifact.
+
+Skipping any `Nb` skill is fine — uncheck it in the StagesDropdown
+checkbox UI to exclude it from the cascade run; the manual picker
+still offers it.
+
+## Per-tier dep ordering (engine-enforced)
+
+Every BA artifact (Epic, Feature, Story, Task) has a `## Depends on`
+section with sibling slugs (or `None (parallel-safe)`). The cascade
+engine reads these and serializes processing per tier:
+- Before running any skill on artifact A, the engine checks A's
+  declared deps. If any dep hasn't been processed (or wasn't already
+  Approved before the cascade started), A defers until they are.
+- The optional `Nb` skills additionally produce a backlog with a
+  `## Cross-tree dependencies` section using `->` or `→` arrows.
+  The engine unions backlog edges with each artifact's own deps
+  when computing the gate.
+- If two backlogs disagree (e.g. `04b` says `T5 -> T2`, `06b` says
+  `T5 -> T3`), the engine respects all listed prerequisites — the
+  union is conservative.
+- **Cycles or unresolvable deps deadlock the cascade**, which then
+  surfaces a `Failed` outcome with the stuck items named (`title <-
+  [unresolved-prereq, …]`). Fix the bodies or backlogs and re-run.
+- **Stale backlog edges**: if you remove a `## Depends on` from an
+  artifact body but the latest backlog still asserts that edge,
+  the engine will keep blocking. Re-run the relevant `Nb` skill to
+  refresh the backlog (or delete the stale backlog artifact).
+- **Re-runs**: after partial completion, every artifact already
+  marked `Approved` counts as "done" for dep-gate purposes. So a
+  re-run picks up where it left off rather than re-blocking on
+  finished work.
 
 ## Tuning
 

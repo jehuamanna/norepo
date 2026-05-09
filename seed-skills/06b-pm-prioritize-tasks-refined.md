@@ -59,8 +59,10 @@ order — the runtime parses `## Priority order`):
   `T001`).
 - **## Changes from coarse pass** — bullets. `T005 moved earlier:
   LLD reveals it blocks T009 too.` One line per re-rank.
-- **## Cross-story dependencies** — refined edges, including any
-  inferred from the LLDs.
+- **## Cross-tree dependencies** — refined edges using `->` or `→`,
+  including any inferred from the LLDs. Augments BA-declared deps;
+  the cascade engine unions both sets and uses the most recent
+  backlog when multiple disagree.
 - **## Risks / unknowns** — sharpened risks, noting which previous
   risks are now resolved.
 - **## Architectural contradictions** — bullets. Anything in the

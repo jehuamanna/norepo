@@ -25,7 +25,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::persistence::Persistence;
-use crate::plugins::artifact::cascade_graph::CascadeGraphWriter;
+use crate::plugins::artifact::cascade_graph::{
+    parse_cross_tree_deps, parse_depends_on, CascadeGraphWriter,
+};
 use crate::plugins::artifact::frontmatter::{
     parse as parse_artifact_fm, rewrite as rewrite_artifact_fm, ArtifactKind, ArtifactStatus,
 };
@@ -33,6 +35,7 @@ use crate::plugins::artifact::runner::{run_skill_on_source, RunnerError};
 use crate::plugins::skill::frontmatter::{
     contract as parse_skill_contract, split as split_skill, SkillContract,
 };
+use operon_store::repos::LocalNote;
 use crate::shell::companion_state::{CascadePhase, CASCADE_STATE};
 
 #[derive(Debug, Clone)]
@@ -103,16 +106,85 @@ pub async fn run_cascade(
     // edges can resolve "Depends on: T001" / "Depends on: feature-01".
     let mut titles: HashMap<Uuid, String> = HashMap::new();
 
-    while let Some((art_id, level)) = queue.pop_front() {
+    // Topological-cascade state. `done` is "this artifact has been
+    // fully processed (every matching skill has fired) by this
+    // cascade run, OR was Approved before the cascade started" —
+    // anything in `done` satisfies dep checks for downstream items.
+    // Pre-seed with every Approved artifact in the project so re-runs
+    // honor prior progress.
+    let mut done: HashSet<Uuid> = pre_existing_approved_artifacts(note_repo, persistence, project_id).await;
+    // `deferred` holds artifacts pulled off the queue whose deps
+    // weren't all in `done`. Value is the set of unmet dep ids; once
+    // all become `done`, the artifact is re-enqueued.
+    let mut deferred: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
+
+    'outer: loop {
         if cancel.is_cancelled() {
             return Ok(CascadeOutcome::Cancelled {
                 artifacts_produced: produced,
             });
         }
 
+        let (art_id, level) = match queue.pop_front() {
+            Some(x) => x,
+            None => {
+                if deferred.is_empty() {
+                    break 'outer;
+                }
+                // Queue is empty but items remain deferred → unresolvable
+                // deps. Surface a Failed outcome with the stuck items so
+                // the user can fix the body or backlog and re-run.
+                let stuck: Vec<String> = deferred
+                    .iter()
+                    .map(|(id, needs)| {
+                        let title = titles
+                            .get(id)
+                            .cloned()
+                            .unwrap_or_else(|| id.to_string());
+                        let need_titles: Vec<String> = needs
+                            .iter()
+                            .map(|n| {
+                                titles.get(n).cloned().unwrap_or_else(|| n.to_string())
+                            })
+                            .collect();
+                        format!("{title} <- [{}]", need_titles.join(", "))
+                    })
+                    .collect();
+                return Err(CascadeError::SkillRun(format!(
+                    "cascade deadlocked — {} item(s) waiting on unresolvable deps (likely a cycle): {}",
+                    deferred.len(),
+                    stuck.join("; ")
+                )));
+            }
+        };
+
+        // Dep gate: before processing this artifact, check that every
+        // declared dep (artifact body's `## Depends on` ∪ cross-tree
+        // edges from sibling backlogs targeting this artifact) is in
+        // `done`. If not, defer until they are.
+        let deps = compute_artifact_deps(
+            note_repo,
+            persistence,
+            project_id,
+            root_artifact_id,
+            art_id,
+        )
+        .await;
+        let unmet: HashSet<Uuid> =
+            deps.into_iter().filter(|d| !done.contains(d)).collect();
+        if !unmet.is_empty() {
+            deferred.insert(art_id, unmet);
+            continue 'outer;
+        }
+
         let kind_str = match read_kind(persistence, art_id).await {
             Some(k) => k,
-            None => continue, // not an artifact note (no frontmatter / wrong kind)
+            None => {
+                // Not an artifact note — still mark "done" so anything
+                // depending on it (unlikely but possible) resolves.
+                done.insert(art_id);
+                continue;
+            }
         };
 
         let matching = by_input.get(&kind_str).cloned().unwrap_or_default();
@@ -247,6 +319,24 @@ pub async fn run_cascade(
                 }
             }
         }
+
+        // All matching skills have fired on `art_id` without bailing
+        // out via cascade_stop. Mark it done so anything deferred on
+        // it can unblock.
+        done.insert(art_id);
+
+        // Sweep deferred — any item whose unmet set is now fully in
+        // `done` re-enters the queue. Removed in a separate pass to
+        // avoid mutating while iterating.
+        let unblocked: Vec<Uuid> = deferred
+            .iter()
+            .filter(|(_, needs)| needs.iter().all(|d| done.contains(d)))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in unblocked {
+            deferred.remove(&id);
+            queue.push_back((id, level + 1));
+        }
     }
 
     // Second pass for the visualization: now that every artifact is
@@ -324,6 +414,184 @@ pub fn group_by_input_kind(skills: &[SkillRef]) -> HashMap<String, Vec<SkillRef>
     for s in skills {
         if let Some(input) = s.contract.input_kind.as_ref() {
             out.entry(input.clone()).or_default().push(s.clone());
+        }
+    }
+    out
+}
+
+/// Snapshot every Artifact note in the project whose status was
+/// already `Approved` before the cascade started. Pre-seeds the
+/// topological cascade's `done` set so re-runs after partial
+/// completion don't re-block on already-finished work.
+pub async fn pre_existing_approved_artifacts(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    persistence: &Arc<dyn Persistence>,
+    project_id: Uuid,
+) -> HashSet<Uuid> {
+    let mut out = HashSet::new();
+    let notes = match note_repo.list_for_project(project_id) {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    for note in notes {
+        if !matches!(note.kind, NoteKind::Artifact) {
+            continue;
+        }
+        let bytes = match persistence.load(&note.id.to_string()).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let body = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let fm = parse_artifact_fm(&body);
+        if fm.status == ArtifactStatus::Approved {
+            out.insert(note.id);
+        }
+    }
+    out
+}
+
+/// Compute the set of artifact ids `art_id` depends on. Sources:
+/// - `art_id`'s own body `## Depends on` slugs.
+/// - Cross-tree edges in any `prioritized_backlog` artifact under the
+///   `seed_id` subtree where the dependent slug resolves to `art_id`.
+///
+/// Slugs are resolved against the project-wide artifact-title index
+/// (full title or first whitespace-delimited token of the title).
+/// Unresolved slugs are silently dropped — they get logged at warn
+/// level for the user to notice but don't deadlock the cascade.
+pub async fn compute_artifact_deps(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    persistence: &Arc<dyn Persistence>,
+    project_id: Uuid,
+    seed_id: Uuid,
+    art_id: Uuid,
+) -> HashSet<Uuid> {
+    let notes = match note_repo.list_for_project(project_id) {
+        Ok(v) => v,
+        Err(_) => return HashSet::new(),
+    };
+    // Title → id index, including TaskID-style first-token alias.
+    let mut by_title: HashMap<String, Uuid> = HashMap::new();
+    for n in &notes {
+        if !matches!(n.kind, NoteKind::Artifact) {
+            continue;
+        }
+        by_title.insert(n.title.clone(), n.id);
+        if let Some(first) = n.title.split_whitespace().next() {
+            by_title.entry(first.to_string()).or_insert(n.id);
+        }
+    }
+
+    // Title for art_id (used to filter cross-tree edges that target
+    // art_id). Same alias rule as the index.
+    let art_title = notes
+        .iter()
+        .find(|n| n.id == art_id)
+        .map(|n| n.title.clone())
+        .unwrap_or_default();
+    let art_first_token: String = art_title
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let art_matches = |slug: &str| -> bool {
+        slug == art_title || (!art_first_token.is_empty() && slug == art_first_token)
+    };
+
+    // Build the seed's descendant id set so we only scan backlogs
+    // under the cascade's root. (Backlogs in unrelated trees in the
+    // same project don't influence this cascade.)
+    let descendants = subtree_ids(&notes, seed_id);
+
+    let mut deps: HashSet<Uuid> = HashSet::new();
+
+    // (1) art_id's own `## Depends on` body slugs.
+    if let Ok(bytes) = persistence.load(&art_id.to_string()).await {
+        if let Ok(body) = String::from_utf8(bytes) {
+            for slug in parse_depends_on(&body) {
+                if let Some(dep_id) = by_title.get(&slug) {
+                    if *dep_id != art_id {
+                        deps.insert(*dep_id);
+                    }
+                } else {
+                    tracing::warn!(
+                        target: "operon::cascade",
+                        "unresolved `## Depends on` slug '{slug}' on artifact {art_id}"
+                    );
+                }
+            }
+        }
+    }
+
+    // (2) Cross-tree edges from prioritized_backlog artifacts under
+    //     the seed's subtree where the dependent slug == art_id.
+    for note in &notes {
+        if !matches!(note.kind, NoteKind::Artifact) || !descendants.contains(&note.id) {
+            continue;
+        }
+        let bytes = match persistence.load(&note.id.to_string()).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let body = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let fm = parse_artifact_fm(&body);
+        let is_backlog = fm
+            .artifact_kind
+            .as_ref()
+            .map(|k| k.as_str() == "prioritized_backlog")
+            .unwrap_or(false);
+        if !is_backlog {
+            continue;
+        }
+        for (dependent, prerequisite) in parse_cross_tree_deps(&body) {
+            if !art_matches(&dependent) {
+                continue;
+            }
+            if let Some(dep_id) = by_title.get(&prerequisite) {
+                if *dep_id != art_id {
+                    deps.insert(*dep_id);
+                }
+            } else {
+                tracing::warn!(
+                    target: "operon::cascade",
+                    "unresolved cross-tree dep '{dependent} -> {prerequisite}' \
+                     in backlog {} (under seed {seed_id})",
+                    note.id
+                );
+            }
+        }
+    }
+
+    deps
+}
+
+/// All note ids reachable from `seed_id` via the `parent_id` chain
+/// (the seed itself plus every descendant). Used to scope dep
+/// scanning to the current cascade's tree.
+fn subtree_ids(notes: &[LocalNote], seed_id: Uuid) -> HashSet<Uuid> {
+    let mut by_parent: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for n in notes {
+        if let Some(p) = n.parent_id {
+            by_parent.entry(p).or_default().push(n.id);
+        }
+    }
+    let mut out = HashSet::new();
+    let mut queue: VecDeque<Uuid> = VecDeque::new();
+    queue.push_back(seed_id);
+    out.insert(seed_id);
+    while let Some(id) = queue.pop_front() {
+        if let Some(children) = by_parent.get(&id) {
+            for c in children {
+                if out.insert(*c) {
+                    queue.push_back(*c);
+                }
+            }
         }
     }
     out
@@ -478,5 +746,69 @@ mod tests {
         weird.contract.input_kind = None;
         let idx = group_by_input_kind(&[weird]);
         assert!(idx.is_empty());
+    }
+
+    fn note(id: Uuid, parent: Option<Uuid>, title: &str) -> LocalNote {
+        LocalNote {
+            id,
+            project_id: Uuid::nil(),
+            parent_id: parent,
+            sibling_index: 0,
+            depth: 0,
+            title: title.into(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            kind: NoteKind::Artifact,
+            blob_path: None,
+        }
+    }
+
+    #[test]
+    fn subtree_ids_includes_seed_and_all_descendants() {
+        let seed = Uuid::from_bytes([1; 16]);
+        let epic_a = Uuid::from_bytes([2; 16]);
+        let epic_b = Uuid::from_bytes([3; 16]);
+        let feat_a1 = Uuid::from_bytes([4; 16]);
+        let feat_a2 = Uuid::from_bytes([5; 16]);
+        let unrelated = Uuid::from_bytes([6; 16]);
+        let notes = vec![
+            note(seed, None, "Requirements"),
+            note(epic_a, Some(seed), "Epic A"),
+            note(epic_b, Some(seed), "Epic B"),
+            note(feat_a1, Some(epic_a), "Feature A.1"),
+            note(feat_a2, Some(epic_a), "Feature A.2"),
+            note(unrelated, None, "Unrelated note"),
+        ];
+        let ids = subtree_ids(&notes, seed);
+        assert_eq!(ids.len(), 5);
+        assert!(ids.contains(&seed));
+        assert!(ids.contains(&epic_a));
+        assert!(ids.contains(&epic_b));
+        assert!(ids.contains(&feat_a1));
+        assert!(ids.contains(&feat_a2));
+        assert!(!ids.contains(&unrelated));
+    }
+
+    #[test]
+    fn subtree_ids_handles_seed_with_no_children() {
+        let seed = Uuid::from_bytes([1; 16]);
+        let notes = vec![note(seed, None, "Requirements")];
+        let ids = subtree_ids(&notes, seed);
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains(&seed));
+    }
+
+    #[test]
+    fn subtree_ids_returns_only_seed_when_seed_unknown() {
+        // No matching note for `seed` — function still returns the
+        // seed id itself (cascade callers always start with a real
+        // root, but we don't want the helper to surprise them by
+        // returning empty when the row hasn't loaded yet).
+        let seed = Uuid::from_bytes([42; 16]);
+        let other = Uuid::from_bytes([99; 16]);
+        let notes = vec![note(other, None, "Some other note")];
+        let ids = subtree_ids(&notes, seed);
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains(&seed));
     }
 }

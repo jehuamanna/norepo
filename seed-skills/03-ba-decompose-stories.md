@@ -50,6 +50,14 @@ Sections (for every file):
 - **## UX notes** — 1–3 bullets (key screens / states / empty cases)
 - **## Edge cases** — what could go wrong
 - **## Definition of done** — must include "tests pass", "approved by reviewer"
+- **## Depends on** — sibling Story slugs that must be Approved
+  first (or `None (parallel-safe)`)
+
+For `## Depends on`, use the slug rule established elsewhere in the
+pipeline (filename slug like `story-01-create-account-happy-path`,
+or the first whitespace token of the title). Sibling-only — do not
+list Stories under other Features. The cascade engine reads this
+and sequences Task-level decomposition in topo order.
 
 ## Calibration
 Single-Story mode. If the walking-skeleton naturally spans >5 days,

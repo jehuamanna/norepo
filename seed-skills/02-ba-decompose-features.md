@@ -52,9 +52,16 @@ Sections (for every file):
 - **## Parent Epic** — name + one-line link to the parent's outcome
 - **## User-visible behavior** — what the user can do that they couldn't before
 - **## Acceptance criteria** — 3–6 Given/When/Then bullets
-- **## Dependencies** — sibling Features that must ship first (or "None")
+- **## Depends on** — sibling Feature slugs that must be Approved
+  first (or `None (parallel-safe)`)
 - **## Out of scope**
 - **## Open questions** — mark each `BLOCKING` or `NON-BLOCKING`
+
+For `## Depends on`, use the same slug rules as elsewhere in the
+pipeline (filename slug like `feature-01-account-creation`, or the
+first whitespace token of the title). Sibling-only — do not point
+at Features under a different Epic. The cascade engine reads this
+and sequences Feature-level decomposition (Stories) in topo order.
 
 ## Calibration
 Two-Feature mode. If the Epic clearly contains more than two

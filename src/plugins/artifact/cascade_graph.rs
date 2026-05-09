@@ -463,6 +463,72 @@ pub fn append_numbered_skill_chain(
     graph
 }
 
+/// Extract `(dependent_slug, prerequisite_slug)` pairs from a
+/// `## Cross-tree dependencies` (or legacy `## Cross-story
+/// dependencies`) section in a `prioritized_backlog` artifact body.
+/// Tolerant: returns an empty Vec when the section is absent or
+/// malformed.
+///
+/// Bullet syntax:
+/// ```markdown
+/// ## Cross-tree dependencies
+/// - feature-04-team-invites -> feature-01-account-creation (rationale)
+/// - feature-05-billing → feature-01-account-creation (rationale)
+/// ```
+/// Both ASCII `->` and Unicode `→` arrows are accepted. Slug =
+/// first whitespace-delimited token on each side, stripped of
+/// trailing punctuation. Annotations after the prerequisite are
+/// dropped — they're prose, not lookup keys.
+pub fn parse_cross_tree_deps(body: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut in_section = false;
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("##") {
+            let heading = trimmed.trim_start_matches('#').trim().to_lowercase();
+            in_section = heading == "cross-tree dependencies"
+                || heading == "cross-story dependencies"
+                || heading == "cross-feature dependencies"
+                || heading == "cross-epic dependencies";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let bullet = trimmed.trim_start_matches(['-', '*', '+']).trim_start();
+        if bullet == trimmed {
+            continue; // not a bullet
+        }
+        // Find the arrow. Accept ASCII "->" or Unicode "→".
+        let split = bullet
+            .split_once("->")
+            .or_else(|| bullet.split_once('\u{2192}'));
+        let (left, right) = match split {
+            Some(parts) => parts,
+            None => continue,
+        };
+        let dependent = left
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches([',', '.', ':', ';']);
+        let prerequisite = right
+            .trim_start()
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches([',', '.', ':', ';', ')']);
+        if dependent.is_empty() || prerequisite.is_empty() {
+            continue;
+        }
+        if dependent.eq_ignore_ascii_case("none") || prerequisite.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        out.push((dependent.to_string(), prerequisite.to_string()));
+    }
+    out
+}
+
 /// Extract the slugs / TaskIDs listed under a `## Depends on`
 /// heading in an artifact body. Tolerant: returns an empty Vec when
 /// the section is absent, malformed, or the body has no headings.
@@ -571,5 +637,48 @@ mod tests {
         assert_eq!(parse_pipeline_order("my-custom-skill"), None);
         assert_eq!(parse_pipeline_order("-leading-dash"), None);
         assert_eq!(parse_pipeline_order(""), None);
+    }
+
+    #[test]
+    fn parse_cross_tree_deps_handles_ascii_arrow() {
+        let body = "# backlog\n\n## Cross-tree dependencies\n\
+            - feature-04 -> feature-01 (rationale here)\n\
+            - story-02 -> story-01 (different rationale)\n";
+        let deps = parse_cross_tree_deps(body);
+        assert_eq!(
+            deps,
+            vec![
+                ("feature-04".to_string(), "feature-01".to_string()),
+                ("story-02".to_string(), "story-01".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_cross_tree_deps_handles_unicode_arrow() {
+        let body = "## Cross-tree dependencies\n- T005 \u{2192} T002 (reads users table)\n";
+        let deps = parse_cross_tree_deps(body);
+        assert_eq!(deps, vec![("T005".to_string(), "T002".to_string())]);
+    }
+
+    #[test]
+    fn parse_cross_tree_deps_accepts_legacy_cross_story_alias() {
+        let body = "## Cross-story dependencies\n- T005 -> T002 (legacy heading)\n";
+        let deps = parse_cross_tree_deps(body);
+        assert_eq!(deps, vec![("T005".to_string(), "T002".to_string())]);
+    }
+
+    #[test]
+    fn parse_cross_tree_deps_skips_lines_without_arrow() {
+        let body =
+            "## Cross-tree dependencies\n- T001 (no arrow yet)\n- T002 -> T001 (good)\n";
+        let deps = parse_cross_tree_deps(body);
+        assert_eq!(deps, vec![("T002".to_string(), "T001".to_string())]);
+    }
+
+    #[test]
+    fn parse_cross_tree_deps_returns_empty_when_section_absent() {
+        let body = "# backlog\n\n## Risks\n- nothing here\n";
+        assert!(parse_cross_tree_deps(body).is_empty());
     }
 }

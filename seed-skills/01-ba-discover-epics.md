@@ -48,6 +48,14 @@ Required body sections (for every file):
 - **## Out of scope** — bullets, with pointers to other Epics where relevant
 - **## Success metric** — one measurable criterion
 - **## Risks** — 1–3 bullets (what could derail this)
+- **## Depends on** — sibling Epic slugs (or `None (parallel-safe)`)
+
+For `## Depends on`, list the slug of every sibling Epic that must
+be Approved before this one can be decomposed. Use the filename slug
+(e.g. `epic-02-billing`) or the Epic's TaskID-style prefix if you
+gave it one. Sibling-only — do not list anything outside this seed.
+Use `None (parallel-safe)` when the Epic has no prerequisites. The
+cascade engine reads this and sequences decomposition accordingly.
 
 Do NOT decompose into Features here. That's the next BA skill's job.
 
