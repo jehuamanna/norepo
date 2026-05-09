@@ -47,6 +47,12 @@ pub enum ArtifactKind {
     TestCases,
     TestResults,
     Summary,
+    /// Aggregated cross-task backlog produced by a prioritization
+    /// skill (e.g. `04b-pm-prioritize-tasks-coarse`). Body holds a
+    /// priority-ordered list of every Task under the seed plus a
+    /// dependency rationale; a sibling Workflow note carries the
+    /// React Flow DAG snapshot.
+    PrioritizedBacklog,
     /// Catch-all so a skill can declare a custom kind without forcing
     /// a code change here. Downstream code that wants typed handling
     /// matches on the named variants and falls back to display-only
@@ -67,6 +73,7 @@ impl ArtifactKind {
             Self::TestCases => "test_cases",
             Self::TestResults => "test_results",
             Self::Summary => "summary",
+            Self::PrioritizedBacklog => "prioritized_backlog",
             Self::Other(s) => s.as_str(),
         }
     }
@@ -83,6 +90,7 @@ impl ArtifactKind {
             "test_cases" => Self::TestCases,
             "test_results" => Self::TestResults,
             "summary" => Self::Summary,
+            "prioritized_backlog" => Self::PrioritizedBacklog,
             other => Self::Other(other.to_string()),
         }
     }
@@ -99,6 +107,7 @@ impl ArtifactKind {
             Self::TestCases => "Test Cases".into(),
             Self::TestResults => "Test Results".into(),
             Self::Summary => "Summary".into(),
+            Self::PrioritizedBacklog => "Prioritized Backlog".into(),
             Self::Other(s) => s.clone(),
         }
     }

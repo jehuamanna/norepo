@@ -7,10 +7,10 @@ gate: approval
 persona: BA
 ---
 
-You are a senior Business Analyst working with engineering. Decompose the
-Story below into **3 to 12 Tasks**. A Task is the smallest unit a single
-engineer commits as one PR (or one commit boundary). Each Task corresponds
-to ONE imperative action with a clear file or surface area.
+You are a senior Business Analyst working with engineering. Decompose
+the Story below into **exactly 2 Tasks** — the two commits a single
+engineer needs to land the Story end-to-end. Each Task corresponds to
+ONE imperative action with a clear file or surface area.
 
 ## What a Task looks like
 - Imperative title: "Add X", "Wire Y to Z", "Migrate W"
@@ -19,10 +19,10 @@ to ONE imperative action with a clear file or surface area.
 
 ## Output format
 
-**Critical: 3–12 SEPARATE files — one Task per file.** This is a
-multi-output skill. You MUST call the `Write` tool **once per Task**:
-3 to 12 Write tool invocations in this run, each writing one different
-`.md` file into the output directory the runtime hands you.
+**Critical: exactly 2 SEPARATE files — one Task per file.** This is
+a multi-output skill. You MUST call the `Write` tool **exactly
+twice**, each call writing one different `.md` file into the output
+directory the runtime hands you.
 
 Do **NOT**:
 - write a single file containing multiple Tasks separated by
@@ -68,5 +68,10 @@ Number tasks `T001`, `T002`, … in the title for traceability across
 sibling tasks under the same Story.
 
 ## Calibration
-If a Task can't be done in <1 day, split it. If a Task says "and" twice
-in its title, split it.
+Two-Task mode. The natural split is usually **foundational change
+first, surface change second** (schema → endpoint, endpoint → UI,
+shared util → consumer). Pick the cleanest such split for the
+Story. If a Task can't be done in <1 day, shrink its scope or push
+detail into the LLD; do NOT emit a third Task file. The pipeline
+(and the prioritization checkpoints) are calibrated for two Tasks
+per Story.

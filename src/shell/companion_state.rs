@@ -130,6 +130,17 @@ pub enum CascadePhase {
         skill_id: Uuid,
         level: u32,
     },
+    /// Cascade hit a checkpoint skill (`cascade_stop: true`) and is
+    /// waiting on the user to review + approve the produced
+    /// `artifact_id` before continuing. The view treats this like
+    /// Completed for spinner-control purposes (no more work in
+    /// flight) but renders a distinct "paused at checkpoint" status
+    /// so the user knows to act.
+    Paused {
+        artifact_id: Uuid,
+        skill_id: Uuid,
+        level: u32,
+    },
     Completed {
         artifacts_produced: usize,
     },

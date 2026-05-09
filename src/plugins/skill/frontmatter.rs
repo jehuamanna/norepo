@@ -96,6 +96,23 @@ pub struct SkillContract {
     /// engine treats this as opaque metadata; the artifact view uses
     /// it for a small badge.
     pub persona: Option<String>,
+    /// Aggregator skill: when set, the runner walks the source seed's
+    /// descendant tree and inlines every artifact with this kind into
+    /// the prompt instead of just the source body. Used by
+    /// prioritization / cross-task analysis skills that need to see
+    /// every Task (or every Plan) under the seed at once.
+    pub aggregate: Option<String>,
+    /// Cascade checkpoint: when `true`, the cascade orchestrator does
+    /// NOT auto-approve this skill's produced artifacts, so the chain
+    /// pauses on them and waits for explicit user approval. Lets a
+    /// pipeline insert human-review gates without separating the run.
+    pub cascade_stop: bool,
+    /// Workflow emission: when `true`, the runner parses the
+    /// produced artifact for a `## Priority order` (and optional
+    /// dependency hints) and creates a sibling `NoteKind::Workflow`
+    /// note holding a React-Flow DAG snapshot of the prioritized
+    /// tasks. Used by the prioritization skills.
+    pub emit_workflow: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -130,12 +147,24 @@ pub fn contract(lines: &[&str]) -> SkillContract {
         _ => SkillGate::Approval,
     };
     let persona = field(lines, "persona").map(str::to_string);
+    let aggregate = field(lines, "aggregate").map(str::to_string);
+    let cascade_stop = matches!(
+        field(lines, "cascade_stop"),
+        Some("true") | Some("True") | Some("TRUE") | Some("yes") | Some("Yes")
+    );
+    let emit_workflow = matches!(
+        field(lines, "emit_workflow"),
+        Some("true") | Some("True") | Some("TRUE") | Some("yes") | Some("Yes")
+    );
     SkillContract {
         input_kind,
         output_kind,
         output_count,
         gate,
         persona,
+        aggregate,
+        cascade_stop,
+        emit_workflow,
     }
 }
 
@@ -231,6 +260,28 @@ mod tests {
         assert_eq!(c.output_count, SkillOutputCount::Many);
         assert_eq!(c.gate, SkillGate::Auto);
         assert_eq!(c.persona.as_deref(), Some("BA"));
+        // Optional new fields default off when absent.
+        assert_eq!(c.aggregate, None);
+        assert!(!c.cascade_stop);
+        assert!(!c.emit_workflow);
+    }
+
+    #[test]
+    fn contract_reads_checkpoint_fields() {
+        let lines = vec![
+            "skill_name: pm-prioritize-tasks-coarse",
+            "input_kind: requirements",
+            "output_kind: prioritized_backlog",
+            "aggregate: task",
+            "cascade_stop: true",
+            "emit_workflow: true",
+            "persona: PM",
+        ];
+        let c = contract(&lines);
+        assert_eq!(c.aggregate.as_deref(), Some("task"));
+        assert!(c.cascade_stop);
+        assert!(c.emit_workflow);
+        assert_eq!(c.persona.as_deref(), Some("PM"));
     }
 
     #[test]

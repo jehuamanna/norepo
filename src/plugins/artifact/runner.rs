@@ -27,11 +27,12 @@ use uuid::Uuid;
 
 use crate::persistence::Persistence;
 use crate::plugins::artifact::frontmatter::{
-    rewrite as rewrite_artifact_fm, ArtifactKind, ArtifactStatus,
+    parse as parse_artifact_fm, rewrite as rewrite_artifact_fm, ArtifactKind, ArtifactStatus,
 };
 use crate::plugins::skill::frontmatter::{
     contract as parse_skill_contract, split as split_skill,
 };
+use crate::plugins::workflow::state::{Edge, Node, NodeStatus, WorkflowGraph};
 
 #[derive(Debug)]
 pub enum RunnerError {
@@ -152,6 +153,21 @@ pub async fn run_skill_on_source(
     let lines = skill_fm_lines.unwrap_or_default();
     let contract = parse_skill_contract(&lines);
 
+    // 3a. Aggregator skills: collect every descendant artifact under
+    //     the source seed whose `artifact_kind` matches the declared
+    //     `aggregate:` kind. The collected (title, body) pairs are
+    //     inlined into the prompt so the LLM sees every Task (or
+    //     every Plan, etc.) at once. Walks the tree breadth-first
+    //     under `source_note_id` — siblings of the seed are NOT
+    //     pulled in.
+    let aggregated: Vec<(String, String)> =
+        if let Some(kind) = contract.aggregate.as_deref() {
+            collect_descendant_artifacts(note_repo, persistence, project_id, source_note_id, kind)
+                .await
+        } else {
+            Vec::new()
+        };
+
     // 4. Where claude is going to write the new artifact files. One
     //    subdir per source so the engine can scan a known place after
     //    the run completes.
@@ -168,7 +184,15 @@ pub async fn run_skill_on_source(
     let existing: HashSet<PathBuf> = list_md_files(&artifacts_dir);
 
     // 6. Build the prompt that claude will see.
-    let prompt = build_prompt(&source_body, &skill_body, &artifacts_dir, &contract, source_note_id, skill_note_id);
+    let prompt = build_prompt(
+        &source_body,
+        &skill_body,
+        &artifacts_dir,
+        &contract,
+        source_note_id,
+        skill_note_id,
+        &aggregated,
+    );
 
     // 7. Persist the prompt as a User message (transcript visibility).
     if let Some(repo) = chat_repo {
@@ -333,10 +357,279 @@ pub async fn run_skill_on_source(
         created_ids.push(row_id);
     }
 
+    // 11. Workflow emission: prioritization skills declare
+    //     `emit_workflow: true` so the runner reads the produced
+    //     backlog artifact's `## Priority order` section, looks up
+    //     each named task in the project, and writes a sibling
+    //     `NoteKind::Workflow` note with one snapshot node per
+    //     prioritized task plus depends-on cross-edges parsed from
+    //     each task's body. The Workflow note opens to the existing
+    //     React Flow canvas so the user gets the cross-story DAG
+    //     they asked for without any new view code.
+    if contract.emit_workflow {
+        for backlog_id in &created_ids {
+            if let Err(e) = emit_workflow_for_backlog(
+                note_repo,
+                persistence,
+                project_id,
+                source_note_id,
+                *backlog_id,
+            )
+            .await
+            {
+                tracing::warn!(
+                    target: "operon::artifact",
+                    "emit_workflow for backlog {backlog_id} failed: {e}"
+                );
+            }
+        }
+    }
+
     Ok(RunOutcome {
         created_artifact_ids: created_ids,
         artifacts_dir,
     })
+}
+
+/// Build (or refresh) the sibling Workflow note for a prioritized
+/// backlog artifact. Reads the backlog's `## Priority order` to get
+/// task titles in priority order, resolves each to an Artifact note
+/// id under the seed, snapshots them as nodes (re-using the
+/// `is_artifact_snapshot` shape established by `cascade_graph`), and
+/// adds depends-on edges parsed from each task body's `## Depends on`
+/// section. Idempotent on re-runs — same title resolves to the same
+/// Workflow note and the body is overwritten.
+async fn emit_workflow_for_backlog(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    persistence: &Arc<dyn Persistence>,
+    project_id: Uuid,
+    seed_id: Uuid,
+    backlog_id: Uuid,
+) -> Result<(), String> {
+    let backlog_bytes = persistence
+        .load(&backlog_id.to_string())
+        .await
+        .map_err(|e| format!("load backlog: {e}"))?;
+    let backlog_body =
+        String::from_utf8(backlog_bytes).map_err(|e| format!("backlog utf8: {e}"))?;
+    let priority = parse_priority_order(&backlog_body);
+    if priority.is_empty() {
+        return Err("backlog body has no `## Priority order` entries".into());
+    }
+
+    // Index every artifact in the project by title (and TaskID
+    // prefix) so a `T001` or `task-01-foo` line resolves cheaply.
+    let all_notes = note_repo
+        .list_for_project(project_id)
+        .map_err(|e| format!("list_for_project: {e}"))?;
+    let mut by_title: std::collections::HashMap<String, &LocalNote> =
+        std::collections::HashMap::new();
+    for n in &all_notes {
+        if !matches!(n.kind, NoteKind::Artifact) {
+            continue;
+        }
+        by_title.insert(n.title.clone(), n);
+        if let Some(first) = n.title.split_whitespace().next() {
+            by_title.insert(first.to_string(), n);
+        }
+    }
+
+    // Resolve priority slugs to Artifact notes; drop unresolved.
+    let mut resolved: Vec<&LocalNote> = Vec::new();
+    for slug in &priority {
+        if let Some(n) = by_title.get(slug.as_str()) {
+            resolved.push(*n);
+        }
+    }
+    if resolved.is_empty() {
+        return Err("no priority entries resolved to known artifacts".into());
+    }
+
+    // Build (or reuse) the sibling Workflow note. Title is derived
+    // from the backlog artifact so coarse + refined runs each get
+    // their own canvas without colliding.
+    let backlog_title = all_notes
+        .iter()
+        .find(|n| n.id == backlog_id)
+        .map(|n| n.title.clone())
+        .unwrap_or_else(|| "backlog".to_string());
+    let workflow_title = format!("Workflow — {backlog_title}");
+    let existing = all_notes
+        .iter()
+        .find(|n| {
+            matches!(n.kind, NoteKind::Workflow)
+                && n.parent_id == Some(seed_id)
+                && n.title == workflow_title
+        })
+        .map(|n| n.id);
+    let workflow_id = match existing {
+        Some(id) => id,
+        None => note_repo
+            .create_with_kind(
+                project_id,
+                Some(seed_id),
+                &workflow_title,
+                NoteKind::Workflow,
+            )
+            .map_err(|e| format!("create_with_kind workflow: {e}"))?
+            .id,
+    };
+
+    // Build the graph. Snapshot nodes (`is_artifact_snapshot:true`)
+    // reuse the read-only render path the cascade graph already uses.
+    // Layout: priority order along the X axis at a single Y so the
+    // canvas opens to a clear left-to-right backlog stripe; depends-
+    // on edges become amber arrows above the stripe.
+    let mut graph = WorkflowGraph::new();
+    let mut node_id_by_artifact: std::collections::HashMap<Uuid, Uuid> =
+        std::collections::HashMap::new();
+    let mut bodies_by_artifact: std::collections::HashMap<Uuid, String> =
+        std::collections::HashMap::new();
+    for (i, art) in resolved.iter().enumerate() {
+        let body = persistence
+            .load(&art.id.to_string())
+            .await
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_default();
+        let kind_label = parse_artifact_fm(&body)
+            .artifact_kind
+            .as_ref()
+            .map(|k| k.display_name())
+            .unwrap_or_else(|| "Artifact".into());
+        let nid = Uuid::new_v4();
+        graph.nodes.insert(
+            nid,
+            Node {
+                id: nid,
+                skill_note_id: Uuid::nil(),
+                typed_fields: serde_json::Value::Null,
+                extra_instructions: String::new(),
+                position: ((i as f64) * 200.0, 80.0),
+                cached_output_path: None,
+                cached_input_hash: None,
+                status: NodeStatus::Fresh,
+                cached_output_note_id: None,
+                is_artifact_snapshot: true,
+                artifact_ref: Some(art.id),
+                artifact_kind_label: Some(kind_label),
+                artifact_title: Some(art.title.clone()),
+            },
+        );
+        node_id_by_artifact.insert(art.id, nid);
+        bodies_by_artifact.insert(art.id, body);
+    }
+
+    // Depends-on edges, reusing the same parser the cascade graph
+    // uses for sibling cross-edges. References that don't resolve to
+    // a node in this backlog are silently dropped.
+    for (artifact_id, body) in &bodies_by_artifact {
+        let to = match node_id_by_artifact.get(artifact_id) {
+            Some(n) => *n,
+            None => continue,
+        };
+        for slug in crate::plugins::artifact::cascade_graph::parse_depends_on(body) {
+            let from_artifact = match by_title.get(slug.as_str()) {
+                Some(n) => n.id,
+                None => continue,
+            };
+            let from = match node_id_by_artifact.get(&from_artifact) {
+                Some(n) => *n,
+                None => continue,
+            };
+            if from == to {
+                continue;
+            }
+            let dup = graph.edges.iter().any(|e| {
+                e.from == from
+                    && e.to == to
+                    && e.edge_kind.as_deref() == Some("depends_on")
+            });
+            if !dup {
+                graph.edges.push(Edge {
+                    id: Uuid::new_v4(),
+                    from,
+                    from_socket: "default".into(),
+                    to,
+                    to_socket: "default".into(),
+                    edge_kind: Some("depends_on".into()),
+                });
+            }
+        }
+    }
+    graph.version = graph.version.saturating_add(1);
+
+    let body = serde_json::to_string_pretty(&graph)
+        .map_err(|e| format!("serialize graph: {e}"))?;
+    persistence
+        .save(&workflow_id.to_string(), body.as_bytes())
+        .await
+        .map_err(|e| format!("save workflow note: {e}"))?;
+    Ok(())
+}
+
+/// Extract titles listed under the backlog artifact's `## Priority
+/// order` heading. Tolerant: returns an empty Vec when the section is
+/// absent. Recognizes ordered (`1. T001`) and unordered (`- T001`)
+/// markers; the first whitespace-delimited token after the marker is
+/// taken as the lookup slug, matching the cascade graph's depends-on
+/// resolution rules.
+pub fn parse_priority_order(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_section = false;
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("##") {
+            let heading = trimmed.trim_start_matches('#').trim().to_lowercase();
+            in_section = heading == "priority order"
+                || heading == "priorities"
+                || heading == "priority";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        // Strip ordered-list "1." / "12)" prefix and unordered
+        // bullet markers, then read the first token.
+        let after_number = strip_list_marker(trimmed);
+        if after_number.is_empty() || after_number == trimmed {
+            // Plain prose / blank lines inside the section are
+            // ignored; only listed bullets count.
+            continue;
+        }
+        let token = after_number
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches([',', '.', ':', ';', ')']);
+        if token.is_empty() || token.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        out.push(token.to_string());
+    }
+    out
+}
+
+/// Strip a leading list marker. Returns the original slice (unchanged)
+/// when no marker is present so the caller can detect "this isn't a
+/// list line" vs "this is a list line with empty content".
+fn strip_list_marker(line: &str) -> &str {
+    if let Some(rest) = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
+    {
+        return rest.trim_start();
+    }
+    // Ordered: "12. foo" or "12) foo"
+    let digits: String = line.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !digits.is_empty() {
+        let after = &line[digits.len()..];
+        if let Some(rest) = after.strip_prefix(". ").or_else(|| after.strip_prefix(") ")) {
+            return rest.trim_start();
+        }
+    }
+    line
 }
 
 fn build_prompt(
@@ -346,6 +639,7 @@ fn build_prompt(
     contract: &crate::plugins::skill::frontmatter::SkillContract,
     source_id: Uuid,
     skill_id: Uuid,
+    aggregated: &[(String, String)],
 ) -> String {
     let mut buf = String::new();
     buf.push_str(
@@ -383,6 +677,23 @@ fn build_prompt(
     buf.push_str("--- source artifact body ---\n");
     buf.push_str(source_body.trim_end());
     buf.push_str("\n--- /source artifact body ---\n\n");
+
+    if !aggregated.is_empty() {
+        let kind = contract.aggregate.as_deref().unwrap_or("artifact");
+        buf.push_str(&format!(
+            "--- aggregated {kind} artifacts ({n} total) ---\n\
+             Every {kind} artifact under the source seed is inlined below. Use\n\
+             these as the canonical input set; do NOT consult the filesystem\n\
+             for additional artifacts of this kind.\n\n",
+            n = aggregated.len()
+        ));
+        for (title, body) in aggregated {
+            buf.push_str(&format!("--- artifact: {title} ---\n"));
+            buf.push_str(body.trim_end());
+            buf.push_str(&format!("\n--- /artifact: {title} ---\n\n"));
+        }
+        buf.push_str(&format!("--- /aggregated {kind} artifacts ---\n\n"));
+    }
 
     buf.push_str(
         "When done, do NOT echo the artifact contents back to the user — the\n\
@@ -436,6 +747,73 @@ fn build_artifact_path_label(
     } else {
         format!("{project_name} / {}", titles.join(" / "))
     }
+}
+
+/// Aggregator helper: walk the descendants of `seed_id` under
+/// `project_id` and return `(title, body)` for every Artifact note
+/// whose `artifact_kind` matches `wanted_kind`. BFS, ordered by note
+/// title so the prompt is deterministic across runs. Skips the seed
+/// itself even if it happens to be the same kind (the seed body is
+/// already inlined separately).
+async fn collect_descendant_artifacts(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    persistence: &Arc<dyn Persistence>,
+    project_id: Uuid,
+    seed_id: Uuid,
+    wanted_kind: &str,
+) -> Vec<(String, String)> {
+    let all = match note_repo.list_for_project(project_id) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut by_parent: std::collections::HashMap<Uuid, Vec<&LocalNote>> =
+        std::collections::HashMap::new();
+    for n in &all {
+        if let Some(p) = n.parent_id {
+            by_parent.entry(p).or_default().push(n);
+        }
+    }
+    let mut visited = HashSet::new();
+    let mut queue: std::collections::VecDeque<Uuid> = std::collections::VecDeque::new();
+    queue.push_back(seed_id);
+    visited.insert(seed_id);
+    let mut matched: Vec<&LocalNote> = Vec::new();
+    while let Some(id) = queue.pop_front() {
+        if let Some(children) = by_parent.get(&id) {
+            for child in children {
+                if !visited.insert(child.id) {
+                    continue;
+                }
+                if matches!(child.kind, NoteKind::Artifact) {
+                    matched.push(child);
+                }
+                queue.push_back(child.id);
+            }
+        }
+    }
+    matched.sort_by(|a, b| a.title.cmp(&b.title));
+    let mut out: Vec<(String, String)> = Vec::with_capacity(matched.len());
+    for n in matched {
+        let bytes = match persistence.load(&n.id.to_string()).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let body = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let fm = parse_artifact_fm(&body);
+        let matches_kind = fm
+            .artifact_kind
+            .as_ref()
+            .map(|k| k.as_str() == wanted_kind)
+            .unwrap_or(false);
+        if !matches_kind {
+            continue;
+        }
+        out.push((n.title.clone(), body));
+    }
+    out
 }
 
 /// List `.md` files (top-level only — no recursion) in `dir`.
@@ -675,10 +1053,74 @@ mod tests {
             &contract,
             Uuid::nil(),
             Uuid::nil(),
+            &[],
         );
         assert!(prompt.contains("REQ_BODY"));
         assert!(prompt.contains("SKILL_BODY"));
         assert!(prompt.contains("/tmp/x"));
         assert!(prompt.contains("artifact_kind: epic"));
+        // No aggregate section when none provided.
+        assert!(!prompt.contains("aggregated"));
+    }
+
+    #[test]
+    fn parse_priority_order_reads_unordered_bullets() {
+        let body =
+            "# Backlog\n\n## Priority order\n- T001\n- T003 (was bumped past T002)\n- T002\n\n## Risks\n- none\n";
+        assert_eq!(parse_priority_order(body), vec!["T001", "T003", "T002"]);
+    }
+
+    #[test]
+    fn parse_priority_order_reads_ordered_bullets() {
+        let body =
+            "## Priority order\n1. task-01-add-user-table\n2. task-02-login-form\n10. task-10-cleanup\n";
+        assert_eq!(
+            parse_priority_order(body),
+            vec![
+                "task-01-add-user-table",
+                "task-02-login-form",
+                "task-10-cleanup",
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_priority_order_skips_none_marker_and_prose() {
+        let body =
+            "## Priority order\n\nSome rationale prose.\n- None\n- T001\n";
+        assert_eq!(parse_priority_order(body), vec!["T001"]);
+    }
+
+    #[test]
+    fn parse_priority_order_returns_empty_when_section_absent() {
+        let body = "# Backlog\n\n## Notes\n- nothing\n";
+        assert!(parse_priority_order(body).is_empty());
+    }
+
+    #[test]
+    fn build_prompt_inlines_aggregated_artifacts() {
+        let dir = std::path::Path::new("/tmp/x");
+        let mut contract = crate::plugins::skill::frontmatter::SkillContract::default();
+        contract.output_kind = Some("prioritized_backlog".into());
+        contract.aggregate = Some("task".into());
+        let aggregated = vec![
+            ("task-01-add-user-table".into(), "Body of task 1".into()),
+            ("task-02-add-login-form".into(), "Body of task 2".into()),
+        ];
+        let prompt = build_prompt(
+            "SEED_BODY",
+            "SKILL_BODY",
+            dir,
+            &contract,
+            Uuid::nil(),
+            Uuid::nil(),
+            &aggregated,
+        );
+        assert!(prompt.contains("SEED_BODY"));
+        assert!(prompt.contains("aggregated task artifacts (2 total)"));
+        assert!(prompt.contains("--- artifact: task-01-add-user-table ---"));
+        assert!(prompt.contains("Body of task 1"));
+        assert!(prompt.contains("--- artifact: task-02-add-login-form ---"));
+        assert!(prompt.contains("Body of task 2"));
     }
 }

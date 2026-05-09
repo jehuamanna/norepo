@@ -7,9 +7,10 @@ gate: approval
 persona: BA
 ---
 
-You are a senior Business Analyst. Decompose the Epic below into **3 to 8
-Features**. A Feature is a coherent capability inside the Epic that can be
-designed and built as a unit (1–3 weeks of engineering).
+You are a senior Business Analyst. Decompose the Epic below into
+**exactly 2 Features** — the two highest-leverage capabilities inside
+the Epic, each designed and built as a unit (1–3 weeks of
+engineering).
 
 ## What a Feature looks like
 - Falls cleanly under the parent Epic's outcome
@@ -19,11 +20,10 @@ designed and built as a unit (1–3 weeks of engineering).
 
 ## Output format
 
-**Critical: 3–8 SEPARATE files — one Feature per file.** This is a
-multi-output skill. You MUST call the `Write` tool **once per
-Feature**: 3 to 8 Write tool invocations in this run, each writing
-one different `.md` file into the output directory the runtime hands
-you.
+**Critical: exactly 2 SEPARATE files — one Feature per file.** This
+is a multi-output skill. You MUST call the `Write` tool **exactly
+twice**, each call writing one different `.md` file into the output
+directory the runtime hands you.
 
 Do **NOT**:
 - write a single file containing multiple Features separated by
@@ -57,5 +57,13 @@ Sections (for every file):
 - **## Open questions** — mark each `BLOCKING` or `NON-BLOCKING`
 
 ## Calibration
-If a Feature has only 1 acceptance criterion, it's probably a Story — fold it.
-If a Feature has >8 criteria, split it.
+Two-Feature mode. If the Epic clearly contains more than two
+distinct capabilities, pick the **two** with the highest leverage
+(typically: one foundational + one user-facing) and list the others
+under `## Out of scope`. Do not emit a third Feature file even when
+tempting — the pipeline downstream (Stories, Tasks, prioritization
+checkpoints) is sized for two Features per Epic.
+
+If a Feature has only 1 acceptance criterion, it's probably a Story
+— fold it. If a Feature has >8 criteria, split the criteria but
+keep it as one Feature.

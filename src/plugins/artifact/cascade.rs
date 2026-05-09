@@ -151,12 +151,23 @@ pub async fn run_cascade(
                     // the Depends-on second pass at the end).
                     let project_notes_for_titles =
                         note_repo.list_for_project(project_id).unwrap_or_default();
+                    // Checkpoint skills (`cascade_stop: true`) emit
+                    // artifacts that the cascade must NOT auto-approve
+                    // — they're human-review gates. Children land in
+                    // Pending, the cascade does not enqueue them, and
+                    // the run ends with a Paused phase so the UI can
+                    // surface "review the new backlog and approve to
+                    // continue".
+                    let checkpoint_hit = skill.contract.cascade_stop
+                        && !o.created_artifact_ids.is_empty();
                     for child_id in &o.created_artifact_ids {
-                        if let Err(e) = approve_artifact(persistence, *child_id).await {
-                            tracing::warn!(
-                                target: "operon::cascade",
-                                "approve_artifact failed for {child_id}: {e}"
-                            );
+                        if !skill.contract.cascade_stop {
+                            if let Err(e) = approve_artifact(persistence, *child_id).await {
+                                tracing::warn!(
+                                    target: "operon::cascade",
+                                    "approve_artifact failed for {child_id}: {e}"
+                                );
+                            }
                         }
                         produced += 1;
 
@@ -188,6 +199,41 @@ pub async fn run_cascade(
                                 "graph flush failed: {e}"
                             );
                         }
+                    }
+                    if checkpoint_hit {
+                        // Surface a Paused phase so the view can
+                        // print the "review and approve" status line.
+                        // We deliberately do NOT enqueue produced
+                        // children — the cascade stops here until
+                        // the user approves and re-runs.
+                        CASCADE_STATE.with_mut(|m| {
+                            m.insert(
+                                root_artifact_id,
+                                CascadePhase::Paused {
+                                    artifact_id: o
+                                        .created_artifact_ids
+                                        .first()
+                                        .copied()
+                                        .unwrap_or(art_id),
+                                    skill_id: skill.id,
+                                    level,
+                                },
+                            );
+                        });
+                        // Final flush of any in-flight graph state
+                        // before bailing — keeps the canvas honest.
+                        if let Some(writer) = graph_writer.as_deref_mut() {
+                            writer.finalize_depends_on(&titles);
+                            if let Err(e) = writer.flush(persistence).await {
+                                tracing::warn!(
+                                    target: "operon::cascade",
+                                    "graph paused-flush failed: {e}"
+                                );
+                            }
+                        }
+                        return Ok(CascadeOutcome::Completed {
+                            artifacts_produced: produced,
+                        });
                     }
                     for child_id in o.created_artifact_ids {
                         queue.push_back((child_id, level + 1));
@@ -394,6 +440,7 @@ mod tests {
                 output_count: SkillOutputCount::Many,
                 gate: SkillGate::Approval,
                 persona: None,
+                ..SkillContract::default()
             },
         }
     }

@@ -2,14 +2,16 @@
 skill_name: 03-ba-decompose-stories
 input_kind: feature
 output_kind: story
-output_count: many
+output_count: one
 gate: approval
 persona: BA
 ---
 
-You are a senior Business Analyst. Decompose the Feature below into **3 to
-10 User Stories**. A Story is a thin vertical slice — one user goal,
-end-to-end (UI → API → storage), shippable in 1–5 days.
+You are a senior Business Analyst. Decompose the Feature below into
+**exactly 1 User Story** — the single walking-skeleton slice that
+proves the Feature works end-to-end (UI → API → storage), shippable
+in 1–5 days. Edge cases, error paths, and polish are deferred to
+later iterations.
 
 ## What a Story looks like
 - Format: "As a <role>, I want <goal>, so that <benefit>"
@@ -18,33 +20,26 @@ end-to-end (UI → API → storage), shippable in 1–5 days.
 
 ## Output format
 
-**Critical: 3–10 SEPARATE files — one Story per file.** This is a
-multi-output skill. You MUST call the `Write` tool **once per
-Story**: 3 to 10 Write tool invocations in this run, each writing
-one different `.md` file into the output directory the runtime hands
-you.
+**Critical: exactly 1 file.** Call the `Write` tool **once**, writing
+a single `.md` file into the output directory the runtime hands you.
 
 Do **NOT**:
-- write a single file containing multiple Stories separated by
-  `# story-XX-name.md` header markers — the engine imports each
-  `.md` file as its own note, so concatenated files lose every
-  Story except the first;
 - emit a sibling "index" or "summary" file;
-- create subdirectories — write directly in the output directory.
+- create subdirectories — write directly in the output directory;
+- emit a second Story even when the Feature naturally has more
+  flows. The pipeline is calibrated for one Story per Feature
+  (walking-skeleton); defer secondary flows under `## Edge cases`
+  for follow-up iterations.
 
-Each Story → one markdown file with a **zero-padded sequence
-number** so lexicographic sort matches build order:
-`story-01-<kebab-name>.md`, `story-02-<kebab-name>.md`, …
+Filename: `story-01-<kebab-name>.md` (the `01-` prefix matches the
+sibling-ordering convention used elsewhere in the pipeline).
 
-Order Stories so the lowest-numbered are the **walking-skeleton**
-slices — narrowest happy paths that prove the Feature works
-end-to-end. Higher numbers add edge cases, error paths, polish, and
-secondary flows. A higher-numbered Story may assume the work in a
-lower-numbered Story is shipped. Use 2-digit padding so 1–99 sort
-correctly.
+The Story must be the **walking-skeleton** slice — the narrowest
+happy path that proves the Feature works end-to-end. Edge cases,
+error paths, polish, and secondary flows belong in `## Edge cases`
+as deferred work, not as separate Story files.
 
-Example under one Feature: `story-01-create-account-happy-path.md`,
-`story-02-handle-duplicate-email.md`, `story-03-resend-verification.md`.
+Example under one Feature: `story-01-create-account-happy-path.md`.
 
 Sections (for every file):
 
@@ -57,5 +52,8 @@ Sections (for every file):
 - **## Definition of done** — must include "tests pass", "approved by reviewer"
 
 ## Calibration
-If a Story spans >5 days of work, split it. If two Stories touch the exact
-same files for the same reason, merge them.
+Single-Story mode. If the walking-skeleton naturally spans >5 days,
+shrink the scope (smaller user role, fewer fields, fewer edge cases
+inside the happy path) — do NOT emit a second Story file. The
+deferred scope goes under `## Edge cases` so the prioritization
+checkpoints can see what was cut.

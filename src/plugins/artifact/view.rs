@@ -276,6 +276,13 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                         "Cascade failed: {reason}"
                     }
                 },
+                Some(crate::shell::companion_state::CascadePhase::Paused { level, .. }) => rsx! {
+                    div {
+                        class: "operon-artifact-run-status",
+                        "data-testid": "artifact-cascade-status",
+                        "Cascade paused at checkpoint (level {level}) \u{2014} review the new backlog and approve to continue."
+                    }
+                },
             }
             div { class: "operon-artifact-body",
                 if body_editable {
