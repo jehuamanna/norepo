@@ -1528,7 +1528,7 @@ fn spawn_cascade(
 /// Deterministic v5 UUID for the cascade-level rail entry. Distinct
 /// namespace from `chat_session_id_for_source` so cascade sessions
 /// don't collide with single-skill sessions on the same artifact.
-fn chat_session_id_for_cascade(root: Uuid) -> Uuid {
+pub fn chat_session_id_for_cascade(root: Uuid) -> Uuid {
     Uuid::new_v5(
         &Uuid::NAMESPACE_OID,
         format!("operon-artifact-cascade:{root}").as_bytes(),

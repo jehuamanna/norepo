@@ -203,7 +203,18 @@ pub async fn run_cascade(
                 );
             });
 
-            let chat_session_id = crate::plugins::artifact::view::chat_session_id_for_source(art_id);
+            // Route every cascade skill run through the cascade-wide
+            // chat session (not the per-source one). Without this the
+            // user's `Cascade: <id>` tab stays empty even while skills
+            // are happily streaming, because the runner persists to
+            // `chat_session_id_for_source(art_id)` while the tab the
+            // user opened was bound on `chat_session_id_for_cascade(root)`
+            // — different v5 UUIDs derived from different namespaces.
+            // Sharing one session means the whole cascade transcript
+            // appears in the one tab the user is watching, in skill
+            // firing order.
+            let chat_session_id =
+                crate::plugins::artifact::view::chat_session_id_for_cascade(root_artifact_id);
             let outcome = run_skill_on_source(
                 note_repo,
                 project_repo,
