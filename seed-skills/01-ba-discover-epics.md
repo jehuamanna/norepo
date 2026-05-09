@@ -57,6 +57,24 @@ gave it one. Sibling-only — do not list anything outside this seed.
 Use `None (parallel-safe)` when the Epic has no prerequisites. The
 cascade engine reads this and sequences decomposition accordingly.
 
+**How to spot cross-Epic deps from the Requirements prose:**
+- **Shared data**: Epic X reads / mutates rows that Epic Y creates
+  (e.g. "billing" needs "user accounts" because billing references
+  `users.id`). Y is the prerequisite.
+- **Prerequisite UX**: the user must complete a flow in Epic Y
+  before any flow in Epic X is meaningful (e.g. "todo list"
+  requires "log in" — you can't have personal todos for an
+  anonymous user).
+- **Shared infrastructure**: Epic X consumes a service / module /
+  contract that Epic Y owns (e.g. "notifications" depends on a
+  message bus that "platform" stands up).
+
+If you can't articulate the dep in one of those terms, leave
+`None (parallel-safe)`. The PM tier (`01b-pm-prioritize-epics`)
+re-reads every Epic together and catches deps you missed — your
+job here is to capture only the deps that are unmistakable from
+this single Epic's local context.
+
 Do NOT decompose into Features here. That's the next BA skill's job.
 
 ## Calibration

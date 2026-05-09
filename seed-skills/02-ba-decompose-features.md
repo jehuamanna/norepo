@@ -63,6 +63,24 @@ first whitespace token of the title). Sibling-only — do not point
 at Features under a different Epic. The cascade engine reads this
 and sequences Feature-level decomposition (Stories) in topo order.
 
+**How to spot cross-Feature deps within an Epic:**
+- **Shared data within the Epic**: Feature X writes a column /
+  table / cache key that Feature Y reads (e.g. "verify email"
+  writes `users.verified_at`; "team invites" reads it to gate the
+  invite flow).
+- **UI flow ordering**: Feature X is a prerequisite step in the
+  user journey that Feature Y begins from (e.g. "create account"
+  is the on-ramp that "first-run onboarding" continues from).
+- **Shared modules**: Feature X exposes a util / hook / endpoint
+  that Feature Y consumes (e.g. "session middleware" gates every
+  authenticated Feature in the Epic).
+
+If you can't articulate the dep in one of those terms, leave
+`None (parallel-safe)`. The PM tier (`02b-pm-prioritize-features`)
+re-reads every Feature in this Epic together and catches deps
+you missed — including cross-Epic edges you wouldn't have visibility
+into from a single Feature's local context.
+
 ## Calibration
 Two-Feature mode. If the Epic clearly contains more than two
 distinct capabilities, pick the **two** with the highest leverage

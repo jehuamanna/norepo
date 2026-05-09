@@ -59,6 +59,25 @@ or the first whitespace token of the title). Sibling-only — do not
 list Stories under other Features. The cascade engine reads this
 and sequences Task-level decomposition in topo order.
 
+**How to spot cross-Story deps within a Feature:**
+- **Walking-skeleton enabling**: Story X is the spine that proves
+  the Feature works end-to-end; Story Y is an embellishment that
+  assumes X already ships (e.g. "create account happy path" must
+  ship before "resend verification email" makes sense).
+- **Acceptance-criterion handoff**: Story X creates the row /
+  resource / state that Story Y's acceptance criteria read or
+  mutate (e.g. "complete onboarding" sets a flag that "skip
+  tutorial" checks).
+- **Navigation precedence**: Story X creates the screen / route
+  that Story Y links to or returns from (e.g. "view dashboard"
+  is the destination of "post-login redirect").
+
+If you can't articulate the dep in one of those terms, leave
+`None (parallel-safe)`. The PM tier (`03b-pm-prioritize-stories`)
+re-reads every Story together and catches deps you missed —
+including cross-Feature edges that aren't visible from a single
+Story's local context.
+
 ## Calibration
 Single-Story mode. If the walking-skeleton naturally spans >5 days,
 shrink the scope (smaller user role, fewer fields, fewer edge cases

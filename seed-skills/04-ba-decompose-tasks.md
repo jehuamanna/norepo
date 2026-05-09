@@ -64,6 +64,25 @@ Sections (for every file):
   test that should newly pass
 - **## Estimated size** — XS / S / M (anything L → split it)
 
+**How to spot cross-Task deps within a Story:**
+- **Schema before usage**: Task X creates / migrates a table or
+  column that Task Y reads or writes (`add users table` blocks
+  `add user-creation endpoint`).
+- **Util before consumer**: Task X exposes a shared helper /
+  module / hook that Task Y imports (`add hashPassword util`
+  blocks `wire signup flow to hash`).
+- **Contract before implementation**: Task X defines an
+  interface / type / endpoint shape that Task Y implements against
+  (`define UserResponse type` blocks `wire endpoint to return
+  UserResponse`).
+- **Fixture before test**: Task X creates seed data / factory /
+  test helper that Task Y's tests depend on.
+
+If you can't articulate the dep in one of those terms, leave
+`None (parallel-safe)`. The PM tier (`04b-pm-prioritize-tasks-coarse`,
+run manually on the seed after Tasks are decomposed) re-reads
+every Task together and catches cross-Story deps you missed.
+
 Number tasks `T001`, `T002`, … in the title for traceability across
 sibling tasks under the same Story.
 
