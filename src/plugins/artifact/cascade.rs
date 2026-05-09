@@ -219,6 +219,35 @@ pub async fn run_cascade(
                 continue;
             }
 
+            // Empty-aggregation gate. Aggregator skills (`aggregate:
+            // <kind>`) are meaningful only when descendants of the
+            // declared kind exist under this artifact. Firing 04b on
+            // the seed at the start of a cascade — when no Tasks
+            // exist yet — produces a "phantom" Rejected backlog and,
+            // worse, hits cascade_stop and pauses the run on
+            // nothing-to-prioritize. Skip silently when the
+            // aggregation would be empty; the user can run the
+            // aggregator manually once descendants exist (or build a
+            // post_pass mechanism in a follow-up).
+            if let Some(agg_kind) = skill.contract.aggregate.as_deref() {
+                let count = count_descendant_artifacts_of_kind(
+                    note_repo,
+                    persistence,
+                    project_id,
+                    art_id,
+                    agg_kind,
+                )
+                .await;
+                if count == 0 {
+                    tracing::debug!(
+                        target: "operon::cascade",
+                        "skipping aggregator skill {} on {art_id}: no `{agg_kind}` descendants yet",
+                        skill.title
+                    );
+                    continue;
+                }
+            }
+
             CASCADE_STATE.with_mut(|m| {
                 m.insert(
                     root_artifact_id,
@@ -607,6 +636,52 @@ pub async fn compute_artifact_deps(
     }
 
     deps
+}
+
+/// Count descendant Artifact notes of `seed_id` whose
+/// `artifact_kind` matches `wanted_kind`. Used by the cascade to
+/// skip aggregator skills whose `aggregate:` set would be empty —
+/// firing them anyway produces phantom Rejected backlogs and traps
+/// the cascade behind cascade_stop on nothing.
+async fn count_descendant_artifacts_of_kind(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    persistence: &Arc<dyn Persistence>,
+    project_id: Uuid,
+    seed_id: Uuid,
+    wanted_kind: &str,
+) -> usize {
+    let notes = match note_repo.list_for_project(project_id) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let descendants = subtree_ids(&notes, seed_id);
+    let mut count = 0usize;
+    for note in &notes {
+        if note.id == seed_id || !descendants.contains(&note.id) {
+            continue;
+        }
+        if !matches!(note.kind, NoteKind::Artifact) {
+            continue;
+        }
+        let bytes = match persistence.load(&note.id.to_string()).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let body = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let fm = parse_artifact_fm(&body);
+        if fm
+            .artifact_kind
+            .as_ref()
+            .map(|k| k.as_str() == wanted_kind)
+            .unwrap_or(false)
+        {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Find children of `parent_id` whose artifact frontmatter declares
