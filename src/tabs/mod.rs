@@ -93,6 +93,24 @@ impl TabManager {
         self.open_inner(note_id, format_id, title, content, true, true)
     }
 
+    /// Open a fresh tab (force_new=true) with auto-save behavior.
+    /// Used for kinds that should never show "Unsaved" — e.g. the
+    /// cascade workflow note, where every state mutation (node
+    /// drag, auto-arrange, cascade-runner flush) should hit disk
+    /// through the debounced [`SaveScheduler`] without the user
+    /// reaching for Ctrl+S. Manual-save remains the right choice
+    /// for free-form markdown bodies; this is the opt-out for
+    /// structured-state notes.
+    pub fn open_auto_save_new(
+        &mut self,
+        note_id: String,
+        format_id: String,
+        title: String,
+        content: String,
+    ) -> TabId {
+        self.open_inner(note_id, format_id, title, content, false, true)
+    }
+
     fn open_inner(
         &mut self,
         note_id: String,

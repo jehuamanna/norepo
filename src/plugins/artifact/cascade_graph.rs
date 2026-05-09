@@ -290,9 +290,98 @@ impl CascadeGraphWriter {
         self.graph.version = self.graph.version.saturating_add(1);
     }
 
+    /// Second pass companion: walk cached artifact bodies for any
+    /// `prioritized_backlog` artifact, parse its
+    /// `## Cross-tree dependencies` section (or any of the legacy
+    /// `cross-{story,feature,epic} dependencies` aliases), resolve
+    /// each `dependent -> prerequisite` pair to sibling snapshot
+    /// nodes by title, and add an amber `depends_on` edge between
+    /// them. Without this, the cross-tree edges declared by the
+    /// prioritization skill stay invisible on the canvas — the
+    /// `## Depends on` parser only fires on per-artifact bodies, but
+    /// the prioritization skills consolidate cross-tree edges into a
+    /// dedicated section on the backlog artifact.
+    ///
+    /// Tolerant: unresolved slugs are dropped silently (matches
+    /// `finalize_depends_on`).
+    pub fn finalize_cross_tree_deps(&mut self, all_titles_by_artifact: &HashMap<Uuid, String>) {
+        let mut by_title: HashMap<String, Uuid> = HashMap::new();
+        for (art, title) in all_titles_by_artifact {
+            by_title.insert(title.clone(), *art);
+            if let Some(first) = title.split_whitespace().next() {
+                by_title.insert(first.to_string(), *art);
+            }
+        }
+        let bodies: Vec<(Uuid, String)> = self
+            .bodies
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        for (artifact_id, body) in bodies {
+            // Only walk prioritized_backlog artifacts — the
+            // `parse_cross_tree_deps` heading match would happily
+            // parse anything containing the section, but other
+            // artifact kinds shouldn't carry cross-tree edges.
+            let fm = crate::plugins::artifact::frontmatter::parse(&body);
+            let is_backlog = fm
+                .artifact_kind
+                .as_ref()
+                .map(|k| k.as_str() == "prioritized_backlog")
+                .unwrap_or(false);
+            if !is_backlog {
+                continue;
+            }
+            for (dependent_slug, prerequisite_slug) in parse_cross_tree_deps(&body) {
+                let dep_artifact = match by_title.get(&dependent_slug) {
+                    Some(a) => *a,
+                    None => continue,
+                };
+                let pre_artifact = match by_title.get(&prerequisite_slug) {
+                    Some(a) => *a,
+                    None => continue,
+                };
+                let from = match self.by_artifact.get(&pre_artifact) {
+                    Some(n) => *n,
+                    None => continue,
+                };
+                let to = match self.by_artifact.get(&dep_artifact) {
+                    Some(n) => *n,
+                    None => continue,
+                };
+                if from == to {
+                    continue;
+                }
+                let already = self.graph.edges.iter().any(|e| {
+                    e.from == from
+                        && e.to == to
+                        && e.edge_kind.as_deref() == Some("depends_on")
+                });
+                if !already {
+                    self.graph.edges.push(Edge {
+                        id: Uuid::new_v4(),
+                        from,
+                        from_socket: "default".into(),
+                        to,
+                        to_socket: "default".into(),
+                        edge_kind: Some("depends_on".into()),
+                    });
+                }
+            }
+            // Avoid the `unused` warning for the loop binding.
+            let _ = artifact_id;
+        }
+        self.graph.version = self.graph.version.saturating_add(1);
+    }
+
     /// Serialize the in-memory graph to the workflow note's body.
     /// Called by the orchestrator at every level boundary so the
     /// canvas re-renders live.
+    ///
+    /// After a successful save we bump
+    /// `WORKFLOW_GRAPH_VERSION[graph_note_id]` so any open canvas for
+    /// this workflow note re-reads the body and refreshes — that's
+    /// what makes new artifact-snapshot tiles appear in the
+    /// `Cascade: <root>` tab as the cascade runs.
     pub async fn flush(&self, persistence: &Arc<dyn Persistence>) -> std::io::Result<()> {
         let body = serde_json::to_string_pretty(&self.graph)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -300,7 +389,29 @@ impl CascadeGraphWriter {
             .save(&self.graph_note_id.to_string(), body.as_bytes())
             .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+        let id = self.graph_note_id;
+        crate::shell::companion_state::WORKFLOW_GRAPH_VERSION.with_mut(|m| {
+            let entry = m.entry(id).or_insert(0);
+            *entry = entry.saturating_add(1);
+        });
         Ok(())
+    }
+
+    /// Mark an artifact-snapshot node's `NodeStatus` so the workflow
+    /// canvas surfaces the in-flight state of the cascade. The
+    /// orchestrator calls this just before invoking a skill on
+    /// `artifact_id` (status=Running) and after the skill completes
+    /// (status=Fresh on success, Error on failure). Idempotent — if
+    /// no snapshot exists yet we mint one (matches the convention
+    /// `on_artifact_produced` uses for the parent slot). The caller
+    /// is responsible for invoking `flush()` so the change reaches
+    /// disk + the canvas.
+    pub fn mark_artifact_status(&mut self, artifact_id: Uuid, status: NodeStatus) {
+        let nid = self.ensure_snapshot_for(artifact_id, None);
+        if let Some(n) = self.graph.nodes.get_mut(&nid) {
+            n.status = status;
+        }
+        self.graph.version = self.graph.version.saturating_add(1);
     }
 }
 
@@ -461,6 +572,56 @@ pub fn append_numbered_skill_chain(
     }
     graph.version = graph.version.saturating_add(1);
     graph
+}
+
+/// Seed a freshly-created `Cascade:` workflow note with **just the
+/// source-artifact root**: one read-only artifact-snapshot node
+/// representing e.g. the user's Requirements note, no downstream
+/// nodes, no placeholder kinds. The Generate Cascade button uses
+/// this so the workflow tab opens with a clear visual anchor for the
+/// pipeline's seed without claiming any downstream artifacts exist
+/// yet — those only get drawn when ▶ Play actually runs the cascade
+/// (the orchestrator's `CascadeGraphWriter::on_artifact_produced`
+/// appends snapshot nodes as real artifacts are produced).
+///
+/// Errors are returned to the caller, which logs and falls through
+/// to opening an unseeded tab.
+pub async fn seed_cascade_workflow_root_only(
+    persistence: &Arc<dyn Persistence>,
+    graph_note_id: Uuid,
+    root_artifact_id: Uuid,
+    root_kind_label: &str,
+    root_artifact_title: &str,
+) -> Result<(), String> {
+    let mut graph = WorkflowGraph::new();
+    let root_node_id = Uuid::new_v4();
+    graph.nodes.insert(
+        root_node_id,
+        Node {
+            id: root_node_id,
+            skill_note_id: Uuid::nil(),
+            typed_fields: serde_json::Value::Null,
+            extra_instructions: String::new(),
+            position: (0.0, 40.0),
+            cached_output_path: None,
+            cached_input_hash: None,
+            status: NodeStatus::Fresh,
+            cached_output_note_id: None,
+            is_artifact_snapshot: true,
+            artifact_ref: Some(root_artifact_id),
+            artifact_kind_label: Some(root_kind_label.to_string()),
+            artifact_title: Some(root_artifact_title.to_string()),
+        },
+    );
+    graph.version = graph.version.saturating_add(1);
+
+    let body = serde_json::to_string_pretty(&graph)
+        .map_err(|e| format!("serialize seeded graph: {e}"))?;
+    persistence
+        .save(&graph_note_id.to_string(), body.as_bytes())
+        .await
+        .map_err(|e| format!("save seeded graph: {e}"))?;
+    Ok(())
 }
 
 /// Extract `(dependent_slug, prerequisite_slug)` pairs from a

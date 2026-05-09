@@ -23,9 +23,14 @@ use crate::editor::LanguageDescriptor;
 /// wasm-bindgen rather than `document::eval`. `Eval` itself is available on
 /// both targets, so the type compiles everywhere — but `set_content` is a
 /// no-op until the host's bootstrap script enters its message loop.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct MonacoChannel {
     eval: document::Eval,
+    /// Per-mount host id, also keyed in `window.__operon_monaco_handles`.
+    /// Lets `splice` issue a fresh `document::eval` that grabs the live
+    /// Monaco handle directly, bypassing the unreliable bootstrap recv
+    /// queue (see `splice` for the full rationale).
+    host_id: String,
 }
 
 impl MonacoChannel {
@@ -54,24 +59,57 @@ impl MonacoChannel {
             .send(serde_json::json!({"type":"revealLine","value":line_number}));
     }
 
-    /// Insert `text` at Monaco's current caret position. JS-side
-    /// computes the caret from `handle.snapshot()`, so the Rust caller
-    /// doesn't need to round-trip the cursor offset. Falls back to
-    /// end-of-buffer when the cursor is past the content (Monaco
-    /// snapshots `getOffsetAt(getPosition())`, which clamps to model
-    /// length).
+    /// Insert `text` at Monaco's current caret position.
+    ///
+    /// Earlier revs sent `{type:"splice"}` through the bootstrap's
+    /// `await dioxus.recv()` loop (the same long-lived `Eval` that
+    /// owns the mount). That path turned out to be unreliable for
+    /// post-mount sends — same hazard the prop-mirror `setContent`
+    /// path documents at the bottom of `MonacoEditorHost`: the recv
+    /// queue silently drops messages, leaving the Monaco buffer
+    /// untouched. The user-visible symptom was "link-picker fires,
+    /// `eval.send` returns Ok, nothing happens in Monaco."
+    ///
+    /// Fix: bypass the recv queue and issue a fresh `document::eval`
+    /// that grabs `window.__operon_monaco_handles[hostId]` and runs
+    /// the `snapshot/getContent/slice/setContent/restore` sequence
+    /// inline. We don't set the suppress flag, so Monaco's onChange
+    /// (registered in the bootstrap) routes the new content back to
+    /// Rust through the bootstrap's safeSend → `Tab.content` mirror
+    /// updates as before. We do NOT also call `eval.send` here — the
+    /// recv-path splice would *also* insert at the cursor, doubling
+    /// the text on the rare occasion both paths land.
     pub fn splice(&self, text: &str) {
         eprintln!(
-            "operon: MonacoChannel::splice eval.send len={} preview={:?}",
+            "operon: MonacoChannel::splice direct-eval len={} preview={:?}",
             text.len(),
             &text.chars().take(40).collect::<String>()
         );
-        let r = self
-            .eval
-            .send(serde_json::json!({"type":"splice","text":text}));
-        if let Err(e) = r {
-            eprintln!("operon: MonacoChannel::splice eval.send FAILED: {e:?}");
-        }
+        let host_id_json = serde_json::to_string(&self.host_id)
+            .unwrap_or_else(|_| String::from("\"\""));
+        let text_json = serde_json::to_string(text)
+            .unwrap_or_else(|_| String::from("\"\""));
+        let direct_script = format!(
+            "(function() {{ \
+                const hid = {host_id_json}; \
+                const h = (window.__operon_monaco_handles || {{}})[hid]; \
+                if (!h) {{ console.warn('operon: direct splice: no handle for', hid); return; }} \
+                try {{ \
+                    const state = h.snapshot(); \
+                    const old = h.getContent(); \
+                    const text = {text_json}; \
+                    const pos = Math.min((state && state.cursor) || 0, old.length); \
+                    const next = old.slice(0, pos) + text + old.slice(pos); \
+                    h.setContent(next); \
+                    try {{ h.restore({{cursor: pos + text.length, selection: null, scroll: (state && state.scroll) || 0}}); }} catch (e) {{}} \
+                    try {{ if (typeof h.layout === 'function') h.layout(); }} catch (e) {{}} \
+                    console.log('operon: direct splice OK', hid, 'oldLen', old.length, 'textLen', text.length, 'nextLen', next.length); \
+                }} catch (e) {{ \
+                    console.warn('operon: direct splice threw', hid, e); \
+                }} \
+            }})();",
+        );
+        let _ = document::eval(&direct_script);
     }
 }
 
@@ -241,16 +279,71 @@ pub fn MonacoEditorHost(
                         const onKey = (ev) => {{
                             if (!target.contains(ev.target)) return;
                             const meta = ev.metaKey || ev.ctrlKey;
-                            if (!meta) return;
-                            const key = ev.key && ev.key.toLowerCase();
-                            let action = null;
-                            if (key === "s" && !ev.shiftKey) action = "save";
-                            else if (key === "k" && !ev.shiftKey) action = "linkpicker";
-                            else if (key === "i" && ev.shiftKey) action = "imagepicker";
-                            if (!action) return;
-                            ev.preventDefault();
-                            ev.stopPropagation();
-                            safeSend({{type:"keyaction", action}});
+                            if (meta) {{
+                                const key = ev.key && ev.key.toLowerCase();
+                                let action = null;
+                                if (key === "s" && !ev.shiftKey) action = "save";
+                                else if (key === "k" && !ev.shiftKey) action = "linkpicker";
+                                else if (key === "i" && ev.shiftKey) action = "imagepicker";
+                                if (!action) return;
+                                ev.preventDefault();
+                                ev.stopPropagation();
+                                safeSend({{type:"keyaction", action}});
+                                return;
+                            }}
+                            // Plans-Phase-9-monaco-desktop: trigger-char
+                            // shortcuts for the link picker. `[[` (the
+                            // second `[` after an existing one) and `@`
+                            // at a non-word boundary both open the same
+                            // picker the meta-K shortcut does. The
+                            // trigger character is consumed here so
+                            // accepting the picker yields a clean
+                            // splice (no leftover `[[` or `@` in the
+                            // body); on dismissal the user just lost
+                            // those keystrokes — same trade-off Notion
+                            // and Slack make for `@`.
+                            if (ev.key === "[" || ev.key === "@") {{
+                                let snap, content, cursor, prevChar;
+                                try {{
+                                    snap = handle.snapshot();
+                                    content = handle.getContent();
+                                    cursor = (snap && typeof snap.cursor === "number") ? snap.cursor : content.length;
+                                    prevChar = cursor > 0 ? content[cursor - 1] : "";
+                                }} catch (e) {{ return; }}
+                                let shouldTrigger = false;
+                                let deleteBefore = 0;
+                                if (ev.key === "[" && prevChar === "[") {{
+                                    shouldTrigger = true;
+                                    deleteBefore = 1;
+                                }} else if (ev.key === "@") {{
+                                    // Boundary check: no prev char, or
+                                    // prev is whitespace / newline /
+                                    // start-of-line punctuation. This
+                                    // keeps `name@example.com` from
+                                    // accidentally firing the picker.
+                                    if (cursor === 0 || /[\s(\[{{<,;:]/.test(prevChar)) {{
+                                        shouldTrigger = true;
+                                    }}
+                                }}
+                                if (!shouldTrigger) return;
+                                ev.preventDefault();
+                                ev.stopPropagation();
+                                if (deleteBefore > 0) {{
+                                    const next = content.slice(0, cursor - deleteBefore) + content.slice(cursor);
+                                    suppress = true;
+                                    try {{ handle.setContent(next); }} finally {{ suppress = false; }}
+                                    try {{
+                                        handle.restore({{
+                                            cursor: cursor - deleteBefore,
+                                            selection: null,
+                                            scroll: (snap && snap.scroll) || 0,
+                                        }});
+                                    }} catch (e) {{}}
+                                    safeSend({{type:"change", value: next, source: "trigger"}});
+                                }}
+                                safeSend({{type:"keyaction", action: "linkpicker"}});
+                                return;
+                            }}
                         }};
                         window.addEventListener("keydown", onKey, true);
                         safeSend({{type:"mounted"}});
@@ -343,8 +436,12 @@ pub fn MonacoEditorHost(
         // `use_hook` runs once per mount so this still avoids extra
         // writes on every render.
         if let Some(mut sink) = channel_sink {
+            let host_id_for_channel = host_id.clone();
             use_hook(move || {
-                sink.set(Some(MonacoChannel { eval: eval_handle }));
+                sink.set(Some(MonacoChannel {
+                    eval: eval_handle,
+                    host_id: host_id_for_channel,
+                }));
             });
         }
 

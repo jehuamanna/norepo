@@ -63,8 +63,26 @@ pub fn MainArea() -> Element {
                     });
                     let local_save: Option<crate::local_mode::LocalSaveAction> =
                         try_consume_context();
+                    // `key="{tab_id:?}"` on each branch forces Dioxus to
+                    // unmount the prior editor and mount a fresh
+                    // instance when the active tab changes — without
+                    // it, plugins that initialize state via use_signal
+                    // / use_hook from props.content (e.g. workflow's
+                    // `text` signal at view.rs:66, the Monaco host's
+                    // eval_handle) hang on to the previous tab's
+                    // content because Dioxus diffs the same rsx slot
+                    // as "same component, new props". `display:
+                    // contents` keeps the wrapper out of the box tree
+                    // so child layout (Monaco's absolute-inset, the
+                    // workflow canvas's flex container) is unaffected.
                     match mode {
-                        EditorMode::View => plugin.render(&note_id, &content),
+                        EditorMode::View => rsx! {
+                            div {
+                                key: "{tab_id:?}",
+                                style: "display: contents;",
+                                {plugin.render(&note_id, &content)}
+                            }
+                        },
                         EditorMode::Edit => {
                             // Local Mode dispatch:
                             //   - Markdown keeps the LocalNoteEditor shell
@@ -78,10 +96,6 @@ pub fn MainArea() -> Element {
                             //     plugin slips through, we fall back to
                             //     LocalNoteEditor so the user can still
                             //     edit text.
-                            // `key` forces Dioxus to unmount the prior
-                            // editor (and any embedded Monaco bootstrap)
-                            // when the active tab changes, then mount a
-                            // fresh instance for the new tab.
                             if is_local {
                                 let uses_local_shell = format_id.as_str() == "markdown";
                                 if uses_local_shell {
@@ -94,18 +108,40 @@ pub fn MainArea() -> Element {
                                             }
                                         }
                                     } else {
-                                        plugin.render_edit(&note_id, &content, on_change)
+                                        rsx! {
+                                            div {
+                                                key: "{tab_id:?}",
+                                                style: "display: contents;",
+                                                {plugin.render_edit(&note_id, &content, on_change)}
+                                            }
+                                        }
                                     }
                                 } else {
-                                    plugin.render_edit(&note_id, &content, on_change)
+                                    rsx! {
+                                        div {
+                                            key: "{tab_id:?}",
+                                            style: "display: contents;",
+                                            {plugin.render_edit(&note_id, &content, on_change)}
+                                        }
+                                    }
                                 }
                             } else {
-                                plugin.render_edit(&note_id, &content, on_change)
+                                rsx! {
+                                    div {
+                                        key: "{tab_id:?}",
+                                        style: "display: contents;",
+                                        {plugin.render_edit(&note_id, &content, on_change)}
+                                    }
+                                }
                             }
                         }
-                        EditorMode::LivePreview => {
-                            plugin.render_live_preview(&note_id, &content, on_change)
-                        }
+                        EditorMode::LivePreview => rsx! {
+                            div {
+                                key: "{tab_id:?}",
+                                style: "display: contents;",
+                                {plugin.render_live_preview(&note_id, &content, on_change)}
+                            }
+                        },
                         EditorMode::Split => {
                             // Local Split: side-by-side textarea + rendered view.
                             if is_local {
@@ -130,6 +166,7 @@ pub fn MainArea() -> Element {
                                 } else {
                                     rsx! {
                                         crate::shell::split_view::SplitView {
+                                            key: "{tab_id:?}",
                                             format_id: format_id.clone(),
                                             note_id: note_id.clone(),
                                             content: content.clone(),
@@ -140,6 +177,7 @@ pub fn MainArea() -> Element {
                             } else {
                                 rsx! {
                                     crate::shell::split_view::SplitView {
+                                        key: "{tab_id:?}",
                                         format_id: format_id.clone(),
                                         note_id: note_id.clone(),
                                         content: content.clone(),

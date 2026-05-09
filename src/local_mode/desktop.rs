@@ -699,6 +699,42 @@ pub fn provide_local_app_signals() {
     });
     use_context_provider(|| crate::plugins::markdown::render::WikiLinkResolver(wikilink_resolver));
 
+    // Click resolver for `[text](operon://note/<uuid>)` markdown links
+    // emitted by the artifact-view link picker. Resolution is direct
+    // (no title parsing) — uuid → first project that contains it →
+    // open in a tab. The `WikiLinkResolver` above handles the legacy
+    // `[[Project/Title^short]]` form; this is its uuid-keyed sibling.
+    let note_repo_for_note_link = note_repo_for_links.clone();
+    let project_repo_for_note_link = project_repo.clone();
+    let tabs_for_note_link = tabs;
+    let scheduler_for_note_link = scheduler.clone();
+    let mut selected_note_for_note_link_setter = selected_note_for_links;
+    let note_link_resolver = use_hook(move || {
+        Callback::new(move |note_id: Uuid| {
+            let snap_projects = project_repo_for_note_link.list().unwrap_or_default();
+            for p in &snap_projects {
+                if let Ok(notes) = note_repo_for_note_link.list_for_project(p.id) {
+                    if let Some(note) = notes.into_iter().find(|n| n.id == note_id) {
+                        super::editor::open_local_note_tab(
+                            tabs_for_note_link,
+                            scheduler_for_note_link.clone(),
+                            note_id,
+                            note.title,
+                            String::new(),
+                            note.kind,
+                        );
+                        selected_note_for_note_link_setter.set(Some(note_id));
+                        return;
+                    }
+                }
+            }
+            eprintln!("operon: operon-note click \u{2014} no project contains note {note_id}");
+        })
+    });
+    use_context_provider(|| {
+        crate::plugins::markdown::render::NoteLinkResolver(note_link_resolver)
+    });
+
     // Plans-Phase-9-wikilink-picker (rev 3): shared per-shell cache for
     // the WikiLinkChecker + WikiLinkImageResolver. Both run on every
     // MarkdownView render; in Split mode that's once per keystroke. The
@@ -852,13 +888,47 @@ pub fn provide_local_app_signals() {
     // Standard `![alt](path)` resolver: when `path` is a vault-relative
     // blob (e.g. `.operon/images/<sha>.png` produced by paste-image), turn
     // it into a `data:` URL so wry's webview can actually render it.
-    // External URLs (http/https/data:) and anything that fails to resolve
-    // pass through as `None`, leaving the literal `dest` on the `<img>`.
+    // Also recognises `operon://note/<uuid>` links — when the target
+    // resolves to a `NoteKind::Image` row, we look up its blob and
+    // return the data URL the same way `WikiLinkImageResolver` does
+    // for `![[Title^short]]` embeds. Everything else (external URLs,
+    // missing notes, unresolvable paths) passes through as `None`,
+    // leaving the literal `dest` on the `<img>`.
     let vault_for_md_img = vault_for_img;
+    let note_repo_for_md_img = note_repo_for_links.clone();
+    let project_repo_for_md_img = project_repo.clone();
     let markdown_image_resolver = use_hook(move || {
         Callback::new(move |dest: String| -> Option<String> {
             let trimmed = dest.trim();
             if trimmed.is_empty() {
+                return None;
+            }
+            // operon:// scheme — resolve to an image-kind note's blob.
+            if let Some(note_id) =
+                crate::plugins::markdown::render::parse_operon_note_url(trimmed)
+            {
+                let snap_projects =
+                    project_repo_for_md_img.list().unwrap_or_default();
+                for p in &snap_projects {
+                    let notes =
+                        match note_repo_for_md_img.list_for_project(p.id) {
+                            Ok(n) => n,
+                            Err(_) => continue,
+                        };
+                    let row = match notes.into_iter().find(|n| n.id == note_id) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    if !matches!(row.kind, NoteKind::Image) {
+                        return None;
+                    }
+                    let blob_path = row.blob_path.clone()?;
+                    let vault = vault_for_md_img.read().clone()?;
+                    return crate::local_mode::images::data_url_for_blob(
+                        &vault,
+                        std::path::Path::new(&blob_path),
+                    );
+                }
                 return None;
             }
             // Bypass absolute URLs and already-resolved data URLs.

@@ -7,6 +7,7 @@
 //! cascade execution is M3c.
 
 use dioxus::prelude::*;
+use keyboard_types::Modifiers;
 use operon_store::repos::{LocalNote, NoteKind};
 use operon_store::repos::{LocalNoteRepository, LocalProjectRepository};
 use std::collections::HashMap;
@@ -14,9 +15,14 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::local_mode::desktop::{LocalNoteRepo, LocalProjectRepo};
-use crate::local_mode::explorer::{LocalNoteVersion, SelectedNote};
-use crate::persistence::Persistence;
+use crate::local_mode::explorer::{FocusedNode as ExplorerFocused, LocalNoteVersion, NodeKey, SelectedNote};
+use crate::editor::EditorMode;
+use crate::local_mode::editor::open_local_note_tab;
+use crate::persistence::{PersistError, Persistence};
+use crate::tabs::{SaveScheduler, TabManager};
 use crate::plugins::markdown::MarkdownView;
+use crate::plugins::artifact::frontmatter::ArtifactStatus;
+use crate::plugins::artifact::view::{mark_descendants_dirty, patch_status_text};
 use crate::plugins::workflow::engine::{propagate_dirty, topo_order_dirty, SkillBag, SkillSnapshot, hash_body};
 use crate::plugins::workflow::executor::{
     collect_upstream_outputs, run_node, CascadeTranscriptSink, RunArtifact,
@@ -28,8 +34,25 @@ use crate::shell::companion_state::{
 };
 use operon_store::repos::ChatScope;
 
-const NODE_W: f64 = 180.0;
-const NODE_H: f64 = 64.0;
+/// Node card dimensions. Sized for a leadership demo: comfortable
+/// reading width, and tall enough to fit five rows of in-tile
+/// controls (header, name, artifact-action strip, NodeStatus pills,
+/// footer icons) without text overlap. The auto-arrange `COL_GAP` /
+/// `ROW_GAP` constants are tuned around these so columns don't bleed.
+const NODE_W: f64 = 260.0;
+const NODE_H: f64 = 210.0;
+/// Vertical row baselines inside a node (in node-local coords). Used
+/// by the SVG render and by the edge-anchor distribution to keep
+/// child layouts aligned with the visible row structure.
+const NODE_ROW1_Y: f64 = 22.0; // header strip (chevron + kind + ≡ ▶ ✏)
+const NODE_ROW2_Y: f64 = 64.0; // name / title text baseline
+const NODE_ROW_ACTIONS_Y: f64 = 92.0; // artifact action strip (Approve / Reject / …)
+const NODE_ROW_STATUS_Y: f64 = 132.0; // NodeStatus pills (Dirty / Running / …)
+const NODE_ROW_FOOTER_Y: f64 = 172.0; // 👁 view + 🗑 delete icons
+/// Top of each in-tile control band — used as the rect `y` for
+/// inline buttons / pills. Distinct from the *baseline* values above
+/// (which position SVG `<text>`).
+const NODE_BTN_H: f64 = 22.0;
 
 #[derive(Props, Clone, PartialEq)]
 pub struct WorkflowEditorProps {
@@ -45,6 +68,37 @@ pub fn WorkflowEditor(props: WorkflowEditorProps) -> Element {
     let text = use_signal(|| initial_text.clone());
     let on_change = props.on_change;
     let note_id = props.note_id.clone();
+    // Toggle for the JSON-tree pane to the right of the canvas. Default
+    // hidden — most BAs work entirely off the canvas, and the textarea
+    // takes screen real-estate that the canvas can use. Toolbar exposes
+    // a button that flips this.
+    let json_visible: Signal<bool> = use_signal(|| false);
+
+    // Undo / redo / clipboard — editor-scope so they survive canvas
+    // re-renders. History caps at HISTORY_CAP entries (oldest dropped
+    // when full) to avoid unbounded memory growth on long sessions.
+    let history: Signal<Vec<WorkflowGraph>> = use_signal(Vec::new);
+    let redo_stack: Signal<Vec<WorkflowGraph>> = use_signal(Vec::new);
+    // Clipboard for cut/copy/paste. Stores nodes by value (not id) so
+    // a paste mints fresh UUIDs and offsets positions; edges internal
+    // to the copied set get re-keyed alongside.
+    let clipboard: Signal<Option<WorkflowClipboard>> = use_signal(|| None);
+    // Expand/collapse set — lifted to editor scope so the toolbar's
+    // "Expand all" / "Collapse all" buttons share state with the
+    // canvas's per-node chevrons. Hydrated on first mount from the
+    // workflow note's persisted `view_state.expanded_nodes`, so closing
+    // and reopening the note restores the exact level-by-level drill-
+    // down the user was looking at. New workflows have an empty
+    // expanded set → only root nodes show, matching the demo flow.
+    let expanded: Signal<std::collections::BTreeSet<NodeId>> = {
+        let initial: std::collections::BTreeSet<NodeId> = initial_graph
+            .view_state
+            .expanded_nodes
+            .iter()
+            .copied()
+            .collect();
+        use_signal(move || initial.clone())
+    };
 
     // Live-parse from the textarea so the canvas updates with every
     // keystroke. Bad JSON renders the previous good graph + a parse
@@ -71,6 +125,136 @@ pub fn WorkflowEditor(props: WorkflowEditorProps) -> Element {
         })
     };
 
+    // Callback every chevron / Expand-all / Collapse-all path calls
+    // after writing to `expanded`. Merges the new set into the graph's
+    // `view_state` and pushes the rewritten JSON via `apply_graph`
+    // (raw — not undoable; expand state isn't a graph edit).
+    let persist_expanded: Callback<std::collections::BTreeSet<NodeId>> = {
+        let snapshot_text = text;
+        let apply_graph_inner = apply_graph;
+        Callback::new(move |new_set: std::collections::BTreeSet<NodeId>| {
+            let cur_text = snapshot_text.peek().clone();
+            let Ok(mut g) = serde_json::from_str::<WorkflowGraph>(&cur_text) else {
+                return;
+            };
+            g.view_state.expanded_nodes = new_set.iter().copied().collect();
+            apply_graph_inner.call(g);
+        })
+    };
+
+    // Live-refresh hook: subscribe to `WORKFLOW_GRAPH_VERSION` keyed on
+    // this workflow note's id. When the cascade graph writer flushes
+    // a new revision to disk, the bump triggers this effect; we async-
+    // load the body, auto-arrange so the new artifact-snapshot tiles
+    // don't pile on top of existing ones, and auto-expand any
+    // artifact-snapshot parents so newly-produced child nodes appear
+    // immediately in the canvas. Idempotent — last-seen-version guard
+    // prevents re-firing on unchanged renders.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let workflow_id_for_effect = note_id.clone();
+        let persistence_for_effect: std::sync::Arc<dyn crate::persistence::Persistence> =
+            use_context();
+        let mut last_seen_version: Signal<u64> = use_signal(|| 0);
+        let mut expanded_for_effect = expanded;
+        let apply_graph_for_effect = apply_graph;
+        use_effect(move || {
+            let Ok(wf_id) = Uuid::parse_str(&workflow_id_for_effect) else {
+                return;
+            };
+            let cur_version = crate::shell::companion_state::WORKFLOW_GRAPH_VERSION
+                .read()
+                .get(&wf_id)
+                .copied()
+                .unwrap_or(0);
+            if cur_version == 0 || cur_version <= *last_seen_version.peek() {
+                return;
+            }
+            last_seen_version.set(cur_version);
+            let persistence = persistence_for_effect.clone();
+            let id_str = wf_id.to_string();
+            spawn(async move {
+                let body_bytes = match persistence.load(&id_str).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("operon: workflow live-refresh load failed: {e:?}");
+                        return;
+                    }
+                };
+                let body = match String::from_utf8(body_bytes) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let parsed: WorkflowGraph = match serde_json::from_str(&body) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        eprintln!("operon: workflow live-refresh parse failed: {e}");
+                        return;
+                    }
+                };
+                let arranged = auto_arrange(&parsed);
+                let mut new_expanded: std::collections::BTreeSet<NodeId> =
+                    expanded_for_effect.peek().clone();
+                for (id, node) in arranged.nodes.iter() {
+                    if !node.is_artifact_snapshot {
+                        continue;
+                    }
+                    let has_out = arranged.edges.iter().any(|e| e.from == *id);
+                    if has_out {
+                        new_expanded.insert(*id);
+                    }
+                }
+                let mut g_final = arranged;
+                g_final.view_state.expanded_nodes =
+                    new_expanded.iter().copied().collect();
+                expanded_for_effect.set(new_expanded);
+                apply_graph_for_effect.call(g_final);
+            });
+        });
+    }
+    // Same idea for viewport pan / zoom. Called from canvas-scope
+    // gestures (pan-drag mouseup, zoom buttons, ctrl+wheel zoom) so
+    // closing and reopening the workflow lands the viewport exactly
+    // where the user left it.
+    let persist_view: Callback<(f64, f64, f64)> = {
+        let snapshot_text = text;
+        let apply_graph_inner = apply_graph;
+        Callback::new(move |(px, py, z): (f64, f64, f64)| {
+            let cur_text = snapshot_text.peek().clone();
+            let Ok(mut g) = serde_json::from_str::<WorkflowGraph>(&cur_text) else {
+                return;
+            };
+            g.view_state.pan_x = px;
+            g.view_state.pan_y = py;
+            g.view_state.zoom = z;
+            apply_graph_inner.call(g);
+        })
+    };
+
+    // Undo-aware variant — captures the current parsed graph before
+    // forwarding to `apply_graph`, so Ctrl+Z on the canvas can revert
+    // it. Caps at HISTORY_CAP to bound memory; clears `redo_stack` on
+    // every new edit (standard branching-on-edit semantics).
+    let apply_with_undo: Callback<WorkflowGraph> = {
+        let snapshot_text = text;
+        let mut history_setter = history;
+        let mut redo_setter = redo_stack;
+        let apply_graph_inner = apply_graph;
+        Callback::new(move |g: WorkflowGraph| {
+            let cur_text = snapshot_text.peek().clone();
+            if let Ok(prev) = serde_json::from_str::<WorkflowGraph>(&cur_text) {
+                history_setter.with_mut(|h| {
+                    h.push(prev);
+                    if h.len() > HISTORY_CAP {
+                        h.remove(0);
+                    }
+                });
+                redo_setter.with_mut(|r| r.clear());
+            }
+            apply_graph_inner.call(g);
+        })
+    };
+
     rsx! {
         div { class: "operon-workflow-surface operon-workflow-surface-edit",
             "data-testid": "workflow-editor",
@@ -86,31 +270,44 @@ pub fn WorkflowEditor(props: WorkflowEditorProps) -> Element {
                     }
                 }),
                 apply_graph: apply_graph,
+                apply_with_undo: apply_with_undo,
+                json_visible: json_visible,
+                expanded: expanded,
+                persist_expanded: persist_expanded,
             }
             div { class: "operon-workflow-pane",
                 WorkflowCanvas {
                     graph: graph_for_canvas,
                     note_id: note_id.clone(),
                     apply_graph: apply_graph,
+                    apply_with_undo: apply_with_undo,
+                    history: history,
+                    redo_stack: redo_stack,
+                    clipboard: clipboard,
+                    expanded: expanded,
+                    persist_expanded: persist_expanded,
+                    persist_view: persist_view,
                 }
-                div { class: "operon-workflow-json",
-                    if let Some(err) = parse_error.as_ref() {
-                        div {
-                            class: "operon-workflow-parse-error",
-                            "data-testid": "workflow-parse-error",
-                            "Invalid JSON \u{2014} canvas shows last good graph: {err}"
+                if *json_visible.read() {
+                    div { class: "operon-workflow-json",
+                        if let Some(err) = parse_error.as_ref() {
+                            div {
+                                class: "operon-workflow-parse-error",
+                                "data-testid": "workflow-parse-error",
+                                "Invalid JSON \u{2014} canvas shows last good graph: {err}"
+                            }
                         }
-                    }
-                    textarea {
-                        class: "operon-workflow-textarea",
-                        "data-testid": "workflow-textarea",
-                        spellcheck: "false",
-                        value: "{text}",
-                        oninput: move |e| {
-                            let mut text_setter = text;
-                            text_setter.set(e.value());
-                            on_change.call(e.value());
-                        },
+                        textarea {
+                            class: "operon-workflow-textarea",
+                            "data-testid": "workflow-textarea",
+                            spellcheck: "false",
+                            value: "{text}",
+                            oninput: move |e| {
+                                let mut text_setter = text;
+                                text_setter.set(e.value());
+                                on_change.call(e.value());
+                            },
+                        }
                     }
                 }
             }
@@ -129,6 +326,23 @@ pub fn WorkflowView(props: WorkflowViewProps) -> Element {
     // No-op apply for read-only View mode — Run buttons in the canvas
     // are still rendered but produce no graph mutations.
     let noop: Callback<WorkflowGraph> = Callback::new(|_| {});
+    // View-mode placeholders for undo / clipboard infra. These signals
+    // are inert because there's no apply path to drive them.
+    let history: Signal<Vec<WorkflowGraph>> = use_signal(Vec::new);
+    let redo_stack: Signal<Vec<WorkflowGraph>> = use_signal(Vec::new);
+    let clipboard: Signal<Option<WorkflowClipboard>> = use_signal(|| None);
+    let expanded: Signal<std::collections::BTreeSet<NodeId>> = {
+        let initial: std::collections::BTreeSet<NodeId> = graph
+            .view_state
+            .expanded_nodes
+            .iter()
+            .copied()
+            .collect();
+        use_signal(move || initial.clone())
+    };
+    let persist_noop: Callback<std::collections::BTreeSet<NodeId>> =
+        Callback::new(|_| {});
+    let persist_view_noop: Callback<(f64, f64, f64)> = Callback::new(|_| {});
     rsx! {
         div { class: "operon-workflow-surface",
             "data-testid": "workflow-view",
@@ -136,6 +350,13 @@ pub fn WorkflowView(props: WorkflowViewProps) -> Element {
                 graph,
                 note_id: String::new(),
                 apply_graph: noop,
+                apply_with_undo: noop,
+                history: history,
+                redo_stack: redo_stack,
+                clipboard: clipboard,
+                expanded: expanded,
+                persist_expanded: persist_noop,
+                persist_view: persist_view_noop,
             }
         }
     }
@@ -145,20 +366,46 @@ pub fn WorkflowView(props: WorkflowViewProps) -> Element {
 struct WorkflowCanvasProps {
     graph: WorkflowGraph,
     note_id: String,
+    /// Raw apply — overwrites the JSON text without recording an
+    /// undoable history entry. Used for drag positions, ghost edges,
+    /// inspector live edits, per-node run state.
     apply_graph: Callback<WorkflowGraph>,
+    /// Undo-aware apply — pushes the *previous* graph onto `history`,
+    /// clears `redo_stack`, then forwards to `apply_graph`. Used for
+    /// discrete keyboard actions: Delete, Cut, Paste, Auto-arrange.
+    apply_with_undo: Callback<WorkflowGraph>,
+    /// Editor-scope undo / redo / clipboard signals so the canvas
+    /// keyboard handler can manipulate them.
+    history: Signal<Vec<WorkflowGraph>>,
+    redo_stack: Signal<Vec<WorkflowGraph>>,
+    clipboard: Signal<Option<WorkflowClipboard>>,
+    /// Editor-scope expand/collapse set, shared with the toolbar's
+    /// Expand-all / Collapse-all buttons.
+    expanded: Signal<std::collections::BTreeSet<NodeId>>,
+    /// Persistence hook — invoked after every mutation of `expanded`
+    /// so the workflow note's `view_state` stays in sync with the UI.
+    persist_expanded: Callback<std::collections::BTreeSet<NodeId>>,
+    /// Persistence hook for viewport pan / zoom. Called on pan-drag
+    /// mouseup, zoom-button click, and ctrl+wheel zoom so the
+    /// workflow note remembers the last viewport across close/reopen.
+    persist_view: Callback<(f64, f64, f64)>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct DragState {
+    /// The node the user grabbed — drives DragState lifecycle but the
+    /// translation applies to every entry in `start_positions`.
     node: NodeId,
     /// Mouse client position at drag start, so subsequent mousemove
-    /// events can compute a delta against it (we update the node's
-    /// position by that delta).
+    /// events can compute a delta against it (we update each node's
+    /// position by that delta, divided by zoom).
     start_client_x: f64,
     start_client_y: f64,
-    /// Node position at drag start.
-    start_node_x: f64,
-    start_node_y: f64,
+    /// (id, original_x, original_y) for *every* selected node at drag
+    /// start. On mousemove we translate all of them by the same delta
+    /// so a multi-selection moves as a group. When the user grabs an
+    /// unselected node the set is just (node, n_x, n_y).
+    start_positions: Vec<(NodeId, f64, f64)>,
 }
 
 /// Active edge-creation drag. The user mousedowns on a node's output
@@ -191,6 +438,43 @@ struct PanDragState {
     start_pan_y: f64,
 }
 
+/// Cap on the undo / redo history so long sessions don't grow
+/// unbounded. 100 discrete actions ≈ 100 graph clones; for the sizes
+/// we typically see (≤ a few hundred nodes) that's small.
+const HISTORY_CAP: usize = 100;
+
+/// Cut / copy clipboard payload. Holds nodes by value (with their
+/// original ids — paste mints fresh UUIDs) and the edges between them.
+/// Cross-set edges (one endpoint inside the copied set, the other
+/// outside) are dropped.
+#[derive(Clone, Debug, PartialEq)]
+struct WorkflowClipboard {
+    nodes: Vec<Node>,
+    edges: Vec<Edge>,
+}
+
+/// Marquee (rubber-band) selection state. `start_*` are world-space
+/// SVG coords captured on mousedown; `cur_*` are the world-space coords
+/// of the cursor's current position. The render reads both and draws a
+/// dashed `<rect>`; on mouseup we test every node card against the
+/// normalized bounding rect and write the set into `selected_nodes`.
+/// `additive` mirrors the modifier the user held on mousedown — Shift
+/// adds the marquee result to the existing selection; no modifier
+/// replaces it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MarqueeState {
+    start_x: f64,
+    start_y: f64,
+    cur_x: f64,
+    cur_y: f64,
+    /// Client-space anchor — needed to map subsequent mousemove client
+    /// deltas back to world space (mirrors the pattern used by node /
+    /// edge drag states).
+    start_client_x: f64,
+    start_client_y: f64,
+    additive: bool,
+}
+
 #[component]
 fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
     let g = props.graph.clone();
@@ -208,6 +492,12 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
     // raw UUID prefix. Falls back to an empty map when LocalNoteRepo
     // isn't in scope (read-only `WorkflowView`) or the workflow note
     // can't be resolved to a project.
+    // Project-wide note title map. Used by `node_label` for both skill
+    // nodes (resolved by `skill_note_id`) and artifact-snapshot nodes
+    // whose `artifact_title` is missing — instead of falling back to
+    // the kind+UUID-prefix string ("Artifact c7752c7e"), look up the
+    // referenced note's actual title (e.g. "Requirements") so the
+    // canvas tile reads like the explorer row.
     let skill_titles: HashMap<Uuid, String> = {
         let mut out = HashMap::new();
         if let (Ok(workflow_id), Some(LocalNoteRepo(repo))) = (
@@ -217,40 +507,294 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
             if let Ok(Some(project_id)) = repo.find_project_for_note(workflow_id) {
                 if let Ok(rows) = repo.list_for_project(project_id) {
                     for row in rows {
-                        if matches!(row.kind, NoteKind::Skill) {
-                            out.insert(row.id, row.title);
-                        }
+                        // Include every note kind; previously this was
+                        // gated on `NoteKind::Skill`, which left
+                        // artifact and markdown notes unresolvable.
+                        out.insert(row.id, row.title);
                     }
                 }
             }
         }
         out
     };
+    // Parallel kind map keyed by note id — needed by the inspector's
+    // View button so it knows which `format_id` to pass to
+    // `open_local_note_tab`. Built from the same project scan above
+    // so the (title, kind) pair is consistent.
+    let note_kinds: HashMap<Uuid, NoteKind> = {
+        let mut out = HashMap::new();
+        if let (Ok(workflow_id), Some(LocalNoteRepo(repo))) = (
+            Uuid::parse_str(&props.note_id),
+            try_consume_context::<LocalNoteRepo>(),
+        ) {
+            if let Ok(Some(project_id)) = repo.find_project_for_note(workflow_id) {
+                if let Ok(rows) = repo.list_for_project(project_id) {
+                    for row in rows {
+                        out.insert(row.id, row.kind);
+                    }
+                }
+            }
+        }
+        out
+    };
+    // Tabs / save-scheduler / persistence handles for the View button
+    // — pulled here so the canvas-scope click handler doesn't need to
+    // reach back through use_context (which would return detached
+    // signals from inside an event closure). All three optional so
+    // read-only `WorkflowView` (no edit infra) still compiles.
+    let tabs_for_view: Option<Signal<TabManager>> =
+        try_consume_context::<Signal<TabManager>>();
+    let scheduler_for_view: Option<SaveScheduler> = try_consume_context::<SaveScheduler>();
+    let persistence_for_view: Option<std::sync::Arc<dyn Persistence>> =
+        try_consume_context::<std::sync::Arc<dyn Persistence>>();
+    // For in-tile Approve / Reject / Mark dirty / Revise — these
+    // mutate the artifact note's frontmatter via Persistence::save
+    // and bump LocalNoteVersion so the explorer + workflow re-render.
+    let note_repo_for_actions: Option<std::sync::Arc<dyn LocalNoteRepository>> =
+        try_consume_context::<LocalNoteRepo>().map(|r| r.0);
+    let note_version_for_actions: Option<Signal<u64>> =
+        try_consume_context::<LocalNoteVersion>().map(|v| v.0);
+    // Per-artifact frontmatter status, keyed by the artifact note's
+    // id. Read once per render and re-read whenever `LocalNoteVersion`
+    // bumps (we subscribe to it below) so the workflow card's
+    // Approve / Reject / Mark dirty buttons mirror the artifact view's
+    // state. Only populated for `is_artifact_snapshot` nodes with an
+    // `artifact_ref`. One Persistence::load per artifact-snapshot per
+    // render — fine for demo workflows; if a project ever scales past
+    // a few hundred artifacts we'd switch to a use_memo with the
+    // artifact body byte hashes as the dep.
+    let artifact_statuses: HashMap<Uuid, ArtifactStatus> = {
+        // Subscribe to LocalNoteVersion (and the global mirror) so a
+        // status flip elsewhere immediately re-renders the canvas.
+        if let Some(mut v) = note_version_for_actions {
+            let _ = *v.read();
+        }
+        let _ = *crate::shell::companion_state::LOCAL_NOTE_VERSION.read();
+        let mut out = HashMap::new();
+        if let Some(pers) = persistence_for_view.as_ref() {
+            // `g` here is the parsed-from-text graph used by the
+            // canvas; iterate every snapshot's `artifact_ref`, load the
+            // body, parse the frontmatter, take its `status`.
+            for (_, node) in g.nodes.iter() {
+                if !node.is_artifact_snapshot {
+                    continue;
+                }
+                let Some(aref) = node.artifact_ref else { continue };
+                let id_str = aref.to_string();
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if let Ok(bytes) = futures::executor::block_on(pers.load(&id_str)) {
+                        let body = String::from_utf8(bytes).unwrap_or_default();
+                        let fm =
+                            crate::plugins::artifact::frontmatter::parse(&body);
+                        out.insert(aref, fm.status);
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = id_str;
+                }
+            }
+        }
+        out
+    };
+    // Cascade plumbing for the workflow card's ▶ button on artifact-
+    // snapshot tiles. Pulled here (not try_consume'd inside the
+    // click closure — those writes go to detached signals) so each
+    // ▶ click can spawn a depth-1 cascade rooted on the snapshot's
+    // referenced artifact, advancing the SDLC pipeline one level.
+    let project_repo_for_cascade: Option<std::sync::Arc<dyn LocalProjectRepository>> =
+        try_consume_context::<LocalProjectRepo>().map(|r| r.0);
+    let plugin_for_cascade: Option<std::sync::Arc<operon_plugins_claude_code::ClaudeCodeChatPlugin>> =
+        try_consume_context::<ClaudeCodePluginCtx>().map(|c| c.0);
+    let chat_session_repo_for_cascade: Option<
+        std::sync::Arc<dyn operon_store::repos::ChatSessionRepository>,
+    > = try_consume_context::<ChatSessionRepo>().map(|r| r.0);
+    let chat_message_repo_for_cascade: Option<
+        std::sync::Arc<dyn operon_store::repos::ChatMessageRepository>,
+    > = try_consume_context::<ChatMessageRepo>().map(|r| r.0);
+    let chat_session_version_for_cascade: Option<Signal<u64>> =
+        try_consume_context::<ChatSessionVersion>().map(|v| v.0);
     let mut drag = use_signal::<Option<DragState>>(|| None);
     let mut edge_drag = use_signal::<Option<EdgeDragState>>(|| None);
-    let mut selected_node = use_signal::<Option<NodeId>>(|| None);
+    // Multi-select model. Plain click replaces the set, Ctrl/Cmd+click
+    // toggles, Shift+click adds, Ctrl+A selects all, Esc clears, the
+    // marquee (left-drag on empty canvas) sets it to nodes intersecting
+    // the rubber-band rectangle. The inspector shows only when exactly
+    // one node is selected.
+    let mut selected_nodes =
+        use_signal::<std::collections::BTreeSet<NodeId>>(std::collections::BTreeSet::new);
     let mut selected_edge = use_signal::<Option<EdgeId>>(|| None);
+    // Marquee (rubber-band) area select. Started by left mousedown on
+    // empty canvas (no modifier = replace selection on release; shift =
+    // add to selection); coordinates are in SVG client space and
+    // converted to world space when we test node intersection.
+    let mut marquee = use_signal::<Option<MarqueeState>>(|| None);
+    // Editor-scope signals lifted via props so the toolbar can also
+    // poke them.
+    let mut expanded = props.expanded;
+    let persist_expanded = props.persist_expanded;
+    // Hover highlight: when the cursor is over an edge, we boost the
+    // edge's stroke and pulse-tint its source / target nodes so the
+    // user can trace fan-out at a glance during demos.
+    let mut hovered_edge = use_signal::<Option<EdgeId>>(|| None);
+    // Extra-instructions popover state. `Some(node_id)` while the
+    // popover is open. Single instance — clicking ✏ on a different
+    // node replaces the open one. The popover renders an overlay
+    // anchored to the target node with a textarea + OK / Clear /
+    // Cancel buttons.
+    let mut extra_instructions_open = use_signal::<Option<NodeId>>(|| None);
+    // Locally-edited buffer for the popover textarea — kept in a
+    // separate signal so Cancel can discard without touching the
+    // graph and Clear can wipe the textarea without committing.
+    let mut extra_instructions_draft = use_signal::<String>(String::new);
     // Phase-3: app-scope signal the explorer watches; setting it
-    // triggers the wired effect in editor_host that opens the note in
-    // an Edit-mode tab. The "View in tab" button writes here.
+    // marks the note as the current selection in the explorer panel.
+    // Combined with the explorer-scope `FocusedNode` (next line) this
+    // gives the inspector's "View" button a "reveal in explorer"
+    // action — the note's row gets highlighted *and* scrolled into
+    // view, without spawning a tab.
     let selected_note_app = try_consume_context::<SelectedNote>().map(|s| s.0);
+    let focused_node_app = try_consume_context::<ExplorerFocused>().map(|f| f.0);
     // Viewport pan/zoom. The SVG itself uses CSS pixel coords (no
     // viewBox), and an inner <g> applies `translate(pan) scale(zoom)`
     // so node positions / edge math stay in "world" coords while the
     // visible window can pan and zoom. Wheel + ctrl/cmd zooms
     // centered on the cursor; plain wheel pans; middle-click drag
     // pans too.
-    let mut pan_x = use_signal(|| 0.0f64);
-    let mut pan_y = use_signal(|| 0.0f64);
-    let zoom = use_signal(|| 1.0f64);
+    // Hydrate pan/zoom from the workflow note's persisted view state
+    // on first mount. `use_signal` runs the init closure once, so
+    // subsequent re-renders don't clobber user-driven pan / zoom that
+    // hasn't yet been written back. Zoom of 0.0 (the serde default
+    // for "view_state was absent") falls back to 1.0 = 100%.
+    let initial_view_state = props.graph.view_state.clone();
+    let mut pan_x = {
+        let v = initial_view_state.pan_x;
+        use_signal(move || v)
+    };
+    let mut pan_y = {
+        let v = initial_view_state.pan_y;
+        use_signal(move || v)
+    };
+    let zoom = {
+        let v = if initial_view_state.zoom == 0.0 {
+            1.0
+        } else {
+            initial_view_state.zoom
+        };
+        use_signal(move || v)
+    };
     let mut pan_drag = use_signal::<Option<PanDragState>>(|| None);
     // Auto-place nodes whose `position` is exactly (0, 0) — keeps the
     // hand-edited "create a node by adding to JSON" flow usable without
     // having to do math. Stable id-sorted layout.
     let positions = layout(&g);
+    // Visibility set = roots + every node reachable from a root through
+    // a chain of *expanded* nodes. Roots are nodes with no incoming
+    // edges (so they always show). A node renders only when its id is
+    // in `visible_set`; edges render only when both endpoints are.
+    let expanded_snap = expanded.read().clone();
+    let visible_set = compute_visible(&g, &expanded_snap);
+    // Track which nodes have at least one outgoing edge so the chevron
+    // (▶ collapsed / ▼ expanded) only shows on actual parents.
+    let has_children_set: std::collections::BTreeSet<NodeId> = g
+        .edges
+        .iter()
+        .map(|e| e.from)
+        .collect();
+    // Count outgoing / incoming edges per node and assign each edge
+    // its fan index in *both* directions. The render uses these to:
+    //   1. Color fan-out edges by `outgoing_index` (palette of 8).
+    //   2. Place edge anchor points along the vertical extent of the
+    //      source's right border and the target's left border, so
+    //      multiple edges don't bunch at a single mid-height point.
+    // Anchor order on each side is by the *other endpoint's*
+    // canonical kind priority + title — so a Feature's outputs
+    // anchor in the order Story (top) → Plan (middle) → Backlog
+    // (bottom), reading naturally from primary work to rollup.
+    // Counts come from the *unfiltered* edge list so anchor positions
+    // stay stable as siblings collapse / expand.
+    let endpoint_key = |id: NodeId| -> (i32, String) {
+        match g.nodes.get(&id) {
+            Some(n) => (
+                kind_priority(n.artifact_kind_label.as_deref()),
+                n.artifact_title.clone().unwrap_or_default(),
+            ),
+            None => (i32::MAX, String::new()),
+        }
+    };
+    let mut outgoing_index: HashMap<EdgeId, usize> = HashMap::new();
+    let mut incoming_index: HashMap<EdgeId, usize> = HashMap::new();
+    let mut outgoing_count: HashMap<NodeId, usize> = HashMap::new();
+    let mut incoming_count: HashMap<NodeId, usize> = HashMap::new();
+    {
+        // Group by source, sort siblings by target's (kind, title),
+        // then assign 0..N.
+        let mut by_source: HashMap<NodeId, Vec<EdgeId>> = HashMap::new();
+        let mut by_target: HashMap<NodeId, Vec<EdgeId>> = HashMap::new();
+        for e in &g.edges {
+            by_source.entry(e.from).or_default().push(e.id);
+            by_target.entry(e.to).or_default().push(e.id);
+        }
+        let edge_target: HashMap<EdgeId, NodeId> =
+            g.edges.iter().map(|e| (e.id, e.to)).collect();
+        let edge_source: HashMap<EdgeId, NodeId> =
+            g.edges.iter().map(|e| (e.id, e.from)).collect();
+        for (src, mut ids) in by_source {
+            ids.sort_by(|a, b| {
+                let ta = edge_target.get(a).copied().unwrap_or(src);
+                let tb = edge_target.get(b).copied().unwrap_or(src);
+                endpoint_key(ta).cmp(&endpoint_key(tb)).then_with(|| a.cmp(b))
+            });
+            outgoing_count.insert(src, ids.len());
+            for (i, eid) in ids.iter().enumerate() {
+                outgoing_index.insert(*eid, i);
+            }
+        }
+        for (tgt, mut ids) in by_target {
+            ids.sort_by(|a, b| {
+                let sa = edge_source.get(a).copied().unwrap_or(tgt);
+                let sb = edge_source.get(b).copied().unwrap_or(tgt);
+                endpoint_key(sa).cmp(&endpoint_key(sb)).then_with(|| a.cmp(b))
+            });
+            incoming_count.insert(tgt, ids.len());
+            for (i, eid) in ids.iter().enumerate() {
+                incoming_index.insert(*eid, i);
+            }
+        }
+    }
+    // Distributes anchor index `i` across `total` slots along a node's
+    // vertical extent so edges land at different y-coords. With one
+    // edge it picks the middle (0.5); with N edges it picks
+    // `(i + 1) / (N + 1)` — evenly spaced, never touching the corners.
+    let anchor_y = |i: usize, total: usize| -> f64 {
+        let total = total.max(1) as f64;
+        NODE_H * (i as f64 + 1.0) / (total + 1.0)
+    };
+    // Per-node lists of anchor y-offsets, one per incident edge. The
+    // node renderer walks these to draw a small dot at each edge's
+    // landing point on the border (visual cue for the user that
+    // multiple edges connect cleanly to distinct points).
+    let mut node_input_anchors: HashMap<NodeId, Vec<f64>> = HashMap::new();
+    let mut node_output_anchors: HashMap<NodeId, Vec<f64>> = HashMap::new();
+    for e in &g.edges {
+        let s_idx = outgoing_index.get(&e.id).copied().unwrap_or(0);
+        let s_total = outgoing_count.get(&e.from).copied().unwrap_or(1);
+        let t_idx = incoming_index.get(&e.id).copied().unwrap_or(0);
+        let t_total = incoming_count.get(&e.to).copied().unwrap_or(1);
+        node_output_anchors
+            .entry(e.from)
+            .or_default()
+            .push(anchor_y(s_idx, s_total));
+        node_input_anchors
+            .entry(e.to)
+            .or_default()
+            .push(anchor_y(t_idx, t_total));
+    }
     let nodes: Vec<NodeRender> = g
         .nodes
         .iter()
+        .filter(|(id, _)| visible_set.contains(id))
         .map(|(id, n)| NodeRender {
             id: *id,
             x: positions.get(id).map(|p| p.0).unwrap_or(n.position.0),
@@ -259,6 +803,8 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
             status: n.status.clone(),
             is_artifact_snapshot: n.is_artifact_snapshot,
             kind_label: n.artifact_kind_label.clone(),
+            has_children: has_children_set.contains(id),
+            is_expanded: expanded_snap.contains(id),
         })
         .collect();
     let edges: Vec<EdgeRender> = g
@@ -267,16 +813,40 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
         .filter_map(|e| {
             let from = nodes.iter().find(|n| n.id == e.from)?;
             let to = nodes.iter().find(|n| n.id == e.to)?;
+            let s_idx = outgoing_index.get(&e.id).copied().unwrap_or(0);
+            let s_total = outgoing_count.get(&e.from).copied().unwrap_or(1);
+            let t_idx = incoming_index.get(&e.id).copied().unwrap_or(0);
+            let t_total = incoming_count.get(&e.to).copied().unwrap_or(1);
             Some(EdgeRender {
                 id: e.id,
+                from_id: e.from,
+                to_id: e.to,
                 from_x: from.x + NODE_W,
-                from_y: from.y + NODE_H / 2.0,
+                from_y: from.y + anchor_y(s_idx, s_total),
                 to_x: to.x,
-                to_y: to.y + NODE_H / 2.0,
+                to_y: to.y + anchor_y(t_idx, t_total),
                 edge_kind: e.edge_kind.clone(),
+                fan_index: s_idx,
             })
         })
         .collect();
+
+    // Resolve the currently-hovered edge to its endpoint nodes so the
+    // node loop below can apply the connecting-node hover class.
+    let hover_endpoints: std::collections::BTreeSet<NodeId> =
+        match *hovered_edge.read() {
+            Some(eid) => edges
+                .iter()
+                .find(|e| e.id == eid)
+                .map(|e| {
+                    let mut s = std::collections::BTreeSet::new();
+                    s.insert(e.from_id);
+                    s.insert(e.to_id);
+                    s
+                })
+                .unwrap_or_default(),
+            None => std::collections::BTreeSet::new(),
+        };
 
     // No viewBox: the SVG draws in CSS pixel coords, and an inner
     // <g> applies pan/zoom. This gives an effectively infinite
@@ -287,12 +857,20 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
     let zoomv = *zoom.read();
     let world_transform = format!("translate({pan_xv} {pan_yv}) scale({zoomv})");
 
-    // Inspector readout for the selected node — extra_instructions live
-    // edits and a skill-id readout for now (typed_fields edit lives in
-    // the JSON pane to keep schema-validation consistent).
-    let selected = *selected_node.read();
-    let selected_node_view = selected.and_then(|sid| g.nodes.get(&sid).cloned());
+    // Inspector readout for a single-selected node — extra_instructions
+    // live edits and a skill-id readout (typed_fields edit lives in the
+    // JSON pane to keep schema-validation consistent). Multi-selection
+    // hides the inspector to avoid the "edit which one?" ambiguity.
+    let selection_snap = selected_nodes.read().clone();
+    let selected_count = selection_snap.len();
+    let single_selected: Option<NodeId> = if selected_count == 1 {
+        selection_snap.iter().next().copied()
+    } else {
+        None
+    };
+    let selected_node_view = single_selected.and_then(|sid| g.nodes.get(&sid).cloned());
 
+    let persist_view = props.persist_view;
     let reset_view = {
         let mut pan_x_setter = pan_x;
         let mut pan_y_setter = pan_y;
@@ -301,6 +879,7 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
             pan_x_setter.set(0.0);
             pan_y_setter.set(0.0);
             zoom_setter.set(1.0);
+            persist_view.call((0.0, 0.0, 1.0));
         }
     };
     // Explicit zoom buttons — the wheel/ctrl-wheel pan/zoom path is
@@ -314,6 +893,7 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
             let cur = *zoom_setter.read();
             let next = (cur * 1.2).clamp(0.2, 5.0);
             zoom_setter.set(next);
+            persist_view.call((*pan_x.peek(), *pan_y.peek(), next));
         }
     };
     let zoom_out = {
@@ -322,12 +902,228 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
             let cur = *zoom_setter.read();
             let next = (cur / 1.2).clamp(0.2, 5.0);
             zoom_setter.set(next);
+            persist_view.call((*pan_x.peek(), *pan_y.peek(), next));
         }
     };
 
     rsx! {
         div { class: "operon-workflow-canvas",
             "data-testid": "workflow-canvas",
+            // tabindex=0 + onkeydown — keyboard shortcuts (Ctrl+A, Del,
+            // Ctrl+C/X/V, Ctrl+Z/Y, Esc) only fire when the canvas has
+            // focus. Browsers auto-focus the nearest tabindex=0
+            // ancestor when the user clicks anywhere inside, so this
+            // works without extra JS plumbing.
+            tabindex: "0",
+            onkeydown: {
+                let g_for_keys = g.clone();
+                let nodes_for_keys = nodes.clone();
+                let apply_graph = props.apply_graph;
+                let apply_with_undo = props.apply_with_undo;
+                let mut history = props.history;
+                let mut redo_stack = props.redo_stack;
+                let mut clipboard = props.clipboard;
+                move |evt: dioxus::events::KeyboardEvent| {
+                    let key = evt.key().to_string();
+                    let mods = evt.modifiers();
+                    let ctrl = mods.contains(Modifiers::CONTROL)
+                        || mods.contains(Modifiers::META);
+                    let shift = mods.contains(Modifiers::SHIFT);
+
+                    // Esc — clear selection.
+                    if key == "Escape" {
+                        evt.prevent_default();
+                        selected_nodes.set(std::collections::BTreeSet::new());
+                        selected_edge.set(None);
+                        return;
+                    }
+
+                    // Ctrl/Cmd+A — select every node.
+                    if ctrl && !shift && key.eq_ignore_ascii_case("a") {
+                        evt.prevent_default();
+                        let mut all = std::collections::BTreeSet::new();
+                        for n in &nodes_for_keys {
+                            all.insert(n.id);
+                        }
+                        selected_nodes.set(all);
+                        return;
+                    }
+
+                    // Delete / Backspace — remove every selected node
+                    // (and any edge incident to one). Plain key, no
+                    // modifiers — Ctrl+Backspace on inputs is the
+                    // "delete word" shortcut, so we deliberately don't
+                    // claim it.
+                    if (key == "Delete" || key == "Backspace") && !ctrl && !shift {
+                        let snap = selected_nodes.read().clone();
+                        if !snap.is_empty() {
+                            evt.prevent_default();
+                            let mut next = g_for_keys.clone();
+                            for id in &snap {
+                                next.nodes.remove(id);
+                            }
+                            next.edges
+                                .retain(|e| !snap.contains(&e.from) && !snap.contains(&e.to));
+                            next.version = next.version.saturating_add(1);
+                            apply_with_undo.call(next);
+                            selected_nodes
+                                .set(std::collections::BTreeSet::new());
+                        }
+                        return;
+                    }
+
+                    // Ctrl+C — copy selected nodes + their internal
+                    // edges (edges that cross the selection boundary
+                    // are dropped on copy; paste won't reconnect to
+                    // outside nodes).
+                    if ctrl && !shift && key.eq_ignore_ascii_case("c") {
+                        let snap = selected_nodes.read().clone();
+                        if !snap.is_empty() {
+                            evt.prevent_default();
+                            let nodes_v: Vec<Node> = snap
+                                .iter()
+                                .filter_map(|id| g_for_keys.nodes.get(id).cloned())
+                                .collect();
+                            let edges_v: Vec<Edge> = g_for_keys
+                                .edges
+                                .iter()
+                                .filter(|e| {
+                                    snap.contains(&e.from) && snap.contains(&e.to)
+                                })
+                                .cloned()
+                                .collect();
+                            clipboard.set(Some(WorkflowClipboard {
+                                nodes: nodes_v,
+                                edges: edges_v,
+                            }));
+                        }
+                        return;
+                    }
+
+                    // Ctrl+X — cut = copy + delete in one step.
+                    if ctrl && !shift && key.eq_ignore_ascii_case("x") {
+                        let snap = selected_nodes.read().clone();
+                        if !snap.is_empty() {
+                            evt.prevent_default();
+                            let nodes_v: Vec<Node> = snap
+                                .iter()
+                                .filter_map(|id| g_for_keys.nodes.get(id).cloned())
+                                .collect();
+                            let edges_v: Vec<Edge> = g_for_keys
+                                .edges
+                                .iter()
+                                .filter(|e| {
+                                    snap.contains(&e.from) && snap.contains(&e.to)
+                                })
+                                .cloned()
+                                .collect();
+                            clipboard.set(Some(WorkflowClipboard {
+                                nodes: nodes_v,
+                                edges: edges_v,
+                            }));
+                            let mut next = g_for_keys.clone();
+                            for id in &snap {
+                                next.nodes.remove(id);
+                            }
+                            next.edges
+                                .retain(|e| !snap.contains(&e.from) && !snap.contains(&e.to));
+                            next.version = next.version.saturating_add(1);
+                            apply_with_undo.call(next);
+                            selected_nodes
+                                .set(std::collections::BTreeSet::new());
+                        }
+                        return;
+                    }
+
+                    // Ctrl+V — paste. Mints fresh UUIDs for every node
+                    // and edge so a paste-into-the-same-graph doesn't
+                    // collide with the originals; offsets positions by
+                    // PASTE_OFFSET so the pasted group lands visibly
+                    // adjacent rather than directly on top.
+                    if ctrl && !shift && key.eq_ignore_ascii_case("v") {
+                        let cb = clipboard.read().clone();
+                        if let Some(cb) = cb {
+                            if !cb.nodes.is_empty() {
+                                evt.prevent_default();
+                                const PASTE_OFFSET: f64 = 40.0;
+                                let mut next = g_for_keys.clone();
+                                let mut id_map: HashMap<NodeId, NodeId> =
+                                    HashMap::new();
+                                let mut new_selection =
+                                    std::collections::BTreeSet::new();
+                                for n in &cb.nodes {
+                                    let new_id = Uuid::new_v4();
+                                    id_map.insert(n.id, new_id);
+                                    let mut clone = n.clone();
+                                    clone.id = new_id;
+                                    clone.position = (
+                                        n.position.0 + PASTE_OFFSET,
+                                        n.position.1 + PASTE_OFFSET,
+                                    );
+                                    next.nodes.insert(new_id, clone);
+                                    new_selection.insert(new_id);
+                                }
+                                for e in &cb.edges {
+                                    if let (Some(&new_from), Some(&new_to)) =
+                                        (id_map.get(&e.from), id_map.get(&e.to))
+                                    {
+                                        let mut clone = e.clone();
+                                        clone.id = Uuid::new_v4();
+                                        clone.from = new_from;
+                                        clone.to = new_to;
+                                        next.edges.push(clone);
+                                    }
+                                }
+                                next.version = next.version.saturating_add(1);
+                                apply_with_undo.call(next);
+                                selected_nodes.set(new_selection);
+                            }
+                        }
+                        return;
+                    }
+
+                    // Ctrl+Z (undo) and Ctrl+Shift+Z / Ctrl+Y (redo).
+                    // We bypass `apply_with_undo` here and call the raw
+                    // `apply_graph` because we're managing the history
+                    // stacks manually (would otherwise loop).
+                    if ctrl && key.eq_ignore_ascii_case("z") {
+                        evt.prevent_default();
+                        if shift {
+                            let next = redo_stack.write().pop();
+                            if let Some(n) = next {
+                                history.with_mut(|h| {
+                                    h.push(g_for_keys.clone());
+                                    if h.len() > HISTORY_CAP {
+                                        h.remove(0);
+                                    }
+                                });
+                                apply_graph.call(n);
+                            }
+                        } else {
+                            let prev = history.write().pop();
+                            if let Some(p) = prev {
+                                redo_stack
+                                    .with_mut(|r| r.push(g_for_keys.clone()));
+                                apply_graph.call(p);
+                            }
+                        }
+                        return;
+                    }
+                    if ctrl && !shift && key.eq_ignore_ascii_case("y") {
+                        evt.prevent_default();
+                        let next = redo_stack.write().pop();
+                        if let Some(n) = next {
+                            history.with_mut(|h| {
+                                h.push(g_for_keys.clone());
+                                if h.len() > HISTORY_CAP {
+                                    h.remove(0);
+                                }
+                            });
+                            apply_graph.call(n);
+                        }
+                    }
+                }
+            },
             // Floating viewport controls — explicit zoom in / zoom
             // out / reset. Wheel + ctrl+wheel still work for power
             // users; these buttons make the same affordance reachable
@@ -359,159 +1155,85 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                     "Reset"
                 }
             }
-            if let Some(sn) = selected_node_view.as_ref() {
+            // Extra-instructions popover. Rendered above the SVG when
+            // a card's ✏ button is clicked; one instance at a time.
+            // Pure HTML overlay (positioned absolute) so the textarea
+            // gets native typing affordance without SVG foreignObject
+            // gymnastics. Anchored to the viewport — pan/zoom doesn't
+            // chase the popover; the user sees a stable dialog.
+            if let Some(target_id) = *extra_instructions_open.read() {
                 {
-                    let sid = sn.id;
-                    let extra = sn.extra_instructions.clone();
-                    let skill_id_str = sn.skill_note_id.to_string();
-                    let apply = props.apply_graph;
-                    let mut graph_for_inspector = g.clone();
-                    let graph_for_delete = g.clone();
-                    let current_status = sn.status.clone();
-                    let graph_for_status = g.clone();
+                    let apply_extra = props.apply_with_undo;
+                    let g_for_extra_apply = g.clone();
+                    let on_ok = move |_| {
+                        let mut next = g_for_extra_apply.clone();
+                        let new_value = extra_instructions_draft.peek().clone();
+                        if let Some(node) = next.nodes.get_mut(&target_id) {
+                            node.extra_instructions = new_value;
+                        }
+                        next.version = next.version.saturating_add(1);
+                        apply_extra.call(next);
+                        extra_instructions_open.set(None);
+                    };
+                    let on_clear = move |_| {
+                        extra_instructions_draft.set(String::new());
+                    };
+                    let on_cancel = move |_| {
+                        extra_instructions_open.set(None);
+                    };
+                    let cur_value = extra_instructions_draft.read().clone();
                     rsx! {
-                        div { class: "operon-workflow-inspector",
-                            "data-testid": "workflow-inspector",
-                            "data-node-id": "{sid}",
-                            div { class: "operon-workflow-inspector-row",
-                                span { class: "operon-workflow-inspector-label", "skill id" }
-                                code { class: "md-inline-code operon-workflow-inspector-code", "{skill_id_str}" }
-                                {
-                                    // Phase-3: open the auto-created
-                                    // output note in a tab. Button is
-                                    // disabled when the node has no
-                                    // output yet.
-                                    let out_note_id = sn.cached_output_note_id;
-                                    let has_output = out_note_id.is_some()
-                                        && selected_note_app.is_some();
-                                    let title = if has_output {
-                                        "Open this node's last output in a tab"
-                                    } else {
-                                        "Run this node first to view its output"
-                                    };
-                                    let sink = selected_note_app;
-                                    rsx! {
-                                        button {
-                                            r#type: "button",
-                                            class: "operon-workflow-inspector-view",
-                                            "data-testid": "workflow-inspector-view-output",
-                                            title: "{title}",
-                                            disabled: !has_output,
-                                            onclick: move |_| {
-                                                if let (Some(id), Some(mut sig)) = (out_note_id, sink) {
-                                                    sig.set(Some(id));
-                                                }
-                                            },
-                                            "View in tab"
-                                        }
-                                    }
+                        div {
+                            class: "operon-workflow-extra-popover-scrim",
+                            "data-testid": "workflow-extra-popover-scrim",
+                            onclick: move |_| {
+                                // Click outside closes without saving.
+                                extra_instructions_open.set(None);
+                            },
+                            onkeydown: move |evt: dioxus::events::KeyboardEvent| {
+                                if evt.key().to_string() == "Escape" {
+                                    extra_instructions_open.set(None);
                                 }
-                                button {
-                                    r#type: "button",
-                                    class: "operon-workflow-inspector-delete",
-                                    "data-testid": "workflow-inspector-delete-node",
-                                    title: "Delete this node and any connected edges",
-                                    onclick: move |_| {
-                                        let next = remove_node(&graph_for_delete, sid);
-                                        apply.call(next);
-                                        selected_node.set(None);
-                                    },
-                                    "Delete"
+                            },
+                            div {
+                                class: "operon-workflow-extra-popover",
+                                "data-testid": "workflow-extra-popover",
+                                onclick: move |evt: dioxus::events::MouseEvent| {
+                                    evt.stop_propagation();
+                                },
+                                div { class: "operon-workflow-extra-popover-title",
+                                    "Extra instructions"
                                 }
-                                button {
-                                    r#type: "button",
-                                    class: "operon-workflow-inspector-close",
-                                    onclick: move |_| selected_node.set(None),
-                                    "\u{2715}"
-                                }
-                            }
-                            label { class: "operon-workflow-inspector-row",
-                                span { class: "operon-workflow-inspector-label", "extra instructions" }
                                 textarea {
-                                    class: "operon-workflow-inspector-textarea",
-                                    "data-testid": "workflow-inspector-extra",
-                                    value: "{extra}",
+                                    class: "operon-workflow-extra-popover-textarea",
+                                    "data-testid": "workflow-extra-popover-textarea",
+                                    autofocus: true,
+                                    value: "{cur_value}",
                                     oninput: move |e| {
-                                        if let Some(node) = graph_for_inspector.nodes.get_mut(&sid) {
-                                            node.extra_instructions = e.value();
-                                        }
-                                        apply.call(graph_for_inspector.clone());
+                                        extra_instructions_draft.set(e.value());
                                     },
                                 }
-                            }
-                            // Status picker — flip a node between the
-                            // four lifecycle states so the user can
-                            // re-trigger a run (Fresh → Dirty), park
-                            // a node mid-cascade (→ Running), or
-                            // mark a problematic node Error to skip
-                            // it. Bumps `graph.version` so dirty
-                            // propagation re-evaluates downstream.
-                            div { class: "operon-workflow-inspector-row",
-                                "data-testid": "workflow-inspector-status-row",
-                                span { class: "operon-workflow-inspector-label", "status" }
-                                div { class: "operon-workflow-inspector-status-buttons",
-                                    {
-                                        let states: [(NodeStatus, &str, &str); 4] = [
-                                            (NodeStatus::Dirty, "Dirty", "Mark as needing a re-run"),
-                                            (NodeStatus::Running, "Running", "Mark as currently running"),
-                                            (NodeStatus::Fresh, "Fresh", "Mark as up-to-date (skip on next run)"),
-                                            (NodeStatus::Error("manual".into()), "Error", "Mark as failed"),
-                                        ];
-                                        rsx! {
-                                            for (target, label, help) in states {
-                                                {
-                                                    let is_current = std::mem::discriminant(&current_status)
-                                                        == std::mem::discriminant(&target);
-                                                    let mut graph_for_apply = graph_for_status.clone();
-                                                    let target_for_click = target.clone();
-                                                    let class = if is_current {
-                                                        "operon-workflow-inspector-status-button operon-workflow-inspector-status-button-active"
-                                                    } else {
-                                                        "operon-workflow-inspector-status-button"
-                                                    };
-                                                    rsx! {
-                                                        button {
-                                                            key: "{label}",
-                                                            r#type: "button",
-                                                            class: "{class}",
-                                                            "data-testid": "workflow-inspector-status-{label}",
-                                                            title: "{help}",
-                                                            onclick: move |_| {
-                                                                if let Some(node) = graph_for_apply.nodes.get_mut(&sid) {
-                                                                    node.status = target_for_click.clone();
-                                                                }
-                                                                graph_for_apply.version =
-                                                                    graph_for_apply.version.saturating_add(1);
-                                                                apply.call(graph_for_apply.clone());
-                                                            },
-                                                            "{label}"
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
+                                div { class: "operon-workflow-extra-popover-actions",
+                                    button {
+                                        r#type: "button",
+                                        class: "operon-workflow-extra-popover-button operon-workflow-extra-popover-button-ok",
+                                        "data-testid": "workflow-extra-popover-ok",
+                                        onclick: on_ok,
+                                        "OK"
                                     }
-                                }
-                            }
-                            // Last-output panel. Reads the cached
-                            // output file off disk via a `use_future`
-                            // inside the child component so the read
-                            // doesn't block render. Keyed on
-                            // (path, graph.version) so a cascade
-                            // re-run invalidates the cached read.
-                            div { class: "operon-workflow-inspector-row",
-                                "data-testid": "workflow-inspector-output-row",
-                                span { class: "operon-workflow-inspector-label", "last output" }
-                                if let Some(path) = sn.cached_output_path.as_ref() {
-                                    InspectorOutputPanel {
-                                        key: "{path.display()}-{g.version}",
-                                        path: path.clone(),
+                                    button {
+                                        r#type: "button",
+                                        class: "operon-workflow-extra-popover-button",
+                                        "data-testid": "workflow-extra-popover-clear",
+                                        onclick: on_clear,
+                                        "Clear"
                                     }
-                                } else {
-                                    div {
-                                        class: "operon-workflow-inspector-output operon-workflow-inspector-output-empty",
-                                        "data-testid": "workflow-inspector-output-empty",
-                                        "No output yet \u{2014} click \u{25B6} on this node (or \u{25B6} Run all dirty) to produce one."
+                                    button {
+                                        r#type: "button",
+                                        class: "operon-workflow-extra-popover-button",
+                                        "data-testid": "workflow-extra-popover-cancel",
+                                        onclick: on_cancel,
+                                        "Cancel"
                                     }
                                 }
                             }
@@ -557,13 +1279,21 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                 // Pinch / wheel: positive delta_y = zoom out.
                                 let factor = if delta.y < 0.0 { 1.1 } else { 1.0 / 1.1 };
                                 let new_zoom = (cur_zoom * factor).clamp(0.2, 5.0);
-                                pan_x_setter.set(coords.x - world_x * new_zoom);
-                                pan_y_setter.set(coords.y - world_y * new_zoom);
+                                let new_pan_x = coords.x - world_x * new_zoom;
+                                let new_pan_y = coords.y - world_y * new_zoom;
+                                pan_x_setter.set(new_pan_x);
+                                pan_y_setter.set(new_pan_y);
                                 zoom_setter.set(new_zoom);
+                                persist_view.call((new_pan_x, new_pan_y, new_zoom));
                             } else {
                                 // Plain wheel = pan in screen space.
                                 pan_x_setter.with_mut(|v| *v -= delta.x);
                                 pan_y_setter.with_mut(|v| *v -= delta.y);
+                                persist_view.call((
+                                    *pan_x_setter.peek(),
+                                    *pan_y_setter.peek(),
+                                    *zoom_setter.peek(),
+                                ));
                             }
                         }
                     },
@@ -578,6 +1308,33 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                 start_client_y: coords.y,
                                 start_pan_x: *pan_x.read(),
                                 start_pan_y: *pan_y.read(),
+                            }));
+                            return;
+                        }
+                        // Left-click on empty SVG: start marquee (rubber
+                        // band) selection. Node mousedowns stop_propagation
+                        // so this fires only on empty canvas. Shift = add
+                        // to current selection on release; no modifier =
+                        // replace.
+                        if evt.trigger_button()
+                            == Some(dioxus::html::input_data::MouseButton::Primary)
+                        {
+                            let mods = evt.modifiers();
+                            let elem = evt.element_coordinates();
+                            let client = evt.client_coordinates();
+                            let cx = *pan_x.read();
+                            let cy = *pan_y.read();
+                            let cz = *zoom.read();
+                            let wx = (elem.x - cx) / cz;
+                            let wy = (elem.y - cy) / cz;
+                            marquee.set(Some(MarqueeState {
+                                start_x: wx,
+                                start_y: wy,
+                                cur_x: wx,
+                                cur_y: wy,
+                                start_client_x: client.x,
+                                start_client_y: client.y,
+                                additive: mods.contains(Modifiers::SHIFT),
                             }));
                         }
                     },
@@ -600,19 +1357,37 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                 return;
                             }
                             let cur_zoom = *zoom.read();
+                            // Marquee drag: update the rubber-band's
+                            // current corner in world coords.
+                            let marquee_now = *marquee.read();
+                            if let Some(cur) = marquee_now {
+                                let dx = (coords.x - cur.start_client_x) / cur_zoom;
+                                let dy = (coords.y - cur.start_client_y) / cur_zoom;
+                                marquee.set(Some(MarqueeState {
+                                    cur_x: cur.start_x + dx,
+                                    cur_y: cur.start_y + dy,
+                                    ..cur
+                                }));
+                                return;
+                            }
                             // Node-position drag: mutate graph + push.
                             // Divide the client delta by zoom because
                             // node positions are in world coords and
                             // the inner <g> scales them by `zoom` for
                             // display.
-                            if let Some(cur) = *drag.read() {
+                            let drag_now = drag.read().clone();
+                            if let Some(cur) = drag_now {
                                 let dx = (coords.x - cur.start_client_x) / cur_zoom;
                                 let dy = (coords.y - cur.start_client_y) / cur_zoom;
-                                if let Some(node) = graph.nodes.get_mut(&cur.node) {
-                                    node.position = (
-                                        cur.start_node_x + dx,
-                                        cur.start_node_y + dy,
-                                    );
+                                // Translate every node in the captured
+                                // start_positions set so a multi-selection
+                                // moves as a group. Single-node grabs only
+                                // have one entry, so this collapses to
+                                // the original behavior.
+                                for (id, sx, sy) in &cur.start_positions {
+                                    if let Some(node) = graph.nodes.get_mut(id) {
+                                        node.position = (sx + dx, sy + dy);
+                                    }
                                 }
                                 apply.call(graph.clone());
                                 return;
@@ -644,9 +1419,62 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                         let apply = props.apply_graph;
                         let nodes_snap = nodes.clone();
                         let graph_snap = g.clone();
+                        let nodes_for_marquee = nodes.clone();
                         move |_| {
+                            // Persist viewport when a pan-drag ends —
+                            // doing it here (not on every mousemove)
+                            // keeps the JSON write at one save per
+                            // gesture instead of one per pixel.
+                            let was_panning = pan_drag.peek().is_some();
                             drag.set(None);
                             pan_drag.set(None);
+                            if was_panning {
+                                persist_view.call((
+                                    *pan_x.peek(),
+                                    *pan_y.peek(),
+                                    *zoom.peek(),
+                                ));
+                            }
+                            // Marquee commit: compute hit set, write to
+                            // selected_nodes. A near-zero-size marquee is
+                            // treated as a click on empty canvas → clear
+                            // selection.
+                            let final_marquee = *marquee.read();
+                            marquee.set(None);
+                            if let Some(m) = final_marquee {
+                                let x0 = m.start_x.min(m.cur_x);
+                                let y0 = m.start_y.min(m.cur_y);
+                                let x1 = m.start_x.max(m.cur_x);
+                                let y1 = m.start_y.max(m.cur_y);
+                                const CLICK_TOL: f64 = 4.0;
+                                if (x1 - x0) < CLICK_TOL && (y1 - y0) < CLICK_TOL {
+                                    if !m.additive {
+                                        selected_nodes
+                                            .set(std::collections::BTreeSet::new());
+                                        selected_edge.set(None);
+                                    }
+                                    return;
+                                }
+                                let mut hit = std::collections::BTreeSet::new();
+                                for n in nodes_for_marquee.iter() {
+                                    let nx0 = n.x;
+                                    let ny0 = n.y;
+                                    let nx1 = n.x + NODE_W;
+                                    let ny1 = n.y + NODE_H;
+                                    if nx0 < x1 && nx1 > x0 && ny0 < y1 && ny1 > y0 {
+                                        hit.insert(n.id);
+                                    }
+                                }
+                                if m.additive {
+                                    let mut existing = selected_nodes.read().clone();
+                                    existing.extend(hit);
+                                    selected_nodes.set(existing);
+                                } else {
+                                    selected_nodes.set(hit);
+                                }
+                                selected_edge.set(None);
+                                return;
+                            }
                             let cur = match *edge_drag.read() {
                                 Some(d) => d,
                                 None => return,
@@ -708,6 +1536,7 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                         {
                             let edge_id = e.id;
                             let is_selected_edge = *selected_edge.read() == Some(edge_id);
+                            let is_hovered_edge = *hovered_edge.read() == Some(edge_id);
                             // Cascade-visualization: amber stroke for
                             // sibling Depends-on cross-edges; default
                             // black for skill-DAG and parent-child
@@ -717,10 +1546,22 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                 Some("parent_child") => " operon-workflow-edge-parent-child",
                                 _ => "",
                             };
-                            let edge_class = if is_selected_edge {
-                                format!("operon-workflow-edge operon-workflow-edge-selected{kind_suffix}")
+                            // Multi-color fan-out — every edge from the
+                            // same source picks a palette slot via
+                            // `fan_index % FAN_COLORS`. Lets the user
+                            // trace which downstream came from which
+                            // upstream when one node fans out to many.
+                            let fan_class =
+                                format!(" operon-workflow-edge-fan-{}", e.fan_index % 8);
+                            let hover_class = if is_hovered_edge {
+                                " operon-workflow-edge-hovered"
                             } else {
-                                format!("operon-workflow-edge{kind_suffix}")
+                                ""
+                            };
+                            let edge_class = if is_selected_edge {
+                                format!("operon-workflow-edge operon-workflow-edge-selected{kind_suffix}{fan_class}{hover_class}")
+                            } else {
+                                format!("operon-workflow-edge{kind_suffix}{fan_class}{hover_class}")
                             };
                             // Wider invisible hit-area path layered
                             // beneath the visible stroke — cubic
@@ -739,7 +1580,20 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                     onclick: move |evt: dioxus::events::MouseEvent| {
                                         evt.stop_propagation();
                                         selected_edge.set(Some(edge_id));
-                                        selected_node.set(None);
+                                        selected_nodes.set(std::collections::BTreeSet::new());
+                                    },
+                                    // Hover targets the wider hit-area
+                                    // path so the highlight kicks in
+                                    // even when the cursor is near the
+                                    // visible stroke but not exactly on
+                                    // it.
+                                    onmouseenter: move |_| {
+                                        hovered_edge.set(Some(edge_id));
+                                    },
+                                    onmouseleave: move |_| {
+                                        if *hovered_edge.peek() == Some(edge_id) {
+                                            hovered_edge.set(None);
+                                        }
                                     },
                                 }
                                 path {
@@ -761,8 +1615,109 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                             let note_id_for_run = props.note_id.clone();
                             let apply_for_run = props.apply_graph;
                             let graph_for_run = g.clone();
+                            // Snapshot artifact-snapshot status + ref so
+                            // the click handler can route to the cascade
+                            // play (one level) for artifact tiles, or to
+                            // the legacy per-skill `spawn_run_node` for
+                            // hand-built skill DAG nodes.
+                            let is_snapshot_for_run = n.is_artifact_snapshot;
+                            let artifact_ref_for_run =
+                                g.nodes.get(&node_id).and_then(|gn| gn.artifact_ref);
+                            let cascade_note_repo = note_repo_for_actions.clone();
+                            let cascade_project_repo = project_repo_for_cascade.clone();
+                            let cascade_persistence = persistence_for_view.clone();
+                            let cascade_plugin = plugin_for_cascade.clone();
+                            let cascade_session_repo =
+                                chat_session_repo_for_cascade.clone();
+                            let cascade_message_repo =
+                                chat_message_repo_for_cascade.clone();
+                            let mut cascade_note_version = note_version_for_actions;
+                            let mut cascade_session_version =
+                                chat_session_version_for_cascade;
                             let on_run_node = move |evt: dioxus::events::MouseEvent| {
                                 evt.stop_propagation();
+                                // Artifact-snapshot tiles → one-level
+                                // cascade rooted on the underlying
+                                // artifact note. Each click advances the
+                                // SDLC pipeline by exactly one step
+                                // (Requirements → Epics, then click on
+                                // Epic → its Features, etc.).
+                                if is_snapshot_for_run {
+                                    let Some(aref) = artifact_ref_for_run else { return };
+                                    let Some(note_repo) = cascade_note_repo.clone() else {
+                                        eprintln!(
+                                            "operon: cascade-play BAIL — LocalNoteRepo missing"
+                                        );
+                                        return;
+                                    };
+                                    let Some(project_repo) = cascade_project_repo.clone()
+                                    else {
+                                        eprintln!(
+                                            "operon: cascade-play BAIL — LocalProjectRepo missing"
+                                        );
+                                        return;
+                                    };
+                                    let Some(persistence) = cascade_persistence.clone()
+                                    else {
+                                        eprintln!(
+                                            "operon: cascade-play BAIL — Persistence missing"
+                                        );
+                                        return;
+                                    };
+                                    let Some(plugin) = cascade_plugin.clone() else {
+                                        eprintln!(
+                                            "operon: cascade-play BAIL — ClaudeCode plugin missing"
+                                        );
+                                        return;
+                                    };
+                                    let Some(session_repo) = cascade_session_repo.clone()
+                                    else {
+                                        eprintln!(
+                                            "operon: cascade-play BAIL — ChatSessionRepo missing"
+                                        );
+                                        return;
+                                    };
+                                    let Some(message_repo) = cascade_message_repo.clone()
+                                    else {
+                                        eprintln!(
+                                            "operon: cascade-play BAIL — ChatMessageRepo missing"
+                                        );
+                                        return;
+                                    };
+                                    let (
+                                        Some(mut active_session),
+                                        Some(mut active_scope),
+                                        Some(mut note_version),
+                                        Some(mut session_version),
+                                    ) = (
+                                        active_session_signal,
+                                        active_scope_signal,
+                                        cascade_note_version,
+                                        cascade_session_version,
+                                    ) else {
+                                        eprintln!(
+                                            "operon: cascade-play BAIL — rail signals missing"
+                                        );
+                                        return;
+                                    };
+                                    crate::plugins::artifact::view::spawn_cascade(
+                                        aref,
+                                        note_repo,
+                                        project_repo,
+                                        persistence,
+                                        plugin,
+                                        session_repo,
+                                        message_repo,
+                                        &mut note_version,
+                                        &mut session_version,
+                                        &mut active_session,
+                                        &mut active_scope,
+                                        Some(1), // one level per click
+                                    );
+                                    return;
+                                }
+                                // Skill DAG nodes (hand-built workflows):
+                                // keep the legacy per-skill run.
                                 let (Some(active_session), Some(active_scope)) =
                                     (active_session_signal, active_scope_signal)
                                 else {
@@ -781,17 +1736,51 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                     active_scope,
                                 );
                             };
+                            let nodes_for_drag = nodes.clone();
                             let on_node_mousedown = move |evt: dioxus::events::MouseEvent| {
                                 evt.stop_propagation();
                                 let coords = evt.client_coordinates();
+                                let mods = evt.modifiers();
+                                let ctrl = mods.contains(Modifiers::CONTROL)
+                                    || mods.contains(Modifiers::META);
+                                let shift = mods.contains(Modifiers::SHIFT);
+                                let mut set = selected_nodes.read().clone();
+                                if ctrl {
+                                    if !set.remove(&node_id) {
+                                        set.insert(node_id);
+                                    }
+                                } else if shift {
+                                    set.insert(node_id);
+                                } else if !set.contains(&node_id) {
+                                    // Plain click on a non-selected node:
+                                    // replace the selection. If the node
+                                    // is already in a multi-selection,
+                                    // keep the rest so the user can drag
+                                    // the whole group.
+                                    set.clear();
+                                    set.insert(node_id);
+                                }
+                                // Capture every selected node's start
+                                // position so the drag move loop can
+                                // translate the group together.
+                                let start_positions: Vec<(NodeId, f64, f64)> = if set.len() >= 2
+                                    && set.contains(&node_id)
+                                {
+                                    nodes_for_drag
+                                        .iter()
+                                        .filter(|n| set.contains(&n.id))
+                                        .map(|n| (n.id, n.x, n.y))
+                                        .collect()
+                                } else {
+                                    vec![(node_id, n_x, n_y)]
+                                };
                                 drag.set(Some(DragState {
                                     node: node_id,
                                     start_client_x: coords.x,
                                     start_client_y: coords.y,
-                                    start_node_x: n_x,
-                                    start_node_y: n_y,
+                                    start_positions,
                                 }));
-                                selected_node.set(Some(node_id));
+                                selected_nodes.set(set);
                                 selected_edge.set(None);
                             };
                             // Output-handle mousedown: start an edge
@@ -841,12 +1830,30 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                             let on_input_mousedown = move |evt: dioxus::events::MouseEvent| {
                                 evt.stop_propagation();
                             };
-                            let is_selected = *selected_node.read() == Some(node_id);
-                            let group_class = if is_selected {
-                                "operon-workflow-node-group operon-workflow-node-group-selected"
-                            } else {
-                                "operon-workflow-node-group"
-                            };
+                            let is_selected = selected_nodes.read().contains(&node_id);
+                            // Hover endpoint: the cursor is on an edge
+                            // whose source or target is this node. Used
+                            // to pulse-tint connecting nodes alongside
+                            // the highlighted edge so the user can
+                            // trace fan-out at a glance.
+                            let is_hover_endpoint = hover_endpoints.contains(&node_id);
+                            let mut group_class = String::from("operon-workflow-node-group");
+                            if is_selected {
+                                group_class.push_str(" operon-workflow-node-group-selected");
+                            }
+                            if is_hover_endpoint {
+                                group_class.push_str(" operon-workflow-node-group-edge-hover");
+                            }
+                            // Slug for the kind-color CSS hook
+                            // (`[data-artifact-kind="epic"]` etc).
+                            // Lower-cased + spaces collapsed to underscores
+                            // so display names like "Test Cases" become
+                            // "test_cases" and the selector is stable.
+                            let kind_slug: String = n
+                                .kind_label
+                                .as_deref()
+                                .map(|s| s.to_lowercase().replace(' ', "_"))
+                                .unwrap_or_default();
                             rsx! {
                                 g {
                                     class: "{group_class}",
@@ -858,31 +1865,34 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                         class: status_class(&n.status, n.is_artifact_snapshot),
                                         "data-testid": "workflow-node",
                                         "data-node-kind": if n.is_artifact_snapshot { "artifact" } else { "skill" },
+                                        "data-artifact-kind": "{kind_slug}",
                                         width: "{NODE_W}",
                                         height: "{NODE_H}",
                                         rx: "8",
                                         ry: "8",
                                     }
+                                    // Row 1: kind badge inline next to
+                                    // the chevron. The chevron itself is
+                                    // rendered later (see below) at the
+                                    // far-left of the controls strip.
                                     if n.is_artifact_snapshot {
                                         text {
                                             class: "operon-workflow-node-kind-badge",
-                                            x: "12",
-                                            y: "14",
+                                            x: "36",
+                                            y: "{NODE_ROW1_Y + 4.0}",
                                             "{n.kind_label.clone().unwrap_or_default()}"
                                         }
                                     }
+                                    // Row 2: name / title.
                                     text {
                                         class: "operon-workflow-node-title",
-                                        x: "12",
-                                        y: "26",
+                                        x: "16",
+                                        y: "{NODE_ROW2_Y}",
                                         "{n.label}"
                                     }
-                                    text {
-                                        class: "operon-workflow-node-status",
-                                        x: "12",
-                                        y: "48",
-                                        "{status_label(&n.status)}"
-                                    }
+                                    // (Status moved to the row-4 pill
+                                    // strip — the pill that matches
+                                    // `n.status` is highlighted.)
                                     // Input handle (left edge,
                                     // mid-height): visible 8-radius
                                     // dot + invisible 14-radius hit
@@ -921,9 +1931,93 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                         cy: "{NODE_H / 2.0}",
                                         r: "8",
                                     }
+                                    // Per-edge anchor dots. One small
+                                    // circle per incident edge, drawn
+                                    // at the y-coord where that edge's
+                                    // bezier actually lands. Lets the
+                                    // user see how many fan-in / fan-
+                                    // out connections a node has at a
+                                    // glance, and matches the visual
+                                    // style of the curves themselves.
+                                    {
+                                        let in_ys = node_input_anchors
+                                            .get(&node_id)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        let out_ys = node_output_anchors
+                                            .get(&node_id)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        rsx! {
+                                            for (i, ya) in in_ys.iter().enumerate() {
+                                                circle {
+                                                    key: "in-{i}",
+                                                    class: "operon-workflow-anchor operon-workflow-anchor-input",
+                                                    cx: "0",
+                                                    cy: "{ya}",
+                                                    r: "3",
+                                                }
+                                            }
+                                            for (i, ya) in out_ys.iter().enumerate() {
+                                                circle {
+                                                    key: "out-{i}",
+                                                    class: "operon-workflow-anchor operon-workflow-anchor-output",
+                                                    cx: "{NODE_W}",
+                                                    cy: "{ya}",
+                                                    r: "3",
+                                                }
+                                            }
+                                        }
+                                    }
                                     // Explicit "View" affordance —
                                     // clicking the rect already
                                     // selects the node (mousedown
+                                    // Expand / collapse chevron — only
+                                    // shown on parents (nodes with at
+                                    // least one outgoing edge). Click
+                                    // toggles the node's membership in
+                                    // the `expanded` set, which is read
+                                    // each render via `compute_visible`.
+                                    if n.has_children {
+                                        {
+                                            let chevron_id = node_id;
+                                            let glyph = if n.is_expanded { "\u{25BE}" } else { "\u{25B8}" };
+                                            rsx! {
+                                                g {
+                                                    class: "operon-workflow-node-toggle",
+                                                    "data-testid": "workflow-node-toggle",
+                                                    "data-expanded": if n.is_expanded { "true" } else { "false" },
+                                                    transform: "translate(8, 8)",
+                                                    onclick: move |evt: dioxus::events::MouseEvent| {
+                                                        evt.stop_propagation();
+                                                        let mut set = expanded.read().clone();
+                                                        if !set.remove(&chevron_id) {
+                                                            set.insert(chevron_id);
+                                                        }
+                                                        expanded.set(set.clone());
+                                                        persist_expanded.call(set);
+                                                    },
+                                                    onmousedown: move |evt: dioxus::events::MouseEvent| {
+                                                        evt.stop_propagation();
+                                                    },
+                                                    rect {
+                                                        width: "20",
+                                                        height: "20",
+                                                        rx: "4",
+                                                        ry: "4",
+                                                        class: "operon-workflow-node-toggle-bg",
+                                                    }
+                                                    text {
+                                                        x: "10",
+                                                        y: "14",
+                                                        "text-anchor": "middle",
+                                                        class: "operon-workflow-node-toggle-glyph",
+                                                        "{glyph}"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     // handler), but a dedicated icon
                                     // makes the inspector
                                     // discoverable. stop_propagation
@@ -935,7 +2029,9 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                         transform: "translate({NODE_W - 56.0}, 8.0)",
                                         onclick: move |evt: dioxus::events::MouseEvent| {
                                             evt.stop_propagation();
-                                            selected_node.set(Some(node_id));
+                                            let mut set = std::collections::BTreeSet::new();
+                                            set.insert(node_id);
+                                            selected_nodes.set(set);
                                             selected_edge.set(None);
                                         },
                                         onmousedown: move |evt: dioxus::events::MouseEvent| {
@@ -971,14 +2067,542 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                             ry: "10",
                                             class: "operon-workflow-node-run-bg",
                                         }
-                                        text {
-                                            x: "10",
-                                            y: "14",
-                                            "text-anchor": "middle",
-                                            class: "operon-workflow-node-run-glyph",
-                                            "\u{25B6}"
+                                        if matches!(n.status, NodeStatus::Running) {
+                                            // Cascade is currently running a
+                                            // skill against this artifact.
+                                            // Swap the ▶ glyph for ⟳ with a
+                                            // CSS rotation animation so the
+                                            // user can see at a glance which
+                                            // tile is being processed.
+                                            text {
+                                                x: "10",
+                                                y: "14",
+                                                "text-anchor": "middle",
+                                                class: "operon-workflow-node-run-glyph operon-workflow-node-run-glyph-running",
+                                                "\u{27F3}"
+                                            }
+                                        } else {
+                                            text {
+                                                x: "10",
+                                                y: "14",
+                                                "text-anchor": "middle",
+                                                class: "operon-workflow-node-run-glyph",
+                                                "\u{25B6}"
+                                            }
                                         }
                                     }
+                                    // ✏ Extra-instructions trigger
+                                    // (row 1, far right). Click hydrates
+                                    // the popover draft from the node's
+                                    // current `extra_instructions` and
+                                    // opens the in-place dialog.
+                                    {
+                                        let g_for_extra = g.clone();
+                                        rsx! {
+                                            g {
+                                                class: "operon-workflow-node-edit",
+                                                "data-testid": "workflow-node-extra-instructions",
+                                                transform: "translate({NODE_W - 84.0}, 8.0)",
+                                                onclick: move |evt: dioxus::events::MouseEvent| {
+                                                    evt.stop_propagation();
+                                                    let cur = g_for_extra
+                                                        .nodes
+                                                        .get(&node_id)
+                                                        .map(|n| n.extra_instructions.clone())
+                                                        .unwrap_or_default();
+                                                    extra_instructions_draft.set(cur);
+                                                    extra_instructions_open
+                                                        .set(Some(node_id));
+                                                },
+                                                onmousedown: move |evt: dioxus::events::MouseEvent| {
+                                                    evt.stop_propagation();
+                                                },
+                                                rect {
+                                                    width: "20",
+                                                    height: "20",
+                                                    rx: "10",
+                                                    ry: "10",
+                                                    class: "operon-workflow-node-edit-bg",
+                                                }
+                                                text {
+                                                    x: "10",
+                                                    y: "14",
+                                                    "text-anchor": "middle",
+                                                    class: "operon-workflow-node-edit-glyph",
+                                                    "\u{270F}"
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Row 3 — artifact action strip
+                                    // (Approve / Reject / Mark dirty /
+                                    // Revise). Only on cascade-snapshot
+                                    // tiles; skill nodes don't have an
+                                    // approval lifecycle.
+                                    if n.is_artifact_snapshot {
+                                        {
+                                            let pers = persistence_for_view.clone();
+                                            let mut version_sink = note_version_for_actions;
+                                            let note_repo_for_revise =
+                                                note_repo_for_actions.clone();
+                                            let aref = g.nodes.get(&node_id).and_then(|gn| gn.artifact_ref);
+                                            // Current artifact frontmatter status — drives both the
+                                            // active-button highlight and the click-time short-circuit
+                                            // (clicking Approve when already approved is a no-op).
+                                            let current_status: Option<ArtifactStatus> =
+                                                aref.and_then(|a| artifact_statuses.get(&a).cloned());
+                                            let cur_for_factory = current_status.clone();
+                                            // Helper closure factory: returns a click handler that
+                                            // loads the artifact body, patches its frontmatter to
+                                            // the chosen status, saves, mirrors the new body into
+                                            // any open tab's buffer (so an artifact-view tab open
+                                            // for the same note re-renders with the fresh status),
+                                            // and bumps LocalNoteVersion. Skips early when the
+                                            // artifact is already in `target`.
+                                            let tabs_for_action = tabs_for_view;
+                                            let patch_action = move |target: ArtifactStatus| {
+                                                let pers = pers.clone();
+                                                let cur = cur_for_factory.clone();
+                                                move |evt: dioxus::events::MouseEvent| {
+                                                    evt.stop_propagation();
+                                                    if let Some(c) = cur.as_ref() {
+                                                        if std::mem::discriminant(c)
+                                                            == std::mem::discriminant(&target)
+                                                        {
+                                                            return;
+                                                        }
+                                                    }
+                                                    let Some(aref) = aref else { return };
+                                                    let Some(pers) = pers.clone() else { return };
+                                                    let id_str = aref.to_string();
+                                                    spawn(async move {
+                                                        let bytes = match pers.load(&id_str).await {
+                                                            Ok(b) => b,
+                                                            Err(PersistError::NotFound) => Vec::new(),
+                                                            Err(e) => {
+                                                                eprintln!(
+                                                                    "operon: workflow action load error note_id={id_str}: {e:?}"
+                                                                );
+                                                                return;
+                                                            }
+                                                        };
+                                                        let body = String::from_utf8(bytes).unwrap_or_default();
+                                                        let new_body =
+                                                            patch_status_text(&body, target.clone());
+                                                        if let Err(e) = pers
+                                                            .save(&id_str, new_body.as_bytes())
+                                                            .await
+                                                        {
+                                                            eprintln!(
+                                                                "operon: workflow action save error note_id={id_str}: {e:?}"
+                                                            );
+                                                            return;
+                                                        }
+                                                        // Mirror the new body into every open tab
+                                                        // for this note. Disk and the in-memory tab
+                                                        // buffer were drifting — the artifact-view
+                                                        // tab kept rendering its stale content prop
+                                                        // even after the workflow card flipped the
+                                                        // frontmatter on disk.
+                                                        if let Some(mut tabs) = tabs_for_action {
+                                                            let tab_ids: Vec<crate::tabs::TabId> = {
+                                                                let snap = tabs.read();
+                                                                let ids = snap
+                                                                    .iter()
+                                                                    .filter(|t| t.note_id == id_str)
+                                                                    .map(|t| t.id)
+                                                                    .collect();
+                                                                ids
+                                                            };
+                                                            for tid in tab_ids {
+                                                                tabs.write()
+                                                                    .set_content(tid, new_body.clone());
+                                                            }
+                                                        }
+                                                        if let Some(mut v) = version_sink {
+                                                            v.with_mut(|x| {
+                                                                *x = x.saturating_add(1)
+                                                            });
+                                                        }
+                                                        crate::shell::companion_state::LOCAL_NOTE_VERSION
+                                                            .with_mut(|x| {
+                                                                *x = x.saturating_add(1)
+                                                            });
+                                                    });
+                                                }
+                                            };
+                                            let on_approve =
+                                                patch_action.clone()(ArtifactStatus::Approved);
+                                            let on_reject =
+                                                patch_action.clone()(ArtifactStatus::Rejected);
+                                            let on_mark_dirty =
+                                                patch_action(ArtifactStatus::Dirty);
+                                            // Revise = walk descendants
+                                            // and flip Approved → Dirty.
+                                            // Reuses the artifact view's
+                                            // helper.
+                                            let on_revise = {
+                                                let note_repo = note_repo_for_revise.clone();
+                                                let pers_revise = persistence_for_view.clone();
+                                                let mut version_sink_rv = note_version_for_actions;
+                                                move |evt: dioxus::events::MouseEvent| {
+                                                    evt.stop_propagation();
+                                                    let Some(aref) = aref else { return };
+                                                    let Some(repo) = note_repo.clone() else { return };
+                                                    let Some(pers) = pers_revise.clone() else { return };
+                                                    spawn(async move {
+                                                        match mark_descendants_dirty(
+                                                            &repo, &pers, aref,
+                                                        )
+                                                        .await
+                                                        {
+                                                            Ok(_n) => {}
+                                                            Err(e) => eprintln!(
+                                                                "operon: workflow Revise walk failed for {aref}: {e}"
+                                                            ),
+                                                        }
+                                                        if let Some(mut v) = version_sink_rv {
+                                                            v.with_mut(|x| {
+                                                                *x = x.saturating_add(1)
+                                                            });
+                                                        }
+                                                        crate::shell::companion_state::LOCAL_NOTE_VERSION
+                                                            .with_mut(|x| {
+                                                                *x = x.saturating_add(1)
+                                                            });
+                                                    });
+                                                }
+                                            };
+                                            // Active = "this is the current ArtifactStatus";
+                                            // we add `-active` to highlight the matching button
+                                            // and `-disabled` so CSS can dim it + drop pointer
+                                            // events. The click handler short-circuits inside
+                                            // `patch_action` either way.
+                                            let approve_active = matches!(current_status, Some(ArtifactStatus::Approved));
+                                            let reject_active = matches!(current_status, Some(ArtifactStatus::Rejected));
+                                            let dirty_active = matches!(current_status, Some(ArtifactStatus::Dirty));
+                                            let approve_class = if approve_active {
+                                                "operon-workflow-node-action-button operon-workflow-node-action-approve operon-workflow-node-action-active operon-workflow-node-action-disabled"
+                                            } else {
+                                                "operon-workflow-node-action-button operon-workflow-node-action-approve"
+                                            };
+                                            let reject_class = if reject_active {
+                                                "operon-workflow-node-action-button operon-workflow-node-action-reject operon-workflow-node-action-active operon-workflow-node-action-disabled"
+                                            } else {
+                                                "operon-workflow-node-action-button operon-workflow-node-action-reject"
+                                            };
+                                            let dirty_class = if dirty_active {
+                                                "operon-workflow-node-action-button operon-workflow-node-action-dirty operon-workflow-node-action-active operon-workflow-node-action-disabled"
+                                            } else {
+                                                "operon-workflow-node-action-button operon-workflow-node-action-dirty"
+                                            };
+                                            rsx! {
+                                                g {
+                                                    class: "operon-workflow-node-actions",
+                                                    transform: "translate(0, {NODE_ROW_ACTIONS_Y - 11.0})",
+                                                    g {
+                                                        class: "{approve_class}",
+                                                        "data-testid": "workflow-node-approve",
+                                                        transform: "translate(14, 0)",
+                                                        onclick: on_approve,
+                                                        onmousedown: move |evt: dioxus::events::MouseEvent| { evt.stop_propagation(); },
+                                                        rect { width: "56", height: "22", rx: "4", ry: "4", class: "operon-workflow-node-action-bg" }
+                                                        text { x: "28", y: "15", "text-anchor": "middle", class: "operon-workflow-node-action-label", "Approve" }
+                                                    }
+                                                    g {
+                                                        class: "{reject_class}",
+                                                        "data-testid": "workflow-node-reject",
+                                                        transform: "translate(76, 0)",
+                                                        onclick: on_reject,
+                                                        onmousedown: move |evt: dioxus::events::MouseEvent| { evt.stop_propagation(); },
+                                                        rect { width: "56", height: "22", rx: "4", ry: "4", class: "operon-workflow-node-action-bg" }
+                                                        text { x: "28", y: "15", "text-anchor": "middle", class: "operon-workflow-node-action-label", "Reject" }
+                                                    }
+                                                    g {
+                                                        class: "{dirty_class}",
+                                                        "data-testid": "workflow-node-mark-dirty",
+                                                        transform: "translate(138, 0)",
+                                                        onclick: on_mark_dirty,
+                                                        onmousedown: move |evt: dioxus::events::MouseEvent| { evt.stop_propagation(); },
+                                                        rect { width: "56", height: "22", rx: "4", ry: "4", class: "operon-workflow-node-action-bg" }
+                                                        text { x: "28", y: "15", "text-anchor": "middle", class: "operon-workflow-node-action-label", "Dirty" }
+                                                    }
+                                                    g {
+                                                        class: "operon-workflow-node-action-button operon-workflow-node-action-revise",
+                                                        "data-testid": "workflow-node-revise",
+                                                        transform: "translate(200, 0)",
+                                                        onclick: on_revise,
+                                                        onmousedown: move |evt: dioxus::events::MouseEvent| { evt.stop_propagation(); },
+                                                        rect { width: "50", height: "22", rx: "4", ry: "4", class: "operon-workflow-node-action-bg" }
+                                                        text { x: "25", y: "15", "text-anchor": "middle", class: "operon-workflow-node-action-label", "Revise" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Row 4 — NodeStatus pill strip.
+                                    // Click flips the node's status and
+                                    // bumps the graph version through
+                                    // `apply_with_undo` so Ctrl+Z reverts.
+                                    {
+                                        let apply_state = props.apply_with_undo;
+                                        let g_state = g.clone();
+                                        let cur_status = n.status.clone();
+                                        let make_state_handler = move |target: NodeStatus| {
+                                            let g_state = g_state.clone();
+                                            move |evt: dioxus::events::MouseEvent| {
+                                                evt.stop_propagation();
+                                                let mut next = g_state.clone();
+                                                if let Some(node) = next.nodes.get_mut(&node_id) {
+                                                    node.status = target.clone();
+                                                }
+                                                next.version = next.version.saturating_add(1);
+                                                apply_state.call(next);
+                                            }
+                                        };
+                                        let active = |s: &NodeStatus| {
+                                            std::mem::discriminant(s)
+                                                == std::mem::discriminant(&cur_status)
+                                        };
+                                        let dirty_class = if active(&NodeStatus::Dirty) {
+                                            "operon-workflow-node-state-pill operon-workflow-node-state-pill-active"
+                                        } else {
+                                            "operon-workflow-node-state-pill"
+                                        };
+                                        let running_class = if active(&NodeStatus::Running) {
+                                            "operon-workflow-node-state-pill operon-workflow-node-state-pill-active"
+                                        } else {
+                                            "operon-workflow-node-state-pill"
+                                        };
+                                        let fresh_class = if active(&NodeStatus::Fresh) {
+                                            "operon-workflow-node-state-pill operon-workflow-node-state-pill-active"
+                                        } else {
+                                            "operon-workflow-node-state-pill"
+                                        };
+                                        let error_class = if matches!(cur_status, NodeStatus::Error(_)) {
+                                            "operon-workflow-node-state-pill operon-workflow-node-state-pill-active"
+                                        } else {
+                                            "operon-workflow-node-state-pill"
+                                        };
+                                        let on_dirty = make_state_handler.clone()(NodeStatus::Dirty);
+                                        let on_running = make_state_handler.clone()(NodeStatus::Running);
+                                        let on_fresh = make_state_handler.clone()(NodeStatus::Fresh);
+                                        let on_error = make_state_handler(NodeStatus::Error("manual".into()));
+                                        rsx! {
+                                            g {
+                                                class: "operon-workflow-node-states",
+                                                transform: "translate(0, {NODE_ROW_STATUS_Y - 11.0})",
+                                                g {
+                                                    class: "{dirty_class}",
+                                                    "data-testid": "workflow-node-state-dirty",
+                                                    transform: "translate(14, 0)",
+                                                    onclick: on_dirty,
+                                                    onmousedown: move |evt: dioxus::events::MouseEvent| { evt.stop_propagation(); },
+                                                    rect { width: "56", height: "22", rx: "11", ry: "11", class: "operon-workflow-node-state-bg" }
+                                                    text { x: "28", y: "15", "text-anchor": "middle", class: "operon-workflow-node-state-label", "Dirty" }
+                                                }
+                                                g {
+                                                    class: "{running_class}",
+                                                    "data-testid": "workflow-node-state-running",
+                                                    transform: "translate(76, 0)",
+                                                    onclick: on_running,
+                                                    onmousedown: move |evt: dioxus::events::MouseEvent| { evt.stop_propagation(); },
+                                                    rect { width: "56", height: "22", rx: "11", ry: "11", class: "operon-workflow-node-state-bg" }
+                                                    text { x: "28", y: "15", "text-anchor": "middle", class: "operon-workflow-node-state-label", "Running" }
+                                                }
+                                                g {
+                                                    class: "{fresh_class}",
+                                                    "data-testid": "workflow-node-state-fresh",
+                                                    transform: "translate(138, 0)",
+                                                    onclick: on_fresh,
+                                                    onmousedown: move |evt: dioxus::events::MouseEvent| { evt.stop_propagation(); },
+                                                    rect { width: "56", height: "22", rx: "11", ry: "11", class: "operon-workflow-node-state-bg" }
+                                                    text { x: "28", y: "15", "text-anchor": "middle", class: "operon-workflow-node-state-label", "Fresh" }
+                                                }
+                                                g {
+                                                    class: "{error_class}",
+                                                    "data-testid": "workflow-node-state-error",
+                                                    transform: "translate(200, 0)",
+                                                    onclick: on_error,
+                                                    onmousedown: move |evt: dioxus::events::MouseEvent| { evt.stop_propagation(); },
+                                                    rect { width: "50", height: "22", rx: "11", ry: "11", class: "operon-workflow-node-state-bg" }
+                                                    text { x: "25", y: "15", "text-anchor": "middle", class: "operon-workflow-node-state-label", "Error" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Row 5 — footer icons (👁 view / 🗑 delete).
+                                    {
+                                        // View: open the node's note in
+                                        // a tab + reveal in explorer.
+                                        let sel_for_view = selected_note_app;
+                                        let focus_for_view = focused_node_app;
+                                        let tabs_handle = tabs_for_view;
+                                        let scheduler_handle = scheduler_for_view.clone();
+                                        let persistence_handle = persistence_for_view.clone();
+                                        let titles_for_click = skill_titles.clone();
+                                        let kinds_for_click = note_kinds.clone();
+                                        // Look up the underlying graph node so we can read
+                                        // `cached_output_note_id` / `artifact_ref` (those
+                                        // fields aren't on the render-side `NodeRender`).
+                                        let view_target_id = g.nodes.get(&node_id).and_then(|gn| {
+                                            gn.cached_output_note_id.or(if gn.is_artifact_snapshot {
+                                                gn.artifact_ref
+                                            } else {
+                                                None
+                                            })
+                                        });
+                                        let on_eye = move |evt: dioxus::events::MouseEvent| {
+                                            evt.stop_propagation();
+                                            let Some(id) = view_target_id else { return };
+                                            if let (Some(mut tabs), Some(scheduler)) =
+                                                (tabs_handle, scheduler_handle.clone())
+                                            {
+                                                let id_str = id.to_string();
+                                                let existing_edit = {
+                                                    let snap = tabs.read();
+                                                    let id_match = snap
+                                                        .iter()
+                                                        .find(|t| {
+                                                            t.note_id == id_str
+                                                                && matches!(t.mode, EditorMode::Edit)
+                                                        })
+                                                        .map(|t| t.id);
+                                                    id_match
+                                                };
+                                                if let Some(tid) = existing_edit {
+                                                    tabs.write().activate(tid);
+                                                } else {
+                                                    let title_str = titles_for_click
+                                                        .get(&id)
+                                                        .cloned()
+                                                        .unwrap_or_else(|| id.to_string());
+                                                    let kind = kinds_for_click
+                                                        .get(&id)
+                                                        .copied()
+                                                        .unwrap_or(NoteKind::Markdown);
+                                                    let inherited = {
+                                                        let snap = tabs.read();
+                                                        let c = snap
+                                                            .iter()
+                                                            .find(|t| t.note_id == id_str)
+                                                            .map(|t| t.content.clone());
+                                                        c
+                                                    };
+                                                    #[cfg(not(target_arch = "wasm32"))]
+                                                    let initial_content = match inherited {
+                                                        Some(c) => c,
+                                                        None => match persistence_handle
+                                                            .as_ref()
+                                                            .map(|p| {
+                                                                futures::executor::block_on(
+                                                                    p.load(&id_str),
+                                                                )
+                                                            })
+                                                        {
+                                                            Some(Ok(bytes)) => {
+                                                                String::from_utf8(bytes)
+                                                                    .unwrap_or_default()
+                                                            }
+                                                            Some(Err(PersistError::NotFound)) => {
+                                                                String::new()
+                                                            }
+                                                            Some(Err(e)) => {
+                                                                eprintln!(
+                                                                    "operon: workflow eye load error note_id={id_str}: {e:?}"
+                                                                );
+                                                                String::new()
+                                                            }
+                                                            None => String::new(),
+                                                        },
+                                                    };
+                                                    #[cfg(target_arch = "wasm32")]
+                                                    let initial_content =
+                                                        inherited.unwrap_or_default();
+                                                    let _ = open_local_note_tab(
+                                                        tabs,
+                                                        scheduler,
+                                                        id,
+                                                        title_str,
+                                                        initial_content,
+                                                        kind,
+                                                    );
+                                                }
+                                            }
+                                            if let Some(mut sel) = sel_for_view {
+                                                sel.set(Some(id));
+                                            }
+                                            if let Some(mut focus) = focus_for_view {
+                                                focus.set(Some(NodeKey::Note(id)));
+                                            }
+                                        };
+                                        // Delete: undoable.
+                                        let apply_delete = props.apply_with_undo;
+                                        let g_delete = g.clone();
+                                        let on_trash = move |evt: dioxus::events::MouseEvent| {
+                                            evt.stop_propagation();
+                                            apply_delete.call(remove_node(&g_delete, node_id));
+                                        };
+                                        let view_disabled = view_target_id.is_none();
+                                        rsx! {
+                                            g {
+                                                class: "operon-workflow-node-footer",
+                                                transform: "translate(0, {NODE_ROW_FOOTER_Y - 11.0})",
+                                                g {
+                                                    class: if view_disabled
+                                                        { "operon-workflow-node-icon-eye operon-workflow-node-icon-disabled" }
+                                                        else { "operon-workflow-node-icon-eye" },
+                                                    "data-testid": "workflow-node-eye",
+                                                    transform: "translate({NODE_W - 56.0}, 0)",
+                                                    onclick: on_eye,
+                                                    onmousedown: move |evt: dioxus::events::MouseEvent| {
+                                                        evt.stop_propagation();
+                                                    },
+                                                    rect { width: "20", height: "20", rx: "4", ry: "4",
+                                                        class: "operon-workflow-node-icon-bg" }
+                                                    text { x: "10", y: "14", "text-anchor": "middle",
+                                                        class: "operon-workflow-node-icon-glyph",
+                                                        "\u{1F441}" }
+                                                }
+                                                g {
+                                                    class: "operon-workflow-node-icon-trash",
+                                                    "data-testid": "workflow-node-trash",
+                                                    transform: "translate({NODE_W - 28.0}, 0)",
+                                                    onclick: on_trash,
+                                                    onmousedown: move |evt: dioxus::events::MouseEvent| {
+                                                        evt.stop_propagation();
+                                                    },
+                                                    rect { width: "20", height: "20", rx: "4", ry: "4",
+                                                        class: "operon-workflow-node-icon-bg operon-workflow-node-icon-bg-danger" }
+                                                    text { x: "10", y: "14", "text-anchor": "middle",
+                                                        class: "operon-workflow-node-icon-glyph",
+                                                        "\u{1F5D1}" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Marquee rectangle — rendered while a left-drag on
+                    // empty canvas is in flight. Drawn last in the world
+                    // group so it sits on top of nodes/edges. The
+                    // pointer-events:none in CSS lets clicks pass through.
+                    if let Some(m) = marquee.read().as_ref() {
+                        {
+                            let x = m.start_x.min(m.cur_x);
+                            let y = m.start_y.min(m.cur_y);
+                            let w = (m.cur_x - m.start_x).abs();
+                            let h = (m.cur_y - m.start_y).abs();
+                            rsx! {
+                                rect {
+                                    class: "operon-workflow-marquee",
+                                    "data-testid": "workflow-marquee",
+                                    x: "{x}",
+                                    y: "{y}",
+                                    width: "{w}",
+                                    height: "{h}",
                                 }
                             }
                         }
@@ -1136,6 +2760,20 @@ struct WorkflowToolbarProps {
     graph_text: String,
     on_apply: Callback<String>,
     apply_graph: Callback<WorkflowGraph>,
+    /// Undo-recording variant of `apply_graph` — used for discrete,
+    /// user-initiated layout changes (currently Auto-arrange) so they
+    /// can be reverted with Ctrl+Z.
+    apply_with_undo: Callback<WorkflowGraph>,
+    /// Visibility of the JSON-tree pane (the textarea to the right of the
+    /// canvas). Toolbar renders a "{}" button that flips this signal.
+    json_visible: Signal<bool>,
+    /// Canvas-scope expand/collapse set. Toolbar buttons clear it
+    /// ("Collapse all") or fill it with every node id ("Expand all").
+    expanded: Signal<std::collections::BTreeSet<NodeId>>,
+    /// Persistence hook — Expand-all / Collapse-all call this after
+    /// updating `expanded` so the new state is written back into the
+    /// workflow note's `view_state`.
+    persist_expanded: Callback<std::collections::BTreeSet<NodeId>>,
 }
 
 #[component]
@@ -1155,6 +2793,51 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
     let graph_text = props.graph_text.clone();
     let note_id_str = props.note_id.clone();
     let apply_graph = props.apply_graph;
+    let apply_with_undo = props.apply_with_undo;
+    let mut json_visible = props.json_visible;
+    let mut expanded = props.expanded;
+    let persist_expanded = props.persist_expanded;
+
+    // Auto-arrange: parse the current graph, run a Sugiyama-style
+    // layered layout, push the rewritten positions back through
+    // `apply_with_undo` so Ctrl+Z reverts the move in one step.
+    let graph_text_for_arrange = graph_text.clone();
+    let on_auto_arrange = move |_| {
+        let g: WorkflowGraph = match serde_json::from_str(&graph_text_for_arrange) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("operon: auto-arrange BAIL — graph_text parse: {e}");
+                return;
+            }
+        };
+        apply_with_undo.call(auto_arrange(&g));
+    };
+
+    // Expand / collapse all. Reading the current graph_text gives us
+    // the full node set without holding a Signal handle to the parsed
+    // graph (which lives one component up). Failures parse → no-op.
+    // Both paths also call `persist_expanded` so the new state writes
+    // back into the workflow note's `view_state` and survives a
+    // close-and-reopen.
+    let graph_text_for_expand = graph_text.clone();
+    let on_expand_all = move |_| {
+        let g: WorkflowGraph = match serde_json::from_str(&graph_text_for_expand) {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let mut all: std::collections::BTreeSet<NodeId> =
+            std::collections::BTreeSet::new();
+        for id in g.nodes.keys() {
+            all.insert(*id);
+        }
+        expanded.set(all.clone());
+        persist_expanded.call(all);
+    };
+    let on_collapse_all = move |_| {
+        let empty = std::collections::BTreeSet::new();
+        expanded.set(empty.clone());
+        persist_expanded.call(empty);
+    };
 
     let mut picker_open = use_signal(|| false);
     let mut picker_options: Signal<Vec<LocalNote>> = use_signal(Vec::new);
@@ -1294,6 +2977,46 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
                 onclick: on_run_all,
                 "\u{25B6} Run all dirty"
             }
+            button {
+                r#type: "button",
+                class: "operon-workflow-toolbar-button",
+                "data-testid": "workflow-toolbar-auto-arrange",
+                title: "Auto-arrange nodes left-to-right by topological rank, ordered to minimize edge crossings",
+                onclick: on_auto_arrange,
+                "\u{2630} Auto-arrange"
+            }
+            button {
+                r#type: "button",
+                class: "operon-workflow-toolbar-button",
+                "data-testid": "workflow-toolbar-expand-all",
+                title: "Expand every node — show every level of the cascade at once",
+                onclick: on_expand_all,
+                "\u{25BE} Expand all"
+            }
+            button {
+                r#type: "button",
+                class: "operon-workflow-toolbar-button",
+                "data-testid": "workflow-toolbar-collapse-all",
+                title: "Collapse every node — show only the root level",
+                onclick: on_collapse_all,
+                "\u{25B8} Collapse all"
+            }
+            button {
+                r#type: "button",
+                class: if *json_visible.read() {
+                    "operon-workflow-toolbar-button operon-workflow-toolbar-button-active"
+                } else {
+                    "operon-workflow-toolbar-button"
+                },
+                "data-testid": "workflow-toolbar-toggle-json",
+                "aria-pressed": if *json_visible.read() { "true" } else { "false" },
+                title: "Show / hide the raw JSON tree pane",
+                onclick: move |_| {
+                    let v = *json_visible.peek();
+                    json_visible.set(!v);
+                },
+                if *json_visible.read() { "{{}} Hide JSON" } else { "{{}} Show JSON" }
+            }
             if *picker_open.read() {
                 // Click-outside dismissal: a transparent fixed-position
                 // backdrop catches clicks anywhere outside the picker
@@ -1373,11 +3096,24 @@ struct NodeRender {
     /// Kind badge ("Epic" / "Feature" / etc.) when this is an artifact
     /// snapshot. None for skill nodes.
     kind_label: Option<String>,
+    /// `true` when this node has at least one outgoing edge in the
+    /// underlying graph. Drives the chevron toggle visibility — a leaf
+    /// node has nothing to expand / collapse.
+    has_children: bool,
+    /// `true` when the user has clicked the chevron and the node's
+    /// children are visible. Default `false`; new nodes (paste, seed
+    /// pipeline, cascade output) start collapsed.
+    is_expanded: bool,
 }
 
 #[derive(Clone, PartialEq)]
 struct EdgeRender {
     id: EdgeId,
+    /// Source / target node ids — kept on the render-side projection so
+    /// hover handlers can highlight the connecting nodes without a
+    /// round-trip through the underlying graph.
+    from_id: NodeId,
+    to_id: NodeId,
     from_x: f64,
     from_y: f64,
     to_x: f64,
@@ -1387,6 +3123,11 @@ struct EdgeRender {
     /// user can distinguish parent/child structure from inter-sibling
     /// dependencies.
     edge_kind: Option<String>,
+    /// 0-based index of this edge within its source node's outgoing
+    /// edges, used to pick a fan-color (`operon-workflow-edge-fan-N`).
+    /// Stable across collapse / expand because we compute it from the
+    /// full graph, not the visible subset.
+    fan_index: usize,
 }
 
 fn parse_or_default(content: &str) -> WorkflowGraph {
@@ -1400,30 +3141,61 @@ fn serialize(graph: &WorkflowGraph) -> String {
     serde_json::to_string_pretty(graph).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Maximum visible characters in a node's title row before it gets a
+/// trailing ellipsis. Tuned for `NODE_W = 260` + the 14px monospace
+/// title font: keeps the card visually contained without truncating
+/// the meaningful prefix (e.g. `epic-01-account-and-personalisation`
+/// → `epic-01-account-and-personali…`).
+const NODE_TITLE_MAX_CHARS: usize = 30;
+
+fn truncate_for_card(s: &str) -> String {
+    let count = s.chars().count();
+    if count <= NODE_TITLE_MAX_CHARS {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(NODE_TITLE_MAX_CHARS - 1).collect();
+    out.push('\u{2026}');
+    out
+}
+
 fn node_label(n: &Node, skill_titles: &HashMap<Uuid, String>) -> String {
-    if n.is_artifact_snapshot {
-        // Cascade snapshot: prefer the artifact's title (e.g.
-        // "epic-01-realtime-collaboration"); fall back to the kind
-        // label ("Epic") + UUID short prefix when title is missing.
+    let raw = if n.is_artifact_snapshot {
+        // Cascade snapshot: prefer the artifact's cached title (e.g.
+        // "epic-01-realtime-collaboration"). When that's missing —
+        // e.g. on the seed root or after a snapshot was created
+        // before titles were cached — look up the referenced note's
+        // current title in the project-wide map. Last-resort fallback
+        // is "<kind> <id-prefix>" so the tile is never blank.
         if let Some(title) = n.artifact_title.as_ref() {
-            return title.clone();
-        }
-        let head: String = n
+            title.clone()
+        } else if let Some(title) = n
             .artifact_ref
-            .map(|id| id.to_string().chars().take(8).collect())
-            .unwrap_or_default();
-        let kind = n.artifact_kind_label.clone().unwrap_or_else(|| "Artifact".into());
-        return format!("{kind} {head}");
-    }
-    // Skill node: prefer the resolved skill title; fall back to the
-    // UUID short prefix when the skill row isn't in the lookup map
-    // (e.g. read-only WorkflowView, or skill note was deleted).
-    if let Some(title) = skill_titles.get(&n.skill_note_id) {
-        return title.clone();
-    }
-    let id = n.skill_note_id.to_string();
-    let head: String = id.chars().take(8).collect();
-    format!("skill {head}")
+            .and_then(|aref| skill_titles.get(&aref))
+        {
+            title.clone()
+        } else {
+            let head: String = n
+                .artifact_ref
+                .map(|id| id.to_string().chars().take(8).collect())
+                .unwrap_or_default();
+            let kind = n
+                .artifact_kind_label
+                .clone()
+                .unwrap_or_else(|| "Artifact".into());
+            format!("{kind} {head}")
+        }
+    } else if let Some(title) = skill_titles.get(&n.skill_note_id) {
+        // Skill node: prefer the resolved skill title.
+        title.clone()
+    } else {
+        // Fall back to the UUID short prefix when the skill row isn't
+        // in the lookup map (e.g. read-only WorkflowView, or skill
+        // note was deleted).
+        let id = n.skill_note_id.to_string();
+        let head: String = id.chars().take(8).collect();
+        format!("skill {head}")
+    };
+    truncate_for_card(&raw)
 }
 
 fn status_class(s: &NodeStatus, is_artifact_snapshot: bool) -> &'static str {
@@ -1476,6 +3248,423 @@ fn layout(graph: &WorkflowGraph) -> HashMap<NodeId, (f64, f64)> {
         }
     }
     out
+}
+
+/// Prioritized-backlog artifacts summarize a particular level of the
+/// cascade — `prioritized-backlog-epics`, `…-features`, `…-stories`,
+/// etc. The auto-arrange uses this to drop each backlog into the same
+/// column as the level it covers, instead of stacking every backlog
+/// in a single rightmost column. Returns the matching kind priority
+/// (Epic = 2, Feature = 3, Story = 4, Task = 5, Plan = 6), or `None`
+/// when the title doesn't follow the convention.
+fn infer_backlog_level(title: &str) -> Option<i32> {
+    let lower = title.to_lowercase();
+    // Order matters only for cosmetic precision: longest/most specific
+    // word first so a custom name like "feature-story-rollup" doesn't
+    // misroute. In practice the seed-pipeline names are clean and the
+    // first hit wins.
+    if lower.contains("epic") {
+        return Some(2);
+    }
+    if lower.contains("feature") {
+        return Some(3);
+    }
+    // `stor` covers both `story` and `stories`. Returns the *raw*
+    // canonical priority — `auto_arrange` collapses Plan→Story for
+    // the column index via `column_kind`, but the raw value is what
+    // we want for the within-column sort key.
+    if lower.contains("stor") {
+        return Some(4);
+    }
+    if lower.contains("task") {
+        return Some(5);
+    }
+    if lower.contains("plan") {
+        return Some(6);
+    }
+    None
+}
+
+/// Canonical SDLC waterfall priority for an `artifact_kind_label` value
+/// (matches the `ArtifactKind::display_name()` strings in
+/// `plugins/artifact/frontmatter.rs:98-113`). Lower numbers are
+/// upstream / earlier in the cascade; nodes with the same priority go
+/// in the same horizontal swim lane.
+fn kind_priority(label: Option<&str>) -> i32 {
+    let key = label.map(|l| l.to_lowercase());
+    match key.as_deref() {
+        None | Some("artifact") => 0, // root seed / generic
+        Some("requirements") => 1,
+        Some("epic") => 2,
+        Some("feature") => 3,
+        Some("story") => 4,
+        Some("task") => 5,
+        Some("plan") => 6,
+        Some("implementation") => 7,
+        Some("test cases") => 8,
+        Some("test results") => 9,
+        Some("summary") => 10,
+        Some("prioritized backlog") => 11,
+        Some(_) => 12, // Other / unknown custom kind
+    }
+}
+
+/// Maps a canonical kind priority (the value returned by
+/// `kind_priority`) to its visual *column index* for `auto_arrange`.
+/// Plan (6) collapses into Story's column (4) because Plans are the
+/// technical expansion of a Story — the cascade emits one Plan per
+/// Story, so visually grouping them keeps the level's items together
+/// instead of leaving Plans in a mostly-empty column. Within the
+/// merged column the within-column sort uses the *raw* priority, so
+/// Stories (4) still appear above Plans (6) in reading order.
+/// Every other kind keeps its own column.
+fn column_kind(p: i32) -> i32 {
+    match p {
+        6 => 4, // Plan → Story column
+        _ => p,
+    }
+}
+
+/// Compute the visible-node set for the current expand state. A node
+/// is visible iff it's a root (no incoming edges) OR it can be reached
+/// from a root through a chain of expanded nodes. This lets the user
+/// drill into the cascade one level at a time — clicking the chevron
+/// on a parent surfaces only its direct children, not the whole
+/// subtree, matching the "expand each level" demo flow.
+///
+/// Cycle-safe: BFS via `BTreeSet::insert` returning bool stops re-
+/// traversal of already-visible nodes.
+fn compute_visible(
+    graph: &WorkflowGraph,
+    expanded: &std::collections::BTreeSet<NodeId>,
+) -> std::collections::BTreeSet<NodeId> {
+    let mut visible = std::collections::BTreeSet::new();
+    let mut indeg: HashMap<NodeId, usize> =
+        graph.nodes.keys().map(|id| (*id, 0usize)).collect();
+    for e in &graph.edges {
+        if indeg.contains_key(&e.from) && indeg.contains_key(&e.to) {
+            *indeg.entry(e.to).or_insert(0) += 1;
+        }
+    }
+    // Roots: indegree 0 in the graph. Always visible.
+    let mut frontier: Vec<NodeId> = indeg
+        .iter()
+        .filter(|(_, &c)| c == 0)
+        .map(|(id, _)| *id)
+        .collect();
+    for r in &frontier {
+        visible.insert(*r);
+    }
+    // BFS, but only follow `from -> to` edges when `from` is expanded.
+    while let Some(n) = frontier.pop() {
+        if !expanded.contains(&n) {
+            continue;
+        }
+        for e in graph.edges.iter().filter(|e| e.from == n) {
+            if !graph.nodes.contains_key(&e.to) {
+                continue;
+            }
+            if visible.insert(e.to) {
+                frontier.push(e.to);
+            }
+        }
+    }
+    visible
+}
+
+/// SDLC waterfall layout — **kind drives the column**, not topological
+/// rank. All Epics share one column, all Features share the next, all
+/// Stories the next, etc. The canonical priority order
+/// (`kind_priority`) sets the left-to-right sequence; only kinds that
+/// actually appear in the graph get a column, so empty levels don't
+/// leave gaps. Within a column, nodes are stacked vertically and
+/// sorted alphabetically by `artifact_title` for stable ordering.
+fn auto_arrange(graph: &WorkflowGraph) -> WorkflowGraph {
+    let mut next = graph.clone();
+    if next.nodes.is_empty() {
+        return next;
+    }
+
+    // Snapshot per-node placement keys. Stored as a 3-tuple so the
+    // column index and within-column sort key can diverge:
+    //   - `column` decides which vertical band the node lands in.
+    //     Plan→Story column collapse and backlog→owner-column routing
+    //     both happen here.
+    //   - `sort_key` keeps the raw `kind_priority`, so Stories (4)
+    //     still appear above Plans (6) inside the merged column, and
+    //     PrioritizedBacklog (11) always falls to the bottom.
+    //   - `title` is the alphabetical tiebreaker.
+    let snapshot: HashMap<NodeId, (i32, i32, String)> = next
+        .nodes
+        .iter()
+        .map(|(id, n)| {
+            let title = n.artifact_title.clone().unwrap_or_default();
+            let raw = kind_priority(n.artifact_kind_label.as_deref());
+            // Sort key: keep raw — backlogs (11) sort to the bottom,
+            // Stories (4) above Plans (6) within the merged column.
+            let sort_key = raw;
+            // Column key: route backlogs to their inferred level's
+            // column (parsed from the title suffix — e.g.
+            // `prioritized-backlog-stories` → Story level), then
+            // collapse Plan→Story for the merged column.
+            let owner = if raw == 11 {
+                infer_backlog_level(&title).unwrap_or(raw)
+            } else {
+                raw
+            };
+            let column = column_kind(owner);
+            (*id, (column, sort_key, title))
+        })
+        .collect();
+
+    // Compress the column index: only include kinds present in the
+    // graph, in canonical priority order. So a workflow with only
+    // Epics, Features, Stories gets columns 0/1/2 — no holes for
+    // missing Tasks/Plans.
+    let mut present_kinds: Vec<i32> = snapshot
+        .values()
+        .map(|(c, _, _)| *c)
+        .collect::<std::collections::BTreeSet<i32>>()
+        .into_iter()
+        .collect();
+    present_kinds.sort();
+    let kind_to_col: HashMap<i32, usize> = present_kinds
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (*k, i))
+        .collect();
+
+    // Group nodes into columns by kind. Each column is one homogeneous
+    // band — all the Epics, all the Features, etc.
+    let mut columns: Vec<Vec<NodeId>> = vec![Vec::new(); present_kinds.len()];
+    for (id, (c, _, _)) in &snapshot {
+        if let Some(col) = kind_to_col.get(c) {
+            columns[*col].push(*id);
+        }
+    }
+    // Within-column ordering. Process columns left-to-right so each
+    // node's "primary ancestor slot" is already known by the time we
+    // need it. Sort key per node, in order of importance:
+    //
+    //   1. Ancestor's slot in some earlier column. BFS up incoming
+    //      edges, take the first parent that already has a slot
+    //      assigned. Children of feature-01 cluster together, then
+    //      children of feature-02, etc.
+    //   2. Raw `sort_key` — Stories (4) above Plans (6) above
+    //      Backlogs (11) within the same parent group.
+    //   3. Title — alphabetical within each (parent, kind) bucket.
+    //   4. Node id — deterministic when titles collide.
+    //
+    // Nodes whose BFS finds no ancestor in any earlier column (e.g.
+    // backlog-features parented straight to the root) sort to the end
+    // of their column via `usize::MAX`, which keeps backlogs as the
+    // tail of every level visually.
+    // Records each node's primary ancestor (if any) so the placement
+    // pass below can center child groups on the parent's Y.
+    let mut primary_parent: HashMap<NodeId, Option<NodeId>> = HashMap::new();
+    let mut slot_in_column: HashMap<NodeId, usize> = HashMap::new();
+    for col_idx in 0..columns.len() {
+        // Precompute the sort key for every node in this column up
+        // front. The key includes the ancestor's (col, slot) computed
+        // by walking incoming edges via BFS — using a precomputed
+        // HashMap avoids capturing closures whose borrows would clash
+        // with `columns[col_idx].sort_by` taking a `&mut Vec`.
+        let mut keys: HashMap<NodeId, (usize, usize, i32, String)> =
+            HashMap::with_capacity(columns[col_idx].len());
+        for id in columns[col_idx].iter() {
+            // BFS up `incoming(*n)` for the first parent already
+            // placed in an earlier column.
+            let anc: Option<NodeId> = {
+                let mut visited: std::collections::HashSet<NodeId> =
+                    std::collections::HashSet::new();
+                visited.insert(*id);
+                let mut frontier: Vec<NodeId> = vec![*id];
+                let mut found: Option<NodeId> = None;
+                'outer: while !frontier.is_empty() {
+                    let mut next_frontier: Vec<NodeId> = Vec::new();
+                    for n in &frontier {
+                        for e in next.edges.iter().filter(|e| e.to == *n) {
+                            if !visited.insert(e.from) {
+                                continue;
+                            }
+                            if slot_in_column.contains_key(&e.from)
+                                && snapshot
+                                    .get(&e.from)
+                                    .and_then(|(c, _, _)| kind_to_col.get(c))
+                                    .is_some()
+                            {
+                                found = Some(e.from);
+                                break 'outer;
+                            }
+                            next_frontier.push(e.from);
+                        }
+                    }
+                    frontier = next_frontier;
+                }
+                found
+            };
+            let (anc_col, anc_slot) = anc
+                .and_then(|aid| {
+                    let col = snapshot
+                        .get(&aid)
+                        .and_then(|(c, _, _)| kind_to_col.get(c).copied());
+                    let slot = slot_in_column.get(&aid).copied();
+                    match (col, slot) {
+                        (Some(c), Some(s)) => Some((c, s)),
+                        _ => None,
+                    }
+                })
+                .unwrap_or((usize::MAX, usize::MAX));
+            let (sort_key, title) = snapshot
+                .get(id)
+                .map(|(_, s, t)| (*s, t.clone()))
+                .unwrap_or((0, String::new()));
+            keys.insert(*id, (anc_col, anc_slot, sort_key, title));
+            primary_parent.insert(*id, anc);
+        }
+        let empty_key = (usize::MAX, usize::MAX, 0i32, String::new());
+        columns[col_idx].sort_by(|a, b| {
+            let ka = keys.get(a).unwrap_or(&empty_key);
+            let kb = keys.get(b).unwrap_or(&empty_key);
+            ka.cmp(kb).then_with(|| a.cmp(b))
+        });
+        // Write slots for this column so the next column's primary-
+        // ancestor lookup can find these nodes.
+        for (slot, id) in columns[col_idx].iter().enumerate() {
+            slot_in_column.insert(*id, slot);
+        }
+    }
+
+    // Generous demo-friendly spacing. The big COL_GAP keeps long
+    // titles visually inside their own column even with the
+    // auto-truncate ellipsis at ~30 chars.
+    const COL_GAP: f64 = 380.0;
+    const ROW_GAP: f64 = 44.0;
+    const BASE_X: f64 = 60.0;
+    const BASE_Y: f64 = 60.0;
+    let col_step = NODE_W + COL_GAP;
+    let row_step = NODE_H + ROW_GAP;
+
+    // Placement pass — *bottom-up centroid*. We process columns
+    // RIGHT-TO-LEFT: the rightmost column is laid out top-down by
+    // its existing within-column sort, then each preceding column
+    // places each node at the *average Y of its children* (children
+    // = direct outgoing-edge targets in any later column). Parents
+    // land at the centroid of their children, so the connector lines
+    // come out roughly horizontal — minimal curvature, the demo look.
+    //
+    // Within a column, after computing each node's ideal Y, we sort
+    // by ideal Y (with the existing sort key as tiebreaker) and
+    // sweep top-down enforcing `row_step` spacing — so two parents
+    // whose ideal Ys overlap get nudged apart while preserving order.
+    let mut node_y: HashMap<NodeId, f64> = HashMap::new();
+    if columns.is_empty() {
+        next.version = next.version.saturating_add(1);
+        return next;
+    }
+    let last_col = columns.len() - 1;
+    // Pre-index direct children for fast lookup. Stored as
+    // `outgoing_targets[from] = Vec<to>`, scoped to nodes that
+    // actually exist in the graph (defensive against dangling refs
+    // mid-edit).
+    let mut outgoing_targets: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for e in &next.edges {
+        if next.nodes.contains_key(&e.from) && next.nodes.contains_key(&e.to) {
+            outgoing_targets.entry(e.from).or_default().push(e.to);
+        }
+    }
+
+    // Step 1 — rightmost column: stack from BASE_Y in within-column
+    // sort order. This anchors the bottom-up cascade.
+    {
+        let x = BASE_X + last_col as f64 * col_step;
+        for (slot, id) in columns[last_col].iter().enumerate() {
+            let y = BASE_Y + slot as f64 * row_step;
+            node_y.insert(*id, y);
+            if let Some(node) = next.nodes.get_mut(id) {
+                node.position = (x, y);
+            }
+        }
+    }
+
+    // Step 2 — every column to the LEFT of the rightmost, in
+    // right-to-left order. Each node's ideal Y is the average of its
+    // already-placed children's Ys. Nodes without placed children
+    // (e.g. backlog-epics whose children sit elsewhere) get a
+    // fallback Y that just appends them after the column's last
+    // placed node, so they tail the column without crossing siblings.
+    for col_idx in (0..last_col).rev() {
+        let x = BASE_X + col_idx as f64 * col_step;
+        if columns[col_idx].is_empty() {
+            continue;
+        }
+
+        // Compute each node's ideal Y from its children.
+        let mut ideal: HashMap<NodeId, Option<f64>> = HashMap::new();
+        for id in &columns[col_idx] {
+            let children = outgoing_targets.get(id);
+            let avg = children.and_then(|kids| {
+                let ys: Vec<f64> =
+                    kids.iter().filter_map(|c| node_y.get(c).copied()).collect();
+                if ys.is_empty() {
+                    None
+                } else {
+                    Some(ys.iter().copied().sum::<f64>() / ys.len() as f64)
+                }
+            });
+            ideal.insert(*id, avg);
+        }
+
+        // Sort the column by ideal Y (with the existing ordering as
+        // tiebreaker). Nodes with no centroid sort to the bottom.
+        let original_order: HashMap<NodeId, usize> = columns[col_idx]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i))
+            .collect();
+        let mut ordered: Vec<NodeId> = columns[col_idx].clone();
+        ordered.sort_by(|a, b| {
+            let ya = ideal.get(a).and_then(|o| *o);
+            let yb = ideal.get(b).and_then(|o| *o);
+            match (ya, yb) {
+                (Some(va), Some(vb)) => va
+                    .partial_cmp(&vb)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        original_order
+                            .get(a)
+                            .cmp(&original_order.get(b))
+                    }),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => original_order.get(a).cmp(&original_order.get(b)),
+            }
+        });
+        columns[col_idx] = ordered;
+
+        // Sweep top-down: clamp each node's Y to (ideal, prev + step).
+        let mut prev_y: Option<f64> = None;
+        for id in &columns[col_idx] {
+            let proposed = ideal
+                .get(id)
+                .and_then(|o| *o)
+                .unwrap_or_else(|| match prev_y {
+                    Some(p) => p + row_step,
+                    None => BASE_Y,
+                });
+            let y = match prev_y {
+                Some(p) => proposed.max(p + row_step),
+                None => proposed.max(BASE_Y),
+            };
+            node_y.insert(*id, y);
+            if let Some(node) = next.nodes.get_mut(id) {
+                node.position = (x, y);
+            }
+            prev_y = Some(y);
+        }
+    }
+    next.version = next.version.saturating_add(1);
+    next
 }
 
 /// Remove `node_id` and any incident edges. Bumps the graph version

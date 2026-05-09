@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::editor::LanguageDescriptor;
 use crate::local_mode::desktop::{LocalNoteRepo, LocalProjectRepo};
 use crate::local_mode::explorer::LocalNoteVersion;
 use crate::persistence::Persistence;
@@ -23,6 +24,7 @@ use crate::shell::companion_state::{
     ArtifactRunState, ChatMessageRepo, ChatSessionRepo, ChatSessionVersion,
     ClaudeCodePluginCtx, ARTIFACT_RUN_STATE,
 };
+use crate::shell::editor_host::{MonacoChannel, MonacoEditorHost};
 
 #[derive(Props, Clone, PartialEq)]
 pub struct ArtifactViewProps {
@@ -70,8 +72,25 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
     };
 
     let body_editable = props.edit && on_change.is_some();
-    let textarea_value = body_only.clone();
-    let fm_for_textarea = fm.clone();
+    let monaco_body = body_only.clone();
+    let fm_for_monaco = fm.clone();
+    let content_for_monaco = content_for_actions.clone();
+    // Plans-Phase-9-monaco-desktop (rev 1): signal sink for the
+    // MonacoChannel handle. Populated once the editor mounts; used by
+    // the link picker (Task #3) to splice picked targets at the
+    // current caret. Wired here so we don't have to re-touch the
+    // editor mount when the picker lands.
+    let monaco_channel: Signal<Option<MonacoChannel>> = use_signal(|| None);
+    // Open-state for the link picker (Cmd+K linkpicker action).
+    let mut link_picker_open: Signal<bool> = use_signal(|| false);
+    let mut image_picker_open: Signal<bool> = use_signal(|| false);
+    // Repos for the drop handler — only consumed on desktop, where
+    // the explorer provides them via context. The artifact view is
+    // mounted inside `LocalShell` so these always resolve when we
+    // reach the body-editable branch.
+    let LocalNoteRepo(drop_note_repo) = use_context();
+    let LocalProjectRepo(drop_project_repo) = use_context();
+    let crate::local_mode::ui::DragSession(drag_session) = use_context();
 
     // "Run skill" picker — collapsed by default; opens inline above
     // the body. Filters skills by `input_kind` matching this
@@ -89,6 +108,11 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
     // runtime layer in `runner::run_skill_on_source`.
     let is_root_seed = fm.source_artifact_id.is_none();
     let is_runnable_source = status == ArtifactStatus::Approved || is_root_seed;
+    // Show the labeled "Generate Cascade" button on Requirements artifacts.
+    // The icon Play button below stays available on every runnable artifact
+    // (including Requirements) — this is an explicit, primary entry point
+    // for the SDLC root.
+    let is_requirements = matches!(fm.artifact_kind, Some(ArtifactKind::Requirements));
     let run_button_title = if is_runnable_source {
         "Run a skill on this artifact to produce child artifacts (Epics, Features, etc.).".to_string()
     } else {
@@ -198,6 +222,9 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                         }
                         if let Some(uuid) = source_uuid {
                             if is_runnable_source {
+                                if is_requirements {
+                                    GenerateCascadeButton { root_artifact_id: uuid }
+                                }
                                 CascadePlayButton { root_artifact_id: uuid }
                             }
                         }
@@ -284,25 +311,129 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                     }
                 },
             }
-            div { class: "operon-artifact-body",
+            div {
+                // In edit mode, the inner MonacoEditorHost mounts with
+                // `position: absolute; inset: 0;`, which only works when
+                // its parent is positioned. The `-edit` modifier also
+                // drops the body padding so Monaco fills the surface
+                // edge to edge — preview mode keeps the padded layout.
+                class: if body_editable {
+                    "operon-artifact-body operon-artifact-body-edit"
+                } else {
+                    "operon-artifact-body"
+                },
                 if body_editable {
-                    textarea {
-                        class: "operon-artifact-textarea",
-                        "data-testid": "artifact-textarea",
-                        spellcheck: "false",
-                        value: "{textarea_value}",
-                        oninput: move |e| {
-                            // The textarea edits the BODY only; we
-                            // re-attach the (untouched) frontmatter
-                            // before pushing the change up so the
-                            // status pill / source linkage survive.
-                            let new_body = e.value();
-                            let recombined = rewrite(&content_for_actions, &fm_for_textarea);
-                            let final_doc = replace_body(&recombined, &new_body);
-                            if let Some(handler) = on_change {
-                                handler.call(final_doc);
+                    {
+                        // Monaco edits the BODY only; we re-attach the
+                        // (untouched) frontmatter before pushing the
+                        // change up so the status pill / source linkage
+                        // survive. Mirrors what the previous <textarea>
+                        // did, but routes through MonacoEditorHost so
+                        // the artifact editor matches every other
+                        // markdown surface (Cmd+K link picker, paste-
+                        // image, drag-drop). The captured `fm_for_monaco`
+                        // is the parsed frontmatter at the start of this
+                        // render — re-derived next render once
+                        // props.content updates.
+                        let on_body_change = {
+                            let content_for_monaco = content_for_monaco.clone();
+                            let fm_for_monaco = fm_for_monaco.clone();
+                            EventHandler::new(move |new_body: String| {
+                                let recombined = rewrite(&content_for_monaco, &fm_for_monaco);
+                                let final_doc = replace_body(&recombined, &new_body);
+                                if let Some(handler) = on_change {
+                                    handler.call(final_doc);
+                                }
+                            })
+                        };
+                        let on_keyaction = EventHandler::new(move |action: String| {
+                            // The Monaco bootstrap intercepts Cmd+K and
+                            // Cmd+Shift+I and posts these action names. We
+                            // open the corresponding picker; its on_pick
+                            // splices the formatted markdown link back
+                            // into Monaco via `monaco_channel`.
+                            match action.as_str() {
+                                "linkpicker" => link_picker_open.set(true),
+                                "imagepicker" => image_picker_open.set(true),
+                                _ => {}
                             }
-                        },
+                        });
+                        rsx! {
+                            div {
+                                // Outer drop target: in-app note drags
+                                // from the explorer (DragSession) are
+                                // converted to a markdown link and
+                                // spliced into Monaco. Sized to fill
+                                // the artifact-body so a drop anywhere
+                                // over the editor lands here. Monaco
+                                // mounts inside via MonacoEditorHost's
+                                // own absolute-inset wrapper.
+                                style: "position: absolute; inset: 0;",
+                                ondragover: move |evt| evt.prevent_default(),
+                                ondrop: {
+                                    let note_repo = drop_note_repo.clone();
+                                    let project_repo = drop_project_repo.clone();
+                                    let mut drag_session = drag_session;
+                                    move |evt: Event<DragData>| {
+                                        let kind = *drag_session.peek();
+                                        let note_id = match kind {
+                                            Some(crate::local_mode::ui::DragKind::Note(id)) => id,
+                                            _ => return,
+                                        };
+                                        evt.prevent_default();
+                                        // Resolve the note's title +
+                                        // kind across all projects.
+                                        let projects = project_repo.list().unwrap_or_default();
+                                        let mut found: Option<(String, operon_store::repos::NoteKind)> = None;
+                                        for p in &projects {
+                                            if let Ok(notes) = note_repo.list_for_project(p.id) {
+                                                if let Some(n) =
+                                                    notes.into_iter().find(|n| n.id == note_id)
+                                                {
+                                                    found = Some((n.title, n.kind));
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        let Some((title, kind)) = found else {
+                                            drag_session.set(None);
+                                            return;
+                                        };
+                                        let inserted = if matches!(
+                                            kind,
+                                            operon_store::repos::NoteKind::Image
+                                        ) {
+                                            format!(
+                                                "![{}](operon://note/{})",
+                                                title, note_id
+                                            )
+                                        } else {
+                                            format!(
+                                                "[{}](operon://note/{})",
+                                                title, note_id
+                                            )
+                                        };
+                                        if let Some(channel) = monaco_channel.peek().as_ref().cloned() {
+                                            channel.splice(&inserted);
+                                        }
+                                        drag_session.set(None);
+                                    }
+                                },
+                                MonacoEditorHost {
+                                    note_id: props.note_id.clone(),
+                                    content: monaco_body.clone(),
+                                    language: LanguageDescriptor::markdown(),
+                                    on_change: on_body_change,
+                                    channel_sink: monaco_channel,
+                                    on_action: on_keyaction,
+                                }
+                            }
+                            ArtifactPickerMounts {
+                                link_open: link_picker_open,
+                                image_open: image_picker_open,
+                                channel: monaco_channel,
+                            }
+                        }
                     }
                 } else {
                     MarkdownView { content: body_only }
@@ -317,12 +448,22 @@ fn patch_status(
     next: ArtifactStatus,
     on_change: Option<EventHandler<String>>,
 ) {
-    let mut fm = parse(content);
-    fm.status = next;
-    let new_body = rewrite(content, &fm);
+    let new_body = patch_status_text(content, next);
     if let Some(handler) = on_change {
         handler.call(new_body);
     }
+}
+
+/// Pure-text variant of `patch_status` — returns the rewritten body
+/// instead of dispatching it through an `EventHandler`. The workflow
+/// plugin uses this when it needs to write the artifact frontmatter
+/// directly via `Persistence::save` (the artifact note isn't open
+/// in a tab when the user clicks Approve / Reject / Mark dirty on
+/// the workflow card).
+pub fn patch_status_text(content: &str, next: ArtifactStatus) -> String {
+    let mut fm = parse(content);
+    fm.status = next;
+    rewrite(content, &fm)
 }
 
 fn status_css_class(s: ArtifactStatus) -> &'static str {
@@ -961,7 +1102,7 @@ fn ReviseButton(props: ReviseButtonProps) -> Element {
 /// flip its status from Approved → Dirty. Returns the number of rows
 /// mutated. Errors are best-effort: a single load/save failure
 /// doesn't abort the walk.
-async fn mark_descendants_dirty(
+pub async fn mark_descendants_dirty(
     note_repo: &Arc<dyn LocalNoteRepository>,
     persistence: &Arc<dyn Persistence>,
     root_id: Uuid,
@@ -1058,15 +1199,66 @@ fn CascadePlayButton(props: CascadePlayButtonProps) -> Element {
         Some(crate::shell::companion_state::CascadePhase::Running { .. })
     );
 
+    // Pre-flight dependency check. Walk up to the seed, ask
+    // `unmet_dep_titles` for prerequisites that aren't yet `Approved`.
+    // Reading `LocalNoteVersion` inside the async block subscribes the
+    // resource to it, so an Approve / Reject elsewhere bumps that
+    // signal and re-runs us with fresh status.
+    let unmet_deps_resource = {
+        let note_repo = note_repo.clone();
+        let persistence = persistence.clone();
+        let mut note_version = note_version;
+        use_resource(move || {
+            let note_repo = note_repo.clone();
+            let persistence = persistence.clone();
+            async move {
+                // Subscribe to LocalNoteVersion so approve/reject elsewhere
+                // re-fires this resource. The read value itself doesn't
+                // matter — we just want the dependency wired up.
+                let _v = *note_version.read();
+                let project_id = match note_repo.find_project_for_note(root_id) {
+                    Ok(Some(p)) => p,
+                    _ => return Vec::new(),
+                };
+                let seed_id = resolve_seed_id_sync(&persistence, root_id);
+                crate::plugins::artifact::cascade::unmet_dep_titles(
+                    &note_repo,
+                    &persistence,
+                    project_id,
+                    seed_id,
+                    root_id,
+                )
+                .await
+            }
+        })
+    };
+    let unmet_titles: Vec<String> = unmet_deps_resource
+        .read()
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
+    let blocked = !unmet_titles.is_empty();
+    let blocked_tooltip = if blocked {
+        format!(
+            "Approve these first: {}",
+            unmet_titles.join(", ")
+        )
+    } else {
+        String::new()
+    };
+
     rsx! {
         button {
             r#type: "button",
             class: if is_running { "operon-artifact-cascade-stop" } else { "operon-artifact-cascade-play" },
             "data-testid": "artifact-cascade-play",
+            disabled: blocked && !is_running,
             title: if is_running {
-                "Stop the cascade at the next skill boundary."
+                "Stop the cascade at the next skill boundary.".to_string()
+            } else if blocked {
+                blocked_tooltip.clone()
             } else {
-                "Run the entire SDLC pipeline from this artifact \u{2014} every produced child auto-approves."
+                "Run the entire SDLC pipeline from this artifact \u{2014} every produced child auto-approves.".to_string()
             },
             onclick: {
                 let note_repo = note_repo.clone();
@@ -1090,6 +1282,12 @@ fn CascadePlayButton(props: CascadePlayButtonProps) -> Element {
                             tok.cancel();
                         }
                     } else {
+                        // Belt-and-suspenders: even if the resource is
+                        // mid-resolve and the disabled attr hasn't taken
+                        // effect, refuse to launch a doomed cascade run.
+                        if blocked {
+                            return;
+                        }
                         spawn_cascade(
                             root_id,
                             note_repo.clone(),
@@ -1102,6 +1300,7 @@ fn CascadePlayButton(props: CascadePlayButtonProps) -> Element {
                             &mut chat_session_version_setter,
                             &mut active_session_setter,
                             &mut active_scope_setter,
+                            None, // full cascade — no depth cap
                         );
                     }
                 }
@@ -1132,6 +1331,264 @@ fn CascadePlayButton(props: CascadePlayButtonProps) -> Element {
             }
         }
     }
+}
+
+/// Format a `PickedLink` as `[Title](operon://note/<uuid>)` for note
+/// hits, or as the bare title for project hits (which don't have a
+/// note id). Used by the artifact link-picker `on_pick` handler.
+#[cfg(not(target_arch = "wasm32"))]
+fn format_picked_as_markdown_link(picked: &crate::local_mode::editor::PickedLink) -> String {
+    match picked.note_id {
+        Some(id) => format!("[{}](operon://note/{})", picked.title, id),
+        None => picked.title.clone(),
+    }
+}
+
+/// Image-embed variant of `format_picked_as_markdown_link`: always
+/// emits `![alt](operon://note/<uuid>)` so the markdown renderer's
+/// image-kind resolver renders an inline `<img>` (or a card preview
+/// for non-image notes — matches the existing Cmd+Shift+I behaviour
+/// in `LocalNoteEditor`).
+#[cfg(not(target_arch = "wasm32"))]
+fn format_picked_as_markdown_image(picked: &crate::local_mode::editor::PickedLink) -> String {
+    match picked.note_id {
+        Some(id) => format!("![{}](operon://note/{})", picked.title, id),
+        None => picked.title.clone(),
+    }
+}
+
+/// Cfg-gated wrapper around `LinkPicker` so the artifact view compiles
+/// on wasm (where the picker isn't built). Desktop: when a picker
+/// signal is open, mounts `LinkPicker` and splices the formatted
+/// markdown link back into Monaco via `channel`. Wasm: no-op.
+#[derive(Props, Clone, PartialEq)]
+struct ArtifactPickerMountsProps {
+    link_open: Signal<bool>,
+    image_open: Signal<bool>,
+    channel: Signal<Option<MonacoChannel>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[component]
+fn ArtifactPickerMounts(props: ArtifactPickerMountsProps) -> Element {
+    let mut link_open = props.link_open;
+    let mut image_open = props.image_open;
+    let channel = props.channel;
+
+    // Plain-closure pattern (matches `LocalNoteEditor::on_pick_link`).
+    // `EventHandler<PickedLink>` auto-coerces from a `FnMut + 'static`
+    // closure; `Callback::new(...)` returns a different type whose
+    // bridge through the EventHandler prop drops the call in some
+    // contexts, so we avoid it here.
+    let on_pick_link = move |picked: crate::local_mode::editor::PickedLink| {
+        let inserted = format_picked_as_markdown_link(&picked);
+        let snap = channel.peek().as_ref().cloned();
+        eprintln!(
+            "operon: artifact link-picker on_pick fired \u{2014} channel_some={} inserted={:?}",
+            snap.is_some(),
+            &inserted
+        );
+        if let Some(c) = snap {
+            c.splice(&inserted);
+        } else {
+            eprintln!(
+                "operon: artifact link-picker SKIPPED splice \u{2014} monaco_channel is None"
+            );
+        }
+        link_open.set(false);
+    };
+    let on_pick_image = move |picked: crate::local_mode::editor::PickedLink| {
+        let inserted = format_picked_as_markdown_image(&picked);
+        let snap = channel.peek().as_ref().cloned();
+        eprintln!(
+            "operon: artifact image-picker on_pick fired \u{2014} channel_some={} inserted={:?}",
+            snap.is_some(),
+            &inserted
+        );
+        if let Some(c) = snap {
+            c.splice(&inserted);
+        } else {
+            eprintln!(
+                "operon: artifact image-picker SKIPPED splice \u{2014} monaco_channel is None"
+            );
+        }
+        image_open.set(false);
+    };
+
+    rsx! {
+        if *link_open.read() {
+            crate::local_mode::editor::LinkPicker {
+                open: link_open,
+                on_pick: on_pick_link,
+            }
+        }
+        if *image_open.read() {
+            crate::local_mode::editor::LinkPicker {
+                open: image_open,
+                on_pick: on_pick_image,
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn ArtifactPickerMounts(_props: ArtifactPickerMountsProps) -> Element {
+    rsx! {}
+}
+
+/// Labeled "Generate Cascade" button rendered only on Requirements
+/// artifacts (the user-facing root of the SDLC pipeline). Clicking it
+/// opens (creating on first use) the `Cascade: <root title>` workflow
+/// note for this Requirements artifact in a new tab. It does NOT spawn
+/// the cascade orchestrator — running is the job of the neighboring
+/// ▶ Play button (`CascadePlayButton`). This split keeps "show me the
+/// cascade graph" cheap and side-effect-free; "actually run the
+/// pipeline" stays explicit on Play.
+#[derive(Props, Clone, PartialEq)]
+struct GenerateCascadeButtonProps {
+    root_artifact_id: Uuid,
+}
+
+#[component]
+fn GenerateCascadeButton(props: GenerateCascadeButtonProps) -> Element {
+    let LocalNoteRepo(note_repo) = use_context();
+    let persistence: Arc<dyn Persistence> = use_context();
+    let tabs: Signal<crate::tabs::TabManager> = use_context();
+    let save_scheduler: crate::tabs::SaveScheduler = use_context();
+    let LocalNoteVersion(note_version) = use_context();
+
+    let root_id = props.root_artifact_id;
+
+    rsx! {
+        button {
+            r#type: "button",
+            class: "operon-artifact-generate-cascade",
+            "data-testid": "artifact-generate-cascade",
+            title: "Open the cascade workflow for this Requirements note (creates one on first click). Use \u{25B6} Play to actually run the pipeline.",
+            onclick: {
+                let note_repo = note_repo.clone();
+                let persistence = persistence.clone();
+                let mut note_version_setter = note_version;
+                move |_| {
+                    open_cascade_workflow_tab(
+                        root_id,
+                        &note_repo,
+                        &persistence,
+                        tabs,
+                        save_scheduler.clone(),
+                        &mut note_version_setter,
+                    );
+                }
+            },
+            "Generate Cascade"
+        }
+    }
+}
+
+/// Resolve (or create) the `Cascade: <root>` workflow note for this
+/// Requirements artifact and open it as an Edit tab. Pure navigation:
+/// no orchestrator spawn, no chat-session bind, no `CASCADE_STATE`
+/// mutation. Mirrors the explorer's note-click flow — the same
+/// `open_local_note_tab` helper handles tab reuse + plugin dispatch.
+fn open_cascade_workflow_tab(
+    root_id: Uuid,
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    persistence: &Arc<dyn Persistence>,
+    tabs: Signal<crate::tabs::TabManager>,
+    save_scheduler: crate::tabs::SaveScheduler,
+    note_version: &mut Signal<u64>,
+) {
+    let project_id = match note_repo.find_project_for_note(root_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            eprintln!(
+                "operon: generate-cascade open: root {root_id} has no project"
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("operon: generate-cascade open: find_project_for_note: {e}");
+            return;
+        }
+    };
+    // Walk up the source_artifact_id chain to find the SEED so that
+    // even if the GenerateCascadeButton ever gets mounted on a
+    // non-Requirements artifact (today it's gated to Requirements),
+    // we still reuse the seed's `Cascade: <seed title>` workflow
+    // note instead of minting a new one. Idempotent for Requirements
+    // because root_id == seed_id there.
+    let seed_id = resolve_seed_id_sync(persistence, root_id);
+    let root_title = note_repo
+        .list_for_project(project_id)
+        .ok()
+        .and_then(|all| all.into_iter().find(|n| n.id == seed_id))
+        .map(|n| n.title)
+        .unwrap_or_else(|| short_uuid(seed_id));
+    let (graph_note_id, was_created) =
+        match crate::plugins::artifact::cascade_graph::ensure_cascade_workflow_note(
+            note_repo,
+            project_id,
+            &root_title,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "operon: generate-cascade open: ensure_cascade_workflow_note: {e}"
+                );
+                return;
+            }
+        };
+    // Seed the freshly-created workflow with just the source-artifact
+    // root snapshot. No placeholder kinds, no skill nodes — Play
+    // populates real artifact-snapshot nodes via the cascade runner's
+    // existing CascadeGraphWriter when the user actually runs.
+    //
+    // Bump LocalNoteVersion when the workflow note was freshly created
+    // so the explorer's per-project note cache re-fetches and the new
+    // `Cascade: <root>` row shows up in the project tree. The seed's
+    // kind is Requirements (the GenerateCascadeButton is mounted only
+    // on Requirements artifacts; if that gate ever loosens, the
+    // resolve_seed_id_sync walk above still keeps us pointed at the
+    // Requirements seed).
+    if was_created {
+        if let Err(e) = futures::executor::block_on(
+            crate::plugins::artifact::cascade_graph::seed_cascade_workflow_root_only(
+                persistence,
+                graph_note_id,
+                seed_id,
+                "Requirements",
+                &root_title,
+            ),
+        ) {
+            eprintln!(
+                "operon: generate-cascade open: seed_cascade_workflow_root_only: {e}"
+            );
+        }
+        note_version.with_mut(|v| *v = v.saturating_add(1));
+    }
+    let tab_title = format!("Cascade: {}", root_title);
+    let initial_content = {
+        let id_str = graph_note_id.to_string();
+        match futures::executor::block_on(persistence.load(&id_str)) {
+            Ok(bytes) => String::from_utf8(bytes).unwrap_or_default(),
+            Err(crate::persistence::PersistError::NotFound) => String::new(),
+            Err(e) => {
+                eprintln!(
+                    "operon: generate-cascade open: load {id_str}: {e:?}"
+                );
+                String::new()
+            }
+        }
+    };
+    crate::local_mode::editor::open_local_note_tab(
+        tabs,
+        save_scheduler,
+        graph_note_id,
+        tab_title,
+        initial_content,
+        operon_store::repos::NoteKind::Workflow,
+    );
 }
 
 /// Inline panel rendered under the Play button: lists every project
@@ -1265,6 +1722,47 @@ fn CascadeStagesDropdown(props: CascadeStagesDropdownProps) -> Element {
     }
 }
 
+/// Walk up an artifact's `source_artifact_id` chain via persistence
+/// loads + frontmatter parses until we hit a root (an artifact with
+/// no `source_artifact_id` set). That topmost ancestor is the
+/// "seed" — for SDLC cascades, typically the user's Requirements
+/// note. Used by `spawn_cascade` to key the workflow note + chat
+/// session, and by `CascadePlayButton` to scope the dependency
+/// pre-flight check.
+///
+/// Synchronous via `block_on` because the callers run in Dioxus
+/// click handlers / render bodies. Self-loop guard returns whatever
+/// node we're at if a cycle is detected (paranoia — frontmatter
+/// shouldn't contain cycles).
+pub fn resolve_seed_id_sync(
+    persistence: &Arc<dyn Persistence>,
+    artifact_id: Uuid,
+) -> Uuid {
+    let persistence = persistence.clone();
+    futures::executor::block_on(async move {
+        let mut current = artifact_id;
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                break;
+            }
+            let body = match persistence.load(&current.to_string()).await {
+                Ok(b) => match String::from_utf8(b) {
+                    Ok(s) => s,
+                    Err(_) => break,
+                },
+                Err(_) => break,
+            };
+            let fm = crate::plugins::artifact::frontmatter::parse(&body);
+            match fm.source_artifact_id {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        current
+    })
+}
+
 /// Spawn the autonomous cascade orchestrator in the background.
 /// Mirrors `spawn_runner`'s setup (binds the rail's chat session,
 /// auto-switches the rail's active session so transcripts stream
@@ -1276,7 +1774,11 @@ fn CascadeStagesDropdown(props: CascadeStagesDropdownProps) -> Element {
 /// here, the orchestrator polls between skill boundaries, the Stop
 /// button calls `.cancel()` on the entry.
 #[allow(clippy::too_many_arguments)]
-fn spawn_cascade(
+/// Spawn a cascade rooted on `root_artifact_id`. `max_depth = None`
+/// runs the full SDLC pipeline; `Some(n)` bounds the BFS to depth `n`
+/// (one click of the workflow card's ▶ uses `Some(1)` so it advances
+/// one level at a time).
+pub fn spawn_cascade(
     root_artifact_id: Uuid,
     note_repo: Arc<dyn operon_store::repos::LocalNoteRepository>,
     project_repo: Arc<dyn operon_store::repos::LocalProjectRepository>,
@@ -1288,6 +1790,7 @@ fn spawn_cascade(
     chat_session_version: &mut Signal<u64>,
     active_session: &mut Signal<Option<Uuid>>,
     active_scope: &mut Signal<operon_store::repos::ChatScope>,
+    max_depth: Option<u32>,
 ) {
     // Resolve project + repo path up front so a missing binding fails
     // loudly rather than silently no-op'ing inside the spawned task.
@@ -1360,15 +1863,25 @@ fn spawn_cascade(
     let enabled =
         crate::plugins::artifact::cascade::stages_sidecar::resolve_or_all(&repo_path, &all_skill_ids);
 
+    // Walk up the source_artifact_id chain to find the *seed* — the
+    // topmost ancestor with no source_artifact_id (typically a
+    // user-authored Requirements note). When the user clicks ▶ Play
+    // on a child artifact (e.g. an Epic), we still want the cascade's
+    // workflow note + chat session to be the SEED's, so all activity
+    // under one Requirements tree appears in the same
+    // `Cascade: Requirements` tab and the same rail session — no
+    // matter which intermediate artifact's Play button kicked off
+    // the run. The BFS scope (passed below as `root_artifact_id`)
+    // stays the clicked artifact so we only walk that subtree.
+    let seed_id = resolve_seed_id_sync(&persistence, root_artifact_id);
+
     // Bind the rail to a deterministic cascade session so transcripts
     // for each skill run inside the cascade land in the same rail
-    // entry as a per-source run would. We reuse the per-source
-    // session id derivation inside the orchestrator (each individual
-    // skill run keys on its own source artifact), and bind a separate
-    // cascade-level session here mainly so the project's chat
-    // surface has a labeled entry.
-    let cascade_session_id = chat_session_id_for_cascade(root_artifact_id);
-    let session_label = format!("Cascade: {}", short_uuid(root_artifact_id));
+    // entry as a per-source run would. Keyed on the SEED so all play
+    // invocations under one Requirements tree share the same chat
+    // session.
+    let cascade_session_id = chat_session_id_for_cascade(seed_id);
+    let session_label = format!("Cascade: {}", short_uuid(seed_id));
     let exists = matches!(chat_session_repo.get(cascade_session_id), Ok(Some(_)));
     if !exists {
         let _ = chat_session_repo.create_with_id(
@@ -1384,7 +1897,11 @@ fn spawn_cascade(
     active_session.set(Some(cascade_session_id));
     plugin.bind_session(cascade_session_id, repo_path.clone());
 
-    // Cancellation handle — Stop button reads this map to cancel.
+    // Cancellation handle — Stop button on the clicked artifact reads
+    // this map. Keyed on the clicked artifact (not the seed) so the
+    // Play button on the clicked artifact morphs to Stop while a run
+    // is in flight; clicking it cancels exactly the run that started
+    // there.
     let cancel = tokio_util::sync::CancellationToken::new();
     crate::shell::companion_state::CASCADE_CANCEL.with_mut(|m| {
         m.insert(root_artifact_id, cancel.clone());
@@ -1403,14 +1920,16 @@ fn spawn_cascade(
         );
     });
 
-    // Resolve a human title for the cascade workflow note; defaults
-    // to the artifact's UUID short-form when the row can't be loaded.
+    // Resolve a human title for the cascade workflow note from the
+    // SEED (not the clicked artifact). All Play invocations under
+    // one Requirements seed land in the same `Cascade: <seed title>`
+    // workflow note.
     let root_title = note_repo
         .list_for_project(project_id)
         .ok()
-        .and_then(|all| all.into_iter().find(|n| n.id == root_artifact_id))
+        .and_then(|all| all.into_iter().find(|n| n.id == seed_id))
         .map(|n| n.title)
-        .unwrap_or_else(|| short_uuid(root_artifact_id));
+        .unwrap_or_else(|| short_uuid(seed_id));
     let (graph_note_id, _graph_was_created) =
         match crate::plugins::artifact::cascade_graph::ensure_cascade_workflow_note(
             &note_repo,
@@ -1459,6 +1978,7 @@ fn spawn_cascade(
             enabled,
             cancel.clone(),
             writer.as_mut(),
+            max_depth,
         )
         .await;
         match result {

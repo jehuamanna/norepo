@@ -26,6 +26,47 @@ pub struct WorkflowGraph {
     /// reload without diffing every field.
     #[serde(default)]
     pub version: u64,
+    /// Persisted view-only state (expand/collapse, pan, zoom). Lives
+    /// on the graph itself so closing and reopening a workflow note
+    /// restores the exact viewport the user was looking at. Skipped
+    /// at serialize time when default so existing workflow files stay
+    /// minimal until the user actually customizes the view.
+    #[serde(default, skip_serializing_if = "WorkflowViewState::is_default")]
+    pub view_state: WorkflowViewState,
+}
+
+/// Persisted UI state for the canvas: which nodes are expanded, plus
+/// the last viewport pan / zoom. All fields default; an absent
+/// `view_state` block deserializes to "everything collapsed,
+/// viewport reset" — matching the first-open experience.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct WorkflowViewState {
+    /// Node ids whose children are currently visible. The set lives
+    /// on the graph (not a sidecar file) so it round-trips with the
+    /// note body — copy/paste / sync works for free.
+    #[serde(default)]
+    pub expanded_nodes: Vec<NodeId>,
+    /// Last viewport translation in canvas client px.
+    #[serde(default)]
+    pub pan_x: f64,
+    #[serde(default)]
+    pub pan_y: f64,
+    /// Last viewport zoom factor (1.0 = 100%). 0.0 / missing → reset
+    /// to 1.0 at hydrate time.
+    #[serde(default)]
+    pub zoom: f64,
+}
+
+impl WorkflowViewState {
+    /// `true` when nothing about the view differs from a fresh first
+    /// open — used by the `skip_serializing_if` on `view_state` so a
+    /// brand-new workflow's JSON stays compact.
+    fn is_default(&self) -> bool {
+        self.expanded_nodes.is_empty()
+            && self.pan_x == 0.0
+            && self.pan_y == 0.0
+            && (self.zoom == 0.0 || self.zoom == 1.0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

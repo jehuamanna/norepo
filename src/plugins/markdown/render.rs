@@ -1,9 +1,26 @@
 //! Render an [`MdNode`] tree into Dioxus RSX, themed via Phase-1 token CSS variables.
 
 use dioxus::prelude::*;
+use uuid::Uuid;
 
 use super::nodes::MdNode;
 use super::parser;
+
+/// URL-scheme prefix used by the artifact link picker to point at a
+/// project-local note. `operon://note/<uuid>` resolves through
+/// `NoteLinkResolver` (clickable anchors) and `MarkdownImageResolver`
+/// (image embeds) when those resolvers are installed by the
+/// Local-Mode shell. External callers (cloud preview, sandbox) leave
+/// the resolvers unset and links fall through to plain anchors.
+pub const OPERON_NOTE_SCHEME: &str = "operon://note/";
+
+/// Parse `operon://note/<uuid>` into a `Uuid`. Returns `None` for any
+/// other URL or a malformed payload — used by the renderer to decide
+/// whether to route a link / image through the operon resolvers.
+pub fn parse_operon_note_url(dest: &str) -> Option<Uuid> {
+    let rest = dest.strip_prefix(OPERON_NOTE_SCHEME)?;
+    Uuid::parse_str(rest.trim()).ok()
+}
 
 /// Plans-Phase-5-vfs-wikilinks: optional click resolver for `[[…]]` links.
 /// When a Local-Mode shell is mounted it installs this context with a
@@ -37,6 +54,14 @@ pub struct WikiLinkImageResolver(pub Callback<String, Option<String>>);
 /// pass through unchanged via `None`.
 #[derive(Clone, Copy)]
 pub struct MarkdownImageResolver(pub Callback<String, Option<String>>);
+
+/// Click resolver for `operon://note/<uuid>` markdown links emitted by
+/// the artifact link picker. The Local-Mode shell installs this with a
+/// callback that opens the target note in a new tab. Uninstalled in
+/// the cloud / sandbox preview, in which case the link falls through
+/// to a plain anchor with the literal `operon://` href.
+#[derive(Clone, Copy)]
+pub struct NoteLinkResolver(pub Callback<Uuid>);
 
 #[component]
 pub fn MarkdownView(content: String) -> Element {
@@ -84,9 +109,36 @@ pub fn render_node(n: &MdNode) -> Element {
         MdNode::Text(t) => rsx! { "{t}" },
         MdNode::Strong(c) => rsx! { strong { {render_children(c)} } },
         MdNode::Emphasis(c) => rsx! { em { {render_children(c)} } },
-        MdNode::Link { dest, children, .. } => rsx! {
-            a { href: "{dest}", target: "_blank", {render_children(children)} }
-        },
+        MdNode::Link { dest, children, .. } => {
+            // Detect `operon://note/<uuid>` links emitted by the
+            // artifact picker / drag-drop. When a `NoteLinkResolver`
+            // is installed (Local-Mode shell), clicking the anchor
+            // routes through it and opens the target note. Otherwise
+            // we fall through to the default external-link behaviour
+            // so cloud preview still shows the literal href.
+            if let Some(note_id) = parse_operon_note_url(dest) {
+                let resolver = try_consume_context::<NoteLinkResolver>();
+                let onclick = move |evt: Event<MouseData>| {
+                    if let Some(NoteLinkResolver(cb)) = resolver {
+                        evt.prevent_default();
+                        cb.call(note_id);
+                    }
+                };
+                rsx! {
+                    a {
+                        class: "operon-note-link",
+                        href: "{dest}",
+                        "data-operon-note": "{note_id}",
+                        onclick,
+                        {render_children(children)}
+                    }
+                }
+            } else {
+                rsx! {
+                    a { href: "{dest}", target: "_blank", {render_children(children)} }
+                }
+            }
+        }
         MdNode::Image { dest, alt } => {
             // Try the local-mode resolver first so vault-relative blob
             // paths (`.operon/images/<sha>.png`) inflate to a data: URL

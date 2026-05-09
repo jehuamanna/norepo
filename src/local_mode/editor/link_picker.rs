@@ -12,6 +12,7 @@
 use dioxus::prelude::*;
 use operon_store::repos::{NoteKind, SearchKind};
 use operon_store::vfs;
+use uuid::Uuid;
 
 use crate::local_mode::explorer::ExplorerSearchRepo;
 
@@ -27,14 +28,25 @@ use crate::local_mode::explorer::ExplorerSearchRepo;
 pub struct PickedLink {
     pub target: String,
     pub embed: bool,
+    /// Resolved note UUID for note hits — `None` for project hits.
+    /// Lets callers that prefer markdown-link syntax build
+    /// `[Title](operon://note/<uuid>)` instead of the wikilink form
+    /// `target` carries.
+    pub note_id: Option<Uuid>,
+    /// Display title for the picked entry — note title for notes,
+    /// project name for projects. Used as the visible link text in
+    /// markdown-link callers.
+    pub title: String,
 }
 
 #[component]
 pub fn LinkPicker(open: Signal<bool>, on_pick: EventHandler<PickedLink>) -> Element {
     let search_repo: ExplorerSearchRepo = use_context();
     let mut query: Signal<String> = use_signal(String::new);
-    // (target, breadcrumb-for-display, kind: None=project, Some(NoteKind)=note)
-    let mut results: Signal<Vec<(String, String, Option<NoteKind>)>> = use_signal(Vec::new);
+    // (target, breadcrumb-for-display, kind: None=project, Some(NoteKind)=note,
+    //  resolved note id, display title)
+    let mut results: Signal<Vec<(String, String, Option<NoteKind>, Option<Uuid>, String)>> =
+        use_signal(Vec::new);
     // Plans-Phase-9-wikilink-picker (rev 2): keyboard-driven highlight
     // index. Arrow up/down moves; Enter picks the highlighted row. Reset
     // to 0 every time the result list changes so a stale index can never
@@ -52,9 +64,14 @@ pub fn LinkPicker(open: Signal<bool>, on_pick: EventHandler<PickedLink>) -> Elem
     // `results.read()`. Builds the PickedLink and closes.
     let pick_at = use_callback(move |idx: usize| {
         let snap = results.read().clone();
-        if let Some((target, _, note_kind)) = snap.get(idx).cloned() {
+        if let Some((target, _, note_kind, note_id, title)) = snap.get(idx).cloned() {
             let embed = matches!(note_kind, Some(NoteKind::Image));
-            on_pick.call(PickedLink { target, embed });
+            on_pick.call(PickedLink {
+                target,
+                embed,
+                note_id,
+                title,
+            });
             close.call(());
         }
     });
@@ -78,25 +95,33 @@ pub fn LinkPicker(open: Signal<bool>, on_pick: EventHandler<PickedLink>) -> Elem
             let loader = |_id: uuid::Uuid| -> Option<String> { None };
             match search_repo.0.search(needle.trim(), false, 50, &loader) {
                 Ok(hits) => {
-                    let rows: Vec<(String, String, Option<NoteKind>)> = hits
-                        .into_iter()
-                        .map(|h| match h.kind {
-                            SearchKind::Project => (h.title.clone(), h.breadcrumb, None),
-                            SearchKind::Note => {
-                                // Plans-Phase-9-wikilink-picker (rev 2):
-                                // emit the FULL parent-path target (the
-                                // search-repo breadcrumb walks parent_id
-                                // and produces "Project / Folder / .../
-                                // Title") AND append `^short` so duplicate
-                                // titles still resolve uniquely. The vfs
-                                // Nested form parses both the path and
-                                // the short id.
-                                let path = h.breadcrumb.replace(" / ", "/");
-                                let target = format!("{}^{}", path, vfs::short_id(h.id));
-                                (target, h.breadcrumb, h.note_kind)
-                            }
-                        })
-                        .collect();
+                    let rows: Vec<(String, String, Option<NoteKind>, Option<Uuid>, String)> =
+                        hits
+                            .into_iter()
+                            .map(|h| match h.kind {
+                                SearchKind::Project => (
+                                    h.title.clone(),
+                                    h.breadcrumb,
+                                    None,
+                                    None,
+                                    h.title,
+                                ),
+                                SearchKind::Note => {
+                                    // Plans-Phase-9-wikilink-picker (rev 2):
+                                    // emit the FULL parent-path target (the
+                                    // search-repo breadcrumb walks parent_id
+                                    // and produces "Project / Folder / .../
+                                    // Title") AND append `^short` so duplicate
+                                    // titles still resolve uniquely. The vfs
+                                    // Nested form parses both the path and
+                                    // the short id.
+                                    let path = h.breadcrumb.replace(" / ", "/");
+                                    let target =
+                                        format!("{}^{}", path, vfs::short_id(h.id));
+                                    (target, h.breadcrumb, h.note_kind, Some(h.id), h.title)
+                                }
+                            })
+                            .collect();
                     results_setter.set(rows);
                 }
                 Err(e) => {
@@ -167,7 +192,7 @@ pub fn LinkPicker(open: Signal<bool>, on_pick: EventHandler<PickedLink>) -> Elem
                     class: "operon-modal-results",
                     role: "listbox",
                     style: "list-style: none; padding: 0; margin: 0.5rem 0; max-height: 16rem; overflow-y: auto;",
-                    for (i, (target, breadcrumb, note_kind)) in results.read().iter().cloned().enumerate() {
+                    for (i, (target, breadcrumb, note_kind, _note_id, _title)) in results.read().iter().cloned().enumerate() {
                         li {
                             key: "{i}-{target}",
                             // Plans-Phase-9-wikilink-picker (rev 2):

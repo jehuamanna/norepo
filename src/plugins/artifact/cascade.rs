@@ -28,6 +28,7 @@ use crate::persistence::Persistence;
 use crate::plugins::artifact::cascade_graph::{
     parse_cross_tree_deps, parse_depends_on, CascadeGraphWriter,
 };
+use crate::plugins::workflow::state::NodeStatus;
 use crate::plugins::artifact::frontmatter::{
     parse as parse_artifact_fm, rewrite as rewrite_artifact_fm, ArtifactKind, ArtifactStatus,
 };
@@ -79,6 +80,13 @@ pub struct SkillRef {
 /// stages dropdown — only skills in this set participate. An empty set
 /// means *no* skills run; the cascade returns Completed with zero
 /// artifacts produced.
+///
+/// `max_depth` bounds how far down the BFS the cascade walks before
+/// stopping. `None` is unbounded (the original full-cascade behavior);
+/// `Some(1)` runs skills only on the root and enqueues — but does not
+/// process — its direct children, which is the "one step at a time"
+/// progression the workflow card's ▶ button uses to walk the SDLC
+/// pipeline level by level.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_cascade(
     note_repo: &Arc<dyn LocalNoteRepository>,
@@ -91,6 +99,7 @@ pub async fn run_cascade(
     enabled_skill_ids: HashSet<Uuid>,
     cancel: CancellationToken,
     graph_writer: Option<&mut CascadeGraphWriter>,
+    max_depth: Option<u32>,
 ) -> Result<CascadeOutcome, CascadeError> {
     // 1. Snapshot every project skill, drop the ones not in the
     //    enabled set, parse contracts. One-shot — skill bodies don't
@@ -177,6 +186,41 @@ pub async fn run_cascade(
             continue 'outer;
         }
 
+        // Depth cap. `max_depth = Some(1)` makes the workflow card's
+        // ▶ button advance one level per click — the root runs its
+        // skills (producing children), the children get popped at
+        // level 1 and short-circuit here without firing skills.
+        if let Some(max) = max_depth {
+            if level >= max {
+                done.insert(art_id);
+                continue 'outer;
+            }
+        }
+
+        // Approval gate: non-root artifacts must be `Approved` for the
+        // cascade to run skills on them. Lets the user approve a subset
+        // of newly-produced children and re-click Play (at any level)
+        // to walk only the approved subtrees. The explicit play
+        // target (`root_artifact_id`) is exempt — it's the entry point
+        // the user just clicked, so it always runs (the toolbar's
+        // `is_runnable_source` check already gated the click on
+        // Approved-or-root anyway). Skipped artifacts stay untouched
+        // visually — the existing status pill on the snapshot already
+        // surfaces "Pending" / "Rejected" without extra UI.
+        if art_id != root_artifact_id {
+            let approved = matches!(
+                read_status(persistence, art_id).await,
+                Some(ArtifactStatus::Approved)
+            );
+            if !approved {
+                tracing::debug!(
+                    target: "operon::cascade",
+                    "approval gate: skipping {art_id} (not Approved)"
+                );
+                continue 'outer;
+            }
+        }
+
         let kind_str = match read_kind(persistence, art_id).await {
             Some(k) => k,
             None => {
@@ -259,6 +303,21 @@ pub async fn run_cascade(
                 );
             });
 
+            // Mark the source artifact's snapshot in the workflow
+            // graph as Running so the canvas surfaces a spinner on
+            // the tile that's currently feeding the active skill.
+            // Flush so the canvas's WORKFLOW_GRAPH_VERSION watcher
+            // re-reads the body and re-renders.
+            if let Some(writer) = graph_writer.as_deref_mut() {
+                writer.mark_artifact_status(art_id, NodeStatus::Running);
+                if let Err(e) = writer.flush(persistence).await {
+                    tracing::warn!(
+                        target: "operon::cascade",
+                        "graph mark-running flush failed: {e}"
+                    );
+                }
+            }
+
             // Route every cascade skill run through the cascade-wide
             // chat session (not the per-source one). Without this the
             // user's `Cascade: <id>` tab stays empty even while skills
@@ -331,7 +390,10 @@ pub async fn run_cascade(
                     // workflow canvas re-renders live as the cascade
                     // progresses (the user can keep the Cascade
                     // workflow tab open and watch nodes appear).
-                    if let Some(writer) = graph_writer.as_deref() {
+                    // Also clear the source's Running marker — the
+                    // skill on this artifact is done.
+                    if let Some(writer) = graph_writer.as_deref_mut() {
+                        writer.mark_artifact_status(art_id, NodeStatus::Fresh);
                         if let Err(e) = writer.flush(persistence).await {
                             tracing::warn!(
                                 target: "operon::cascade",
@@ -363,6 +425,7 @@ pub async fn run_cascade(
                         // before bailing — keeps the canvas honest.
                         if let Some(writer) = graph_writer.as_deref_mut() {
                             writer.finalize_depends_on(&titles);
+                            writer.finalize_cross_tree_deps(&titles);
                             if let Err(e) = writer.flush(persistence).await {
                                 tracing::warn!(
                                     target: "operon::cascade",
@@ -379,10 +442,17 @@ pub async fn run_cascade(
                     }
                 }
                 Err(e) => {
-                    return Err(CascadeError::SkillRun(format!(
-                        "{} on {}: {e}",
-                        skill.title, art_id
-                    )));
+                    let msg = format!("{} on {}: {e}", skill.title, art_id);
+                    if let Some(writer) = graph_writer.as_deref_mut() {
+                        writer.mark_artifact_status(art_id, NodeStatus::Error(msg.clone()));
+                        if let Err(fe) = writer.flush(persistence).await {
+                            tracing::warn!(
+                                target: "operon::cascade",
+                                "graph mark-error flush failed: {fe}"
+                            );
+                        }
+                    }
+                    return Err(CascadeError::SkillRun(msg));
                 }
             }
         }
@@ -408,10 +478,14 @@ pub async fn run_cascade(
 
     // Second pass for the visualization: now that every artifact is
     // on disk with its body, parse `## Depends on` sections and add
-    // amber cross-edges between siblings. Then a final flush so the
-    // canvas reflects the dependency edges.
+    // amber cross-edges between siblings. Also walk
+    // prioritized_backlog bodies for their `## Cross-tree
+    // dependencies` section so the consolidated cross-edges declared
+    // by the prioritization skills land on the canvas. Then a final
+    // flush so the canvas reflects the dependency edges.
     if let Some(writer) = graph_writer.as_deref_mut() {
         writer.finalize_depends_on(&titles);
+        writer.finalize_cross_tree_deps(&titles);
         if let Err(e) = writer.flush(persistence).await {
             tracing::warn!(
                 target: "operon::cascade",
@@ -757,6 +831,68 @@ pub async fn read_kind(persistence: &Arc<dyn Persistence>, id: Uuid) -> Option<S
     let body = String::from_utf8(bytes).ok()?;
     let fm = parse_artifact_fm(&body);
     fm.artifact_kind.map(|k| k.as_str().to_string())
+}
+
+/// Read the artifact's status (Pending/Approved/Rejected/Dirty/...) off
+/// its frontmatter. Returns `None` if the note can't be loaded; treat
+/// that as "skip" at the callsite. Used by the cascade BFS approval
+/// gate so non-approved children block downstream walking.
+pub async fn read_status(
+    persistence: &Arc<dyn Persistence>,
+    id: Uuid,
+) -> Option<ArtifactStatus> {
+    let bytes = persistence.load(&id.to_string()).await.ok()?;
+    let body = String::from_utf8(bytes).ok()?;
+    let fm = parse_artifact_fm(&body);
+    Some(fm.status)
+}
+
+/// For an artifact `art_id` rooted somewhere under `seed_id`, return
+/// the human titles of every prerequisite (from its `## Depends on`
+/// body section + sibling prioritized-backlog cross-tree edges) that
+/// is NOT currently `ArtifactStatus::Approved`. Empty Vec means the
+/// cascade can run on this artifact without the runtime dep gate
+/// (`cascade.rs:174-187`) deadlocking.
+///
+/// The artifact-view's Play button uses this to render its disabled
+/// state + tooltip, so the user sees "Approve X first" instead of
+/// clicking through to a confusing "cascade deadlocked" error. The
+/// runtime gate stays intact as a defensive net for races.
+pub async fn unmet_dep_titles(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    persistence: &Arc<dyn Persistence>,
+    project_id: Uuid,
+    seed_id: Uuid,
+    art_id: Uuid,
+) -> Vec<String> {
+    let deps = compute_artifact_deps(note_repo, persistence, project_id, seed_id, art_id).await;
+    if deps.is_empty() {
+        return Vec::new();
+    }
+    let notes = match note_repo.list_for_project(project_id) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let title_for = |id: Uuid| -> String {
+        notes
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| n.title.clone())
+            .unwrap_or_else(|| id.to_string())
+    };
+    let mut out: Vec<String> = Vec::new();
+    for dep_id in deps {
+        let approved = matches!(
+            read_status(persistence, dep_id).await,
+            Some(ArtifactStatus::Approved)
+        );
+        if !approved {
+            out.push(title_for(dep_id));
+        }
+    }
+    // Stable order so the tooltip text doesn't churn between renders.
+    out.sort();
+    out
 }
 
 /// Flip an artifact's status to Approved on disk so downstream skills

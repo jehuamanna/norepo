@@ -328,13 +328,32 @@ pub fn open_local_note_tab(
     // MainArea can dispatch to the right FormatPlugin (markdown → textarea
     // fallback inside LocalNoteEditor; mdx/canvas/excalidraw/kanban/code →
     // their own plugin's render_edit).
-    let id = tabs.write().open_manual_save_new(
-        note_id_str,
-        kind.format_id().to_string(),
-        title,
-        initial_content,
-    );
-    save_scheduler.set_manual_save(id);
+    //
+    // Workflow notes (NoteKind::Workflow) opt OUT of manual-save:
+    // their bodies are structured graph state that's mutated by node
+    // drags, auto-arrange, "Run all dirty", and the cascade runner's
+    // out-of-band flushes. Showing "Unsaved" between every node move
+    // and forcing Ctrl+S to confirm makes no sense for that workflow
+    // — auto-save through the debounced `SaveScheduler` is the right
+    // default. Free-form kinds (markdown, mdx, code, …) keep
+    // manual-save so users have explicit control over text edits.
+    let id = if matches!(kind, operon_store::repos::NoteKind::Workflow) {
+        tabs.write().open_auto_save_new(
+            note_id_str,
+            kind.format_id().to_string(),
+            title,
+            initial_content,
+        )
+    } else {
+        let new_id = tabs.write().open_manual_save_new(
+            note_id_str,
+            kind.format_id().to_string(),
+            title,
+            initial_content,
+        );
+        save_scheduler.set_manual_save(new_id);
+        new_id
+    };
     tabs.write().set_mode(id, EditorMode::Edit);
     id
 }
@@ -1027,7 +1046,7 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
             let short = operon_store::vfs::short_id(new_note.id);
             let embed = format!("![[{}^{}]]", stem, short);
             // Plans-Phase-9-monaco-desktop (rev 1): splice via Monaco.
-            if let Some(channel) = *monaco_channel.peek() {
+            if let Some(channel) = monaco_channel.peek().as_ref().cloned() {
                 channel.splice(&embed);
                 tabs_for_image.write().set_dirty(tab_id, true);
             } else {
@@ -1061,7 +1080,7 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
         // Plans-Phase-9-monaco-desktop (rev 1): splice through Monaco
         // (caret-aware, undo-aware). The resulting onChange propagates
         // back into `Tab.content` automatically.
-        if let Some(channel) = *monaco_channel.peek() {
+        if let Some(channel) = monaco_channel.peek().as_ref().cloned() {
             channel.splice(&inserted);
             tabs_for_link.write().set_dirty(tab_id, true);
         } else {
@@ -1242,7 +1261,7 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
                             let embed = format!("![[{stem}^{short}]]");
                             // Plans-Phase-9-monaco-desktop (rev 1):
                             // splice via Monaco (caret-aware, undo-aware).
-                            if let Some(channel) = *monaco_channel.peek() {
+                            if let Some(channel) = monaco_channel.peek().as_ref().cloned() {
                                 channel.splice(&embed);
                                 tabs_sig.write().set_dirty(cur_tab_id, true);
                             } else {

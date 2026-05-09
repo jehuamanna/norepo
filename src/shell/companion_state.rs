@@ -164,6 +164,24 @@ pub static CASCADE_STATE: GlobalSignal<HashMap<Uuid, CascadePhase>> =
 pub static CASCADE_CANCEL: GlobalSignal<HashMap<Uuid, tokio_util::sync::CancellationToken>> =
     Signal::global(HashMap::new);
 
+/// Per-workflow-note version counter that the cascade graph writer
+/// bumps after every successful `flush()` to disk. The workflow
+/// canvas subscribes by note id: when its entry changes, it re-loads
+/// the body from persistence and re-parses the graph so the user
+/// sees newly-produced artifact-snapshot nodes appear live as a
+/// cascade runs.
+///
+/// Keyed by the **workflow note id** (the `Cascade: <root>` note),
+/// not the source-artifact id, so two open canvases backed by
+/// distinct cascade roots refresh independently.
+///
+/// We don't piggyback on `LocalNoteVersion` because that bumps for
+/// every note write app-wide; per-workflow keying lets idle canvases
+/// pay nothing and limits the re-render storm during a busy
+/// cascade.
+pub static WORKFLOW_GRAPH_VERSION: GlobalSignal<HashMap<Uuid, u64>> =
+    Signal::global(HashMap::new);
+
 /// Live letter-by-letter streaming buffer for in-progress Claude
 /// assistant text, keyed on `chat_session_id`. The runner appends
 /// each `Text` event delta to the entry and clears it on flush
