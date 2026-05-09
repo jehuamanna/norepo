@@ -158,6 +158,16 @@ pub(super) fn extend_keyboard_selection(
 #[derive(Clone, Copy)]
 pub struct LastClicked(pub Signal<Option<NodeKey>>);
 
+/// Source-of-truth for which row should currently hold DOM focus. Each
+/// row's `use_effect` subscribes to this (plus `LocalNoteVersion` so the
+/// effect also re-fires after data mutations) and calls `set_focus(true)`
+/// on its captured `MountedData` when matched. Replacing imperative JS
+/// `el.focus()` calls with this signal makes focus reactive — Dioxus
+/// list-reorder diffs (Alt+↑/↓ moves) that drop browser focus self-heal
+/// on the next render because the effect re-runs and re-focuses the row.
+#[derive(Clone, Copy)]
+pub struct FocusedNode(pub Signal<Option<NodeKey>>);
+
 /// Plans-Phase-4-multiselect-aria: visible flattened tree across all
 /// projects, in document order, respecting open/closed state. Updated by
 /// ExplorerPanel whenever its inputs change; NoteRow / ProjectRow consume
@@ -515,6 +525,8 @@ pub fn ExplorerPanel() -> Element {
     let mut pending_bulk_delete_setter = pending_bulk_delete;
     let MultiSelected(mut multi_selected) = use_context();
     let multi_selected_for_render = multi_selected;
+    let LastClicked(mut last_clicked_for_clear) = use_context();
+    let FocusedNode(mut focused_node_for_clear) = use_context();
 
     // ===== Project handlers =====
     let on_select_project = use_callback(move |id: Uuid| {
@@ -2344,7 +2356,28 @@ pub fn ExplorerPanel() -> Element {
                     let mods = evt.modifiers();
                     let with_meta = mods.contains(keyboard_types::Modifiers::META)
                         || mods.contains(keyboard_types::Modifiers::CONTROL);
-                    if key == "Delete" || key == "Backspace" {
+                    if key == "Escape" {
+                        // Clear all selection state — single + multi + anchor
+                        // + focused-row marker. Stop propagation so a wrapping
+                        // shell (palette, etc.) doesn't also eat this Escape.
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        if !multi_selected.peek().is_empty() {
+                            multi_selected.set(std::collections::BTreeSet::new());
+                        }
+                        if selected_note.peek().is_some() {
+                            selected_note.set(None);
+                        }
+                        if selected_project.peek().is_some() {
+                            selected_project.set(None);
+                        }
+                        if last_clicked_for_clear.peek().is_some() {
+                            last_clicked_for_clear.set(None);
+                        }
+                        if focused_node_for_clear.peek().is_some() {
+                            focused_node_for_clear.set(None);
+                        }
+                    } else if key == "Delete" || key == "Backspace" {
                         let count = multi_selected_for_render.read().len();
                         if count >= 2 {
                             evt.prevent_default();

@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::editor::EditorMode;
 use crate::local_mode::explorer::{
-    extend_keyboard_selection, ExplorerUndoCtx, LastClicked, MultiSelected, NodeKey,
+    extend_keyboard_selection, ExplorerUndoCtx, FocusedNode, LastClicked, MultiSelected, NodeKey,
     NotesByProjectCtx, VisibleFlat,
 };
 use crate::local_mode::ui::{
@@ -129,6 +129,7 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let MultiSelected(mut multi_selected) = use_context();
     let LastClicked(mut last_clicked) = use_context();
     let VisibleFlat(visible_flat) = use_context();
+    let FocusedNode(mut focused_node) = use_context();
     // Space = open without focus shift. We need a handle to the focus
     // request signal so the Space keydown branch can clear it after
     // on_select sets it (see the Space handler below).
@@ -139,6 +140,11 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let id = note.id;
     let id_str = id.to_string();
     let title = note.title.clone();
+    // Captured by Copy into the keydown closure so ArrowLeft (parent
+    // navigation) can write the parent's NodeKey into `focused_node`
+    // without re-borrowing `note`.
+    let parent_id = note.parent_id;
+    let project_id = note.project_id;
     let depth = props.depth.max(0);
     let has_children = props.has_children;
     let is_open = props.is_open;
@@ -490,7 +496,11 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                     multi_selected.set(std::collections::BTreeSet::new());
                 }
                 last_clicked.set(Some(key));
+                let mut focus_req = focus_request_for_space;
                 on_select.call(id);
+                focus_req.set(None);
+                focused_node.set(Some(NodeKey::Note(id)));
+                focus_explorer_node_deferred(NodeKey::Note(id));
             },
             ondoubleclick: move |evt| {
                 evt.stop_propagation();
@@ -541,22 +551,34 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                         }
                         return;
                     }
-                    if key == "Tab" {
-                        evt.prevent_default();
-                        evt.stop_propagation();
-                        if mods.contains(Modifiers::SHIFT) {
-                            on_outdent.call(id);
-                        } else {
-                            on_indent.call(id);
-                        }
-                    } else if key == "ArrowUp" && mods.contains(Modifiers::ALT) {
+                    if key == "ArrowUp" && mods.contains(Modifiers::ALT) {
                         evt.prevent_default();
                         evt.stop_propagation();
                         on_move_up.call(id);
+                        // Same NodeKey, but the data mutation reorders the
+                        // DOM; the deferred JS focus re-asserts DOM focus
+                        // after the diff applies (double-RAF), keeping
+                        // held-down Alt+↑ continuous.
+                        focused_node.set(Some(NodeKey::Note(id)));
+                        focus_explorer_node_deferred(NodeKey::Note(id));
                     } else if key == "ArrowDown" && mods.contains(Modifiers::ALT) {
                         evt.prevent_default();
                         evt.stop_propagation();
                         on_move_down.call(id);
+                        focused_node.set(Some(NodeKey::Note(id)));
+                        focus_explorer_node_deferred(NodeKey::Note(id));
+                    } else if key == "ArrowLeft" && mods.contains(Modifiers::ALT) {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        on_outdent.call(id);
+                        focused_node.set(Some(NodeKey::Note(id)));
+                        focus_explorer_node_deferred(NodeKey::Note(id));
+                    } else if key == "ArrowRight" && mods.contains(Modifiers::ALT) {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        on_indent.call(id);
+                        focused_node.set(Some(NodeKey::Note(id)));
+                        focus_explorer_node_deferred(NodeKey::Note(id));
                     } else if key == "ArrowDown" && mods.contains(Modifiers::SHIFT) {
                         // Shift+ArrowDown: extend the multi-selection one row
                         // downward from the current anchor (last_clicked).
@@ -569,7 +591,10 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                             &last_clicked,
                             &visible_flat,
                         );
-                        focus_explorer_sibling(1);
+                        if let Some(next) = next_visible(NodeKey::Note(id), 1, &visible_flat) {
+                            focused_node.set(Some(next));
+                            focus_explorer_node_deferred(next);
+                        }
                     } else if key == "ArrowUp" && mods.contains(Modifiers::SHIFT) {
                         evt.prevent_default();
                         evt.stop_propagation();
@@ -580,23 +605,35 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                             &last_clicked,
                             &visible_flat,
                         );
-                        focus_explorer_sibling(-1);
+                        if let Some(next) = next_visible(NodeKey::Note(id), -1, &visible_flat) {
+                            focused_node.set(Some(next));
+                            focus_explorer_node_deferred(next);
+                        }
                     } else if key == "ArrowDown" {
                         evt.prevent_default();
                         evt.stop_propagation();
-                        focus_explorer_sibling(1);
+                        if let Some(next) = next_visible(NodeKey::Note(id), 1, &visible_flat) {
+                            focused_node.set(Some(next));
+                            focus_explorer_node_deferred(next);
+                        }
                     } else if key == "ArrowUp" {
                         evt.prevent_default();
                         evt.stop_propagation();
-                        focus_explorer_sibling(-1);
+                        if let Some(next) = next_visible(NodeKey::Note(id), -1, &visible_flat) {
+                            focused_node.set(Some(next));
+                            focus_explorer_node_deferred(next);
+                        }
                     } else if key == "ArrowRight" {
                         evt.prevent_default();
                         evt.stop_propagation();
                         if has_children {
                             if !is_open {
                                 on_toggle_open.call(id);
-                            } else {
-                                focus_explorer_sibling(1);
+                            } else if let Some(next) =
+                                next_visible(NodeKey::Note(id), 1, &visible_flat)
+                            {
+                                focused_node.set(Some(next));
+                                focus_explorer_node_deferred(next);
                             }
                         }
                     } else if key == "ArrowLeft" {
@@ -605,16 +642,30 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                         if has_children && is_open {
                             on_toggle_open.call(id);
                         } else {
-                            focus_explorer_parent();
+                            // Parent: NodeKey::Note(parent_id) if nested,
+                            // otherwise the project row (NodeKey::Project).
+                            let parent_key = parent_id
+                                .map(NodeKey::Note)
+                                .unwrap_or(NodeKey::Project(project_id));
+                            focused_node.set(Some(parent_key));
+                            focus_explorer_node_deferred(parent_key);
                         }
                     } else if key == "Home" {
                         evt.prevent_default();
                         evt.stop_propagation();
-                        focus_explorer_edge(true);
+                        let flat = visible_flat.peek().clone();
+                        if let Some(first) = flat.first().copied() {
+                            focused_node.set(Some(first));
+                            focus_explorer_node_deferred(first);
+                        }
                     } else if key == "End" {
                         evt.prevent_default();
                         evt.stop_propagation();
-                        focus_explorer_edge(false);
+                        let flat = visible_flat.peek().clone();
+                        if let Some(last) = flat.last().copied() {
+                            focused_node.set(Some(last));
+                            focus_explorer_node_deferred(last);
+                        }
                     } else if key == "Enter" {
                         evt.prevent_default();
                         evt.stop_propagation();
@@ -1084,74 +1135,59 @@ fn DropIndicator(position: DropPosition, snapped: bool, depth: i64) -> Element {
     }
 }
 
-/// Move keyboard focus to the next or previous explorer row (project or
-/// note) in document order. `dir` is `1` for down, `-1` for up. Wraps at
-/// the ends. Implemented via a small JS shim because focus is a DOM-only
-/// concern in Dioxus desktop / web.
-pub(super) fn focus_explorer_sibling(dir: i32) {
+/// Defer a DOM focus to *after* Dioxus's diff has applied. Uses a
+/// double-`requestAnimationFrame`: the first RAF runs before the next
+/// paint (mutations applied), the second guarantees we're past the
+/// diff-paint cycle. We don't use `setTimeout(0)` because that fires on
+/// the next event-loop tick, which can land *before* Dioxus finishes
+/// applying the keyed-list move. We don't use `MountedData::set_focus`
+/// because Dioxus 0.7.1's keyed-list reorder is a *move* — `onmounted`
+/// doesn't re-fire and the cached handle silently no-ops in Wry's
+/// interpreter. We don't use a panel-scope `use_effect` because
+/// `use_effect` is documented-broken in `ExplorerPanel`'s render scope
+/// (`mod.rs:379-416`). Querying by `data-note-id` / `data-project-id`
+/// inside a double-RAF works around all three pitfalls.
+pub(super) fn focus_explorer_node_deferred(target: NodeKey) {
+    let attr = match target {
+        NodeKey::Project(id) => format!(r#"data-project-id="{id}""#),
+        NodeKey::Note(id) => format!(r#"data-note-id="{id}""#),
+    };
     let script = format!(
         r#"
-        (function() {{
-            var nodes = Array.prototype.slice.call(document.querySelectorAll(
-                '[data-testid="explorer-panel"] [data-explorer="true"][tabindex="0"], '
-                + '[data-testid="explorer-panel"] [data-explorer="true"][role="treeitem"]'
-            ));
-            if (!nodes.length) return;
-            var cur = document.activeElement;
-            var idx = nodes.indexOf(cur);
-            if (idx < 0) idx = 0;
-            var next = idx + ({dir});
-            if (next < 0) next = nodes.length - 1;
-            if (next >= nodes.length) next = 0;
-            var el = nodes[next];
-            if (el && typeof el.focus === 'function') el.focus();
-        }})();
+        requestAnimationFrame(function() {{
+            requestAnimationFrame(function() {{
+                var el = document.querySelector(
+                    '[data-testid="explorer-panel"] [{attr}]'
+                );
+                if (el && typeof el.focus === 'function') el.focus();
+            }});
+        }});
         "#
     );
-    document::eval(&script);
+    let _ = document::eval(&script);
 }
 
-/// Move keyboard focus to the parent of the focused row. For a top-level
-/// row (no parent within the panel) this is a no-op. The parent is
-/// detected by walking back through document order until we find a row
-/// at a lower depth.
-pub(super) fn focus_explorer_parent() {
-    document::eval(
-        r#"
-        (function() {
-            var nodes = Array.prototype.slice.call(document.querySelectorAll(
-                '[data-testid="explorer-panel"] [data-explorer="true"][role="treeitem"]'
-            ));
-            if (!nodes.length) return;
-            var cur = document.activeElement;
-            var idx = nodes.indexOf(cur);
-            if (idx < 0) return;
-            var curLevel = parseInt(cur.getAttribute('aria-level') || '1', 10);
-            for (var i = idx - 1; i >= 0; i--) {
-                var lvl = parseInt(nodes[i].getAttribute('aria-level') || '1', 10);
-                if (lvl < curLevel) { nodes[i].focus(); return; }
-            }
-        })();
-        "#,
-    );
-}
-
-/// Move focus to the first or last explorer row.
-pub(super) fn focus_explorer_edge(first: bool) {
-    let pick = if first { "0" } else { "nodes.length - 1" };
-    let script = format!(
-        r#"
-        (function() {{
-            var nodes = document.querySelectorAll(
-                '[data-testid="explorer-panel"] [data-explorer="true"][role="treeitem"]'
-            );
-            if (!nodes.length) return;
-            var el = nodes[{pick}];
-            if (el && typeof el.focus === 'function') el.focus();
-        }})();
-        "#
-    );
-    document::eval(&script);
+/// Resolve the next/previous visible explorer row from `visible_flat`,
+/// wrapping at the ends. `dir` is `1` for down, `-1` for up. Returns
+/// `None` when the list is empty (callers should leave `focused_node`
+/// unchanged in that case). Pure Rust — no JS / DOM access.
+pub(super) fn next_visible(
+    current: NodeKey,
+    dir: i32,
+    visible_flat: &Signal<Vec<NodeKey>>,
+) -> Option<NodeKey> {
+    let flat = visible_flat.peek().clone();
+    if flat.is_empty() {
+        return None;
+    }
+    let cur_pos = flat
+        .iter()
+        .position(|k| k == &current)
+        .map(|p| p as i32)
+        .unwrap_or(0);
+    let len = flat.len() as i32;
+    let next_pos = ((cur_pos + dir) % len + len) % len;
+    Some(flat[next_pos as usize])
 }
 
 /// Plans-Phase-3-explorer-drag-drop-feedback: shown when the dragged note

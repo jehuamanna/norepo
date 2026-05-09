@@ -14,8 +14,8 @@ use keyboard_types::Modifiers;
 
 use crate::local_mode::desktop::LocalNoteRepo;
 use crate::local_mode::explorer::{
-    ExplorerUndoCtx, LastClicked, LocalNoteVersion, MultiSelected, NodeKey, NotesByProjectCtx,
-    VisibleFlat,
+    ExplorerUndoCtx, FocusedNode, LastClicked, LocalNoteVersion, MultiSelected, NodeKey,
+    NotesByProjectCtx, VisibleFlat,
 };
 use crate::local_mode::ui::{
     classify_drop_position, ContextMenu, ContextMenuItem, DragKind, DragSession, DropPosition,
@@ -98,6 +98,7 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     let MultiSelected(mut multi_selected) = use_context();
     let LastClicked(mut last_clicked) = use_context();
     let VisibleFlat(visible_flat) = use_context();
+    let FocusedNode(mut focused_node) = use_context();
     let NotesByProjectCtx(notes_by_project_ctx) = use_context();
 
     let project = props.project.clone();
@@ -397,7 +398,14 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
                         &last_clicked,
                         &visible_flat,
                     );
-                    super::note_row::focus_explorer_sibling(1);
+                    if let Some(next) = super::note_row::next_visible(
+                        NodeKey::Project(id),
+                        1,
+                        &visible_flat,
+                    ) {
+                        focused_node.set(Some(next));
+                        super::note_row::focus_explorer_node_deferred(next);
+                    }
                 } else if key == "ArrowUp" && mods.contains(Modifiers::SHIFT) {
                     evt.prevent_default();
                     evt.stop_propagation();
@@ -408,22 +416,48 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
                         &last_clicked,
                         &visible_flat,
                     );
-                    super::note_row::focus_explorer_sibling(-1);
+                    if let Some(next) = super::note_row::next_visible(
+                        NodeKey::Project(id),
+                        -1,
+                        &visible_flat,
+                    ) {
+                        focused_node.set(Some(next));
+                        super::note_row::focus_explorer_node_deferred(next);
+                    }
                 } else if key == "ArrowDown" {
                     evt.prevent_default();
                     evt.stop_propagation();
-                    super::note_row::focus_explorer_sibling(1);
+                    if let Some(next) = super::note_row::next_visible(
+                        NodeKey::Project(id),
+                        1,
+                        &visible_flat,
+                    ) {
+                        focused_node.set(Some(next));
+                        super::note_row::focus_explorer_node_deferred(next);
+                    }
                 } else if key == "ArrowUp" {
                     evt.prevent_default();
                     evt.stop_propagation();
-                    super::note_row::focus_explorer_sibling(-1);
+                    if let Some(next) = super::note_row::next_visible(
+                        NodeKey::Project(id),
+                        -1,
+                        &visible_flat,
+                    ) {
+                        focused_node.set(Some(next));
+                        super::note_row::focus_explorer_node_deferred(next);
+                    }
                 } else if key == "ArrowRight" {
                     evt.prevent_default();
                     evt.stop_propagation();
                     if !is_open {
                         on_toggle.call(id);
-                    } else {
-                        super::note_row::focus_explorer_sibling(1);
+                    } else if let Some(next) = super::note_row::next_visible(
+                        NodeKey::Project(id),
+                        1,
+                        &visible_flat,
+                    ) {
+                        focused_node.set(Some(next));
+                        super::note_row::focus_explorer_node_deferred(next);
                     }
                 } else if key == "ArrowLeft" {
                     evt.prevent_default();
@@ -434,11 +468,19 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
                 } else if key == "Home" {
                     evt.prevent_default();
                     evt.stop_propagation();
-                    super::note_row::focus_explorer_edge(true);
+                    let flat = visible_flat.peek().clone();
+                    if let Some(first) = flat.first().copied() {
+                        focused_node.set(Some(first));
+                        super::note_row::focus_explorer_node_deferred(first);
+                    }
                 } else if key == "End" {
                     evt.prevent_default();
                     evt.stop_propagation();
-                    super::note_row::focus_explorer_edge(false);
+                    let flat = visible_flat.peek().clone();
+                    if let Some(last) = flat.last().copied() {
+                        focused_node.set(Some(last));
+                        super::note_row::focus_explorer_node_deferred(last);
+                    }
                 } else if key == "Enter" {
                     evt.prevent_default();
                     evt.stop_propagation();
@@ -504,6 +546,8 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
                 }
                 last_clicked.set(Some(key));
                 on_select.call(id);
+                focused_node.set(Some(NodeKey::Project(id)));
+                super::note_row::focus_explorer_node_deferred(NodeKey::Project(id));
             },
             ondoubleclick: move |evt| {
                 evt.stop_propagation();
