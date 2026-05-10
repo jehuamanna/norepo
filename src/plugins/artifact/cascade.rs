@@ -100,6 +100,7 @@ pub async fn run_cascade(
     cancel: CancellationToken,
     graph_writer: Option<&mut CascadeGraphWriter>,
     max_depth: Option<u32>,
+    cascade_session_id: Uuid,
 ) -> Result<CascadeOutcome, CascadeError> {
     // 1. Snapshot every project skill, drop the ones not in the
     //    enabled set, parse contracts. One-shot — skill bodies don't
@@ -194,6 +195,70 @@ pub async fn run_cascade(
             if level >= max {
                 done.insert(art_id);
                 continue 'outer;
+            }
+        }
+
+        // Regenerate-on-Dirty pre-clean: if the explicit play target
+        // (the artifact the user just clicked Play on) is `Dirty`,
+        // wipe its existing descendants and flip it back to Pending
+        // before the dedup branch below sees the old children. The
+        // dedup at "skip-already-produced (artifact, skill) pairs"
+        // would otherwise short-circuit and reuse the stale outputs;
+        // by deleting first, we force fresh skill runs. Only the
+        // explicit play target triggers this — Dirty descendants
+        // (children of an Approved root) take the approval gate
+        // below and get skipped, which is the resume semantics we
+        // already documented.
+        if art_id == root_artifact_id {
+            let is_dirty = matches!(
+                read_status(persistence, art_id).await,
+                Some(ArtifactStatus::Dirty)
+            );
+            if is_dirty {
+                let all_notes = note_repo
+                    .list_for_project(project_id)
+                    .unwrap_or_default();
+                let descendants_set = subtree_ids(&all_notes, art_id);
+                let mut deleted = 0usize;
+                for child_id in descendants_set {
+                    if child_id == art_id {
+                        continue; // keep the parent; only sweep its tree
+                    }
+                    if let Err(e) = persistence.delete(&child_id.to_string()).await {
+                        tracing::warn!(
+                            target: "operon::cascade",
+                            "regenerate-on-dirty: persistence.delete({child_id}) failed: {e}"
+                        );
+                    }
+                    if let Err(e) = note_repo.delete(child_id) {
+                        tracing::warn!(
+                            target: "operon::cascade",
+                            "regenerate-on-dirty: note_repo.delete({child_id}) failed: {e}"
+                        );
+                    } else {
+                        deleted += 1;
+                    }
+                }
+                tracing::info!(
+                    target: "operon::cascade",
+                    "regenerate-on-dirty: wiped {deleted} descendant(s) under {art_id}"
+                );
+                // Flip the parent's status from Dirty → Pending so a
+                // second click on the same artifact (after this run
+                // produces fresh children) doesn't trigger another
+                // wipe. Pending is the natural pre-Approval state.
+                if let Ok(bytes) = persistence.load(&art_id.to_string()).await {
+                    if let Ok(body) = String::from_utf8(bytes) {
+                        let mut fm = parse_artifact_fm(&body);
+                        if matches!(fm.status, ArtifactStatus::Dirty) {
+                            fm.status = ArtifactStatus::Pending;
+                            let new_body = rewrite_artifact_fm(&body, &fm);
+                            let _ = persistence
+                                .save(&art_id.to_string(), new_body.as_bytes())
+                                .await;
+                        }
+                    }
+                }
             }
         }
 
@@ -318,25 +383,20 @@ pub async fn run_cascade(
                 }
             }
 
-            // Route every cascade skill run through the cascade-wide
-            // chat session (not the per-source one). Without this the
-            // user's `Cascade: <id>` tab stays empty even while skills
-            // are happily streaming, because the runner persists to
-            // `chat_session_id_for_source(art_id)` while the tab the
-            // user opened was bound on `chat_session_id_for_cascade(root)`
-            // — different v5 UUIDs derived from different namespaces.
-            // Sharing one session means the whole cascade transcript
-            // appears in the one tab the user is watching, in skill
-            // firing order.
-            let chat_session_id =
-                crate::plugins::artifact::view::chat_session_id_for_cascade(root_artifact_id);
+            // Route every cascade skill run through the per-Play-click
+            // chat session passed in by the caller (`spawn_cascade`).
+            // Each Play click mints a fresh session UUID so two
+            // simultaneous cascades don't share a transcript; the
+            // cascade orchestrator picks up the same id we registered
+            // for the "Claude is working…" indicator and the rail
+            // session label.
             let outcome = run_skill_on_source(
                 note_repo,
                 project_repo,
                 persistence,
                 plugin,
                 Some(chat_message_repo),
-                chat_session_id,
+                cascade_session_id,
                 art_id,
                 skill.id,
             )
@@ -356,10 +416,23 @@ pub async fn run_cascade(
                     // the run ends with a Paused phase so the UI can
                     // surface "review the new backlog and approve to
                     // continue".
-                    let checkpoint_hit = skill.contract.cascade_stop
+                    //
+                    // Step mode (read off the cascade workflow note's
+                    // view_state) widens this: every skill that
+                    // produced artifacts becomes a checkpoint, so the
+                    // user can review each stage independently before
+                    // continuing. Defaults off when there's no graph
+                    // writer or the user hasn't enabled it.
+                    let step_mode_on = graph_writer
+                        .as_deref()
+                        .map(|w| {
+                            crate::plugins::workflow::state::effective_step_mode(&w.graph)
+                        })
+                        .unwrap_or(false);
+                    let checkpoint_hit = (skill.contract.cascade_stop || step_mode_on)
                         && !o.created_artifact_ids.is_empty();
                     for child_id in &o.created_artifact_ids {
-                        if !skill.contract.cascade_stop {
+                        if !skill.contract.cascade_stop && !step_mode_on {
                             if let Err(e) = approve_artifact(persistence, *child_id).await {
                                 tracing::warn!(
                                     target: "operon::cascade",

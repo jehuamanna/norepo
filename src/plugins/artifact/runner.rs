@@ -26,8 +26,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::persistence::Persistence;
+use crate::plugins::artifact::aggregation::{
+    collect_ancestor_sibling_artifacts, collect_descendant_artifacts,
+};
 use crate::plugins::artifact::frontmatter::{
-    parse as parse_artifact_fm, rewrite as rewrite_artifact_fm, ArtifactKind, ArtifactStatus,
+    rewrite as rewrite_artifact_fm, ArtifactKind, ArtifactStatus,
 };
 use crate::plugins::skill::frontmatter::{
     contract as parse_skill_contract, split as split_skill,
@@ -96,6 +99,46 @@ pub async fn run_skill_on_source(
     chat_session_id: Uuid,
     source_note_id: Uuid,
     skill_note_id: Uuid,
+) -> Result<RunOutcome, RunnerError> {
+    run_skill_on_source_with_revision_notes(
+        note_repo,
+        project_repo,
+        persistence,
+        plugin,
+        chat_repo,
+        chat_session_id,
+        source_note_id,
+        skill_note_id,
+        None,
+    )
+    .await
+}
+
+/// Variant of `run_skill_on_source` that accepts a caller-supplied
+/// `extra_revision_notes` payload (e.g. notes from a Dirty *output*
+/// artifact when the user clicks "Re-run" on it). The runner combines
+/// these with the source artifact's own `revision_notes` and inlines
+/// the result into the skill prompt under
+/// `--- refinement notes from user ---`. After a successful import,
+/// both note sources are auto-cleared so subsequent re-runs don't
+/// replay stale feedback.
+///
+/// Pass `(None, None)` (i.e., call `run_skill_on_source` instead) when
+/// the cascade orchestrator drives the run — cascade-side dirty
+/// descendants get wiped before re-runs and don't have a place to
+/// surface their notes. The Re-run button path is the primary user
+/// motion for this feature today.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_skill_on_source_with_revision_notes(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    project_repo: &Arc<dyn LocalProjectRepository>,
+    persistence: &Arc<dyn Persistence>,
+    plugin: &Arc<ClaudeCodeChatPlugin>,
+    chat_repo: Option<&Arc<dyn ChatMessageRepository>>,
+    chat_session_id: Uuid,
+    source_note_id: Uuid,
+    skill_note_id: Uuid,
+    extra_revision_notes: Option<(Uuid, String)>,
 ) -> Result<RunOutcome, RunnerError> {
     // 1. Resolve project + repo_path.
     let project_id = note_repo
@@ -168,6 +211,28 @@ pub async fn run_skill_on_source(
             Vec::new()
         };
 
+    // 3b. Inheritance: walk the **ancestor chain** from the source
+    //     upward and inline every sibling artifact whose
+    //     `artifact_kind` matches the declared `inherit:` kind. Lets a
+    //     skill pull design context produced upstream — e.g. an SDE
+    //     skill on a Task pulls the parent Story's LLD plan and the
+    //     grandparent Feature's HLD plan into its prompt. Empty when
+    //     the contract doesn't declare `inherit:` or no matching
+    //     ancestors-sibling artifacts exist.
+    let inherited: Vec<(String, String)> =
+        if let Some(kind) = contract.inherit.as_deref() {
+            collect_ancestor_sibling_artifacts(
+                note_repo,
+                persistence,
+                project_id,
+                source_note_id,
+                kind,
+            )
+            .await
+        } else {
+            Vec::new()
+        };
+
     // 4. Where claude is going to write the new artifact files. One
     //    subdir per source so the engine can scan a known place after
     //    the run completes.
@@ -183,7 +248,15 @@ pub async fn run_skill_on_source(
     //    prior run that the user already imported.
     let existing: HashSet<PathBuf> = list_md_files(&artifacts_dir);
 
-    // 6. Build the prompt that claude will see.
+    // 6. Build the prompt that claude will see. Combine the source
+    //    artifact's `revision_notes` (set by the user on the artifact
+    //    they're refining) with any caller-supplied
+    //    `extra_revision_notes` (e.g. notes lifted off a Dirty output
+    //    artifact when the user clicked "Re-run" on it). Both reach
+    //    the LLM under a single `--- refinement notes from user ---`
+    //    fence so the model treats them as one priority block.
+    let combined_notes =
+        combine_revision_notes(source_fm.revision_notes.as_deref(), extra_revision_notes.as_ref());
     let prompt = build_prompt(
         &source_body,
         &skill_body,
@@ -192,6 +265,8 @@ pub async fn run_skill_on_source(
         source_note_id,
         skill_note_id,
         &aggregated,
+        &inherited,
+        combined_notes.as_deref(),
     );
 
     // 7. Persist the prompt as a User message (transcript visibility).
@@ -221,6 +296,25 @@ pub async fn run_skill_on_source(
     //    flows without breaking the single-skill path.
     plugin.bind_session(chat_session_id, repo_path.clone());
 
+    // 8a. Wire up the inline-permission-prompt MCP bridge so that any
+    //     Bash command claude wants to run (which `acceptEdits` does
+    //     NOT auto-approve — only file edits do) surfaces as a
+    //     clickable prompt in the active companion chat instead of
+    //     silently denying. Idempotent per session; safe to call on
+    //     every runner invocation.
+    if let Err(e) = crate::shell::companion_state::ensure_session_bridge(
+        plugin,
+        chat_session_id,
+        repo_path.clone(),
+    )
+    .await
+    {
+        tracing::warn!(
+            target: "operon::permission",
+            "ensure_session_bridge({chat_session_id}): {e}"
+        );
+    }
+
     // 9. Run claude. The runner forces `acceptEdits` on this
     //    session so its automated Write tool calls don't hang
     //    waiting for stdin approval — even when the user's global
@@ -241,6 +335,52 @@ pub async fn run_skill_on_source(
             let appended = persist_event(repo, chat_session_id, &ev, &mut assistant_buf);
             if appended {
                 bump_message_version();
+            }
+        }
+        // Streaming artifact import: as soon as Claude calls `Write`
+        // for a path under the per-source `artifacts_dir`, land that
+        // single file in the explorer immediately. Lets the user
+        // watch Features / Tasks pop in one-by-one for `output_count:
+        // many` skills instead of seeing nothing for the whole run
+        // and then 5 artifacts at the end. The end-of-run scan +
+        // import remains a safety net (idempotent dedup at
+        // `import_produced_artifacts` keeps it a no-op for files
+        // already imported).
+        if let ClaudeCodeEvent::ToolUse { name, input, .. } = &ev {
+            if name == "Write" {
+                if let Some(file_path) =
+                    input.get("file_path").and_then(|v| v.as_str())
+                {
+                    let path = std::path::Path::new(file_path);
+                    if path.parent() == Some(artifacts_dir.as_path()) {
+                        // Best-effort flush: Claude's Write tool
+                        // usually has the bytes on disk by this
+                        // event, but there's no hard ordering
+                        // guarantee — write the inlined content if
+                        // the file is missing.
+                        if !path.exists() {
+                            if let Some(content) =
+                                input.get("content").and_then(|v| v.as_str())
+                            {
+                                let _ = std::fs::write(path, content);
+                            }
+                        }
+                        let imported = import_produced_artifacts(
+                            note_repo,
+                            persistence,
+                            project_id,
+                            source_note_id,
+                            skill_note_id,
+                            &contract,
+                            std::slice::from_ref(&path.to_path_buf()),
+                        )
+                        .await;
+                        if !imported.is_empty() {
+                            crate::shell::companion_state::LOCAL_NOTE_VERSION
+                                .with_mut(|v| *v = v.saturating_add(1));
+                        }
+                    }
+                }
             }
         }
         match ev {
@@ -283,299 +423,52 @@ pub async fn run_skill_on_source(
     let produced = scan_produced_files(&artifacts_dir, &existing, run_started_at);
 
     // 10. Import each produced file as an Artifact note under the
-    //     source. Body is read from disk; frontmatter is patched so
-    //     the engine's view fields (status, source linkage) are
-    //     authoritative regardless of what claude wrote.
-    //
-    //     Dedup: if a sibling Artifact note with the same title
-    //     already exists under this source, reuse its row id and
-    //     overwrite the body. Without this, every Re-run / Revise
-    //     cycle would duplicate every child artifact under the same
-    //     parent — making the explorer tree increasingly noisy and
-    //     making "regenerate after editing the Epic" a destructive
-    //     UX (the user would have to manually delete N stale rows).
-    let existing_siblings: Vec<LocalNote> = note_repo
-        .list_for_project(project_id)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|n| {
-            n.parent_id == Some(source_note_id) && matches!(n.kind, NoteKind::Artifact)
-        })
-        .collect();
+    //     source. Delegates to the shared `import_produced_artifacts`
+    //     helper so the workflow-canvas executor can use the same
+    //     codepath (Phase 3 of the parity port).
+    let created_ids: Vec<Uuid> = import_produced_artifacts(
+        note_repo,
+        persistence,
+        project_id,
+        source_note_id,
+        skill_note_id,
+        &contract,
+        &produced,
+    )
+    .await;
 
-    let mut created_ids: Vec<Uuid> = Vec::new();
-    for file in produced {
-        let body = match std::fs::read_to_string(&file) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("operon: artifact import skipped {} ({e})", file.display());
-                continue;
-            }
-        };
-        let title = file
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("artifact")
-            .to_string();
-        let existing_id = existing_siblings
-            .iter()
-            .find(|n| n.title == title)
-            .map(|n| n.id);
-        let row_id = match existing_id {
-            Some(id) => id,
-            None => match note_repo.create_with_kind(
-                project_id,
-                Some(source_note_id),
-                &title,
-                NoteKind::Artifact,
-            ) {
-                Ok(r) => r.id,
-                Err(e) => {
-                    eprintln!("operon: artifact create_with_kind failed: {e}");
-                    continue;
-                }
-            },
-        };
-        // Patch the artifact frontmatter so source_artifact_id /
-        // source_skill_id / status are always correct, even if the
-        // skill prompt forgot to emit them.
-        let mut fm = crate::plugins::artifact::frontmatter::parse(&body);
-        if fm.artifact_kind.is_none() {
-            fm.artifact_kind = contract
-                .output_kind
-                .as_deref()
-                .map(ArtifactKind::parse);
+    // 10a. Clear `revision_notes` on the artifacts whose notes we
+    //      just consumed in the prompt — successful regeneration
+    //      means the user's feedback was applied; replaying it on
+    //      the next run would be wrong. Skipped on a zero-import
+    //      run so a failed regeneration leaves the notes intact for
+    //      retry.
+    if !created_ids.is_empty() && combined_notes.is_some() {
+        if source_fm.revision_notes.is_some() {
+            clear_revision_notes(persistence, source_note_id, &source_body).await;
         }
-        fm.status = match contract.gate {
-            crate::plugins::skill::frontmatter::SkillGate::Auto => {
-                ArtifactStatus::Approved
-            }
-            crate::plugins::skill::frontmatter::SkillGate::Approval => {
-                ArtifactStatus::Pending
-            }
-        };
-        fm.source_artifact_id = Some(source_note_id);
-        fm.source_skill_id = Some(skill_note_id);
-        let final_body = rewrite_artifact_fm(&body, &fm);
-        if let Err(e) = persistence
-            .save(&row_id.to_string(), final_body.as_bytes())
-            .await
-        {
-            eprintln!("operon: artifact persistence save failed: {e}");
-            continue;
+        if let Some((extra_id, _)) = extra_revision_notes.as_ref() {
+            clear_revision_notes_by_id(persistence, *extra_id).await;
         }
-        created_ids.push(row_id);
     }
 
-    // 11. Workflow emission: prioritization skills declare
-    //     `emit_workflow: true` so the runner reads the produced
-    //     backlog artifact's `## Priority order` section, looks up
-    //     each named task in the project, and writes a sibling
-    //     `NoteKind::Workflow` note with one snapshot node per
-    //     prioritized task plus depends-on cross-edges parsed from
-    //     each task's body. The Workflow note opens to the existing
-    //     React Flow canvas so the user gets the cross-story DAG
-    //     they asked for without any new view code.
-    if contract.emit_workflow {
-        for backlog_id in &created_ids {
-            if let Err(e) = emit_workflow_for_backlog(
-                note_repo,
-                persistence,
-                project_id,
-                source_note_id,
-                *backlog_id,
-            )
-            .await
-            {
-                tracing::warn!(
-                    target: "operon::artifact",
-                    "emit_workflow for backlog {backlog_id} failed: {e}"
-                );
-            }
-        }
-    }
+    // 11. Workflow emission: removed. Prioritization skills used to
+    //     declare `emit_workflow: true` and the runner would write
+    //     a sibling `NoteKind::Workflow` snapshot of the prioritized
+    //     tasks alongside the produced backlog. That side-effect
+    //     was disabled globally — users only want one workflow
+    //     note per cascade root (the live `Cascade: <seed>` canvas
+    //     populated by `CascadeGraphWriter`); the auto-emitted
+    //     prioritized-tasks graphs were noise. The
+    //     `emit_workflow` frontmatter field still parses (no-op)
+    //     so existing skill files keep loading. Helper
+    //     `emit_workflow_for_backlog` deleted along with this
+    //     callsite.
 
     Ok(RunOutcome {
         created_artifact_ids: created_ids,
         artifacts_dir,
     })
-}
-
-/// Build (or refresh) the sibling Workflow note for a prioritized
-/// backlog artifact. Reads the backlog's `## Priority order` to get
-/// task titles in priority order, resolves each to an Artifact note
-/// id under the seed, snapshots them as nodes (re-using the
-/// `is_artifact_snapshot` shape established by `cascade_graph`), and
-/// adds depends-on edges parsed from each task body's `## Depends on`
-/// section. Idempotent on re-runs — same title resolves to the same
-/// Workflow note and the body is overwritten.
-async fn emit_workflow_for_backlog(
-    note_repo: &Arc<dyn LocalNoteRepository>,
-    persistence: &Arc<dyn Persistence>,
-    project_id: Uuid,
-    seed_id: Uuid,
-    backlog_id: Uuid,
-) -> Result<(), String> {
-    let backlog_bytes = persistence
-        .load(&backlog_id.to_string())
-        .await
-        .map_err(|e| format!("load backlog: {e}"))?;
-    let backlog_body =
-        String::from_utf8(backlog_bytes).map_err(|e| format!("backlog utf8: {e}"))?;
-    let priority = parse_priority_order(&backlog_body);
-    if priority.is_empty() {
-        return Err("backlog body has no `## Priority order` entries".into());
-    }
-
-    // Index every artifact in the project by title (and TaskID
-    // prefix) so a `T001` or `task-01-foo` line resolves cheaply.
-    let all_notes = note_repo
-        .list_for_project(project_id)
-        .map_err(|e| format!("list_for_project: {e}"))?;
-    let mut by_title: std::collections::HashMap<String, &LocalNote> =
-        std::collections::HashMap::new();
-    for n in &all_notes {
-        if !matches!(n.kind, NoteKind::Artifact) {
-            continue;
-        }
-        by_title.insert(n.title.clone(), n);
-        if let Some(first) = n.title.split_whitespace().next() {
-            by_title.insert(first.to_string(), n);
-        }
-    }
-
-    // Resolve priority slugs to Artifact notes; drop unresolved.
-    let mut resolved: Vec<&LocalNote> = Vec::new();
-    for slug in &priority {
-        if let Some(n) = by_title.get(slug.as_str()) {
-            resolved.push(*n);
-        }
-    }
-    if resolved.is_empty() {
-        return Err("no priority entries resolved to known artifacts".into());
-    }
-
-    // Build (or reuse) the sibling Workflow note. Title is derived
-    // from the backlog artifact so coarse + refined runs each get
-    // their own canvas without colliding.
-    let backlog_title = all_notes
-        .iter()
-        .find(|n| n.id == backlog_id)
-        .map(|n| n.title.clone())
-        .unwrap_or_else(|| "backlog".to_string());
-    let workflow_title = format!("Workflow — {backlog_title}");
-    let existing = all_notes
-        .iter()
-        .find(|n| {
-            matches!(n.kind, NoteKind::Workflow)
-                && n.parent_id == Some(seed_id)
-                && n.title == workflow_title
-        })
-        .map(|n| n.id);
-    let workflow_id = match existing {
-        Some(id) => id,
-        None => note_repo
-            .create_with_kind(
-                project_id,
-                Some(seed_id),
-                &workflow_title,
-                NoteKind::Workflow,
-            )
-            .map_err(|e| format!("create_with_kind workflow: {e}"))?
-            .id,
-    };
-
-    // Build the graph. Snapshot nodes (`is_artifact_snapshot:true`)
-    // reuse the read-only render path the cascade graph already uses.
-    // Layout: priority order along the X axis at a single Y so the
-    // canvas opens to a clear left-to-right backlog stripe; depends-
-    // on edges become amber arrows above the stripe.
-    let mut graph = WorkflowGraph::new();
-    let mut node_id_by_artifact: std::collections::HashMap<Uuid, Uuid> =
-        std::collections::HashMap::new();
-    let mut bodies_by_artifact: std::collections::HashMap<Uuid, String> =
-        std::collections::HashMap::new();
-    for (i, art) in resolved.iter().enumerate() {
-        let body = persistence
-            .load(&art.id.to_string())
-            .await
-            .ok()
-            .and_then(|b| String::from_utf8(b).ok())
-            .unwrap_or_default();
-        let kind_label = parse_artifact_fm(&body)
-            .artifact_kind
-            .as_ref()
-            .map(|k| k.display_name())
-            .unwrap_or_else(|| "Artifact".into());
-        let nid = Uuid::new_v4();
-        graph.nodes.insert(
-            nid,
-            Node {
-                id: nid,
-                skill_note_id: Uuid::nil(),
-                typed_fields: serde_json::Value::Null,
-                extra_instructions: String::new(),
-                position: ((i as f64) * 200.0, 80.0),
-                cached_output_path: None,
-                cached_input_hash: None,
-                status: NodeStatus::Fresh,
-                cached_output_note_id: None,
-                is_artifact_snapshot: true,
-                artifact_ref: Some(art.id),
-                artifact_kind_label: Some(kind_label),
-                artifact_title: Some(art.title.clone()),
-            },
-        );
-        node_id_by_artifact.insert(art.id, nid);
-        bodies_by_artifact.insert(art.id, body);
-    }
-
-    // Depends-on edges, reusing the same parser the cascade graph
-    // uses for sibling cross-edges. References that don't resolve to
-    // a node in this backlog are silently dropped.
-    for (artifact_id, body) in &bodies_by_artifact {
-        let to = match node_id_by_artifact.get(artifact_id) {
-            Some(n) => *n,
-            None => continue,
-        };
-        for slug in crate::plugins::artifact::cascade_graph::parse_depends_on(body) {
-            let from_artifact = match by_title.get(slug.as_str()) {
-                Some(n) => n.id,
-                None => continue,
-            };
-            let from = match node_id_by_artifact.get(&from_artifact) {
-                Some(n) => *n,
-                None => continue,
-            };
-            if from == to {
-                continue;
-            }
-            let dup = graph.edges.iter().any(|e| {
-                e.from == from
-                    && e.to == to
-                    && e.edge_kind.as_deref() == Some("depends_on")
-            });
-            if !dup {
-                graph.edges.push(Edge {
-                    id: Uuid::new_v4(),
-                    from,
-                    from_socket: "default".into(),
-                    to,
-                    to_socket: "default".into(),
-                    edge_kind: Some("depends_on".into()),
-                });
-            }
-        }
-    }
-    graph.version = graph.version.saturating_add(1);
-
-    let body = serde_json::to_string_pretty(&graph)
-        .map_err(|e| format!("serialize graph: {e}"))?;
-    persistence
-        .save(&workflow_id.to_string(), body.as_bytes())
-        .await
-        .map_err(|e| format!("save workflow note: {e}"))?;
-    Ok(())
 }
 
 /// Extract titles listed under the backlog artifact's `## Priority
@@ -642,6 +535,7 @@ fn strip_list_marker(line: &str) -> &str {
     line
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_prompt(
     source_body: &str,
     skill_body: &str,
@@ -650,6 +544,8 @@ fn build_prompt(
     source_id: Uuid,
     skill_id: Uuid,
     aggregated: &[(String, String)],
+    inherited: &[(String, String)],
+    revision_notes: Option<&str>,
 ) -> String {
     let mut buf = String::new();
     buf.push_str(
@@ -705,12 +601,69 @@ fn build_prompt(
         buf.push_str(&format!("--- /aggregated {kind} artifacts ---\n\n"));
     }
 
+    if !inherited.is_empty() {
+        let kind = contract.inherit.as_deref().unwrap_or("artifact");
+        buf.push_str(&format!(
+            "--- inherited {kind} artifacts from ancestor chain ({n} total) ---\n\
+             These are design / context artifacts produced upstream of the\n\
+             source (siblings of one of its ancestors). Treat them as\n\
+             authoritative inputs that scope the work you're about to do.\n\
+             If the source artifact and an inherited artifact disagree,\n\
+             flag the contradiction in your output rather than silently\n\
+             choosing one.\n\n",
+            n = inherited.len()
+        ));
+        for (title, body) in inherited {
+            buf.push_str(&format!("--- artifact: {title} ---\n"));
+            buf.push_str(body.trim_end());
+            buf.push_str(&format!("\n--- /artifact: {title} ---\n\n"));
+        }
+        buf.push_str(&format!("--- /inherited {kind} artifacts ---\n\n"));
+    }
+
+    if let Some(notes) = revision_notes {
+        let trimmed = notes.trim();
+        if !trimmed.is_empty() {
+            buf.push_str(
+                "--- refinement notes from user ---\n\
+                 The user has explicitly requested the following adjustments\n\
+                 for this regeneration. Treat them as priority guidance over\n\
+                 the source artifact body when they conflict. After applying\n\
+                 them, write the new artifact(s) as instructed above.\n\n",
+            );
+            buf.push_str(trimmed);
+            buf.push_str("\n--- /refinement notes from user ---\n\n");
+        }
+    }
+
     buf.push_str(
         "When done, do NOT echo the artifact contents back to the user — the\n\
          engine reads them from disk. A short summary of how many artifacts\n\
          you produced is enough.\n",
     );
     buf
+}
+
+/// Combine source-side and caller-supplied refinement notes into a
+/// single payload for `build_prompt`. Both are trimmed; empty inputs
+/// are dropped; when both are present they're concatenated with a
+/// `[from <kind>]:` label so the model can tell them apart.
+fn combine_revision_notes(
+    source_notes: Option<&str>,
+    extra: Option<&(Uuid, String)>,
+) -> Option<String> {
+    let src = source_notes.map(str::trim).filter(|s| !s.is_empty());
+    let extra_text = extra
+        .map(|(_, s)| s.as_str().trim())
+        .filter(|s| !s.is_empty());
+    match (src, extra_text) {
+        (None, None) => None,
+        (Some(s), None) => Some(s.to_string()),
+        (None, Some(e)) => Some(e.to_string()),
+        (Some(s), Some(e)) => Some(format!(
+            "[from source artifact]:\n{s}\n\n[from output artifact]:\n{e}"
+        )),
+    }
 }
 
 /// Build a human-readable WPN-style path for an artifact: `Project /
@@ -759,71 +712,166 @@ fn build_artifact_path_label(
     }
 }
 
-/// Aggregator helper: walk the descendants of `seed_id` under
-/// `project_id` and return `(title, body)` for every Artifact note
-/// whose `artifact_kind` matches `wanted_kind`. BFS, ordered by note
-/// title so the prompt is deterministic across runs. Skips the seed
-/// itself even if it happens to be the same kind (the seed body is
-/// already inlined separately).
-async fn collect_descendant_artifacts(
+/// Import a list of skill-produced `.md` files as `NoteKind::Artifact`
+/// notes under `source_note_id`. Shared between the cascade orchestrator
+/// (`run_skill_on_source` above) and the workflow-canvas executor
+/// (Phase 3 of the parity port).
+///
+/// Behavior, per file:
+/// - Read the file body from disk; skip files that fail to read.
+/// - Derive a title from the file stem.
+/// - Dedup against existing sibling Artifact notes under the source
+///   (parent_id match + same title). On hit, reuse that row id; on
+///   miss, create a new `NoteKind::Artifact` row parented to the
+///   source. This keeps the explorer tree stable across re-runs —
+///   without it, every Re-run / Revise cycle would duplicate every
+///   child under the same parent.
+/// - Patch artifact frontmatter so `artifact_kind` falls back to the
+///   skill contract's `output_kind`, `status` reflects the skill's
+///   `gate`, and `source_artifact_id` / `source_skill_id` are always
+///   authoritative regardless of what the model wrote.
+/// - Save the rewritten body via Persistence.
+///
+/// Returns the row ids of every successfully imported file (in input
+/// order). Errors during read / create / save are logged via eprintln
+/// and skip the offending file rather than aborting the batch — same
+/// resilience as the inlined version.
+pub async fn import_produced_artifacts(
     note_repo: &Arc<dyn LocalNoteRepository>,
     persistence: &Arc<dyn Persistence>,
     project_id: Uuid,
-    seed_id: Uuid,
-    wanted_kind: &str,
-) -> Vec<(String, String)> {
-    let all = match note_repo.list_for_project(project_id) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let mut by_parent: std::collections::HashMap<Uuid, Vec<&LocalNote>> =
-        std::collections::HashMap::new();
-    for n in &all {
-        if let Some(p) = n.parent_id {
-            by_parent.entry(p).or_default().push(n);
-        }
-    }
-    let mut visited = HashSet::new();
-    let mut queue: std::collections::VecDeque<Uuid> = std::collections::VecDeque::new();
-    queue.push_back(seed_id);
-    visited.insert(seed_id);
-    let mut matched: Vec<&LocalNote> = Vec::new();
-    while let Some(id) = queue.pop_front() {
-        if let Some(children) = by_parent.get(&id) {
-            for child in children {
-                if !visited.insert(child.id) {
+    source_note_id: Uuid,
+    skill_note_id: Uuid,
+    contract: &crate::plugins::skill::frontmatter::SkillContract,
+    produced: &[PathBuf],
+) -> Vec<Uuid> {
+    let existing_siblings: Vec<LocalNote> = note_repo
+        .list_for_project(project_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| {
+            n.parent_id == Some(source_note_id) && matches!(n.kind, NoteKind::Artifact)
+        })
+        .collect();
+
+    let mut created_ids: Vec<Uuid> = Vec::new();
+    for file in produced {
+        let body = match std::fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("operon: artifact import skipped {} ({e})", file.display());
+                continue;
+            }
+        };
+        let title = file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("artifact")
+            .to_string();
+        let existing_id = existing_siblings
+            .iter()
+            .find(|n| n.title == title)
+            .map(|n| n.id);
+        let row_id = match existing_id {
+            Some(id) => id,
+            None => match note_repo.create_with_kind(
+                project_id,
+                Some(source_note_id),
+                &title,
+                NoteKind::Artifact,
+            ) {
+                Ok(r) => r.id,
+                Err(e) => {
+                    eprintln!("operon: artifact create_with_kind failed: {e}");
                     continue;
                 }
-                if matches!(child.kind, NoteKind::Artifact) {
-                    matched.push(child);
-                }
-                queue.push_back(child.id);
-            }
+            },
+        };
+        let mut fm = crate::plugins::artifact::frontmatter::parse(&body);
+        if fm.artifact_kind.is_none() {
+            fm.artifact_kind = contract
+                .output_kind
+                .as_deref()
+                .map(ArtifactKind::parse);
         }
-    }
-    matched.sort_by(|a, b| a.title.cmp(&b.title));
-    let mut out: Vec<(String, String)> = Vec::with_capacity(matched.len());
-    for n in matched {
-        let bytes = match persistence.load(&n.id.to_string()).await {
-            Ok(b) => b,
-            Err(_) => continue,
+        fm.status = match contract.gate {
+            crate::plugins::skill::frontmatter::SkillGate::Auto => {
+                ArtifactStatus::Approved
+            }
+            crate::plugins::skill::frontmatter::SkillGate::Approval => {
+                ArtifactStatus::Pending
+            }
         };
-        let body = match String::from_utf8(bytes) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let fm = parse_artifact_fm(&body);
-        let matches_kind = fm
-            .artifact_kind
-            .as_ref()
-            .map(|k| k.as_str() == wanted_kind)
-            .unwrap_or(false);
-        if !matches_kind {
+        fm.source_artifact_id = Some(source_note_id);
+        fm.source_skill_id = Some(skill_note_id);
+        let final_body = rewrite_artifact_fm(&body, &fm);
+        if let Err(e) = persistence
+            .save(&row_id.to_string(), final_body.as_bytes())
+            .await
+        {
+            eprintln!("operon: artifact persistence save failed: {e}");
             continue;
         }
-        out.push((n.title.clone(), body));
+        created_ids.push(row_id);
     }
-    out
+    created_ids
+}
+
+/// Clear the `revision_notes` field on an artifact whose body we
+/// already have in memory (the source artifact's body was loaded at
+/// the start of the run). Saves the rewritten body back to
+/// persistence. Failures are logged and ignored — clearing notes is
+/// best-effort cleanup, never load-bearing for the run's success.
+async fn clear_revision_notes(
+    persistence: &Arc<dyn Persistence>,
+    artifact_id: Uuid,
+    body: &str,
+) {
+    let mut fm = crate::plugins::artifact::frontmatter::parse(body);
+    if fm.revision_notes.is_none() {
+        return;
+    }
+    fm.revision_notes = None;
+    let rewritten = rewrite_artifact_fm(body, &fm);
+    if let Err(e) = persistence
+        .save(&artifact_id.to_string(), rewritten.as_bytes())
+        .await
+    {
+        tracing::warn!(
+            target: "operon::artifact",
+            "clear_revision_notes save failed for {artifact_id}: {e}"
+        );
+    }
+}
+
+/// Clear an artifact's `revision_notes` field by id when the caller
+/// doesn't already have its body in memory (the Re-run path uses this
+/// for the dirty *output* artifact). Loads body, rewrites, saves.
+async fn clear_revision_notes_by_id(
+    persistence: &Arc<dyn Persistence>,
+    artifact_id: Uuid,
+) {
+    let bytes = match persistence.load(&artifact_id.to_string()).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                target: "operon::artifact",
+                "clear_revision_notes_by_id load failed for {artifact_id}: {e}"
+            );
+            return;
+        }
+    };
+    let body = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                target: "operon::artifact",
+                "clear_revision_notes_by_id utf8 for {artifact_id}: {e}"
+            );
+            return;
+        }
+    };
+    clear_revision_notes(persistence, artifact_id, &body).await;
 }
 
 /// List `.md` files (top-level only — no recursion) in `dir`.
@@ -1064,13 +1112,16 @@ mod tests {
             Uuid::nil(),
             Uuid::nil(),
             &[],
+            &[],
+            None,
         );
         assert!(prompt.contains("REQ_BODY"));
         assert!(prompt.contains("SKILL_BODY"));
         assert!(prompt.contains("/tmp/x"));
         assert!(prompt.contains("artifact_kind: epic"));
-        // No aggregate section when none provided.
+        // No aggregate / inherit sections when none provided.
         assert!(!prompt.contains("aggregated"));
+        assert!(!prompt.contains("inherited"));
     }
 
     #[test]
@@ -1125,6 +1176,8 @@ mod tests {
             Uuid::nil(),
             Uuid::nil(),
             &aggregated,
+            &[],
+            None,
         );
         assert!(prompt.contains("SEED_BODY"));
         assert!(prompt.contains("aggregated task artifacts (2 total)"));
@@ -1132,5 +1185,101 @@ mod tests {
         assert!(prompt.contains("Body of task 1"));
         assert!(prompt.contains("--- artifact: task-02-add-login-form ---"));
         assert!(prompt.contains("Body of task 2"));
+    }
+
+    #[test]
+    fn build_prompt_inlines_inherited_artifacts() {
+        let dir = std::path::Path::new("/tmp/x");
+        let mut contract = crate::plugins::skill::frontmatter::SkillContract::default();
+        contract.output_kind = Some("implementation".into());
+        contract.inherit = Some("plan".into());
+        let inherited = vec![
+            ("plan-hld-feature-auth".into(), "HLD plan body".into()),
+            ("plan-lld-story-login".into(), "LLD plan body".into()),
+        ];
+        let prompt = build_prompt(
+            "TASK_BODY",
+            "SKILL_BODY",
+            dir,
+            &contract,
+            Uuid::nil(),
+            Uuid::nil(),
+            &[],
+            &inherited,
+            None,
+        );
+        assert!(prompt.contains("TASK_BODY"));
+        assert!(prompt.contains(
+            "inherited plan artifacts from ancestor chain (2 total)"
+        ));
+        assert!(prompt.contains("--- artifact: plan-hld-feature-auth ---"));
+        assert!(prompt.contains("HLD plan body"));
+        assert!(prompt.contains("--- artifact: plan-lld-story-login ---"));
+        assert!(prompt.contains("LLD plan body"));
+        // No aggregate section when only inherit is set.
+        assert!(!prompt.contains("aggregated"));
+    }
+
+    #[test]
+    fn build_prompt_inlines_revision_notes_when_present() {
+        let dir = std::path::Path::new("/tmp/x");
+        let mut contract = crate::plugins::skill::frontmatter::SkillContract::default();
+        contract.output_kind = Some("epic".into());
+        let prompt = build_prompt(
+            "REQ_BODY",
+            "SKILL_BODY",
+            dir,
+            &contract,
+            Uuid::nil(),
+            Uuid::nil(),
+            &[],
+            &[],
+            Some("Emphasize observability concerns"),
+        );
+        assert!(prompt.contains("--- refinement notes from user ---"));
+        assert!(prompt.contains("Emphasize observability concerns"));
+        assert!(prompt.contains("--- /refinement notes from user ---"));
+    }
+
+    #[test]
+    fn build_prompt_skips_revision_notes_when_blank() {
+        let dir = std::path::Path::new("/tmp/x");
+        let mut contract = crate::plugins::skill::frontmatter::SkillContract::default();
+        contract.output_kind = Some("epic".into());
+        // Whitespace-only notes must not produce an empty fence.
+        let prompt = build_prompt(
+            "REQ_BODY",
+            "SKILL_BODY",
+            dir,
+            &contract,
+            Uuid::nil(),
+            Uuid::nil(),
+            &[],
+            &[],
+            Some("   \n  "),
+        );
+        assert!(!prompt.contains("refinement notes"));
+    }
+
+    #[test]
+    fn combine_revision_notes_merges_source_and_extra() {
+        let merged = combine_revision_notes(
+            Some("from source"),
+            Some(&(Uuid::nil(), "from output".to_string())),
+        )
+        .expect("combined notes");
+        assert!(merged.contains("[from source artifact]"));
+        assert!(merged.contains("from source"));
+        assert!(merged.contains("[from output artifact]"));
+        assert!(merged.contains("from output"));
+    }
+
+    #[test]
+    fn combine_revision_notes_returns_none_when_both_blank() {
+        assert!(combine_revision_notes(None, None).is_none());
+        assert!(combine_revision_notes(Some("   "), None).is_none());
+        assert!(
+            combine_revision_notes(None, Some(&(Uuid::nil(), "  ".into()))).is_none()
+        );
     }
 }

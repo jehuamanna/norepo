@@ -143,16 +143,29 @@ pub struct SkillContract {
     /// prioritization / cross-task analysis skills that need to see
     /// every Task (or every Plan) under the seed at once.
     pub aggregate: Option<String>,
+    /// Inheritance: when set, the runner walks the **ancestor** chain
+    /// from the source artifact upward and inlines every sibling
+    /// artifact (children of each ancestor) whose `artifact_kind`
+    /// matches this kind. Complement of `aggregate` (which descends).
+    /// Used by skills that need design context produced upstream —
+    /// e.g. an SDE skill on a Task pulling the parent Story's LLD plan
+    /// and the grandparent Feature's HLD plan into its prompt.
+    pub inherit: Option<String>,
     /// Cascade checkpoint: when `true`, the cascade orchestrator does
     /// NOT auto-approve this skill's produced artifacts, so the chain
     /// pauses on them and waits for explicit user approval. Lets a
     /// pipeline insert human-review gates without separating the run.
     pub cascade_stop: bool,
-    /// Workflow emission: when `true`, the runner parses the
-    /// produced artifact for a `## Priority order` (and optional
-    /// dependency hints) and creates a sibling `NoteKind::Workflow`
-    /// note holding a React-Flow DAG snapshot of the prioritized
-    /// tasks. Used by the prioritization skills.
+    /// Workflow emission: **NO-OP — parsed but ignored.** Used to
+    /// instruct the runner to write a sibling `NoteKind::Workflow`
+    /// snapshot of the produced backlog's `## Priority order`. The
+    /// side effect was disabled globally because users only want
+    /// one workflow note per cascade root (the live
+    /// `Cascade: <seed>` canvas populated by `CascadeGraphWriter`)
+    /// — the auto-emitted prioritized-tasks graphs were noise. The
+    /// parser still reads the field so existing skill files that
+    /// declare it don't fail to load; the runner just doesn't
+    /// honor it. Safe to leave in skill frontmatter; safe to omit.
     pub emit_workflow: bool,
 }
 
@@ -189,6 +202,7 @@ pub fn contract(lines: &[&str]) -> SkillContract {
     };
     let persona = field(lines, "persona").map(str::to_string);
     let aggregate = field(lines, "aggregate").map(str::to_string);
+    let inherit = field(lines, "inherit").map(str::to_string);
     let cascade_stop = matches!(
         field(lines, "cascade_stop"),
         Some("true") | Some("True") | Some("TRUE") | Some("yes") | Some("Yes")
@@ -204,6 +218,7 @@ pub fn contract(lines: &[&str]) -> SkillContract {
         gate,
         persona,
         aggregate,
+        inherit,
         cascade_stop,
         emit_workflow,
     }
@@ -368,8 +383,23 @@ mod tests {
         assert_eq!(c.persona.as_deref(), Some("BA"));
         // Optional new fields default off when absent.
         assert_eq!(c.aggregate, None);
+        assert_eq!(c.inherit, None);
         assert!(!c.cascade_stop);
         assert!(!c.emit_workflow);
+    }
+
+    #[test]
+    fn contract_reads_inherit_field() {
+        let lines = vec![
+            "skill_name: sde-implement-task",
+            "input_kind: task",
+            "output_kind: implementation",
+            "inherit: plan",
+            "persona: SDE",
+        ];
+        let c = contract(&lines);
+        assert_eq!(c.inherit.as_deref(), Some("plan"));
+        assert_eq!(c.aggregate, None);
     }
 
     #[test]

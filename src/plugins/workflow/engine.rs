@@ -281,6 +281,8 @@ mod tests {
             artifact_ref: None,
             artifact_kind_label: None,
             artifact_title: None,
+            source_artifact_id: None,
+            cached_produced_artifact_ids: Vec::new(),
         }
     }
 

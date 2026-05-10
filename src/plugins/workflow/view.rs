@@ -906,7 +906,49 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
         }
     };
 
+    // Cascade-paused banner: visible whenever this workflow's root
+    // artifact is in `CascadePhase::Paused` (set when a `cascade_stop`
+    // skill produces a checkpoint artifact). Without this surface,
+    // a paused cascade looks identical to a hung run — the user
+    // wouldn't know that re-clicking ▶ Play after approving the
+    // checkpoint is what continues the cascade.
+    let cascade_pause_banner: Option<(Uuid, String)> = (|| {
+        let root_id = find_cascade_root_artifact(&g)?;
+        // Subscribe to CASCADE_STATE so the banner appears/clears
+        // reactively as phases transition.
+        let phase = crate::shell::companion_state::CASCADE_STATE
+            .read()
+            .get(&root_id)
+            .cloned()?;
+        if let crate::shell::companion_state::CascadePhase::Paused {
+            artifact_id, ..
+        } = phase
+        {
+            let title = g
+                .nodes
+                .values()
+                .find(|n| n.artifact_ref == Some(artifact_id))
+                .and_then(|n| n.artifact_title.clone())
+                .unwrap_or_else(|| artifact_id.to_string());
+            Some((artifact_id, title))
+        } else {
+            None
+        }
+    })();
+
     rsx! {
+        if let Some((_pause_artifact_id, pause_title)) = cascade_pause_banner.clone() {
+            div {
+                class: "operon-cascade-pause-banner",
+                "data-testid": "cascade-pause-banner",
+                span { class: "operon-cascade-pause-icon", "⏸" }
+                span { class: "operon-cascade-pause-text",
+                    "Cascade paused at checkpoint: "
+                    strong { "{pause_title}" }
+                    ". Approve the artifact and click ▶ Play on Requirements to continue."
+                }
+            }
+        }
         div { class: "operon-workflow-canvas",
             "data-testid": "workflow-canvas",
             // tabindex=0 + onkeydown — keyboard shortcuts (Ctrl+A, Del,
@@ -1506,6 +1548,18 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                     add_edge_if_new(&graph_snap, cur.from, target)
                                 {
                                     apply.call(g_next);
+                                    // Auto-expand the upstream so the
+                                    // newly-wired downstream stays
+                                    // visible. Without this, wiring
+                                    // tile→01 makes 01 disappear
+                                    // because the tile becomes the
+                                    // new indegree-0 root and isn't
+                                    // in `expanded` yet.
+                                    expanded.with_mut(|s| {
+                                        s.insert(cur.from);
+                                    });
+                                    let snap = expanded.read().clone();
+                                    persist_expanded.call(snap);
                                 }
                             }
                         }
@@ -1821,6 +1875,15 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                 let next = add_edge_if_new(&graph_for_edge, cur.from, node_id);
                                 if let Some(g_next) = next {
                                     apply_for_edge.call(g_next);
+                                    // Auto-expand the upstream so the
+                                    // newly-wired downstream stays
+                                    // visible (parity with the canvas-
+                                    // level edge-drag mouseup handler).
+                                    expanded.with_mut(|s| {
+                                        s.insert(cur.from);
+                                    });
+                                    let snap = expanded.read().clone();
+                                    persist_expanded.call(snap);
                                 }
                                 edge_drag.set(None);
                             };
@@ -2841,6 +2904,13 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
 
     let mut picker_open = use_signal(|| false);
     let mut picker_options: Signal<Vec<LocalNote>> = use_signal(Vec::new);
+    // Parallel picker for inserting artifact-snapshot tiles by hand.
+    // Lets users build a workflow that drives Requirements → Code
+    // without having to bootstrap the Requirements tile via ▶ Play
+    // first. Mirrors the skill picker's signal pattern.
+    let mut artifact_picker_open = use_signal(|| false);
+    let mut artifact_picker_options: Signal<Vec<LocalNote>> = use_signal(Vec::new);
+    let note_repo_for_artifact_picker = note_repo.clone();
 
     // Run-all-dirty: parse current graph, topo-sort dirty nodes, run
     // each sequentially via the executor, applying the mutated graph
@@ -2871,8 +2941,39 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
         );
     };
 
+    // Compute the current effective step-mode for label rendering.
+    // Re-parses on every toolbar render — cheap (graph_text is a few
+    // KB) and matches the rest of the toolbar's "trust the JSON,
+    // re-derive" pattern.
+    let current_step_mode = {
+        let parsed: WorkflowGraph =
+            serde_json::from_str(&graph_text).unwrap_or_default();
+        crate::plugins::workflow::state::effective_step_mode(&parsed)
+    };
+
+    // Toggle handler: flip the persisted `view_state.step_mode`. We
+    // always persist `Some(_)` (not `None`) so the user's explicit
+    // choice sticks even if the graph shape later changes (e.g. they
+    // delete every skill node — the heuristic would flip otherwise).
+    let graph_text_for_step = graph_text.clone();
+    let on_toggle_step_mode = move |_| {
+        let mut graph: WorkflowGraph =
+            match serde_json::from_str(&graph_text_for_step) {
+                Ok(g) => g,
+                Err(_) if graph_text_for_step.trim().is_empty() => {
+                    WorkflowGraph::new()
+                }
+                Err(_) => return,
+            };
+        let next = !crate::plugins::workflow::state::effective_step_mode(&graph);
+        graph.view_state.step_mode = Some(next);
+        graph.version = graph.version.saturating_add(1);
+        on_apply.call(serialize(&graph));
+    };
+
+    let note_id_str_for_picker = note_id_str.clone();
     let open_picker = move |_| {
-        let note_uuid = match Uuid::parse_str(&note_id_str) {
+        let note_uuid = match Uuid::parse_str(&note_id_str_for_picker) {
             Ok(u) => u,
             Err(_) => return,
         };
@@ -2889,6 +2990,29 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
         skills.sort_by(|a, b| a.title.cmp(&b.title));
         picker_options.set(skills);
         picker_open.set(true);
+    };
+
+    let note_id_str_for_artifact_picker = note_id_str.clone();
+    let open_artifact_picker = move |_| {
+        let note_uuid = match Uuid::parse_str(&note_id_str_for_artifact_picker) {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let project_id = match note_repo_for_artifact_picker
+            .find_project_for_note(note_uuid)
+        {
+            Ok(Some(p)) => p,
+            _ => return,
+        };
+        let mut artifacts: Vec<LocalNote> = note_repo_for_artifact_picker
+            .list_for_project(project_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|n| matches!(n.kind, NoteKind::Artifact))
+            .collect();
+        artifacts.sort_by(|a, b| a.title.cmp(&b.title));
+        artifact_picker_options.set(artifacts);
+        artifact_picker_open.set(true);
     };
 
     // Seed-pipeline: bulk-add every numbered skill in the project as a
@@ -2948,6 +3072,15 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
             current,
             &project_skills,
         );
+        // Auto-expand every node in the post-seed graph so the chain
+        // is visible immediately. Without this, `compute_visible`
+        // walks from the indegree-0 root (skill 01) and stops there
+        // because no node is in `expanded` — the user sees only 01
+        // and has to click chevrons to reveal the rest.
+        let all_ids: std::collections::BTreeSet<NodeId> =
+            next.nodes.keys().copied().collect();
+        expanded.set(all_ids.clone());
+        persist_expanded.call(all_ids);
         on_apply.call(serialize(&next));
     };
 
@@ -2964,6 +3097,14 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
             button {
                 r#type: "button",
                 class: "operon-workflow-toolbar-button",
+                "data-testid": "workflow-toolbar-add-artifact",
+                title: "Drop a read-only Artifact tile onto the canvas (Requirements / Epic / etc.) — wire it to a skill node to bind that skill's source artifact",
+                onclick: open_artifact_picker,
+                "+ Add artifact tile"
+            }
+            button {
+                r#type: "button",
+                class: "operon-workflow-toolbar-button",
                 "data-testid": "workflow-toolbar-seed",
                 title: "Add every numbered skill in the project as a chained Dirty node, in numeric order",
                 onclick: on_seed_pipeline,
@@ -2976,6 +3117,23 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
                 title: "Run every Dirty node in topological order",
                 onclick: on_run_all,
                 "\u{25B6} Run all dirty"
+            }
+            button {
+                r#type: "button",
+                class: if current_step_mode {
+                    "operon-workflow-toolbar-button operon-workflow-toolbar-button-active"
+                } else {
+                    "operon-workflow-toolbar-button"
+                },
+                "data-testid": "workflow-toolbar-step-mode",
+                "aria-pressed": if current_step_mode { "true" } else { "false" },
+                title: if current_step_mode {
+                    "Step mode ON — cascade pauses after every skill so each stage can be reviewed independently. Click to disable and run continuously."
+                } else {
+                    "Continuous run — cascade only pauses at cascade_stop checkpoints (01b, 02b, etc.). Click to enable per-skill pauses."
+                },
+                onclick: on_toggle_step_mode,
+                if current_step_mode { "\u{23F8} Step mode" } else { "\u{27A1} Continuous" }
             }
             button {
                 r#type: "button",
@@ -3076,6 +3234,64 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
                     }
                 }
             }
+            if *artifact_picker_open.read() {
+                div {
+                    class: "operon-workflow-skill-picker-backdrop",
+                    "data-testid": "workflow-artifact-picker-backdrop",
+                    onclick: move |_| artifact_picker_open.set(false),
+                }
+                div {
+                    class: "operon-workflow-skill-picker",
+                    "data-testid": "workflow-artifact-picker",
+                    onclick: move |evt: dioxus::events::MouseEvent| {
+                        evt.stop_propagation();
+                    },
+                    div { class: "operon-workflow-skill-picker-header",
+                        span { "Pick an artifact to drop on the canvas" }
+                        button {
+                            r#type: "button",
+                            class: "operon-workflow-skill-picker-close",
+                            onclick: move |_| artifact_picker_open.set(false),
+                            "\u{2715}"
+                        }
+                    }
+                    if artifact_picker_options.read().is_empty() {
+                        div { class: "operon-workflow-skill-picker-empty",
+                            "No artifact notes in this project yet \u{2014} create a Requirements artifact in the explorer first."
+                        }
+                    } else {
+                        ul { class: "operon-workflow-skill-picker-list",
+                            for art in artifact_picker_options.read().iter() {
+                                {
+                                    let art_id = art.id;
+                                    let label = art.title.clone();
+                                    let graph_text = graph_text.clone();
+                                    let on_apply = on_apply;
+                                    rsx! {
+                                        li {
+                                            key: "{art_id}",
+                                            button {
+                                                r#type: "button",
+                                                class: "operon-workflow-skill-picker-item",
+                                                onclick: move |_| {
+                                                    let next = append_artifact_tile_to_graph(
+                                                        &graph_text,
+                                                        art_id,
+                                                        &label,
+                                                    );
+                                                    on_apply.call(next);
+                                                    artifact_picker_open.set(false);
+                                                },
+                                                "{label}"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -3135,6 +3351,101 @@ fn parse_or_default(content: &str) -> WorkflowGraph {
         return WorkflowGraph::new();
     }
     serde_json::from_str(content).unwrap_or_default()
+}
+
+/// Compute the effective list of source artifact ids for a node when
+/// it runs in the topo loop (Phase 6 fan-out). Three cases:
+///
+/// 1. Node has an explicit `source_artifact_id` (typically auto-set
+///    when wired downstream of an artifact-snapshot tile, or set in
+///    the inspector). Returns that single id — node runs once.
+/// 2. Node has no explicit source but at least one upstream skill
+///    node has `cached_produced_artifact_ids` populated. Returns the
+///    union of all upstreams' ids — node fans out, running once per
+///    upstream-produced artifact. Order is upstream-iteration order
+///    so the canvas/topo sequence is preserved.
+/// 3. Neither of the above. Returns an empty Vec — caller should
+///    skip the node (no source to consume).
+///
+/// The fan-out only kicks in for nodes WITHOUT an explicit source.
+/// Aggregator skills (e.g. `aggregate: task`, `input_kind:
+/// requirements`) anchored to the Requirements root keep their
+/// single-source semantic even when downstream of a many-output
+/// upstream — their explicit `source_artifact_id` overrides fan-out.
+fn effective_sources_for_node(graph: &WorkflowGraph, node_id: NodeId) -> Vec<Uuid> {
+    if let Some(node) = graph.nodes.get(&node_id) {
+        if let Some(explicit) = node.source_artifact_id {
+            return vec![explicit];
+        }
+    } else {
+        return Vec::new();
+    }
+
+    let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut sources: Vec<Uuid> = Vec::new();
+    for edge in &graph.edges {
+        if edge.to != node_id {
+            continue;
+        }
+        let Some(upstream) = graph.nodes.get(&edge.from) else {
+            continue;
+        };
+        // Artifact-snapshot upstream: the tile's `artifact_ref` IS
+        // the source. (Phase 2 normally auto-derives this onto the
+        // downstream node, but a workflow JSON edited by hand may
+        // skip that step.)
+        if upstream.is_artifact_snapshot {
+            if let Some(art) = upstream.artifact_ref {
+                if seen.insert(art) {
+                    sources.push(art);
+                }
+            }
+            continue;
+        }
+        // Skill upstream: every artifact this upstream produced is
+        // a separate source for the downstream node — implicit
+        // fan-out.
+        for art in &upstream.cached_produced_artifact_ids {
+            if seen.insert(*art) {
+                sources.push(*art);
+            }
+        }
+    }
+    sources
+}
+
+/// Pull the cascade root artifact id out of a workflow graph: the
+/// artifact-snapshot tile that has no inbound `parent_child` edge.
+/// `Cascade: <root>` notes (auto-generated by `CascadeGraphWriter`)
+/// always have exactly one such tile — the artifact the user clicked
+/// ▶ on. Returns `None` for hand-built workflow graphs that aren't
+/// cascade snapshots (no artifact-snapshot tiles at all). When the
+/// shape is ambiguous (multiple unrooted artifact tiles), prefer the
+/// node with the smallest `position.1` (top-most on the canvas), which
+/// matches the writer's level-0 layout convention
+/// (`cascade_graph.rs:594-617`).
+fn find_cascade_root_artifact(graph: &WorkflowGraph) -> Option<Uuid> {
+    let mut has_parent_edge: std::collections::HashSet<NodeId> =
+        std::collections::HashSet::new();
+    for e in &graph.edges {
+        let kind = e.edge_kind.as_deref().unwrap_or("");
+        if kind == "parent_child" {
+            has_parent_edge.insert(e.to);
+        }
+    }
+    let mut candidates: Vec<&Node> = graph
+        .nodes
+        .values()
+        .filter(|n| n.is_artifact_snapshot && n.artifact_ref.is_some())
+        .filter(|n| !has_parent_edge.contains(&n.id))
+        .collect();
+    candidates.sort_by(|a, b| {
+        a.position
+            .1
+            .partial_cmp(&b.position.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates.first().and_then(|n| n.artifact_ref)
 }
 
 fn serialize(graph: &WorkflowGraph) -> String {
@@ -3681,6 +3992,15 @@ fn remove_node(graph: &WorkflowGraph, node_id: NodeId) -> WorkflowGraph {
 /// Append a `from -> to` edge if it would be safe (no self-loop, not
 /// a duplicate of an existing edge). Returns `None` when the edge is
 /// rejected so the caller can skip the apply round-trip.
+///
+/// Side effect: when `from` is an artifact-snapshot tile (carries
+/// `artifact_ref`) and `to` is a skill node without a
+/// `source_artifact_id` yet, auto-populate `to.source_artifact_id`
+/// with the upstream tile's `artifact_ref`. This is what binds a
+/// freshly-wired skill node to its consumed artifact so the
+/// workflow-canvas executor can route the run through
+/// `runner::run_skill_on_source` (Phase 4) and inherit aggregate /
+/// inherit / cascade_stop behavior.
 fn add_edge_if_new(graph: &WorkflowGraph, from: NodeId, to: NodeId) -> Option<WorkflowGraph> {
     if from == to {
         return None;
@@ -3697,6 +4017,24 @@ fn add_edge_if_new(graph: &WorkflowGraph, from: NodeId, to: NodeId) -> Option<Wo
         to_socket: "default".into(),
         edge_kind: None,
     });
+
+    // Auto-derive `source_artifact_id` on the destination skill node
+    // when the upstream is an artifact-snapshot tile. Only fills when
+    // the destination doesn't already have a source set (preserves
+    // explicit user overrides).
+    let upstream_artifact_ref = next
+        .nodes
+        .get(&from)
+        .filter(|n| n.is_artifact_snapshot)
+        .and_then(|n| n.artifact_ref);
+    if let Some(art_id) = upstream_artifact_ref {
+        if let Some(dest) = next.nodes.get_mut(&to) {
+            if !dest.is_artifact_snapshot && dest.source_artifact_id.is_none() {
+                dest.source_artifact_id = Some(art_id);
+            }
+        }
+    }
+
     next.version = next.version.saturating_add(1);
     Some(next)
 }
@@ -3710,6 +4048,31 @@ fn remove_edge(graph: &WorkflowGraph, edge_id: EdgeId) -> WorkflowGraph {
     next
 }
 
+/// Pick a non-overlapping drop position for a freshly-added node.
+/// Stacks new tiles diagonally to the bottom-right of whatever is
+/// already on the canvas so picker drops don't pile on top of each
+/// other (or each other plus existing seeded nodes). Strides match
+/// `seed-pipeline`'s `SEED_X_STRIDE`/`SEED_Y_STRIDE` so the visual
+/// gap rule is consistent across entry points.
+fn next_drop_position(graph: &WorkflowGraph) -> (f64, f64) {
+    const DROP_X_STRIDE: f64 = 340.0;
+    const DROP_Y_STRIDE: f64 = 290.0;
+    if graph.nodes.is_empty() {
+        return (40.0, 40.0);
+    }
+    let max_x = graph
+        .nodes
+        .values()
+        .map(|n| n.position.0)
+        .fold(0.0_f64, f64::max);
+    let max_y = graph
+        .nodes
+        .values()
+        .map(|n| n.position.1)
+        .fold(0.0_f64, f64::max);
+    (max_x + DROP_X_STRIDE, max_y + DROP_Y_STRIDE)
+}
+
 /// Insert a fresh node referencing `skill_note_id` into the JSON-text
 /// representation of a `WorkflowGraph`. Tolerates malformed input —
 /// returns the input unchanged in that case so the user's pending
@@ -3721,12 +4084,13 @@ fn append_node_to_graph(graph_text: &str, skill_note_id: Uuid) -> String {
         Err(_) => return graph_text.to_string(),
     };
     let id = Uuid::new_v4();
+    let position = next_drop_position(&graph);
     let node = Node {
         id,
         skill_note_id,
         typed_fields: serde_json::Value::Null,
         extra_instructions: String::new(),
-        position: (0.0, 0.0),
+        position,
         cached_output_path: None,
         cached_input_hash: None,
         status: NodeStatus::Dirty,
@@ -3735,6 +4099,53 @@ fn append_node_to_graph(graph_text: &str, skill_note_id: Uuid) -> String {
         artifact_ref: None,
         artifact_kind_label: None,
         artifact_title: None,
+        source_artifact_id: None,
+        cached_produced_artifact_ids: Vec::new(),
+    };
+    graph.nodes.insert(id, node);
+    graph.version = graph.version.saturating_add(1);
+    serialize(&graph)
+}
+
+/// Drop a read-only artifact-snapshot tile onto the canvas. Mirror of
+/// `append_node_to_graph` but builds the artifact-tile shape: no
+/// `skill_note_id`, `is_artifact_snapshot: true`, `artifact_ref` set,
+/// `artifact_title` cached for badge rendering. Lets the user wire
+/// this tile to a downstream skill node — `add_edge_if_new` then
+/// auto-derives `source_artifact_id` on the skill, which unlocks the
+/// SDLC executor route (`run_one_node_sdlc`) on the next "Run all
+/// dirty". `artifact_kind_label` is left None here; the canvas's
+/// reactive load loop fills it in on the next paint by reading the
+/// artifact body's frontmatter (same path the cascade-driven tiles
+/// use, so kind badges stay consistent across orchestrators).
+fn append_artifact_tile_to_graph(
+    graph_text: &str,
+    artifact_note_id: Uuid,
+    artifact_title: &str,
+) -> String {
+    let mut graph: WorkflowGraph = match serde_json::from_str(graph_text) {
+        Ok(g) => g,
+        Err(_) if graph_text.trim().is_empty() => WorkflowGraph::new(),
+        Err(_) => return graph_text.to_string(),
+    };
+    let id = Uuid::new_v4();
+    let position = next_drop_position(&graph);
+    let node = Node {
+        id,
+        skill_note_id: Uuid::nil(),
+        typed_fields: serde_json::Value::Null,
+        extra_instructions: String::new(),
+        position,
+        cached_output_path: None,
+        cached_input_hash: None,
+        status: NodeStatus::Fresh,
+        cached_output_note_id: None,
+        is_artifact_snapshot: true,
+        artifact_ref: Some(artifact_note_id),
+        artifact_kind_label: None,
+        artifact_title: Some(artifact_title.to_string()),
+        source_artifact_id: None,
+        cached_produced_artifact_ids: Vec::new(),
     };
     graph.nodes.insert(id, node);
     graph.version = graph.version.saturating_add(1);
@@ -3906,70 +4317,189 @@ fn spawn_run_cascade(
             return;
         }
 
+        // Phase 5 resume: clear any prior Paused phase keyed on this
+        // workflow's root artifact (or the workflow id fallback) so a
+        // re-click of "Run all dirty" after the user approved a
+        // checkpoint hides the pause banner before the next node
+        // starts. Subsequent cascade_stop hits in this run will
+        // re-Pause as expected.
+        let resume_root =
+            find_cascade_root_artifact(&graph).unwrap_or(workflow_id);
+        crate::shell::companion_state::CASCADE_STATE.with_mut(|m| {
+            m.remove(&resume_root);
+        });
+
+        // Outer loop: each node visited in topo order.
+        // Inner loop (Phase 6): each source artifact in the effective
+        // sources list. For SDLC nodes downstream of a many-output
+        // upstream this fans out — N upstream artifacts → N
+        // invocations of the downstream node, each parented to its
+        // own source artifact.
+        let mut paused_after_node = false;
         for node_id in order {
-            eprintln!("operon: cascade running node {node_id}");
-            if let Some(n) = graph.nodes.get_mut(&node_id) {
-                n.status = NodeStatus::Running;
+            if paused_after_node {
+                break;
             }
-            apply_graph.call(graph.clone());
-            match run_one_node(
-                &mut graph,
-                node_id,
-                workflow_id,
-                operon_session,
-                &repo_path,
-                plugin.clone(),
-                &persistence,
-                &note_repo,
-                transcript_sink.clone(),
-            )
-            .await
-            {
-                Err(e) => {
-                    eprintln!("operon: cascade node {node_id} failed: {e}");
-                    if let Some(n) = graph.nodes.get_mut(&node_id) {
-                        n.status = NodeStatus::Error(format!("{e}"));
-                    }
-                    apply_graph.call(graph.clone());
-                    break;
+            let sources = effective_sources_for_node(&graph, node_id);
+            eprintln!(
+                "operon: cascade visiting node {node_id} sources={}",
+                sources.len()
+            );
+            if sources.is_empty() {
+                eprintln!(
+                    "operon: cascade node {node_id} has no source — skipping"
+                );
+                continue;
+            }
+            // Fan-out: run the node once per source. Accumulate
+            // produced ids across invocations so downstream nodes
+            // see the full set on their next visit.
+            let mut accumulated_artifact_ids: Vec<Uuid> = Vec::new();
+            let mut node_failed = false;
+            for source_id in sources {
+                eprintln!(
+                    "operon: cascade running node {node_id} (source={source_id})"
+                );
+                // Stamp the source on the node so run_one_node's
+                // SDLC routing decision and run_one_node_sdlc both
+                // see the right input.
+                if let Some(n) = graph.nodes.get_mut(&node_id) {
+                    n.source_artifact_id = Some(source_id);
+                    n.status = NodeStatus::Running;
                 }
-                Ok(NodeRunOk { skill_note_id, produced }) => {
-                    eprintln!(
-                        "operon: cascade node {node_id} completed \
-                         produced={} (skill {skill_note_id})",
-                        produced.len()
-                    );
-                    // Best-effort import of every produced file as its
-                    // own Outputs note. Only when the workflow has a
-                    // resolvable project.
-                    if let Some(project_id) = project_id_opt {
-                        match upsert_output_notes(
-                            &note_repo,
-                            &persistence,
-                            project_id,
-                            &mut graph,
-                            node_id,
-                            skill_note_id,
-                            &produced,
-                        )
-                        .await
-                        {
-                            Ok(ids) => {
-                                eprintln!(
-                                    "operon: cascade imported {} output note(s)",
-                                    ids.len()
-                                );
-                                if let Some(mut sig) = note_version {
-                                    sig.with_mut(|v| *v = v.saturating_add(1));
+                apply_graph.call(graph.clone());
+                let result = run_one_node(
+                    &mut graph,
+                    node_id,
+                    workflow_id,
+                    operon_session,
+                    &repo_path,
+                    plugin.clone(),
+                    &persistence,
+                    &note_repo,
+                    transcript_sink.clone(),
+                )
+                .await;
+                let mut node_paused = false;
+                match result {
+                    Err(e) => {
+                        eprintln!("operon: cascade node {node_id} failed: {e}");
+                        if let Some(n) = graph.nodes.get_mut(&node_id) {
+                            n.status = NodeStatus::Error(format!("{e}"));
+                        }
+                        apply_graph.call(graph.clone());
+                        node_failed = true;
+                    }
+                    Ok(NodeRunOk {
+                        skill_note_id,
+                        produced,
+                        sdlc_artifact_ids,
+                        cascade_stop_artifact,
+                    }) => {
+                        if let Some(ids) = sdlc_artifact_ids.as_ref() {
+                            for id in ids {
+                                if !accumulated_artifact_ids.contains(id) {
+                                    accumulated_artifact_ids.push(*id);
                                 }
                             }
-                            Err(e) => eprintln!(
-                                "operon: cascade output-note upsert failed: {e}"
-                            ),
+                        }
+                        eprintln!(
+                            "operon: cascade node {node_id} (source={source_id}) \
+                             produced={} sdlc={} stop={:?} (skill {skill_note_id})",
+                            produced.len(),
+                            sdlc_artifact_ids.as_ref().map(|v| v.len()).unwrap_or(0),
+                            cascade_stop_artifact,
+                        );
+                        if sdlc_artifact_ids.is_some() {
+                            if let Some(mut sig) = note_version {
+                                sig.with_mut(|v| *v = v.saturating_add(1));
+                            }
+                        } else if let Some(project_id) = project_id_opt {
+                            match upsert_output_notes(
+                                &note_repo,
+                                &persistence,
+                                project_id,
+                                &mut graph,
+                                node_id,
+                                skill_note_id,
+                                &produced,
+                            )
+                            .await
+                            {
+                                Ok(ids) => {
+                                    eprintln!(
+                                        "operon: cascade imported {} output note(s)",
+                                        ids.len()
+                                    );
+                                    if let Some(mut sig) = note_version {
+                                        sig.with_mut(|v| *v = v.saturating_add(1));
+                                    }
+                                }
+                                Err(e) => eprintln!(
+                                    "operon: cascade output-note upsert failed: {e}"
+                                ),
+                            }
+                        }
+                        apply_graph.call(graph.clone());
+
+                        // Pause condition: a `cascade_stop` skill
+                        // produced a checkpoint artifact, OR step mode
+                        // is on AND any artifact was produced. Step
+                        // mode treats every successful skill run as a
+                        // checkpoint so the user can review each
+                        // stage independently before continuing.
+                        let step_mode_on =
+                            crate::plugins::workflow::state::effective_step_mode(&graph);
+                        let step_pause_artifact = if step_mode_on
+                            && cascade_stop_artifact.is_none()
+                        {
+                            sdlc_artifact_ids
+                                .as_ref()
+                                .and_then(|v| v.first().copied())
+                        } else {
+                            None
+                        };
+                        let pause_artifact = cascade_stop_artifact.or(step_pause_artifact);
+                        if let Some(checkpoint_id) = pause_artifact {
+                            let pause_root = find_cascade_root_artifact(&graph)
+                                .unwrap_or(workflow_id);
+                            crate::shell::companion_state::CASCADE_STATE
+                                .with_mut(|m| {
+                                    m.insert(
+                                        pause_root,
+                                        crate::shell::companion_state::CascadePhase::Paused {
+                                            artifact_id: checkpoint_id,
+                                            skill_id: skill_note_id,
+                                            level: 0,
+                                        },
+                                    );
+                                });
+                            eprintln!(
+                                "operon: cascade PAUSED at artifact {checkpoint_id} \
+                                 (root {pause_root}) cascade_stop={} step_mode={}",
+                                cascade_stop_artifact.is_some(),
+                                step_mode_on,
+                            );
+                            node_paused = true;
                         }
                     }
-                    apply_graph.call(graph.clone());
                 }
+                if node_failed || node_paused {
+                    if node_paused {
+                        paused_after_node = true;
+                    }
+                    break;
+                }
+            }
+            // After all sources for this node, stamp the accumulated
+            // produced artifact ids so downstream nodes see the full
+            // fan-out set on their next visit.
+            if let Some(n) = graph.nodes.get_mut(&node_id) {
+                n.cached_produced_artifact_ids = accumulated_artifact_ids;
+            }
+            apply_graph.call(graph.clone());
+            if node_failed {
+                break;
             }
         }
         eprintln!("operon: cascade DONE");
@@ -4084,12 +4614,22 @@ fn spawn_run_node(
                     n.status = NodeStatus::Error(format!("{e}"));
                 }
             }
-            Ok(NodeRunOk { skill_note_id, produced }) => {
+            Ok(NodeRunOk {
+                skill_note_id,
+                produced,
+                sdlc_artifact_ids,
+                cascade_stop_artifact: _,
+            }) => {
                 eprintln!(
-                    "operon: per-node run produced={} (skill {skill_note_id})",
-                    produced.len()
+                    "operon: per-node run produced={} sdlc={} (skill {skill_note_id})",
+                    produced.len(),
+                    sdlc_artifact_ids.as_ref().map(|v| v.len()).unwrap_or(0),
                 );
-                if let Some(project_id) = project_id_opt {
+                if sdlc_artifact_ids.is_some() {
+                    if let Some(mut sig) = note_version {
+                        sig.with_mut(|v| *v = v.saturating_add(1));
+                    }
+                } else if let Some(project_id) = project_id_opt {
                     match upsert_output_notes(
                         &note_repo,
                         &persistence,
@@ -4156,6 +4696,21 @@ struct NodeRunOk {
     /// element; multi-output skills (BA decompose, etc.) yield N.
     /// Each entry is `(absolute_path, body)`.
     produced: Vec<(std::path::PathBuf, String)>,
+    /// `Some(ids)` when this run went through the SDLC path
+    /// (`runner::run_skill_on_source`), which already imported each
+    /// produced file as a `NoteKind::Artifact` row. The outer cascade
+    /// driver uses this to (1) skip the legacy Outputs-note upsert
+    /// and (2) stamp `Node::cached_produced_artifact_ids` for fan-out
+    /// (Phase 6). `None` for the legacy free-form `executor::run_node`
+    /// path, which still emits Outputs notes via `upsert_output_notes`.
+    sdlc_artifact_ids: Option<Vec<Uuid>>,
+    /// `Some(checkpoint_artifact_id)` when this SDLC run produced an
+    /// artifact via a skill with `cascade_stop: true`. The cascade
+    /// driver writes `CASCADE_STATE::Paused` and breaks the topo
+    /// loop on this signal so the user reviews + approves the
+    /// checkpoint before continuing. The pause banner already reads
+    /// `CASCADE_STATE` and surfaces automatically (Phase 5).
+    cascade_stop_artifact: Option<Uuid>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4201,11 +4756,41 @@ async fn run_one_node(
         .and_then(|fm| crate::plugins::skill::frontmatter::field(fm, "skill_version"))
         .unwrap_or("")
         .to_string();
+    let skill_contract = crate::plugins::skill::frontmatter::contract(
+        frontmatter.as_deref().unwrap_or(&[]),
+    );
     eprintln!(
         "operon: run_one_node [{node_id}] skill_version={:?} body_len={}",
         skill_version,
         skill_body.len()
     );
+
+    // SDLC routing (Phase 4): when the node has a source artifact AND
+    // the skill contract declares any of `input_kind`/`aggregate`/
+    // `inherit`, route the run through `runner::run_skill_on_source`.
+    // That codepath inlines aggregated descendants and inherited
+    // ancestors, applies the gate (Pending vs Approved), and emits
+    // real `NoteKind::Artifact` notes parented to the source —
+    // identical to what ▶ Play on a Requirements artifact does.
+    let is_sdlc_node = node_snapshot.source_artifact_id.is_some()
+        && (skill_contract.input_kind.is_some()
+            || skill_contract.aggregate.is_some()
+            || skill_contract.inherit.is_some());
+    if is_sdlc_node {
+        return run_one_node_sdlc(
+            graph,
+            node_id,
+            &node_snapshot,
+            &skill_body,
+            skill_version,
+            &skill_contract,
+            persistence,
+            note_repo,
+            plugin,
+            operon_session,
+        )
+        .await;
+    }
 
     // Gather upstream outputs from disk (already-Fresh upstreams have
     // a `cached_output_path` we can read).
@@ -4283,6 +4868,108 @@ async fn run_one_node(
     Ok(NodeRunOk {
         skill_note_id: node_snapshot.skill_note_id,
         produced: artifact.produced,
+        sdlc_artifact_ids: None,
+        cascade_stop_artifact: None,
+    })
+}
+
+/// SDLC variant of `run_one_node` (Phase 4 of the workflow→cascade
+/// parity port). Routes the run through
+/// `runner::run_skill_on_source`, which handles aggregate / inherit /
+/// gates / artifact emission identically to the cascade orchestrator.
+/// Called when the node has a `source_artifact_id` and the skill
+/// declares an SDLC contract (`input_kind` / `aggregate` / `inherit`).
+///
+/// `contract` is the parsed SkillContract — used here only to detect
+/// `cascade_stop: true` so the SDLC route can surface a checkpoint
+/// signal back to `spawn_run_cascade` (Phase 5).
+#[allow(clippy::too_many_arguments)]
+async fn run_one_node_sdlc(
+    graph: &mut WorkflowGraph,
+    node_id: NodeId,
+    node_snapshot: &Node,
+    skill_body: &str,
+    skill_version: String,
+    contract: &crate::plugins::skill::frontmatter::SkillContract,
+    persistence: &Arc<dyn Persistence>,
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    plugin: Arc<operon_plugins_claude_code::ClaudeCodeChatPlugin>,
+    operon_session: Uuid,
+) -> Result<NodeRunOk, String> {
+    let source_id = node_snapshot
+        .source_artifact_id
+        .ok_or_else(|| "SDLC route requires source_artifact_id".to_string())?;
+    let project_repo: Arc<dyn LocalProjectRepository> = match try_consume_context::<
+        LocalProjectRepo,
+    >() {
+        Some(LocalProjectRepo(r)) => r,
+        None => return Err("LocalProjectRepo context missing in SDLC node run".into()),
+    };
+    let chat_repo_opt: Option<Arc<dyn operon_store::repos::ChatMessageRepository>> =
+        try_consume_context::<ChatMessageRepo>().map(|r| r.0);
+
+    eprintln!(
+        "operon: run_one_node_sdlc [{node_id}] source={source_id} \
+         skill={} session={operon_session}",
+        node_snapshot.skill_note_id,
+    );
+
+    let outcome = crate::plugins::artifact::runner::run_skill_on_source(
+        note_repo,
+        &project_repo,
+        persistence,
+        &plugin,
+        chat_repo_opt.as_ref(),
+        operon_session,
+        source_id,
+        node_snapshot.skill_note_id,
+    )
+    .await
+    .map_err(|e| format!("run_skill_on_source: {e}"))?;
+
+    eprintln!(
+        "operon: run_one_node_sdlc [{node_id}] produced {} artifact(s) under {}",
+        outcome.created_artifact_ids.len(),
+        outcome.artifacts_dir.display(),
+    );
+
+    // Stamp the node so the dirty/version logic sees this run as
+    // completed. `cached_produced_artifact_ids` accumulation across
+    // multiple fan-out invocations (Phase 6) is handled by the topo
+    // loop in `spawn_run_cascade` — this function only reports the
+    // ids it produced via `NodeRunOk::sdlc_artifact_ids`.
+    if let Some(n) = graph.nodes.get_mut(&node_id) {
+        n.cached_output_path = Some(outcome.artifacts_dir.clone());
+        n.cached_input_hash = Some(format!("sdlc-{}", node_id));
+        n.status = NodeStatus::Fresh;
+    }
+    let mut bag = SkillBag::new();
+    bag.insert(
+        node_snapshot.skill_note_id,
+        SkillSnapshot {
+            version: skill_version,
+            body_hash: hash_body(skill_body),
+        },
+    );
+    let _ = propagate_dirty(node_id, graph, &bag);
+
+    let cascade_stop_artifact = if contract.cascade_stop
+        && !outcome.created_artifact_ids.is_empty()
+    {
+        outcome.created_artifact_ids.first().copied()
+    } else {
+        None
+    };
+
+    Ok(NodeRunOk {
+        skill_note_id: node_snapshot.skill_note_id,
+        // Empty `produced` because the SDLC path already imported
+        // every file as an Artifact note via `import_produced_artifacts`
+        // — the outer cascade loop won't re-run `upsert_output_notes`
+        // when `sdlc_artifact_ids` is `Some`.
+        produced: Vec::new(),
+        sdlc_artifact_ids: Some(outcome.created_artifact_ids),
+        cascade_stop_artifact,
     })
 }
 
@@ -4490,6 +5177,8 @@ mod tests {
                 artifact_ref: None,
                 artifact_kind_label: None,
                 artifact_title: None,
+                source_artifact_id: None,
+                cached_produced_artifact_ids: Vec::new(),
             },
         );
         let s = serialize(&g);
@@ -4530,6 +5219,8 @@ mod tests {
                 artifact_ref: None,
                 artifact_kind_label: None,
                 artifact_title: None,
+                source_artifact_id: None,
+                cached_produced_artifact_ids: Vec::new(),
             },
         );
         let s = serialize(&g);
@@ -4544,6 +5235,54 @@ mod tests {
         let bad = "not actually json";
         let next = append_node_to_graph(bad, Uuid::new_v4());
         assert_eq!(next, bad);
+    }
+
+    #[test]
+    fn append_artifact_tile_creates_snapshot_node() {
+        let g = WorkflowGraph::new();
+        let s = serialize(&g);
+        let art = Uuid::new_v4();
+        let next = append_artifact_tile_to_graph(&s, art, "Requirements: Auth");
+        let parsed: WorkflowGraph = serde_json::from_str(&next).unwrap();
+        assert_eq!(parsed.nodes.len(), 1);
+        let node = parsed.nodes.values().next().unwrap();
+        assert!(node.is_artifact_snapshot);
+        assert_eq!(node.artifact_ref, Some(art));
+        assert_eq!(node.artifact_title.as_deref(), Some("Requirements: Auth"));
+        assert_eq!(node.skill_note_id, Uuid::nil());
+        assert!(matches!(node.status, NodeStatus::Fresh));
+    }
+
+    #[test]
+    fn append_artifact_tile_then_skill_node_then_edge_auto_derives_source() {
+        // End-to-end of the new picker flow: drop an artifact tile,
+        // then a skill node, then wire them — confirms the wiring
+        // populates source_artifact_id so the SDLC executor route
+        // takes effect on the next "Run all dirty".
+        let s = serialize(&WorkflowGraph::new());
+        let art = Uuid::new_v4();
+        let s = append_artifact_tile_to_graph(&s, art, "Requirements");
+        let skill = Uuid::new_v4();
+        let s = append_node_to_graph(&s, skill);
+        let mut g: WorkflowGraph = serde_json::from_str(&s).unwrap();
+        let tile_id = *g
+            .nodes
+            .iter()
+            .find(|(_, n)| n.is_artifact_snapshot)
+            .map(|(id, _)| id)
+            .unwrap();
+        let skill_node_id = *g
+            .nodes
+            .iter()
+            .find(|(_, n)| !n.is_artifact_snapshot)
+            .map(|(id, _)| id)
+            .unwrap();
+        g = add_edge_if_new(&g, tile_id, skill_node_id).expect("edge added");
+        assert_eq!(
+            g.nodes.get(&skill_node_id).and_then(|n| n.source_artifact_id),
+            Some(art),
+            "skill node should inherit source from the upstream tile"
+        );
     }
 
     #[test]
@@ -4569,6 +5308,8 @@ mod tests {
                     artifact_ref: None,
                     artifact_kind_label: None,
                     artifact_title: None,
+                    source_artifact_id: None,
+                    cached_produced_artifact_ids: Vec::new(),
                 },
             );
         }
@@ -4630,6 +5371,8 @@ mod tests {
                     artifact_ref: None,
                     artifact_kind_label: None,
                     artifact_title: None,
+                    source_artifact_id: None,
+                    cached_produced_artifact_ids: Vec::new(),
                 },
             );
         }
@@ -4710,6 +5453,8 @@ mod tests {
                 artifact_ref: None,
                 artifact_kind_label: None,
                 artifact_title: None,
+                source_artifact_id: None,
+                cached_produced_artifact_ids: Vec::new(),
             },
         );
         g.nodes.insert(
@@ -4728,10 +5473,249 @@ mod tests {
                 artifact_ref: None,
                 artifact_kind_label: None,
                 artifact_title: None,
+                source_artifact_id: None,
+                cached_produced_artifact_ids: Vec::new(),
             },
         );
         let map = layout(&g);
         assert!(map.contains_key(&a));
         assert!(!map.contains_key(&b));
+    }
+
+    /// Build a node with the given id, skill, and (optional)
+    /// source_artifact_id. Test helper for the fan-out / source-
+    /// resolution suite.
+    fn skill_node(id: NodeId, source: Option<Uuid>, produced: Vec<Uuid>) -> Node {
+        Node {
+            id,
+            skill_note_id: Uuid::new_v4(),
+            typed_fields: serde_json::Value::Null,
+            extra_instructions: String::new(),
+            position: (0.0, 0.0),
+            cached_output_path: None,
+            cached_input_hash: None,
+            status: NodeStatus::Fresh,
+            cached_output_note_id: None,
+            is_artifact_snapshot: false,
+            artifact_ref: None,
+            artifact_kind_label: None,
+            artifact_title: None,
+            source_artifact_id: source,
+            cached_produced_artifact_ids: produced,
+        }
+    }
+
+    fn artifact_tile(id: NodeId, art: Uuid) -> Node {
+        Node {
+            id,
+            skill_note_id: Uuid::nil(),
+            typed_fields: serde_json::Value::Null,
+            extra_instructions: String::new(),
+            position: (0.0, 0.0),
+            cached_output_path: None,
+            cached_input_hash: None,
+            status: NodeStatus::Fresh,
+            cached_output_note_id: None,
+            is_artifact_snapshot: true,
+            artifact_ref: Some(art),
+            artifact_kind_label: None,
+            artifact_title: None,
+            source_artifact_id: None,
+            cached_produced_artifact_ids: Vec::new(),
+        }
+    }
+
+    fn plain_edge(from: NodeId, to: NodeId) -> Edge {
+        Edge {
+            id: Uuid::new_v4(),
+            from,
+            from_socket: "default".into(),
+            to,
+            to_socket: "default".into(),
+            edge_kind: None,
+        }
+    }
+
+    #[test]
+    fn effective_sources_uses_explicit_source_artifact_id() {
+        let mut g = WorkflowGraph::new();
+        let n = Uuid::new_v4();
+        let art = Uuid::new_v4();
+        g.nodes.insert(n, skill_node(n, Some(art), vec![]));
+        let sources = effective_sources_for_node(&g, n);
+        assert_eq!(sources, vec![art]);
+    }
+
+    #[test]
+    fn effective_sources_returns_empty_for_unbound_node() {
+        let mut g = WorkflowGraph::new();
+        let n = Uuid::new_v4();
+        g.nodes.insert(n, skill_node(n, None, vec![]));
+        let sources = effective_sources_for_node(&g, n);
+        assert!(sources.is_empty());
+    }
+
+    #[test]
+    fn effective_sources_pulls_from_artifact_snapshot_upstream() {
+        let mut g = WorkflowGraph::new();
+        let tile_id = Uuid::new_v4();
+        let skill_id = Uuid::new_v4();
+        let art = Uuid::new_v4();
+        g.nodes.insert(tile_id, artifact_tile(tile_id, art));
+        g.nodes.insert(skill_id, skill_node(skill_id, None, vec![]));
+        g.edges.push(plain_edge(tile_id, skill_id));
+        let sources = effective_sources_for_node(&g, skill_id);
+        assert_eq!(sources, vec![art]);
+    }
+
+    #[test]
+    fn effective_sources_fans_out_from_skill_upstream_with_many_outputs() {
+        // Phase 6: when an upstream skill node has produced N
+        // artifacts (output_count: many), the downstream node fans
+        // out — sources list contains all N ids.
+        let mut g = WorkflowGraph::new();
+        let upstream = Uuid::new_v4();
+        let downstream = Uuid::new_v4();
+        let art_a = Uuid::new_v4();
+        let art_b = Uuid::new_v4();
+        let art_c = Uuid::new_v4();
+        g.nodes.insert(
+            upstream,
+            skill_node(upstream, None, vec![art_a, art_b, art_c]),
+        );
+        g.nodes
+            .insert(downstream, skill_node(downstream, None, vec![]));
+        g.edges.push(plain_edge(upstream, downstream));
+        let sources = effective_sources_for_node(&g, downstream);
+        assert_eq!(sources, vec![art_a, art_b, art_c]);
+    }
+
+    #[test]
+    fn effective_sources_explicit_source_overrides_upstream_fan_out() {
+        // Aggregator skills (input_kind: requirements, anchored to
+        // the seed root) keep their single-source semantic even when
+        // downstream of a many-output upstream — explicit
+        // source_artifact_id wins.
+        let mut g = WorkflowGraph::new();
+        let upstream = Uuid::new_v4();
+        let aggregator = Uuid::new_v4();
+        let req_root = Uuid::new_v4();
+        let task_a = Uuid::new_v4();
+        let task_b = Uuid::new_v4();
+        g.nodes.insert(
+            upstream,
+            skill_node(upstream, None, vec![task_a, task_b]),
+        );
+        g.nodes.insert(
+            aggregator,
+            skill_node(aggregator, Some(req_root), vec![]),
+        );
+        g.edges.push(plain_edge(upstream, aggregator));
+        let sources = effective_sources_for_node(&g, aggregator);
+        assert_eq!(sources, vec![req_root]);
+    }
+
+    #[test]
+    fn effective_sources_dedups_same_artifact_seen_via_multiple_upstreams() {
+        let mut g = WorkflowGraph::new();
+        let up_a = Uuid::new_v4();
+        let up_b = Uuid::new_v4();
+        let down = Uuid::new_v4();
+        let shared_art = Uuid::new_v4();
+        g.nodes
+            .insert(up_a, skill_node(up_a, None, vec![shared_art]));
+        g.nodes
+            .insert(up_b, skill_node(up_b, None, vec![shared_art]));
+        g.nodes.insert(down, skill_node(down, None, vec![]));
+        g.edges.push(plain_edge(up_a, down));
+        g.edges.push(plain_edge(up_b, down));
+        let sources = effective_sources_for_node(&g, down);
+        assert_eq!(sources, vec![shared_art]);
+    }
+
+    #[test]
+    fn add_edge_auto_derives_source_from_artifact_snapshot_upstream() {
+        // Phase 2: wiring an edge from an artifact-snapshot tile to
+        // a fresh skill node should copy the tile's `artifact_ref`
+        // onto the skill's `source_artifact_id`.
+        let mut g = WorkflowGraph::new();
+        let tile_id = Uuid::new_v4();
+        let skill_id = Uuid::new_v4();
+        let art = Uuid::new_v4();
+        g.nodes.insert(tile_id, artifact_tile(tile_id, art));
+        g.nodes.insert(skill_id, skill_node(skill_id, None, vec![]));
+        let next = add_edge_if_new(&g, tile_id, skill_id)
+            .expect("edge should be added");
+        assert_eq!(
+            next.nodes.get(&skill_id).and_then(|n| n.source_artifact_id),
+            Some(art),
+            "skill node should inherit the tile's artifact_ref"
+        );
+    }
+
+    #[test]
+    fn add_edge_does_not_overwrite_explicit_source() {
+        // When the destination already has source_artifact_id set,
+        // wiring a new artifact-tile upstream must NOT overwrite it
+        // (preserves explicit user overrides).
+        let mut g = WorkflowGraph::new();
+        let tile_id = Uuid::new_v4();
+        let skill_id = Uuid::new_v4();
+        let tile_art = Uuid::new_v4();
+        let explicit_art = Uuid::new_v4();
+        g.nodes.insert(tile_id, artifact_tile(tile_id, tile_art));
+        g.nodes
+            .insert(skill_id, skill_node(skill_id, Some(explicit_art), vec![]));
+        let next = add_edge_if_new(&g, tile_id, skill_id)
+            .expect("edge should be added");
+        assert_eq!(
+            next.nodes.get(&skill_id).and_then(|n| n.source_artifact_id),
+            Some(explicit_art),
+            "explicit source must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn add_edge_skill_to_skill_does_not_set_source() {
+        // When the upstream is another skill (not an artifact tile),
+        // no auto-derive should happen — the downstream node stays
+        // unbound so the topo loop's fan-out logic kicks in.
+        let mut g = WorkflowGraph::new();
+        let s1 = Uuid::new_v4();
+        let s2 = Uuid::new_v4();
+        g.nodes.insert(s1, skill_node(s1, None, vec![]));
+        g.nodes.insert(s2, skill_node(s2, None, vec![]));
+        let next = add_edge_if_new(&g, s1, s2).expect("edge should be added");
+        assert!(
+            next.nodes
+                .get(&s2)
+                .and_then(|n| n.source_artifact_id)
+                .is_none(),
+            "skill→skill edge must not auto-derive source"
+        );
+    }
+
+    #[test]
+    fn find_cascade_root_picks_top_artifact_snapshot_with_no_inbound_parent_edge() {
+        let mut g = WorkflowGraph::new();
+        let root_tile = Uuid::new_v4();
+        let child_tile = Uuid::new_v4();
+        let root_art = Uuid::new_v4();
+        let child_art = Uuid::new_v4();
+        let mut root_node = artifact_tile(root_tile, root_art);
+        root_node.position = (0.0, 0.0);
+        let mut child_node = artifact_tile(child_tile, child_art);
+        child_node.position = (0.0, 200.0);
+        g.nodes.insert(root_tile, root_node);
+        g.nodes.insert(child_tile, child_node);
+        g.edges.push(Edge {
+            id: Uuid::new_v4(),
+            from: root_tile,
+            from_socket: "default".into(),
+            to: child_tile,
+            to_socket: "default".into(),
+            edge_kind: Some("parent_child".into()),
+        });
+        assert_eq!(find_cascade_root_artifact(&g), Some(root_art));
     }
 }

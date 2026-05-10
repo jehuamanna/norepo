@@ -1535,6 +1535,49 @@ html, body {
   border: 1px solid var(--vscode-panel-border);
   border-radius: 12px;
 }
+/* Cascade-paused checkpoint banner — shown above the workflow
+   canvas when CASCADE_STATE for the workflow's root artifact is
+   in CascadePhase::Paused. Sticky at the top of the canvas so the
+   user can't scroll past the "approve and re-click ▶" cue while
+   the cascade is in checkpoint state. */
+.operon-cascade-pause-banner {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  font-size: 13px;
+  color: var(--vscode-editor-foreground);
+  background: var(--vscode-editorWarning-background, rgba(255, 200, 0, 0.10));
+  border-bottom: 2px solid var(--vscode-editorWarning-foreground, #d6a000);
+}
+.operon-cascade-pause-icon {
+  font-size: 16px;
+  line-height: 1;
+}
+.operon-cascade-pause-text strong {
+  color: var(--vscode-editorWarning-foreground, #d6a000);
+}
+
+/* Cascade-level "Claude is working…" banner. Same shape as the
+   per-skill `.operon-companion-msg-thinking` row but with a
+   slightly stronger accent border so the user can distinguish
+   "single skill thinking" from "the whole cascade is in flight". */
+.operon-companion-cascade-working {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+  background: var(--vscode-editorWidget-background, rgba(127, 127, 127, 0.06));
+  border: 1px solid var(--operon-accent, #4ea1ff);
+  border-radius: 12px;
+}
 .operon-companion-thinking-spinner {
   width: 10px;
   height: 10px;
@@ -2485,6 +2528,51 @@ html, body {
   font-size: 12px;
   background: transparent;
   color: var(--vscode-editor-foreground);
+}
+
+/* ===== Artifact: Refinement notes (per-artifact custom prompt) =====
+   Collapsible section that surfaces between the action buttons and
+   the body editor. The user types feedback here ("regenerate this
+   Epic but emphasize observability") and the runner inlines it into
+   the next regeneration prompt; cleared after a successful run. */
+.operon-artifact-revision-notes-section {
+  margin: 8px 12px 0;
+  padding: 6px 10px;
+  background: var(--vscode-editorWidget-background, rgba(127, 127, 127, 0.06));
+  border: 1px solid var(--vscode-panel-border, rgba(127, 127, 127, 0.2));
+  border-radius: 4px;
+}
+.operon-artifact-revision-notes-section > summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  user-select: none;
+  color: var(--vscode-descriptionforeground);
+}
+.operon-artifact-revision-notes {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 6px 8px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--vscode-input-foreground, inherit);
+  background: var(--vscode-input-background, rgba(0, 0, 0, 0.04));
+  border: 1px solid var(--vscode-input-border, rgba(127, 127, 127, 0.2));
+  border-radius: 3px;
+  resize: vertical;
+  box-sizing: border-box;
+}
+.operon-artifact-revision-notes:focus {
+  outline: 1px solid var(--operon-accent, #4ea1ff);
+  outline-offset: -1px;
+}
+.operon-artifact-revision-notes-hint {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--vscode-descriptionforeground);
 }
 
 /* ===== Artifact: Revise / Re-run action buttons ===== */

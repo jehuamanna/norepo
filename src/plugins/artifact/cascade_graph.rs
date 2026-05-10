@@ -180,6 +180,8 @@ impl CascadeGraphWriter {
                 artifact_ref: Some(artifact_id),
                 artifact_kind_label: kind_label_hint,
                 artifact_title: None,
+                source_artifact_id: None,
+                cached_produced_artifact_ids: Vec::new(),
             },
         );
         self.by_artifact.insert(artifact_id, nid);
@@ -526,6 +528,15 @@ pub fn append_numbered_skill_chain(
     // Place the new chain one row below the deepest existing node so
     // re-clicking "Seed pipeline" with hand-edited content above just
     // appends fresh chains instead of overwriting existing work.
+    //
+    // Strides must clear the tile dimensions in `workflow::view`
+    // (`NODE_W = 260`, `NODE_H = 210`) plus a comfortable gap so
+    // adjacent tiles don't visually collide — the previous 220-px
+    // x-stride was 40 px narrower than the tiles themselves and the
+    // 160-px y-stride was 50 px shorter than the tile height, both of
+    // which produced overlapping cards on a fresh seed.
+    const SEED_X_STRIDE: f64 = 340.0; // 260 tile + 80 gap
+    const SEED_Y_STRIDE: f64 = 290.0; // 210 tile + 80 gap
     let row_y = graph
         .nodes
         .values()
@@ -534,7 +545,7 @@ pub fn append_numbered_skill_chain(
     let next_y = if graph.nodes.is_empty() {
         40.0
     } else {
-        row_y + 160.0
+        row_y + SEED_Y_STRIDE
     };
 
     let mut prev: Option<Uuid> = None;
@@ -547,7 +558,7 @@ pub fn append_numbered_skill_chain(
                 skill_note_id: skill.id,
                 typed_fields: serde_json::Value::Null,
                 extra_instructions: String::new(),
-                position: (40.0 + (i as f64) * 220.0, next_y),
+                position: (40.0 + (i as f64) * SEED_X_STRIDE, next_y),
                 cached_output_path: None,
                 cached_input_hash: None,
                 status: NodeStatus::Dirty,
@@ -556,6 +567,8 @@ pub fn append_numbered_skill_chain(
                 artifact_ref: None,
                 artifact_kind_label: None,
                 artifact_title: None,
+                source_artifact_id: None,
+                cached_produced_artifact_ids: Vec::new(),
             },
         );
         if let Some(from) = prev {
@@ -611,6 +624,8 @@ pub async fn seed_cascade_workflow_root_only(
             artifact_ref: Some(root_artifact_id),
             artifact_kind_label: Some(root_kind_label.to_string()),
             artifact_title: Some(root_artifact_title.to_string()),
+            source_artifact_id: None,
+            cached_produced_artifact_ids: Vec::new(),
         },
     );
     graph.version = graph.version.saturating_add(1);

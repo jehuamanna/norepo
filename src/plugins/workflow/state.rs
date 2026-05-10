@@ -55,6 +55,16 @@ pub struct WorkflowViewState {
     /// to 1.0 at hydrate time.
     #[serde(default)]
     pub zoom: f64,
+    /// "Step mode" — when set, the cascade pauses after every skill
+    /// that produced an artifact (not just `cascade_stop` checkpoint
+    /// skills) and outputs stay `Pending` instead of being
+    /// auto-approved. Lets the user check + edit + approve each
+    /// stage independently before continuing. `None` means "use the
+    /// heuristic default" (see `effective_step_mode`); `Some(true)`
+    /// / `Some(false)` is the user's explicit choice persisted from
+    /// the toolbar toggle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_mode: Option<bool>,
 }
 
 impl WorkflowViewState {
@@ -66,7 +76,29 @@ impl WorkflowViewState {
             && self.pan_x == 0.0
             && self.pan_y == 0.0
             && (self.zoom == 0.0 || self.zoom == 1.0)
+            && self.step_mode.is_none()
     }
+}
+
+/// Resolve a graph's effective step-mode flag. Returns the persisted
+/// `view_state.step_mode` when the user has explicitly chosen, or the
+/// heuristic default when they haven't.
+///
+/// Heuristic: "is there at least one skill node?".
+/// - Cascade-driven `Cascade: <root>` notes are seeded with a single
+///   artifact-snapshot tile and grow more snapshots as the cascade
+///   runs — they have zero skill nodes. Default → `false` (continuous,
+///   matches existing ▶ Play UX).
+/// - Hand-built workflows have at least one skill node wired in
+///   (otherwise there's nothing to run). Default → `true` so the user
+///   can step through and validate each skill in isolation while
+///   designing the chain.
+/// - Empty graphs default to `false` (no skills to step through).
+pub fn effective_step_mode(graph: &WorkflowGraph) -> bool {
+    if let Some(explicit) = graph.view_state.step_mode {
+        return explicit;
+    }
+    graph.nodes.values().any(|n| !n.is_artifact_snapshot)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -137,6 +169,27 @@ pub struct Node {
     /// lookup on every paint.
     #[serde(default)]
     pub artifact_title: Option<String>,
+    /// The source `NoteKind::Artifact` this skill node consumes when
+    /// the workflow-canvas executor invokes it. Set automatically when
+    /// the user wires an edge from an artifact-snapshot tile (the
+    /// edge-creation handler copies the upstream tile's `artifact_ref`
+    /// here) or set explicitly via the inspector. Empty for hand-built
+    /// "free-form" workflow nodes that have no artifact context — in
+    /// that case the executor falls back to the legacy upstream-outputs
+    /// prompt instead of routing through `runner::run_skill_on_source`.
+    /// Populating this is what unlocks `aggregate` / `inherit` /
+    /// `cascade_stop` / artifact-frontmatter behavior in workflow runs.
+    #[serde(default)]
+    pub source_artifact_id: Option<Uuid>,
+    /// Artifact note ids produced by the most recent successful run
+    /// of this node. Populated after `runner::run_skill_on_source`
+    /// returns. Used by downstream nodes for fan-out (Phase 6): when
+    /// node B's source isn't explicitly set, the executor walks B's
+    /// incoming edges and visits each upstream node's
+    /// `cached_produced_artifact_ids` as a separate source — i.e.
+    /// node B fires once per artifact the upstream produced.
+    #[serde(default)]
+    pub cached_produced_artifact_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -238,6 +291,8 @@ mod tests {
             artifact_ref: None,
             artifact_kind_label: None,
             artifact_title: None,
+            source_artifact_id: None,
+            cached_produced_artifact_ids: Vec::new(),
         }
     }
 
@@ -314,5 +369,77 @@ mod tests {
         let e: Edge = serde_json::from_str(json).unwrap();
         assert_eq!(e.from_socket, "default");
         assert_eq!(e.to_socket, "default");
+    }
+
+    fn artifact_tile_node(id: NodeId) -> Node {
+        Node {
+            id,
+            skill_note_id: Uuid::nil(),
+            typed_fields: serde_json::Value::Null,
+            extra_instructions: String::new(),
+            position: (0.0, 0.0),
+            cached_output_path: None,
+            cached_input_hash: None,
+            status: NodeStatus::Fresh,
+            cached_output_note_id: None,
+            is_artifact_snapshot: true,
+            artifact_ref: Some(Uuid::new_v4()),
+            artifact_kind_label: None,
+            artifact_title: None,
+            source_artifact_id: None,
+            cached_produced_artifact_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn effective_step_mode_explicit_choice_wins() {
+        let mut g = WorkflowGraph::new();
+        g.view_state.step_mode = Some(true);
+        assert!(effective_step_mode(&g));
+        g.view_state.step_mode = Some(false);
+        assert!(!effective_step_mode(&g));
+    }
+
+    #[test]
+    fn effective_step_mode_defaults_false_for_artifact_only_graph() {
+        // Cascade-driven `Cascade: <root>` notes start with just a
+        // single artifact-snapshot tile and zero skill nodes.
+        let mut g = WorkflowGraph::new();
+        let id = Uuid::new_v4();
+        g.nodes.insert(id, artifact_tile_node(id));
+        assert!(!effective_step_mode(&g));
+    }
+
+    #[test]
+    fn effective_step_mode_defaults_true_when_skill_node_present() {
+        // Hand-built workflow: at least one skill node wired in.
+        let mut g = WorkflowGraph::new();
+        let id = Uuid::new_v4();
+        g.nodes.insert(id, node(id));
+        assert!(effective_step_mode(&g));
+    }
+
+    #[test]
+    fn effective_step_mode_defaults_false_for_empty_graph() {
+        let g = WorkflowGraph::new();
+        assert!(!effective_step_mode(&g));
+    }
+
+    #[test]
+    fn view_state_step_mode_round_trips_through_serde() {
+        let mut vs = WorkflowViewState::default();
+        vs.step_mode = Some(true);
+        let json = serde_json::to_string(&vs).unwrap();
+        let back: WorkflowViewState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.step_mode, Some(true));
+    }
+
+    #[test]
+    fn view_state_default_skips_step_mode_in_serialized_form() {
+        // None should be skipped to keep brand-new workflow JSON
+        // compact (matches the other view_state fields).
+        let vs = WorkflowViewState::default();
+        let json = serde_json::to_string(&vs).unwrap();
+        assert!(!json.contains("step_mode"));
     }
 }

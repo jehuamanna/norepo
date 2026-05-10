@@ -163,6 +163,18 @@ pub struct ArtifactFrontmatter {
     pub source_artifact_id: Option<Uuid>,
     pub source_skill_id: Option<Uuid>,
     pub input_hash: Option<String>,
+    /// Free-form user feedback that should be inlined into the next
+    /// re-run's prompt. Lets the user say "regenerate this Epic but
+    /// emphasize X" without polluting the artifact body. Auto-cleared
+    /// by the runner after a successful regeneration so old feedback
+    /// doesn't replay on subsequent runs.
+    ///
+    /// Persisted on a single line as `revision_notes: <inline string>`.
+    /// Newlines in the user's input are escaped to `\n` on serialize
+    /// and restored on parse so multi-line notes round-trip cleanly
+    /// without breaking the YAML-ish single-line frontmatter format
+    /// the rest of this parser expects.
+    pub revision_notes: Option<String>,
 }
 
 impl Default for ArtifactFrontmatter {
@@ -173,6 +185,7 @@ impl Default for ArtifactFrontmatter {
             source_artifact_id: None,
             source_skill_id: None,
             input_hash: None,
+            revision_notes: None,
         }
     }
 }
@@ -195,13 +208,64 @@ pub fn parse(body: &str) -> ArtifactFrontmatter {
     let source_skill_id = field(&lines, "source_skill_id")
         .and_then(|s| Uuid::parse_str(s).ok());
     let input_hash = field(&lines, "input_hash").map(str::to_string);
+    let revision_notes = field(&lines, "revision_notes")
+        .map(unescape_inline)
+        .filter(|s| !s.is_empty());
     ArtifactFrontmatter {
         artifact_kind,
         status,
         source_artifact_id,
         source_skill_id,
         input_hash,
+        revision_notes,
     }
+}
+
+/// Escape a user-typed string into a single-line frontmatter value:
+/// newlines become `\n`, backslashes become `\\`. Mirrors
+/// `unescape_inline`'s decoder.
+fn escape_inline(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Reverse of `escape_inline`: turn `\n` / `\r` / `\\` sequences back
+/// into the literal characters. Unknown escapes pass through verbatim
+/// so user-typed backslashes don't get eaten if the field was hand-
+/// edited in raw form.
+fn unescape_inline(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.peek() {
+                Some('n') => {
+                    chars.next();
+                    out.push('\n');
+                }
+                Some('r') => {
+                    chars.next();
+                    out.push('\r');
+                }
+                Some('\\') => {
+                    chars.next();
+                    out.push('\\');
+                }
+                _ => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Replace the frontmatter block in `body` with one rebuilt from
@@ -226,6 +290,15 @@ pub fn rewrite(body: &str, next: &ArtifactFrontmatter) -> String {
     if let Some(h) = next.input_hash.as_ref() {
         out.push_str(&format!("input_hash: {h}\n"));
     }
+    if let Some(notes) = next.revision_notes.as_ref() {
+        let trimmed = notes.trim();
+        if !trimmed.is_empty() {
+            out.push_str(&format!(
+                "revision_notes: {}\n",
+                escape_inline(trimmed)
+            ));
+        }
+    }
     // Preserve any *other* keys the skill emitted that we don't
     // model here (e.g. acceptance_criteria, dependencies). They
     // round-trip verbatim so the artifact view's "Edit body" path
@@ -237,6 +310,7 @@ pub fn rewrite(body: &str, next: &ArtifactFrontmatter) -> String {
             "source_artifact_id",
             "source_skill_id",
             "input_hash",
+            "revision_notes",
         ];
         for line in &prev_lines {
             let trimmed = line.trim();
@@ -398,5 +472,60 @@ mod tests {
         let body = rewrite("", &fm);
         let parsed = parse(&body);
         assert_eq!(parsed.source_artifact_id, Some(id));
+    }
+
+    #[test]
+    fn revision_notes_round_trip_single_line() {
+        let mut fm = ArtifactFrontmatter::default();
+        fm.artifact_kind = Some(ArtifactKind::Epic);
+        fm.revision_notes = Some("Emphasize observability concerns".into());
+        let body = rewrite("", &fm);
+        assert!(body.contains("revision_notes: Emphasize observability concerns"));
+        let parsed = parse(&body);
+        assert_eq!(
+            parsed.revision_notes.as_deref(),
+            Some("Emphasize observability concerns")
+        );
+    }
+
+    #[test]
+    fn revision_notes_round_trip_multi_line() {
+        // Newlines have to be escaped so the single-line frontmatter
+        // serializer doesn't split the value across multiple keys.
+        let mut fm = ArtifactFrontmatter::default();
+        fm.artifact_kind = Some(ArtifactKind::Feature);
+        fm.revision_notes = Some(
+            "Drop the analytics epic.\nAdd an SLO epic instead.".into(),
+        );
+        let body = rewrite("", &fm);
+        // Stored escaped on disk:
+        assert!(body.contains("revision_notes: Drop the analytics epic.\\nAdd an SLO epic instead."));
+        // Decoded back when parsing:
+        let parsed = parse(&body);
+        assert_eq!(
+            parsed.revision_notes.as_deref(),
+            Some("Drop the analytics epic.\nAdd an SLO epic instead.")
+        );
+    }
+
+    #[test]
+    fn revision_notes_empty_string_is_dropped() {
+        // Empty / whitespace-only notes should NOT serialize a blank
+        // `revision_notes:` line — that would be visual noise on the
+        // common case.
+        let mut fm = ArtifactFrontmatter::default();
+        fm.artifact_kind = Some(ArtifactKind::Task);
+        fm.revision_notes = Some("   ".into());
+        let body = rewrite("", &fm);
+        assert!(!body.contains("revision_notes"));
+    }
+
+    #[test]
+    fn revision_notes_absent_in_legacy_bodies() {
+        // Existing artifact frontmatter without the field parses
+        // cleanly with `revision_notes: None`.
+        let body = "---\nartifact_kind: epic\nstatus: approved\n---\nbody";
+        let fm = parse(body);
+        assert_eq!(fm.revision_notes, None);
     }
 }

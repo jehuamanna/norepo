@@ -201,10 +201,15 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                             ReviseButton { artifact_id: uuid }
                         }
                         if status == ArtifactStatus::Dirty {
-                            if let (Some(parent), Some(skill)) =
-                                (fm.source_artifact_id, fm.source_skill_id)
+                            if let (Some(parent), Some(skill), Some(self_id)) =
+                                (fm.source_artifact_id, fm.source_skill_id, source_uuid)
                             {
-                                RerunButton { parent_id: parent, skill_id: skill }
+                                RerunButton {
+                                    parent_id: parent,
+                                    skill_id: skill,
+                                    artifact_id: self_id,
+                                    artifact_body: content_for_actions.clone(),
+                                }
                             }
                         }
                         button {
@@ -310,6 +315,51 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                         "Cascade paused at checkpoint (level {level}) \u{2014} review the new backlog and approve to continue."
                     }
                 },
+            }
+            if body_editable {
+                {
+                    let revision_notes_value =
+                        fm.revision_notes.clone().unwrap_or_default();
+                    let initially_open =
+                        matches!(status, ArtifactStatus::Dirty)
+                            || !revision_notes_value.is_empty();
+                    let content_for_revision = content_for_actions.clone();
+                    rsx! {
+                        details {
+                            class: "operon-artifact-revision-notes-section",
+                            "data-testid": "artifact-revision-notes",
+                            open: initially_open,
+                            summary { "Refinement notes (used on next re-run)" }
+                            textarea {
+                                class: "operon-artifact-revision-notes",
+                                "data-testid": "artifact-revision-notes-textarea",
+                                placeholder:
+                                    "e.g. Drop the analytics epic — out of scope. Add an Epic for observability/SLOs.",
+                                rows: "4",
+                                value: "{revision_notes_value}",
+                                oninput: move |evt| {
+                                    let next = evt.value();
+                                    patch_revision_notes(
+                                        &content_for_revision,
+                                        Some(next),
+                                        on_change,
+                                    );
+                                },
+                            }
+                            if !revision_notes_value.is_empty() {
+                                small {
+                                    class: "operon-artifact-revision-notes-hint",
+                                    "These notes will be inlined into the next regeneration prompt and cleared automatically after a successful run."
+                                }
+                            } else {
+                                small {
+                                    class: "operon-artifact-revision-notes-hint",
+                                    "Type guidance here. Mark the artifact Dirty and click Re-run — your notes get inlined into the prompt that regenerates this artifact."
+                                }
+                            }
+                        }
+                    }
+                }
             }
             div {
                 // In edit mode, the inner MonacoEditorHost mounts with
@@ -464,6 +514,30 @@ pub fn patch_status_text(content: &str, next: ArtifactStatus) -> String {
     let mut fm = parse(content);
     fm.status = next;
     rewrite(content, &fm)
+}
+
+/// Frontmatter-only patch for `revision_notes`. Whitespace-only input
+/// is stored as `None` so the field doesn't serialize a noisy empty
+/// line. Body is preserved untouched. The runner clears this field
+/// after a successful regeneration consumed it.
+fn patch_revision_notes(
+    content: &str,
+    next: Option<String>,
+    on_change: Option<EventHandler<String>>,
+) {
+    let mut fm = parse(content);
+    fm.revision_notes = next.and_then(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    let new_body = rewrite(content, &fm);
+    if let Some(handler) = on_change {
+        handler.call(new_body);
+    }
 }
 
 fn status_css_class(s: ArtifactStatus) -> &'static str {
@@ -713,6 +787,7 @@ fn SkillPickerPanel(props: SkillPickerPanelProps) -> Element {
                                                 &mut chat_session_version_setter,
                                                 &mut active_session_setter,
                                                 &mut active_scope_setter,
+                                                None,
                                             );
                                             on_dismiss.call(());
                                         },
@@ -792,6 +867,7 @@ fn preview_skill_contract(
 /// child artifact, where we run against the parent's already-on-disk
 /// body).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn spawn_runner(
     source_note_id: Uuid,
     skill_note_id: Uuid,
@@ -807,6 +883,7 @@ fn spawn_runner(
     chat_session_version: &mut Signal<u64>,
     active_session: &mut Signal<Option<Uuid>>,
     active_scope: &mut Signal<operon_store::repos::ChatScope>,
+    extra_revision_notes: Option<(Uuid, String)>,
 ) {
     // Deterministic chat-session id per source artifact: re-runs of
     // any skill against the same source land in the same rail entry.
@@ -914,17 +991,19 @@ fn spawn_runner(
                 return;
             }
         }
-        let result = crate::plugins::artifact::run_skill_on_source(
-            &note_repo,
-            &project_repo,
-            &persistence,
-            &plugin,
-            Some(&chat_message_repo),
-            chat_session_id,
-            source_note_id,
-            skill_note_id,
-        )
-        .await;
+        let result =
+            crate::plugins::artifact::runner::run_skill_on_source_with_revision_notes(
+                &note_repo,
+                &project_repo,
+                &persistence,
+                &plugin,
+                Some(&chat_message_repo),
+                chat_session_id,
+                source_note_id,
+                skill_note_id,
+                extra_revision_notes,
+            )
+            .await;
         // Both Ok/Err writes go to the GlobalSignal map, so they
         // don't trigger `__copy_value_hoisted` warnings. The
         // artifact view subscribes to the map and re-renders the
@@ -983,6 +1062,17 @@ pub fn chat_session_id_for_source(source_note_id: Uuid) -> Uuid {
 struct RerunButtonProps {
     parent_id: Uuid,
     skill_id: Uuid,
+    /// The Dirty output artifact whose Re-run button this is. Used to
+    /// pull the user's `revision_notes` off its frontmatter so they
+    /// can be inlined into the regeneration prompt under
+    /// `--- refinement notes from user ---`. The runner clears the
+    /// notes after a successful run.
+    artifact_id: Uuid,
+    /// The current rendered body of the Dirty artifact (already in
+    /// memory in `ArtifactView`). Pre-flushed to disk by `spawn_runner`
+    /// before the run starts so the parsed `revision_notes` reflects
+    /// the user's latest edit, not stale persistence bytes.
+    artifact_body: String,
 }
 
 #[component]
@@ -999,13 +1089,15 @@ fn RerunButton(props: RerunButtonProps) -> Element {
     let crate::shell::companion_state::ActiveChatScope(active_scope) = use_context();
     let parent_id = props.parent_id;
     let skill_id = props.skill_id;
+    let artifact_id = props.artifact_id;
+    let artifact_body = props.artifact_body.clone();
 
     rsx! {
         button {
             r#type: "button",
             class: "operon-artifact-rerun",
             "data-testid": "artifact-rerun",
-            title: "Re-run the producing skill against the parent — overwrites this artifact (siblings produced by the same skill may also be regenerated).",
+            title: "Re-run the producing skill against the parent — overwrites this artifact. If you've added Refinement notes, they're inlined into the regeneration prompt.",
             onclick: move |_| {
                 let project_id = match note_repo.find_project_for_note(parent_id) {
                     Ok(Some(p)) => p,
@@ -1021,6 +1113,15 @@ fn RerunButton(props: RerunButtonProps) -> Element {
                 let mut chat_session_version_setter = chat_session_version;
                 let mut active_session_setter = active_session;
                 let mut active_scope_setter = active_scope;
+                // Pull the user's refinement notes off this dirty
+                // artifact's frontmatter so they reach the regenerator
+                // under the `--- refinement notes from user ---`
+                // prompt fence. None when the user didn't type any
+                // notes — the runner falls back to source-side notes
+                // and/or no fence at all.
+                let extra_notes = crate::plugins::artifact::frontmatter::parse(&artifact_body)
+                    .revision_notes
+                    .map(|n| (artifact_id, n));
                 spawn_runner(
                     parent_id,
                     skill_id,
@@ -1036,6 +1137,7 @@ fn RerunButton(props: RerunButtonProps) -> Element {
                     &mut chat_session_version_setter,
                     &mut active_session_setter,
                     &mut active_scope_setter,
+                    extra_notes,
                 );
             },
             "Re-run"
@@ -1875,23 +1977,64 @@ pub fn spawn_cascade(
     // stays the clicked artifact so we only walk that subtree.
     let seed_id = resolve_seed_id_sync(&persistence, root_artifact_id);
 
-    // Bind the rail to a deterministic cascade session so transcripts
-    // for each skill run inside the cascade land in the same rail
-    // entry as a per-source run would. Keyed on the SEED so all play
-    // invocations under one Requirements tree share the same chat
-    // session.
-    let cascade_session_id = chat_session_id_for_cascade(seed_id);
-    let session_label = format!("Cascade: {}", short_uuid(seed_id));
-    let exists = matches!(chat_session_repo.get(cascade_session_id), Ok(Some(_)));
-    if !exists {
-        let _ = chat_session_repo.create_with_id(
-            cascade_session_id,
-            operon_store::repos::ChatScope::Project(project_id),
-            &session_label,
-        );
-    }
+    // Mint a fresh chat session per Play click. Two simultaneous
+    // cascades — one per click — each get their own rail entry and
+    // their own transcript. We label the entry with both the seed
+    // title and the clicked artifact so the user can tell which
+    // run is which when several are in flight at once.
+    let cascade_session_id = Uuid::new_v4();
+    let seed_label_short = note_repo
+        .list_for_project(project_id)
+        .ok()
+        .and_then(|all| all.into_iter().find(|n| n.id == seed_id))
+        .map(|n| n.title)
+        .unwrap_or_else(|| short_uuid(seed_id));
+    let click_label_short = if root_artifact_id == seed_id {
+        String::new()
+    } else {
+        note_repo
+            .list_for_project(project_id)
+            .ok()
+            .and_then(|all| all.into_iter().find(|n| n.id == root_artifact_id))
+            .map(|n| n.title)
+            .unwrap_or_else(|| short_uuid(root_artifact_id))
+    };
+    let stamp = {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Convert seconds-since-epoch to HH:MM:SS local-ish form
+        // without pulling in chrono. Wraps every 24h, fine for a
+        // labeling suffix.
+        let secs_in_day = (now % 86_400) as u64;
+        let h = secs_in_day / 3600;
+        let m = (secs_in_day % 3600) / 60;
+        let s = secs_in_day % 60;
+        format!("{:02}:{:02}:{:02}", h, m, s)
+    };
+    let session_label = if click_label_short.is_empty() {
+        format!("Cascade: {} @ {}", seed_label_short, stamp)
+    } else {
+        format!(
+            "Cascade: {} \u{2192} {} @ {}",
+            seed_label_short, click_label_short, stamp
+        )
+    };
+    let _ = chat_session_repo.create_with_id(
+        cascade_session_id,
+        operon_store::repos::ChatScope::Project(project_id),
+        &session_label,
+    );
     let _ = chat_session_repo.touch(cascade_session_id);
     chat_session_version.with_mut(|v| *v = v.saturating_add(1));
+    // Register this session as currently running so the companion
+    // transcript renderer can show "Claude is working…" until the
+    // cascade ends. Removed in the spawn_forever's terminal arms
+    // below.
+    crate::shell::companion_state::CASCADE_RUNNING_SESSIONS.with_mut(|s| {
+        s.insert(cascade_session_id);
+    });
     let scope = operon_store::repos::ChatScope::Project(project_id);
     active_scope.set(scope);
     active_session.set(Some(cascade_session_id));
@@ -1979,6 +2122,7 @@ pub fn spawn_cascade(
             cancel.clone(),
             writer.as_mut(),
             max_depth,
+            cascade_session_id,
         )
         .await;
         match result {
@@ -2017,6 +2161,10 @@ pub fn spawn_cascade(
         // creates a fresh token.
         crate::shell::companion_state::CASCADE_CANCEL.with_mut(|m| {
             m.remove(&root_artifact_id);
+        });
+        // Clear the "Claude is working…" indicator for this session.
+        crate::shell::companion_state::CASCADE_RUNNING_SESSIONS.with_mut(|s| {
+            s.remove(&cascade_session_id);
         });
         // Bump the GlobalSignal — `spawn_forever` runs in the virtual
         // root scope, so writes to the component-scope Signal here
