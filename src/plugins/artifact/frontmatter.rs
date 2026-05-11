@@ -33,10 +33,18 @@ use crate::plugins::skill::frontmatter::{field, split};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactKind {
+    /// Project root in the updated SDLC chain: holds the high-level
+    /// charter ("build a portfolio management system") plus any
+    /// CE-team inputs. The Play button is restricted to this kind so
+    /// every cascade starts from master. `01-ba-aggregate-requirements`
+    /// fans this out into multiple `Requirements` children.
+    MasterRequirement,
     /// The user-authored seed: a Markdown note titled "Requirements"
-    /// (or any markdown body) that the BA pipeline starts from. This
-    /// kind is observed on synthetic root artifacts created when a
-    /// non-Artifact note is used as the cascade entry.
+    /// (or any markdown body) that the BA pipeline starts from. In
+    /// the legacy chain this was the project root; in the updated
+    /// chain it's one of many detailed requirement children under a
+    /// `MasterRequirement`. Also observed on synthetic root artifacts
+    /// created when a non-Artifact note is used as the cascade entry.
     Requirements,
     Epic,
     Feature,
@@ -47,6 +55,17 @@ pub enum ArtifactKind {
     TestCases,
     TestResults,
     Summary,
+    /// SA's single architecture note, iteratively revised in-place
+    /// from the project's `MasterRequirement`. Inherited by SDE skills
+    /// to scope implementation work.
+    Architecture,
+    /// SDE-filed bug pointing at a specific Implementation. Consumed by
+    /// the bug-fix skill, which produces a new Implementation revision.
+    Bug,
+    /// Cross-level discrepancy question emitted by the coherence-check
+    /// skill. Body lists single/multi-choice options the user resolves
+    /// in-place; the cascade halts until the artifact is Approved.
+    Clarification,
     /// Aggregated cross-task backlog produced by a prioritization
     /// skill (e.g. `04b-pm-prioritize-tasks-coarse`). Body holds a
     /// priority-ordered list of every Task under the seed plus a
@@ -63,6 +82,7 @@ pub enum ArtifactKind {
 impl ArtifactKind {
     pub fn as_str(&self) -> &str {
         match self {
+            Self::MasterRequirement => "master_requirement",
             Self::Requirements => "requirements",
             Self::Epic => "epic",
             Self::Feature => "feature",
@@ -73,6 +93,9 @@ impl ArtifactKind {
             Self::TestCases => "test_cases",
             Self::TestResults => "test_results",
             Self::Summary => "summary",
+            Self::Architecture => "architecture",
+            Self::Bug => "bug",
+            Self::Clarification => "clarification",
             Self::PrioritizedBacklog => "prioritized_backlog",
             Self::Other(s) => s.as_str(),
         }
@@ -80,6 +103,7 @@ impl ArtifactKind {
 
     pub fn parse(s: &str) -> Self {
         match s.trim() {
+            "master_requirement" => Self::MasterRequirement,
             "requirements" => Self::Requirements,
             "epic" => Self::Epic,
             "feature" => Self::Feature,
@@ -90,6 +114,9 @@ impl ArtifactKind {
             "test_cases" => Self::TestCases,
             "test_results" => Self::TestResults,
             "summary" => Self::Summary,
+            "architecture" => Self::Architecture,
+            "bug" => Self::Bug,
+            "clarification" => Self::Clarification,
             "prioritized_backlog" => Self::PrioritizedBacklog,
             other => Self::Other(other.to_string()),
         }
@@ -97,6 +124,7 @@ impl ArtifactKind {
 
     pub fn display_name(&self) -> String {
         match self {
+            Self::MasterRequirement => "Master Requirement".into(),
             Self::Requirements => "Requirements".into(),
             Self::Epic => "Epic".into(),
             Self::Feature => "Feature".into(),
@@ -107,6 +135,9 @@ impl ArtifactKind {
             Self::TestCases => "Test Cases".into(),
             Self::TestResults => "Test Results".into(),
             Self::Summary => "Summary".into(),
+            Self::Architecture => "Architecture".into(),
+            Self::Bug => "Bug".into(),
+            Self::Clarification => "Clarification".into(),
             Self::PrioritizedBacklog => "Prioritized Backlog".into(),
             Self::Other(s) => s.clone(),
         }
@@ -208,8 +239,14 @@ pub fn parse(body: &str) -> ArtifactFrontmatter {
     let source_skill_id = field(&lines, "source_skill_id")
         .and_then(|s| Uuid::parse_str(s).ok());
     let input_hash = field(&lines, "input_hash").map(str::to_string);
-    let revision_notes = field(&lines, "revision_notes")
-        .map(unescape_inline)
+    // Custom parse path — the shared `field()` helper trims and
+    // greedy-strips outer `"`/`'` chars, which would eat both our
+    // wrapping quotes AND any user-typed escaped `\"` sitting at the
+    // edges. We need to remove exactly one wrapping `"` from each side
+    // and leave inner escapes alone. Falls back to `field()`'s
+    // behaviour for legacy unquoted values written before the wrapping
+    // format landed.
+    let revision_notes = revision_notes_from_lines(&lines)
         .filter(|s| !s.is_empty());
     ArtifactFrontmatter {
         artifact_kind,
@@ -221,9 +258,55 @@ pub fn parse(body: &str) -> ArtifactFrontmatter {
     }
 }
 
+/// Pull the `revision_notes` value out of frontmatter lines without
+/// going through the shared `field()` helper. We need this because:
+///
+/// * `field()` greedy-strips outer `"`/`'` chars via `trim_matches`,
+///   which also eats the trailing `\"` of an escaped inner quote.
+/// * `field()` calls `v.trim()` first, which would eat the trailing
+///   space the user just typed in the controlled textarea.
+///
+/// This parser strips exactly ONE wrapping `"` from each side (when
+/// present) and leaves the inner escape sequences alone for
+/// `unescape_inline` to decode. For legacy bodies written before the
+/// quote-wrapping format landed, it falls back to the old behaviour
+/// (trim + decode).
+fn revision_notes_from_lines(lines: &[&str]) -> Option<String> {
+    for line in lines {
+        let body = line.trim_start();
+        let Some(rest) = body.strip_prefix("revision_notes:") else {
+            continue;
+        };
+        // YAML idiom: one space after the colon. Strip it if present
+        // but don't trim the rest — we need the user's leading
+        // whitespace inside the value to survive.
+        let rest = rest.strip_prefix(' ').unwrap_or(rest);
+        // `lines()` already stripped the line ending, but be defensive
+        // about a stray `\r` on CRLF inputs.
+        let rest = rest.trim_end_matches('\r');
+        // Quoted form: `"...escape_inline(value)..."`. Strip exactly
+        // one `"` from each end.
+        if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
+            let inner = &rest[1..rest.len() - 1];
+            return Some(unescape_inline(inner));
+        }
+        // Legacy unquoted form — match the prior behaviour so old
+        // notes still parse cleanly.
+        let inner = rest.trim();
+        if inner.is_empty() {
+            return None;
+        }
+        return Some(unescape_inline(inner));
+    }
+    None
+}
+
 /// Escape a user-typed string into a single-line frontmatter value:
-/// newlines become `\n`, backslashes become `\\`. Mirrors
-/// `unescape_inline`'s decoder.
+/// newlines become `\n`, backslashes become `\\`, double quotes become
+/// `\"`. Mirrors `unescape_inline`'s decoder. Double-quote escaping
+/// matters because `rewrite` wraps the serialized value in `"..."` so
+/// the custom revision-notes parser can strip exactly one wrapping
+/// quote from each side.
 fn escape_inline(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -231,16 +314,17 @@ fn escape_inline(s: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
+            '"' => out.push_str("\\\""),
             other => out.push(other),
         }
     }
     out
 }
 
-/// Reverse of `escape_inline`: turn `\n` / `\r` / `\\` sequences back
-/// into the literal characters. Unknown escapes pass through verbatim
-/// so user-typed backslashes don't get eaten if the field was hand-
-/// edited in raw form.
+/// Reverse of `escape_inline`: turn `\n` / `\r` / `\\` / `\"` sequences
+/// back into the literal characters. Unknown escapes pass through
+/// verbatim so user-typed backslashes don't get eaten if the field was
+/// hand-edited in raw form.
 fn unescape_inline(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -258,6 +342,10 @@ fn unescape_inline(s: &str) -> String {
                 Some('\\') => {
                     chars.next();
                     out.push('\\');
+                }
+                Some('"') => {
+                    chars.next();
+                    out.push('"');
                 }
                 _ => out.push('\\'),
             }
@@ -291,11 +379,20 @@ pub fn rewrite(body: &str, next: &ArtifactFrontmatter) -> String {
         out.push_str(&format!("input_hash: {h}\n"));
     }
     if let Some(notes) = next.revision_notes.as_ref() {
-        let trimmed = notes.trim();
-        if !trimmed.is_empty() {
+        // Don't trim — the controlled textarea sends every keystroke
+        // through here, so stripping trailing whitespace would eat the
+        // space the user just typed. We do skip serialization for
+        // all-whitespace notes (they round-trip as `None` via parse's
+        // `is_empty` filter on the unescaped form anyway).
+        if !notes.chars().all(char::is_whitespace) {
+            // Wrap in double quotes so the shared `field()` parser's
+            // `v.trim()` step has whitespace to chew through *outside*
+            // the quotes — preserving any leading/trailing whitespace
+            // the user actually typed. `escape_inline` escapes `"` so
+            // user-typed quotes don't break the wrapping.
             out.push_str(&format!(
-                "revision_notes: {}\n",
-                escape_inline(trimmed)
+                "revision_notes: \"{}\"\n",
+                escape_inline(notes)
             ));
         }
     }
@@ -374,6 +471,41 @@ mod tests {
         assert_eq!(
             ArtifactKind::TestResults.display_name(),
             "Test Results"
+        );
+    }
+
+    #[test]
+    fn parse_extracts_master_requirement_kind() {
+        let body = "---\nartifact_kind: master_requirement\nstatus: approved\n---\nbody";
+        let fm = parse(body);
+        assert_eq!(fm.artifact_kind, Some(ArtifactKind::MasterRequirement));
+        assert_eq!(ArtifactKind::MasterRequirement.as_str(), "master_requirement");
+        assert_eq!(
+            ArtifactKind::MasterRequirement.display_name(),
+            "Master Requirement"
+        );
+    }
+
+    #[test]
+    fn parse_extracts_architecture_kind() {
+        let body = "---\nartifact_kind: architecture\nstatus: pending\n---\nbody";
+        let fm = parse(body);
+        assert_eq!(fm.artifact_kind, Some(ArtifactKind::Architecture));
+        assert_eq!(ArtifactKind::Architecture.as_str(), "architecture");
+        assert_eq!(ArtifactKind::Architecture.display_name(), "Architecture");
+    }
+
+    #[test]
+    fn parse_extracts_bug_and_clarification_kinds() {
+        let bug = parse("---\nartifact_kind: bug\n---\nbody");
+        assert_eq!(bug.artifact_kind, Some(ArtifactKind::Bug));
+        assert_eq!(ArtifactKind::Bug.as_str(), "bug");
+        let clar = parse("---\nartifact_kind: clarification\n---\nbody");
+        assert_eq!(clar.artifact_kind, Some(ArtifactKind::Clarification));
+        assert_eq!(ArtifactKind::Clarification.as_str(), "clarification");
+        assert_eq!(
+            ArtifactKind::Clarification.display_name(),
+            "Clarification"
         );
     }
 
@@ -480,7 +612,7 @@ mod tests {
         fm.artifact_kind = Some(ArtifactKind::Epic);
         fm.revision_notes = Some("Emphasize observability concerns".into());
         let body = rewrite("", &fm);
-        assert!(body.contains("revision_notes: Emphasize observability concerns"));
+        assert!(body.contains("revision_notes: \"Emphasize observability concerns\""));
         let parsed = parse(&body);
         assert_eq!(
             parsed.revision_notes.as_deref(),
@@ -498,14 +630,63 @@ mod tests {
             "Drop the analytics epic.\nAdd an SLO epic instead.".into(),
         );
         let body = rewrite("", &fm);
-        // Stored escaped on disk:
-        assert!(body.contains("revision_notes: Drop the analytics epic.\\nAdd an SLO epic instead."));
+        // Stored escaped + quoted on disk:
+        assert!(body.contains(
+            "revision_notes: \"Drop the analytics epic.\\nAdd an SLO epic instead.\""
+        ));
         // Decoded back when parsing:
         let parsed = parse(&body);
         assert_eq!(
             parsed.revision_notes.as_deref(),
             Some("Drop the analytics epic.\nAdd an SLO epic instead.")
         );
+    }
+
+    #[test]
+    fn revision_notes_round_trip_preserves_trailing_space() {
+        // Regression: a trailing space mid-typing must survive the
+        // round-trip — otherwise the controlled textarea snaps the
+        // cursor back and the user can never type a real space.
+        let mut fm = ArtifactFrontmatter::default();
+        fm.artifact_kind = Some(ArtifactKind::Epic);
+        fm.revision_notes = Some("hello ".into());
+        let body = rewrite("", &fm);
+        let parsed = parse(&body);
+        assert_eq!(parsed.revision_notes.as_deref(), Some("hello "));
+    }
+
+    #[test]
+    fn revision_notes_round_trip_preserves_trailing_newline() {
+        // Same regression for newlines: pressing Enter at the end
+        // must not be eaten by the serializer.
+        let mut fm = ArtifactFrontmatter::default();
+        fm.artifact_kind = Some(ArtifactKind::Epic);
+        fm.revision_notes = Some("line1\n".into());
+        let body = rewrite("", &fm);
+        let parsed = parse(&body);
+        assert_eq!(parsed.revision_notes.as_deref(), Some("line1\n"));
+    }
+
+    #[test]
+    fn revision_notes_round_trip_preserves_embedded_double_quotes() {
+        // The quote-wrapping serializer escapes inner `"` so user
+        // content like `say "hi"` survives the round-trip.
+        let mut fm = ArtifactFrontmatter::default();
+        fm.artifact_kind = Some(ArtifactKind::Epic);
+        fm.revision_notes = Some(r#"say "hi""#.into());
+        let body = rewrite("", &fm);
+        let parsed = parse(&body);
+        assert_eq!(parsed.revision_notes.as_deref(), Some(r#"say "hi""#));
+    }
+
+    #[test]
+    fn revision_notes_legacy_unquoted_value_still_parses() {
+        // Older artifact files on disk used the unquoted form. They
+        // must continue to parse cleanly so this format change is
+        // backwards-compatible.
+        let body = "---\nartifact_kind: epic\nstatus: pending\nrevision_notes: legacy plain value\n---\nbody";
+        let parsed = parse(body);
+        assert_eq!(parsed.revision_notes.as_deref(), Some("legacy plain value"));
     }
 
     #[test]

@@ -29,6 +29,18 @@ mod companion_area;
 pub mod companion_chat;
 pub mod companion_state;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod agent_backend_picker;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod permission_persist;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod permission_prompt;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod clarification_prompt;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod settings;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod mcp_settings;
+#[cfg(not(target_arch = "wasm32"))]
 mod session_rail;
 #[cfg(not(target_arch = "wasm32"))]
 mod tool_card;

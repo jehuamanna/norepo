@@ -110,6 +110,7 @@ pub async fn run_skill_on_source(
         source_note_id,
         skill_note_id,
         None,
+        Vec::new(),
     )
     .await
 }
@@ -122,6 +123,15 @@ pub async fn run_skill_on_source(
 /// `--- refinement notes from user ---`. After a successful import,
 /// both note sources are auto-cleared so subsequent re-runs don't
 /// replay stale feedback.
+///
+/// `previous_outputs` carries the prior `(title, body)` pairs of any
+/// existing child artifacts that are about to be overwritten or whose
+/// subtree just got wiped. The runner inlines these under
+/// `--- previous revisions to preserve ---` so the regen prompt can
+/// honor the seed-skill convention of appending a new
+/// `## Revision N (YYYY-MM-DD)` block and stashing the prior body
+/// inside a collapsed `<details>` section rather than discarding
+/// history. Pass `Vec::new()` when there's no history to preserve.
 ///
 /// Pass `(None, None)` (i.e., call `run_skill_on_source` instead) when
 /// the cascade orchestrator drives the run — cascade-side dirty
@@ -139,6 +149,7 @@ pub async fn run_skill_on_source_with_revision_notes(
     source_note_id: Uuid,
     skill_note_id: Uuid,
     extra_revision_notes: Option<(Uuid, String)>,
+    previous_outputs: Vec<(String, String)>,
 ) -> Result<RunOutcome, RunnerError> {
     // 1. Resolve project + repo_path.
     let project_id = note_repo
@@ -267,6 +278,7 @@ pub async fn run_skill_on_source_with_revision_notes(
         &aggregated,
         &inherited,
         combined_notes.as_deref(),
+        &previous_outputs,
     );
 
     // 7. Persist the prompt as a User message (transcript visibility).
@@ -546,6 +558,7 @@ fn build_prompt(
     aggregated: &[(String, String)],
     inherited: &[(String, String)],
     revision_notes: Option<&str>,
+    previous_outputs: &[(String, String)],
 ) -> String {
     let mut buf = String::new();
     buf.push_str(
@@ -619,6 +632,36 @@ fn build_prompt(
             buf.push_str(&format!("\n--- /artifact: {title} ---\n\n"));
         }
         buf.push_str(&format!("--- /inherited {kind} artifacts ---\n\n"));
+    }
+
+    if !previous_outputs.is_empty() {
+        buf.push_str(&format!(
+            "--- previous revisions to preserve ({n} total) ---\n\
+             These are the prior bodies of the artifacts you're about to\n\
+             regenerate. The seed-skill convention is to PRESERVE history\n\
+             rather than discard it:\n\
+             \n\
+             1. Generate the new revision's body above any prior content.\n\
+             2. Move the previous body's content into a collapsed\n\
+                `<details><summary>Revision N (YYYY-MM-DD)</summary>` block\n\
+                at the bottom of the new file. Stack older revisions below\n\
+                newer ones inside their own `<details>` blocks.\n\
+             3. Add a new `## Revision history` row dated today summarising\n\
+                what changed in this regeneration. Keep every prior row\n\
+                verbatim.\n\
+             \n\
+             Match each previous body to the new file you write by title:\n\
+             reuse the same kebab-case filename so the engine's title-based\n\
+             dedup overwrites in place. If you choose to rename, drop a\n\
+             pointer row in the new file's revision history.\n\n",
+            n = previous_outputs.len()
+        ));
+        for (title, body) in previous_outputs {
+            buf.push_str(&format!("--- previous: {title} ---\n"));
+            buf.push_str(body.trim_end());
+            buf.push_str(&format!("\n--- /previous: {title} ---\n\n"));
+        }
+        buf.push_str("--- /previous revisions to preserve ---\n\n");
     }
 
     if let Some(notes) = revision_notes {
@@ -745,6 +788,23 @@ pub async fn import_produced_artifacts(
     contract: &crate::plugins::skill::frontmatter::SkillContract,
     produced: &[PathBuf],
 ) -> Vec<Uuid> {
+    // Normalizer branch. When a skill declares the same input and
+    // output kind with `output_count: one` (e.g. `02n-ba-normalize-
+    // epics`), the produced file is a *rewrite* of the source
+    // artifact, not a fresh child. Overwrite the source body in
+    // place, preserve the source's existing parent linkage, and
+    // skip child-note creation. Returns the source id so the
+    // revision-notes clear logic upstream still fires.
+    if is_normalizer_contract(contract) {
+        return import_normalizer_rewrite(
+            persistence,
+            source_note_id,
+            skill_note_id,
+            contract,
+            produced,
+        )
+        .await;
+    }
     let existing_siblings: Vec<LocalNote> = note_repo
         .list_for_project(project_id)
         .unwrap_or_default()
@@ -815,6 +875,127 @@ pub async fn import_produced_artifacts(
         created_ids.push(row_id);
     }
     created_ids
+}
+
+/// `true` when a skill contract describes an in-place rewrite: the
+/// input and output kinds match and exactly one artifact is produced.
+/// Used by `import_produced_artifacts` to switch from the
+/// child-creating branch to the source-overwriting branch. Empty
+/// `input_kind` / `output_kind` (rare; usually means the skill
+/// hand-rolled the frontmatter) doesn't qualify — both fields must
+/// be set and equal.
+pub fn is_normalizer_contract(
+    contract: &crate::plugins::skill::frontmatter::SkillContract,
+) -> bool {
+    if !matches!(
+        contract.output_count,
+        crate::plugins::skill::frontmatter::SkillOutputCount::One
+    ) {
+        return false;
+    }
+    match (
+        contract.input_kind.as_deref(),
+        contract.output_kind.as_deref(),
+    ) {
+        (Some(i), Some(o)) if !i.is_empty() && i == o => true,
+        _ => false,
+    }
+}
+
+/// Apply a normalizer skill's first produced file as an in-place
+/// rewrite of the source artifact: keep the source's existing parent
+/// linkage and `source_artifact_id`, swap in the new body, refresh
+/// `source_skill_id` to the normalizer that just ran, and pick the
+/// status from the skill's gate (Auto → Approved, Approval → Pending).
+/// Returns `[source_note_id]` on success, empty Vec otherwise.
+///
+/// Multi-file output is silently truncated to the first file — a
+/// normalizer that emits multiple `.md` files is a skill-prompt bug
+/// (the seed instructs `Write` exactly once), and child-creating
+/// behavior for the extras would be worse than dropping them.
+async fn import_normalizer_rewrite(
+    persistence: &Arc<dyn Persistence>,
+    source_note_id: Uuid,
+    skill_note_id: Uuid,
+    contract: &crate::plugins::skill::frontmatter::SkillContract,
+    produced: &[PathBuf],
+) -> Vec<Uuid> {
+    let Some(first) = produced.first() else {
+        return Vec::new();
+    };
+    let new_body = match std::fs::read_to_string(first) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                target: "operon::artifact",
+                "normalizer rewrite skipped: read {} failed: {e}",
+                first.display()
+            );
+            return Vec::new();
+        }
+    };
+    // Pull existing source frontmatter so we can preserve the
+    // parent linkage (the source's own `source_artifact_id`) — the
+    // normalizer is a sibling-level rewrite, not a re-parenting.
+    let existing_bytes = match persistence.load(&source_note_id.to_string()).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                target: "operon::artifact",
+                "normalizer rewrite skipped: load existing source {source_note_id} failed: {e}"
+            );
+            return Vec::new();
+        }
+    };
+    let existing_body = match String::from_utf8(existing_bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                target: "operon::artifact",
+                "normalizer rewrite skipped: existing source {source_note_id} utf8: {e}"
+            );
+            return Vec::new();
+        }
+    };
+    let existing_fm = crate::plugins::artifact::frontmatter::parse(&existing_body);
+    // Build the final frontmatter: kind from contract (== input kind
+    // == output kind), parent linkage from existing source, producer
+    // pointer from the normalizer skill that just ran. Status from
+    // skill gate so an auto-gate normalizer leaves the artifact
+    // ready to feed downstream, and an approval-gate one parks it
+    // Pending for a human review pass.
+    let mut fm = crate::plugins::artifact::frontmatter::parse(&new_body);
+    if fm.artifact_kind.is_none() {
+        fm.artifact_kind = contract
+            .output_kind
+            .as_deref()
+            .map(ArtifactKind::parse);
+    }
+    fm.source_artifact_id = existing_fm.source_artifact_id;
+    fm.source_skill_id = Some(skill_note_id);
+    fm.status = match contract.gate {
+        crate::plugins::skill::frontmatter::SkillGate::Auto => {
+            ArtifactStatus::Approved
+        }
+        crate::plugins::skill::frontmatter::SkillGate::Approval => {
+            ArtifactStatus::Pending
+        }
+    };
+    let final_body = rewrite_artifact_fm(&new_body, &fm);
+    if let Err(e) = persistence
+        .save(&source_note_id.to_string(), final_body.as_bytes())
+        .await
+    {
+        tracing::warn!(
+            target: "operon::artifact",
+            "normalizer rewrite save failed for {source_note_id}: {e}"
+        );
+        return Vec::new();
+    }
+    // Best-effort: delete the scratch file so a subsequent
+    // `scan_produced_files` doesn't import it again on a later run.
+    let _ = std::fs::remove_file(first);
+    vec![source_note_id]
 }
 
 /// Clear the `revision_notes` field on an artifact whose body we
@@ -1053,6 +1234,11 @@ fn persist_event(
             true
         }
         Done { .. } | Error(_) => flush(assistant_buf),
+        // Init carries MCP roster + tool inventory but the artifact
+        // runner doesn't render those — `apply_event` in
+        // `companion_chat.rs` is the one place that mirrors them into
+        // `MCP_LIVE_STATUS`. Drop here.
+        SessionInit { .. } => false,
     }
 }
 
@@ -1114,14 +1300,16 @@ mod tests {
             &[],
             &[],
             None,
+            &[],
         );
         assert!(prompt.contains("REQ_BODY"));
         assert!(prompt.contains("SKILL_BODY"));
         assert!(prompt.contains("/tmp/x"));
         assert!(prompt.contains("artifact_kind: epic"));
-        // No aggregate / inherit sections when none provided.
+        // No aggregate / inherit / previous-revisions sections when none provided.
         assert!(!prompt.contains("aggregated"));
         assert!(!prompt.contains("inherited"));
+        assert!(!prompt.contains("previous revisions to preserve"));
     }
 
     #[test]
@@ -1178,6 +1366,7 @@ mod tests {
             &aggregated,
             &[],
             None,
+            &[],
         );
         assert!(prompt.contains("SEED_BODY"));
         assert!(prompt.contains("aggregated task artifacts (2 total)"));
@@ -1207,6 +1396,7 @@ mod tests {
             &[],
             &inherited,
             None,
+            &[],
         );
         assert!(prompt.contains("TASK_BODY"));
         assert!(prompt.contains(
@@ -1235,6 +1425,7 @@ mod tests {
             &[],
             &[],
             Some("Emphasize observability concerns"),
+            &[],
         );
         assert!(prompt.contains("--- refinement notes from user ---"));
         assert!(prompt.contains("Emphasize observability concerns"));
@@ -1257,8 +1448,58 @@ mod tests {
             &[],
             &[],
             Some("   \n  "),
+            &[],
         );
         assert!(!prompt.contains("refinement notes"));
+    }
+
+    #[test]
+    fn build_prompt_inlines_previous_outputs_when_present() {
+        let dir = std::path::Path::new("/tmp/x");
+        let mut contract = crate::plugins::skill::frontmatter::SkillContract::default();
+        contract.output_kind = Some("epic".into());
+        let previous = vec![
+            ("epic-01-onboarding".into(), "Body of the prior onboarding epic".into()),
+            ("epic-02-billing".into(), "Body of the prior billing epic".into()),
+        ];
+        let prompt = build_prompt(
+            "REQ_BODY",
+            "SKILL_BODY",
+            dir,
+            &contract,
+            Uuid::nil(),
+            Uuid::nil(),
+            &[],
+            &[],
+            None,
+            &previous,
+        );
+        assert!(prompt.contains("previous revisions to preserve (2 total)"));
+        assert!(prompt.contains("--- previous: epic-01-onboarding ---"));
+        assert!(prompt.contains("Body of the prior onboarding epic"));
+        assert!(prompt.contains("--- previous: epic-02-billing ---"));
+        assert!(prompt.contains("Body of the prior billing epic"));
+        assert!(prompt.contains("--- /previous revisions to preserve ---"));
+    }
+
+    #[test]
+    fn build_prompt_skips_previous_outputs_section_when_empty() {
+        let dir = std::path::Path::new("/tmp/x");
+        let mut contract = crate::plugins::skill::frontmatter::SkillContract::default();
+        contract.output_kind = Some("epic".into());
+        let prompt = build_prompt(
+            "REQ_BODY",
+            "SKILL_BODY",
+            dir,
+            &contract,
+            Uuid::nil(),
+            Uuid::nil(),
+            &[],
+            &[],
+            None,
+            &[],
+        );
+        assert!(!prompt.contains("previous revisions to preserve"));
     }
 
     #[test]
@@ -1281,5 +1522,38 @@ mod tests {
         assert!(
             combine_revision_notes(None, Some(&(Uuid::nil(), "  ".into()))).is_none()
         );
+    }
+
+    #[test]
+    fn is_normalizer_contract_recognizes_matching_kinds() {
+        let mut c = crate::plugins::skill::frontmatter::SkillContract::default();
+        c.input_kind = Some("epic".into());
+        c.output_kind = Some("epic".into());
+        c.output_count = crate::plugins::skill::frontmatter::SkillOutputCount::One;
+        assert!(is_normalizer_contract(&c));
+    }
+
+    #[test]
+    fn is_normalizer_contract_rejects_mismatched_kinds() {
+        let mut c = crate::plugins::skill::frontmatter::SkillContract::default();
+        c.input_kind = Some("epic".into());
+        c.output_kind = Some("feature".into());
+        c.output_count = crate::plugins::skill::frontmatter::SkillOutputCount::One;
+        assert!(!is_normalizer_contract(&c));
+    }
+
+    #[test]
+    fn is_normalizer_contract_rejects_many_output_count() {
+        let mut c = crate::plugins::skill::frontmatter::SkillContract::default();
+        c.input_kind = Some("epic".into());
+        c.output_kind = Some("epic".into());
+        c.output_count = crate::plugins::skill::frontmatter::SkillOutputCount::Many;
+        assert!(!is_normalizer_contract(&c));
+    }
+
+    #[test]
+    fn is_normalizer_contract_rejects_missing_kinds() {
+        let c = crate::plugins::skill::frontmatter::SkillContract::default();
+        assert!(!is_normalizer_contract(&c));
     }
 }

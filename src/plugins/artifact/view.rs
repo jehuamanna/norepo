@@ -20,6 +20,9 @@ use crate::plugins::artifact::frontmatter::{
     parse, rewrite, ArtifactFrontmatter, ArtifactKind, ArtifactStatus,
 };
 use crate::plugins::markdown::MarkdownView;
+use crate::shell::clarification_prompt::{
+    parse_clarification, ClarificationAnswer, ClarificationPanel,
+};
 use crate::shell::companion_state::{
     ArtifactRunState, ChatMessageRepo, ChatSessionRepo, ChatSessionVersion,
     ClaudeCodePluginCtx, ARTIFACT_RUN_STATE,
@@ -91,6 +94,12 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
     let LocalNoteRepo(drop_note_repo) = use_context();
     let LocalProjectRepo(drop_project_repo) = use_context();
     let crate::local_mode::ui::DragSession(drag_session) = use_context();
+    // Persistence is fetched at component init so the clarification
+    // submit handler can mutate sibling artifacts (resolution
+    // targets) without re-pulling context inside a closure. Other
+    // sub-components (`CascadePlayButton`, etc.) also pull it via
+    // `use_context()` — the underlying Arc is cheap to clone.
+    let persistence_for_clarification: Arc<dyn Persistence> = use_context();
 
     // "Run skill" picker — collapsed by default; opens inline above
     // the body. Filters skills by `input_kind` matching this
@@ -108,11 +117,37 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
     // runtime layer in `runner::run_skill_on_source`.
     let is_root_seed = fm.source_artifact_id.is_none();
     let is_runnable_source = status == ArtifactStatus::Approved || is_root_seed;
-    // Show the labeled "Generate Cascade" button on Requirements artifacts.
-    // The icon Play button below stays available on every runnable artifact
-    // (including Requirements) — this is an explicit, primary entry point
-    // for the SDLC root.
-    let is_requirements = matches!(fm.artifact_kind, Some(ArtifactKind::Requirements));
+    // Show the labeled "Generate Cascade" button on the project root —
+    // either a `MasterRequirement` (updated chain) or a `Requirements`
+    // artifact (legacy chain). The icon Play button is restricted to
+    // the same set so every cascade starts from the documented project
+    // root and so intermediate artifacts don't expose a per-node Play
+    // that would re-trigger work upstream.
+    let is_master_requirement =
+        matches!(fm.artifact_kind, Some(ArtifactKind::MasterRequirement));
+    let is_task = matches!(fm.artifact_kind, Some(ArtifactKind::Task));
+    // Cascade-root artifacts are the only places the SDLC skill
+    // toolbar (Run skill / Generate Cascade / Play) is shown:
+    //   - master_requirement (project root, runs A0→A4 + Architecture)
+    //   - task (runs the per-task SDE chain: implementation → tests
+    //     → results)
+    // Every other artifact kind — including a `Requirements` artifact
+    // at the tree root, which used to be the entry point in the
+    // legacy seed-skills-employee chain — hides the entire toolbar.
+    // Only the Approve / Reject / Mark-dirty / Revise actions remain
+    // on those kinds. Legacy projects can keep working by adding a
+    // wrapping `master_requirement` artifact as their new project
+    // root, or by running individual skills via the Workflow canvas.
+    let is_cascade_root = is_master_requirement || is_task;
+    let is_clarification =
+        matches!(fm.artifact_kind, Some(ArtifactKind::Clarification));
+    // Show the inline answer panel only while the clarification is
+    // still awaiting an answer. Once Approved the parsed answer lives
+    // in the body's `## Answer` section the writeback helper appended,
+    // so the markdown render is enough — we hide the form to make it
+    // obvious the question's been resolved.
+    let show_clarification_panel =
+        is_clarification && !matches!(status, ArtifactStatus::Approved);
     let run_button_title = if is_runnable_source {
         "Run a skill on this artifact to produce child artifacts (Epics, Features, etc.).".to_string()
     } else {
@@ -212,25 +247,25 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                                 }
                             }
                         }
-                        button {
-                            r#type: "button",
-                            class: "operon-artifact-run-skill",
-                            "data-testid": "artifact-run-skill",
-                            disabled: !is_runnable_source,
-                            title: "{run_button_title}",
-                            onclick: move |_| {
+                        if is_cascade_root {
+                            button {
+                                r#type: "button",
+                                class: "operon-artifact-run-skill",
+                                "data-testid": "artifact-run-skill",
+                                disabled: !is_runnable_source,
+                                title: "{run_button_title}",
+                                onclick: move |_| {
+                                    if is_runnable_source {
+                                        picker_open.with_mut(|v| *v = !*v);
+                                    }
+                                },
+                                if *picker_open.read() { "Hide skills" } else { "Run skill\u{2026}" }
+                            }
+                            if let Some(uuid) = source_uuid {
                                 if is_runnable_source {
-                                    picker_open.with_mut(|v| *v = !*v);
-                                }
-                            },
-                            if *picker_open.read() { "Hide skills" } else { "Run skill\u{2026}" }
-                        }
-                        if let Some(uuid) = source_uuid {
-                            if is_runnable_source {
-                                if is_requirements {
                                     GenerateCascadeButton { root_artifact_id: uuid }
+                                    CascadePlayButton { root_artifact_id: uuid }
                                 }
-                                CascadePlayButton { root_artifact_id: uuid }
                             }
                         }
                     }
@@ -357,6 +392,72 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                                     "Type guidance here. Mark the artifact Dirty and click Re-run — your notes get inlined into the prompt that regenerates this artifact."
                                 }
                             }
+                        }
+                    }
+                }
+            }
+            if show_clarification_panel {
+                {
+                    let parsed = parse_clarification(&body_only);
+                    let note_repo_for_submit = drop_note_repo.clone();
+                    let persistence_for_submit = persistence_for_clarification.clone();
+                    let content_for_submit = content_for_actions.clone();
+                    let on_change_for_submit = on_change;
+                    let note_id_str_for_submit = props.note_id.clone();
+                    let targets_for_submit = parsed.resolution_targets.clone();
+                    rsx! {
+                        ClarificationPanel {
+                            clarification: parsed,
+                            on_submit: EventHandler::new(move |answer: ClarificationAnswer| {
+                                // 1. Rewrite the clarification's own body
+                                //    with the user's answer appended and
+                                //    status flipped to Approved. Pushed
+                                //    through `on_change` so the standard
+                                //    save / version-bump path runs.
+                                let new_body = clarification_body_with_answer(
+                                    &content_for_submit,
+                                    &answer,
+                                );
+                                if let Some(handler) = on_change_for_submit {
+                                    handler.call(new_body);
+                                }
+                                // 2. Best-effort writeback to each
+                                //    `## Resolution target` artifact: append
+                                //    the answer to `revision_notes` and mark
+                                //    it Dirty so the next Play regenerates
+                                //    it with the resolved direction. Runs
+                                //    async so the form doesn't block on it;
+                                //    failures log but don't surface (the
+                                //    clarification's own state has already
+                                //    been recorded).
+                                let note_repo = note_repo_for_submit.clone();
+                                let persistence = persistence_for_submit.clone();
+                                let answer = answer.clone();
+                                let targets = targets_for_submit.clone();
+                                let id_str = note_id_str_for_submit.clone();
+                                spawn(async move {
+                                    let Ok(self_id) = Uuid::parse_str(&id_str) else {
+                                        return;
+                                    };
+                                    let Ok(Some(project_id)) =
+                                        note_repo.find_project_for_note(self_id)
+                                    else {
+                                        return;
+                                    };
+                                    let n = apply_clarification_answer_to_targets(
+                                        &note_repo,
+                                        &persistence,
+                                        project_id,
+                                        &answer,
+                                        &targets,
+                                    )
+                                    .await;
+                                    tracing::info!(
+                                        target: "operon::clarification",
+                                        "clarification {self_id}: wrote answer to {n} resolution target(s)"
+                                    );
+                                });
+                            }),
                         }
                     }
                 }
@@ -526,12 +627,16 @@ fn patch_revision_notes(
     on_change: Option<EventHandler<String>>,
 ) {
     let mut fm = parse(content);
+    // Don't trim — the textarea is controlled, so stripping trailing
+    // whitespace mid-keystroke eats the space the user just typed and
+    // makes the field feel broken (e.g. "hello world" → "helloworld").
+    // We only collapse all-whitespace input to None so an empty edit
+    // doesn't serialize a noisy field.
     fm.revision_notes = next.and_then(|s| {
-        let trimmed = s.trim();
-        if trimmed.is_empty() {
+        if s.trim().is_empty() {
             None
         } else {
-            Some(trimmed.to_string())
+            Some(s)
         }
     });
     let new_body = rewrite(content, &fm);
@@ -639,6 +744,80 @@ mod tests {
     fn short_uuid_is_eight_chars() {
         let u = Uuid::nil();
         assert_eq!(short_uuid(u).len(), 8);
+    }
+
+    #[test]
+    fn iso_date_from_unix_secs_handles_epoch_and_known_dates() {
+        // Epoch.
+        assert_eq!(iso_date_from_unix_secs(0), "1970-01-01");
+        // 2026-05-11 00:00:00 UTC = 1778457600
+        assert_eq!(iso_date_from_unix_secs(1_778_457_600), "2026-05-11");
+        // Leap-day check: 2024-02-29 00:00:00 UTC = 1709164800
+        assert_eq!(iso_date_from_unix_secs(1_709_164_800), "2024-02-29");
+        // Last second of 2023-12-31 → still 2023-12-31.
+        assert_eq!(iso_date_from_unix_secs(1_704_067_199), "2023-12-31");
+        // First second of 2024-01-01 → 2024-01-01.
+        assert_eq!(iso_date_from_unix_secs(1_704_067_200), "2024-01-01");
+    }
+
+    #[test]
+    fn format_clarification_answer_block_renders_selected_and_other() {
+        let answer = ClarificationAnswer {
+            selected: vec!["Keep scope".into(), "Add SLO".into()],
+            other: "freeze marketing".into(),
+        };
+        let block = format_clarification_answer_block(&answer);
+        assert!(block.starts_with("\n## Answer ("));
+        assert!(block.contains("- Keep scope"));
+        assert!(block.contains("- Add SLO"));
+        assert!(block.contains("- Other: freeze marketing"));
+    }
+
+    #[test]
+    fn format_clarification_answer_block_handles_empty_selection() {
+        let answer = ClarificationAnswer::default();
+        let block = format_clarification_answer_block(&answer);
+        assert!(block.contains("_(no option selected)_"));
+    }
+
+    #[test]
+    fn clarification_body_with_answer_appends_and_approves() {
+        let body = "---\n\
+            artifact_kind: clarification\n\
+            status: pending\n\
+            ---\n\
+            \n\
+            # Clarification: scope\n\
+            \n\
+            ## Options\n\
+            - [ ] Keep\n\
+            - [ ] Drop\n";
+        let answer = ClarificationAnswer {
+            selected: vec!["Keep".into()],
+            other: String::new(),
+        };
+        let next = clarification_body_with_answer(body, &answer);
+        assert!(next.contains("status: approved"));
+        assert!(next.contains("# Clarification: scope"));
+        assert!(next.contains("## Answer ("));
+        assert!(next.contains("- Keep"));
+    }
+
+    #[test]
+    fn summarize_answer_for_notes_joins_selected_and_other() {
+        let answer = ClarificationAnswer {
+            selected: vec!["Keep".into(), "Defer".into()],
+            other: "split into v2".into(),
+        };
+        assert_eq!(
+            summarize_answer_for_notes(&answer),
+            "Keep; Defer; Other: split into v2"
+        );
+    }
+
+    #[test]
+    fn summarize_answer_for_notes_returns_empty_for_empty_answer() {
+        assert_eq!(summarize_answer_for_notes(&ClarificationAnswer::default()), "");
     }
 }
 
@@ -1002,6 +1181,7 @@ fn spawn_runner(
                 source_note_id,
                 skill_note_id,
                 extra_revision_notes,
+                Vec::new(),
             )
             .await;
         // Both Ok/Err writes go to the GlobalSignal map, so they
@@ -1198,6 +1378,181 @@ fn ReviseButton(props: ReviseButtonProps) -> Element {
             "Revise"
         }
     }
+}
+
+/// Render the user's answer to a clarification artifact into a
+/// markdown block suitable for appending to the artifact's body.
+/// Carries the selected option labels, any free-text "Other" input,
+/// and an ISO date so the audit trail survives in the note.
+pub fn format_clarification_answer_block(answer: &ClarificationAnswer) -> String {
+    use std::fmt::Write as _;
+    let today = current_iso_date();
+    let mut out = String::new();
+    writeln!(out, "\n## Answer ({today})").ok();
+    if !answer.selected.is_empty() {
+        for label in &answer.selected {
+            writeln!(out, "- {label}").ok();
+        }
+    }
+    if !answer.other.is_empty() {
+        writeln!(out, "- Other: {}", answer.other).ok();
+    }
+    if answer.selected.is_empty() && answer.other.is_empty() {
+        writeln!(out, "- _(no option selected)_").ok();
+    }
+    out
+}
+
+/// `YYYY-MM-DD` today in UTC. Done by hand rather than via `chrono`
+/// because the dependency isn't already in `operon-dioxus` and this
+/// is the only date-format consumer for now.
+fn current_iso_date() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    iso_date_from_unix_secs(secs)
+}
+
+/// Pure helper for `current_iso_date` — lets the date logic be tested
+/// without freezing the clock. Implements the proleptic Gregorian
+/// calendar math directly (no chrono).
+fn iso_date_from_unix_secs(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    // Days from 1970-01-01 (epoch) to 0000-03-01 (proleptic Gregorian,
+    // year-month-day computation reference). 1970-01-01 is day 719468
+    // counting from 0000-03-01.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Compute the new clarification body: append the answer block at the
+/// end and flip the frontmatter to Approved. Used by both the inline
+/// submit handler and tests.
+pub fn clarification_body_with_answer(
+    content: &str,
+    answer: &ClarificationAnswer,
+) -> String {
+    let answer_block = format_clarification_answer_block(answer);
+    let mut fm = parse(content);
+    fm.status = ArtifactStatus::Approved;
+    let rewritten = rewrite(content, &fm);
+    // The seed-skill convention is to keep the question prose at the
+    // top of the body; the answer block lands at the bottom so the
+    // markdown view shows the question first, then the resolution.
+    if rewritten.ends_with('\n') {
+        format!("{rewritten}{answer_block}")
+    } else {
+        format!("{rewritten}\n{answer_block}")
+    }
+}
+
+/// Best-effort writeback: for each resolution-target slug, find a
+/// sibling artifact note in the same project whose title matches the
+/// slug, append the user's answer to its `revision_notes`, and flip
+/// it to Dirty so the next cascade Play regenerates it with the
+/// resolved direction. Returns the count of artifacts mutated.
+///
+/// Slug matching strips a leading `epic-`/`feature-`/etc. prefix is
+/// NOT necessary — the seed-skill convention names artifacts by
+/// their full slug (e.g. `epic-02-billing`) and the corresponding
+/// note title is the same string. Falls back to exact title match
+/// against every note in the project.
+pub async fn apply_clarification_answer_to_targets(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    persistence: &Arc<dyn Persistence>,
+    project_id: Uuid,
+    answer: &ClarificationAnswer,
+    targets: &[String],
+) -> usize {
+    if targets.is_empty() {
+        return 0;
+    }
+    let summary = summarize_answer_for_notes(answer);
+    if summary.is_empty() {
+        return 0;
+    }
+    let all = match note_repo.list_for_project(project_id) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                target: "operon::clarification",
+                "list_for_project for writeback failed: {e}"
+            );
+            return 0;
+        }
+    };
+    let by_title: HashMap<&str, &LocalNote> = all
+        .iter()
+        .filter(|n| matches!(n.kind, NoteKind::Artifact))
+        .map(|n| (n.title.as_str(), n))
+        .collect();
+    let mut changed = 0usize;
+    for target in targets {
+        let key = target.trim().trim_matches('`');
+        let Some(note) = by_title.get(key) else {
+            tracing::debug!(
+                target: "operon::clarification",
+                "writeback skipped: no artifact in project {project_id} with title {key:?}"
+            );
+            continue;
+        };
+        let bytes = match persistence.load(&note.id.to_string()).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let body = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let mut fm = parse(&body);
+        let merged = match fm.revision_notes.as_deref() {
+            Some(existing) if !existing.trim().is_empty() => {
+                format!("{existing}\n\n[from clarification]: {summary}")
+            }
+            _ => format!("[from clarification]: {summary}"),
+        };
+        fm.revision_notes = Some(merged);
+        // Mark dirty so the dirty-regen cascade picks it up on the
+        // next Play. Skip the flip when the artifact is already
+        // Rejected — the user explicitly said no to that line of
+        // work and a clarification answer shouldn't override that
+        // signal.
+        if !matches!(fm.status, ArtifactStatus::Rejected) {
+            fm.status = ArtifactStatus::Dirty;
+        }
+        let new_body = rewrite(&body, &fm);
+        if persistence
+            .save(&note.id.to_string(), new_body.as_bytes())
+            .await
+            .is_ok()
+        {
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// Flatten a `ClarificationAnswer` into a one-line string suitable
+/// for embedding inside another artifact's `revision_notes`. Selected
+/// options are comma-joined; an "Other" value (if any) is appended
+/// after a semicolon.
+fn summarize_answer_for_notes(answer: &ClarificationAnswer) -> String {
+    let mut parts: Vec<String> = answer.selected.clone();
+    let other = answer.other.trim();
+    if !other.is_empty() {
+        parts.push(format!("Other: {other}"));
+    }
+    parts.join("; ")
 }
 
 /// Walk every Artifact descendant of `root_id` in the note tree and

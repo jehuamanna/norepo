@@ -32,7 +32,9 @@ use crate::plugins::workflow::state::NodeStatus;
 use crate::plugins::artifact::frontmatter::{
     parse as parse_artifact_fm, rewrite as rewrite_artifact_fm, ArtifactKind, ArtifactStatus,
 };
-use crate::plugins::artifact::runner::{run_skill_on_source, RunnerError};
+use crate::plugins::artifact::runner::{
+    run_skill_on_source, run_skill_on_source_with_revision_notes, RunnerError,
+};
 use crate::plugins::skill::frontmatter::{
     contract as parse_skill_contract, split as split_skill, SkillContract,
 };
@@ -73,6 +75,90 @@ pub struct SkillRef {
     pub contract: SkillContract,
 }
 
+/// Which arm of the SDLC pipeline the current cascade is running.
+/// Determined once per `run_cascade` from the root artifact's kind:
+///
+///   - `Ba`: cascade rooted on a `master_requirement` (or legacy
+///     `requirements` root). Runs the BA chain plus
+///     `06-sa-draft-architecture`. SDE-chain skills are filtered out
+///     so the cascade naturally stops once Architecture is produced.
+///   - `Sde`: cascade rooted on a `task`. Runs only the SDE chain
+///     (`implementation` → `test_cases` → `test_results`, plus
+///     `bug` → fix-bug regen). BA-chain and Architecture skills are
+///     filtered out.
+///   - `Mixed`: any other root — run every enabled skill (legacy
+///     behavior, for back-compat with the seed-skills-employee chain
+///     and ad-hoc roots).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillPhase {
+    Ba,
+    Sde,
+    Mixed,
+}
+
+impl SkillPhase {
+    /// Pick the phase based on the cascade root's `artifact_kind`
+    /// string. `None` (or any unrecognised kind) falls back to
+    /// `Mixed` so old-style cascades keep working.
+    pub fn for_root_kind(kind: Option<&str>) -> Self {
+        match kind {
+            Some("master_requirement") => Self::Ba,
+            Some("requirements") => Self::Ba,
+            Some("task") => Self::Sde,
+            _ => Self::Mixed,
+        }
+    }
+}
+
+/// `true` when a skill's `input_kind` belongs to the BA arm of the
+/// pipeline (master_requirement, requirements, epic, feature, story).
+/// Architecture skills (`input_kind: master_requirement` →
+/// `output_kind: architecture`) fall in this set too because they
+/// run as part of the master-driven phase.
+fn is_ba_input_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "master_requirement"
+            | "requirements"
+            | "epic"
+            | "feature"
+            | "story"
+    )
+}
+
+/// `true` when a skill's `input_kind` belongs to the SDE arm
+/// (task, implementation, test_cases, bug, test_results). Test
+/// results' downstream skills (e.g. legacy `10-sum-summarize-task`)
+/// stay in the SDE arm.
+fn is_sde_input_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "task" | "implementation" | "test_cases" | "test_results" | "bug"
+    )
+}
+
+/// Drop skills whose `input_kind` doesn't belong to the active
+/// phase. Skills with no declared `input_kind` always survive — they
+/// run at any phase as utility skills (e.g. a global summarizer).
+pub fn filter_skills_for_phase(skills: Vec<SkillRef>, phase: SkillPhase) -> Vec<SkillRef> {
+    if matches!(phase, SkillPhase::Mixed) {
+        return skills;
+    }
+    skills
+        .into_iter()
+        .filter(|s| {
+            let Some(input_kind) = s.contract.input_kind.as_deref() else {
+                return true;
+            };
+            match phase {
+                SkillPhase::Ba => is_ba_input_kind(input_kind),
+                SkillPhase::Sde => is_sde_input_kind(input_kind),
+                SkillPhase::Mixed => true,
+            }
+        })
+        .collect()
+}
+
 /// Drive the autonomous cascade. Returns when the queue is empty or
 /// `cancel` fires; both are reported via the `CascadeOutcome` variant.
 ///
@@ -102,10 +188,46 @@ pub async fn run_cascade(
     max_depth: Option<u32>,
     cascade_session_id: Uuid,
 ) -> Result<CascadeOutcome, CascadeError> {
+    // 0. Clarification gate. The `00-coherence-check` skill produces
+    //    `clarification` artifacts when it detects cross-level
+    //    discrepancies. Any clarification left in `Pending` is a hard
+    //    signal that the user owes the pipeline a decision before
+    //    downstream work re-runs — refuse to start so the user can't
+    //    accidentally produce work that contradicts what they're
+    //    about to answer. The fix-up motion is: open each unresolved
+    //    clarification, submit an answer (which appends an
+    //    `## Answer` block, flips status to Approved, and writes the
+    //    resolved direction into each `## Resolution target`'s
+    //    `revision_notes`). Then click Play again.
+    let pending_clarifications =
+        unresolved_clarification_titles(note_repo, persistence, project_id).await;
+    if !pending_clarifications.is_empty() {
+        return Err(CascadeError::SkillRun(format!(
+            "{} unresolved clarification(s) blocking cascade — answer them first: {}",
+            pending_clarifications.len(),
+            pending_clarifications.join(", ")
+        )));
+    }
+
     // 1. Snapshot every project skill, drop the ones not in the
     //    enabled set, parse contracts. One-shot — skill bodies don't
     //    change mid-cascade.
     let skills = load_project_skills(note_repo, persistence, project_id, &enabled_skill_ids).await;
+
+    // 1a. Phase filter. The SDLC pipeline splits at the Architecture
+    //     boundary: master_requirement runs (and any descendant up
+    //     through `task`) trigger the BA chain + Architecture only,
+    //     stopping before SDE skills fire. Task runs trigger the SDE
+    //     chain only. This keeps the per-task Play button surgical
+    //     (just THIS task's chain) and the master Play meaningful
+    //     (produce the spec, hand off to engineering).
+    //
+    //     The filter is driven by the cascade root's kind, read once
+    //     here. Skills whose `input_kind` falls outside the active
+    //     phase are dropped before `group_by_input_kind`.
+    let root_kind_str = read_kind(persistence, root_artifact_id).await;
+    let phase = SkillPhase::for_root_kind(root_kind_str.as_deref());
+    let skills = filter_skills_for_phase(skills, phase);
     let by_input = group_by_input_kind(&skills);
 
     let mut graph_writer = graph_writer;
@@ -313,6 +435,16 @@ pub async fn run_cascade(
             // skill. If any exist, treat the (artifact, skill) pair
             // as already done — enqueue the existing children for
             // further walking and skip the run.
+            //
+            // Exception: if any of those existing children is `Dirty`
+            // (the user added Refinement notes and clicked Mark dirty
+            // on a descendant, then clicked Play on an ancestor),
+            // wipe the dirty child's stale subtree and FALL THROUGH
+            // to re-run the skill — passing the dirty child's
+            // `revision_notes` as `extra_revision_notes` so they
+            // reach the regen prompt. The runner's title-based dedup
+            // overwrites the dirty child(ren) in place; the runner
+            // also clears the inlined notes after a successful run.
             let already_produced = existing_children_with_skill(
                 note_repo,
                 persistence,
@@ -321,11 +453,95 @@ pub async fn run_cascade(
                 skill.id,
             )
             .await;
-            if !already_produced.is_empty() {
+            // Load each existing child's body once, then run the
+            // pure-fn dirty detector on the bundle. Splitting load
+            // (impure) from detection (pure) keeps the dirty/regen
+            // selection unit-testable without spinning up a real
+            // persistence layer.
+            let mut child_bodies: Vec<(Uuid, String)> =
+                Vec::with_capacity(already_produced.len());
+            for child_id in &already_produced {
+                if let Ok(bytes) = persistence.load(&child_id.to_string()).await {
+                    if let Ok(body) = String::from_utf8(bytes) {
+                        child_bodies.push((*child_id, body));
+                    }
+                }
+            }
+            let (any_dirty, dirty_notes) = select_dirty_regen_seed(&child_bodies);
+            if !already_produced.is_empty() && !any_dirty {
                 for child_id in &already_produced {
                     queue.push_back((*child_id, level + 1));
                 }
                 continue;
+            }
+            // Captured prior (title, body) pairs of children that
+            // are about to be overwritten by this skill rerun, fed
+            // to the runner as `previous_outputs` so the regen prompt
+            // can honor the seed-skill revision-history convention
+            // (append `## Revision N` rows; stash prior body under a
+            // collapsed `<details>` block) rather than discarding it.
+            // Populated only on the dirty-regen branch — fresh runs
+            // have nothing to preserve.
+            let mut previous_outputs: Vec<(String, String)> = Vec::new();
+            if any_dirty {
+                // Wipe each dirty child's subtree — its descendants
+                // were derived from the about-to-be-regenerated body
+                // and would be stale after the rerun. Keep the dirty
+                // node itself; the runner's import dedup overwrites
+                // it in place by title. Use the already-loaded
+                // `child_bodies` so we don't re-read status from
+                // disk.
+                let project_notes_snapshot =
+                    note_repo.list_for_project(project_id).unwrap_or_default();
+                // Index titles by id once so we can resolve each
+                // child's title in O(1) below.
+                let title_by_id: std::collections::HashMap<Uuid, String> =
+                    project_notes_snapshot
+                        .iter()
+                        .map(|n| (n.id, n.title.clone()))
+                        .collect();
+                // Capture every child being regenerated (Dirty AND
+                // non-Dirty siblings whose body the prompt should
+                // preserve). The seed-skill prompts re-emit every
+                // sibling on a fan-out run, so any non-dirty body
+                // whose subtree we keep would otherwise be silently
+                // replaced.
+                for (child_id, body) in &child_bodies {
+                    if let Some(title) = title_by_id.get(child_id) {
+                        previous_outputs.push((title.clone(), body.clone()));
+                    }
+                }
+                let mut wiped: usize = 0;
+                for (child_id, body) in &child_bodies {
+                    if !matches!(parse_artifact_fm(body).status, ArtifactStatus::Dirty) {
+                        continue;
+                    }
+                    for desc_id in subtree_ids(&project_notes_snapshot, *child_id) {
+                        if desc_id == *child_id {
+                            continue;
+                        }
+                        if let Err(e) = persistence.delete(&desc_id.to_string()).await {
+                            tracing::warn!(
+                                target: "operon::cascade",
+                                "dirty-regen: persistence.delete({desc_id}) failed: {e}"
+                            );
+                        }
+                        if let Err(e) = note_repo.delete(desc_id) {
+                            tracing::warn!(
+                                target: "operon::cascade",
+                                "dirty-regen: note_repo.delete({desc_id}) failed: {e}"
+                            );
+                        } else {
+                            wiped += 1;
+                        }
+                    }
+                }
+                tracing::info!(
+                    target: "operon::cascade",
+                    "dirty-regen on {art_id} via skill {}: wiped {wiped} stale descendant(s) before rerun; captured {} prior body(ies) for revision-history preservation",
+                    skill.title,
+                    previous_outputs.len()
+                );
             }
 
             // Empty-aggregation gate. Aggregator skills (`aggregate:
@@ -390,17 +606,40 @@ pub async fn run_cascade(
             // cascade orchestrator picks up the same id we registered
             // for the "Claude is working…" indicator and the rail
             // session label.
-            let outcome = run_skill_on_source(
-                note_repo,
-                project_repo,
-                persistence,
-                plugin,
-                Some(chat_message_repo),
-                cascade_session_id,
-                art_id,
-                skill.id,
-            )
-            .await;
+            //
+            // When the dirty-descendant branch above collected
+            // refinement notes off a prior output, route through the
+            // _with_revision_notes variant so the notes reach the
+            // regen prompt under `--- refinement notes from user ---`.
+            // The plain `run_skill_on_source` is the unmodified path
+            // for the common (no-dirty) case.
+            let outcome = if dirty_notes.is_some() || !previous_outputs.is_empty() {
+                run_skill_on_source_with_revision_notes(
+                    note_repo,
+                    project_repo,
+                    persistence,
+                    plugin,
+                    Some(chat_message_repo),
+                    cascade_session_id,
+                    art_id,
+                    skill.id,
+                    dirty_notes.clone(),
+                    previous_outputs.clone(),
+                )
+                .await
+            } else {
+                run_skill_on_source(
+                    note_repo,
+                    project_repo,
+                    persistence,
+                    plugin,
+                    Some(chat_message_repo),
+                    cascade_session_id,
+                    art_id,
+                    skill.id,
+                )
+                .await
+            };
 
             match outcome {
                 Ok(o) => {
@@ -667,6 +906,44 @@ pub async fn pre_existing_approved_artifacts(
     out
 }
 
+/// Collect every `clarification` artifact in the project whose
+/// status is `Pending` — these block the cascade until the user
+/// submits an answer (which flips the artifact to `Approved` and
+/// writes the resolution into each target's `revision_notes`).
+/// Returns artifact titles for the error message; `Rejected` and
+/// `Approved` clarifications are ignored.
+pub async fn unresolved_clarification_titles(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    persistence: &Arc<dyn Persistence>,
+    project_id: Uuid,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let notes = match note_repo.list_for_project(project_id) {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    for note in notes {
+        if !matches!(note.kind, NoteKind::Artifact) {
+            continue;
+        }
+        let bytes = match persistence.load(&note.id.to_string()).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let body = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let fm = parse_artifact_fm(&body);
+        if matches!(fm.artifact_kind, Some(ArtifactKind::Clarification))
+            && matches!(fm.status, ArtifactStatus::Pending)
+        {
+            out.push(note.title.clone());
+        }
+    }
+    out
+}
+
 /// Compute the set of artifact ids `art_id` depends on. Sources:
 /// - `art_id`'s own body `## Depends on` slugs.
 /// - Cross-tree edges in any `prioritized_backlog` artifact under the
@@ -867,6 +1144,44 @@ async fn existing_children_with_skill(
         }
     }
     out
+}
+
+/// Pure-fn slice of the cascade's "skip already-produced gate" that
+/// asks: do any of these existing children need a regen pass? Given
+/// `(child_id, body)` pairs for every artifact already produced by
+/// the current `(art_id, skill)` pair, returns:
+///
+///   - `any_dirty`: `true` if at least one child has `Dirty` status.
+///     The orchestrator uses this to decide between the fast
+///     enqueue-and-skip path and the regen path (which wipes stale
+///     subtrees and re-runs the skill against `art_id`).
+///   - `dirty_notes`: the first dirty child carrying a non-empty
+///     `revision_notes`. Plumbed into `run_skill_on_source_with_
+///     revision_notes`'s `extra_revision_notes` so the user's
+///     refinement notes reach the regen prompt.
+///
+/// Splitting this off the orchestrator keeps the dirty-detection
+/// behaviour unit-testable without standing up a real persistence
+/// layer or note repository.
+fn select_dirty_regen_seed(
+    children: &[(Uuid, String)],
+) -> (bool, Option<(Uuid, String)>) {
+    let mut any_dirty = false;
+    let mut dirty_notes: Option<(Uuid, String)> = None;
+    for (child_id, body) in children {
+        let fm = parse_artifact_fm(body);
+        if !matches!(fm.status, ArtifactStatus::Dirty) {
+            continue;
+        }
+        any_dirty = true;
+        if dirty_notes.is_some() {
+            continue;
+        }
+        if let Some(notes) = fm.revision_notes {
+            dirty_notes = Some((*child_id, notes));
+        }
+    }
+    (any_dirty, dirty_notes)
 }
 
 /// All note ids reachable from `seed_id` via the `parent_id` chain
@@ -1170,5 +1485,212 @@ mod tests {
         let ids = subtree_ids(&notes, seed);
         assert_eq!(ids.len(), 1);
         assert!(ids.contains(&seed));
+    }
+
+    /// Build a minimal artifact body with the given status + optional
+    /// revision_notes. Mirrors the on-disk YAML-ish frontmatter the
+    /// runner writes; round-trips through `parse_artifact_fm`.
+    fn artifact_body(status: ArtifactStatus, notes: Option<&str>) -> String {
+        let mut fm = crate::plugins::artifact::frontmatter::ArtifactFrontmatter::default();
+        fm.artifact_kind = Some(ArtifactKind::Epic);
+        fm.status = status;
+        fm.revision_notes = notes.map(|s| s.to_string());
+        rewrite_artifact_fm("", &fm)
+    }
+
+    #[test]
+    fn select_dirty_regen_seed_returns_false_when_no_dirty_children() {
+        let approved = (
+            Uuid::from_bytes([1; 16]),
+            artifact_body(ArtifactStatus::Approved, None),
+        );
+        let pending = (
+            Uuid::from_bytes([2; 16]),
+            artifact_body(ArtifactStatus::Pending, None),
+        );
+        let (any_dirty, notes) = select_dirty_regen_seed(&[approved, pending]);
+        assert!(!any_dirty);
+        assert!(notes.is_none());
+    }
+
+    #[test]
+    fn select_dirty_regen_seed_picks_up_dirty_child_with_notes() {
+        let dirty_id = Uuid::from_bytes([7; 16]);
+        let dirty = (
+            dirty_id,
+            artifact_body(ArtifactStatus::Dirty, Some("Add SLO epic instead")),
+        );
+        let approved = (
+            Uuid::from_bytes([8; 16]),
+            artifact_body(ArtifactStatus::Approved, None),
+        );
+        let (any_dirty, notes) = select_dirty_regen_seed(&[approved, dirty]);
+        assert!(any_dirty);
+        assert_eq!(
+            notes,
+            Some((dirty_id, "Add SLO epic instead".to_string()))
+        );
+    }
+
+    #[test]
+    fn select_dirty_regen_seed_reports_dirty_even_when_notes_empty() {
+        // A user can mark Dirty without typing any notes (the
+        // refinement-notes textarea is optional). The cascade still
+        // needs to wipe the child's subtree and rerun the skill —
+        // it just won't have notes to inline.
+        let dirty = (
+            Uuid::from_bytes([9; 16]),
+            artifact_body(ArtifactStatus::Dirty, None),
+        );
+        let (any_dirty, notes) = select_dirty_regen_seed(&[dirty]);
+        assert!(any_dirty);
+        assert!(notes.is_none());
+    }
+
+    #[test]
+    fn select_dirty_regen_seed_picks_first_dirty_with_notes() {
+        // Two dirty siblings, both with notes. The cascade only has
+        // one slot for `extra_revision_notes`; document that we pick
+        // the first one. (Order matches the input slice's order — the
+        // caller controls determinism via title-sorting upstream.)
+        let dirty_a_id = Uuid::from_bytes([10; 16]);
+        let dirty_b_id = Uuid::from_bytes([11; 16]);
+        let dirty_a = (
+            dirty_a_id,
+            artifact_body(ArtifactStatus::Dirty, Some("notes A")),
+        );
+        let dirty_b = (
+            dirty_b_id,
+            artifact_body(ArtifactStatus::Dirty, Some("notes B")),
+        );
+        let (any_dirty, notes) = select_dirty_regen_seed(&[dirty_a, dirty_b]);
+        assert!(any_dirty);
+        assert_eq!(notes, Some((dirty_a_id, "notes A".to_string())));
+    }
+
+    #[test]
+    fn select_dirty_regen_seed_skips_dirty_without_notes_when_other_has_them() {
+        // If multiple siblings are Dirty but only some carry notes,
+        // pick the one with notes so the regen prompt actually
+        // receives the user's guidance.
+        let dirty_no_notes_id = Uuid::from_bytes([12; 16]);
+        let dirty_with_notes_id = Uuid::from_bytes([13; 16]);
+        let dirty_no_notes = (
+            dirty_no_notes_id,
+            artifact_body(ArtifactStatus::Dirty, None),
+        );
+        let dirty_with_notes = (
+            dirty_with_notes_id,
+            artifact_body(ArtifactStatus::Dirty, Some("emphasize SLOs")),
+        );
+        let (any_dirty, notes) =
+            select_dirty_regen_seed(&[dirty_no_notes, dirty_with_notes]);
+        assert!(any_dirty);
+        assert_eq!(
+            notes,
+            Some((dirty_with_notes_id, "emphasize SLOs".to_string()))
+        );
+    }
+
+    fn skill_with_input(id: &str, input_kind: &str) -> SkillRef {
+        let mut c = SkillContract::default();
+        c.input_kind = Some(input_kind.to_string());
+        SkillRef {
+            id: Uuid::new_v4(),
+            title: id.to_string(),
+            contract: c,
+        }
+    }
+
+    #[test]
+    fn skill_phase_picks_ba_for_master_requirement_root() {
+        assert_eq!(
+            SkillPhase::for_root_kind(Some("master_requirement")),
+            SkillPhase::Ba
+        );
+    }
+
+    #[test]
+    fn skill_phase_picks_ba_for_legacy_requirements_root() {
+        assert_eq!(
+            SkillPhase::for_root_kind(Some("requirements")),
+            SkillPhase::Ba
+        );
+    }
+
+    #[test]
+    fn skill_phase_picks_sde_for_task_root() {
+        assert_eq!(SkillPhase::for_root_kind(Some("task")), SkillPhase::Sde);
+    }
+
+    #[test]
+    fn skill_phase_falls_back_to_mixed_for_unknown_root() {
+        assert_eq!(SkillPhase::for_root_kind(None), SkillPhase::Mixed);
+        assert_eq!(
+            SkillPhase::for_root_kind(Some("plan")),
+            SkillPhase::Mixed
+        );
+    }
+
+    #[test]
+    fn filter_skills_for_ba_phase_keeps_ba_chain_and_architecture() {
+        let skills = vec![
+            skill_with_input("01-ba-agg", "master_requirement"),
+            skill_with_input("02-ba-epics", "master_requirement"),
+            skill_with_input("03-ba-features", "epic"),
+            skill_with_input("06-sa-arch", "master_requirement"),
+            skill_with_input("07-sde-impl", "task"),
+            skill_with_input("08-sde-tests", "implementation"),
+            skill_with_input("10-sde-bug", "bug"),
+        ];
+        let kept = filter_skills_for_phase(skills, SkillPhase::Ba);
+        let titles: Vec<&str> = kept.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["01-ba-agg", "02-ba-epics", "03-ba-features", "06-sa-arch"]
+        );
+    }
+
+    #[test]
+    fn filter_skills_for_sde_phase_drops_ba_chain_and_architecture() {
+        let skills = vec![
+            skill_with_input("01-ba-agg", "master_requirement"),
+            skill_with_input("06-sa-arch", "master_requirement"),
+            skill_with_input("07-sde-impl", "task"),
+            skill_with_input("08-sde-tests", "implementation"),
+            skill_with_input("09-sde-results", "test_cases"),
+            skill_with_input("10-sde-bug", "bug"),
+        ];
+        let kept = filter_skills_for_phase(skills, SkillPhase::Sde);
+        let titles: Vec<&str> = kept.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["07-sde-impl", "08-sde-tests", "09-sde-results", "10-sde-bug"]
+        );
+    }
+
+    #[test]
+    fn filter_skills_for_mixed_phase_keeps_everything() {
+        let skills = vec![
+            skill_with_input("01-ba-agg", "master_requirement"),
+            skill_with_input("07-sde-impl", "task"),
+            skill_with_input("10-sde-bug", "bug"),
+        ];
+        let kept = filter_skills_for_phase(skills.clone(), SkillPhase::Mixed);
+        assert_eq!(kept.len(), skills.len());
+    }
+
+    #[test]
+    fn filter_skills_keeps_skills_with_no_input_kind() {
+        let mut utility = SkillRef {
+            id: Uuid::new_v4(),
+            title: "utility-no-kind".into(),
+            contract: SkillContract::default(),
+        };
+        utility.contract.input_kind = None;
+        let kept = filter_skills_for_phase(vec![utility.clone()], SkillPhase::Sde);
+        assert_eq!(kept.len(), 1);
+        let kept_ba = filter_skills_for_phase(vec![utility], SkillPhase::Ba);
+        assert_eq!(kept_ba.len(), 1);
     }
 }
