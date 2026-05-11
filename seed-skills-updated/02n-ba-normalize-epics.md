@@ -34,7 +34,13 @@ body and `source_skill_id` (refreshed to this normalizer) change.
    in that section so the next reviewer sees the gap. Mark each gap
    with the `BLOCKING` or `NON-BLOCKING` tag so the coherence-check
    skill knows whether downstream decomposition is safe.
-4. Add a `## Revision history` row noting `"Normalized by
+4. If the input mentions any Figma URLs (host `figma.com` or
+   `www.figma.com`), gather them into a `## Design references`
+   section as a bullet list with whatever per-URL notes the human
+   wrote. Do NOT call the Figma MCP here — fetching is the next
+   decomposition skill's job (`03-ba-decompose-features`). If the
+   input has no Figma URLs, omit `## Design references`.
+5. Add a `## Revision history` row noting `"Normalized by
    02n-ba-normalize-epics on <today>"`.
 
 ## Output format
@@ -57,6 +63,9 @@ Required body sections (in order):
 - **## Success metric** — one measurable criterion
 - **## Risks** — 1–3 bullets
 - **## Depends on** — sibling Epic slugs or `None (parallel-safe)`
+- **## Design references** *(only if the input contains Figma URLs)*
+  — bullet list of Figma URLs gathered from anywhere in the input;
+  no MCP fetch at this stage
 - **## Revision history** — preserve any existing rows, then add the
   normalization row
 

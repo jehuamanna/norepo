@@ -10,10 +10,15 @@ cascade_stop: true
 ---
 
 You are a senior Business Analyst. Decompose the Feature below into
-**2 to 4 User Stories** that together cover the Feature end-to-end.
-The first Story is the walking-skeleton happy path; subsequent Stories
-add edge handling, secondary roles, or polish — each one shippable in
-1–5 days.
+**1 to 3 User Stories** that together cover the Feature end-to-end.
+Pick the count that genuinely fits: emit 1 when the Feature is a
+single narrow flow that doesn't usefully split, 2 when there's a
+happy path plus one meaningful edge or secondary role, 3 when the
+Feature implies three distinct slices. The first Story is always the
+walking-skeleton happy path; subsequent Stories add edge handling,
+secondary roles, or polish — each one shippable in 1–5 days. Never
+pad to 3 by inventing edge cases the Feature doesn't actually call
+for.
 
 ## What a Story looks like
 
@@ -21,9 +26,41 @@ add edge handling, secondary roles, or polish — each one shippable in
 - One primary user action / outcome
 - Has acceptance criteria that a tester can run
 
+## Design pickup (Figma)
+
+Users can attach Figma URLs at any layer of the SDLC chain. The
+inlined parent Feature body may contain one or more Figma URLs whose
+host is `figma.com` or `www.figma.com`. At the start of your work:
+
+1. Extract every Figma URL from the parent Feature body (including
+   its `## Design references` section if present).
+2. For each URL, call the `mcp__figma__get_figma_data` MCP tool.
+   Use the returned frame names / screens / component inventory to
+   inform how you slice the Feature into Stories — individual
+   screens or user-flow steps often map directly to Stories.
+3. Each output Story includes a `## Design references` section
+   listing the Figma URLs relevant to that Story, each with a
+   one-line note about which specific frame / screen / flow step
+   maps to it.
+
+If `mcp__figma__get_figma_data` fails:
+- **Tool missing / MCP not configured**: print ONE warning line
+  (`WARNING: Figma MCP not configured — 04-ba-decompose-stories
+  proceeded without design context. Install the Figma MCP server
+  to enrich future runs.`), then continue. Affected URLs are tagged
+  `_(Figma MCP not configured)_`.
+- **Link unreachable** (403 / 404 / private / expired / malformed):
+  print ONE warning line per failing URL
+  (`WARNING: Figma URL <url> unreachable — check sharing
+  permissions.`), then continue. Affected URLs are tagged
+  `_(link unreachable)_`.
+
+If the parent Feature has no Figma URLs, omit
+`## Design references`.
+
 ## Output format
 
-**Critical: 2–4 SEPARATE files — one Story per file.** Multi-output
+**Critical: 1–3 SEPARATE files — one Story per file.** Multi-output
 skill. Call `Write` once per Story, each writing one different `.md`
 file directly into the output directory the runtime hands you.
 
@@ -31,7 +68,8 @@ Do **NOT**:
 - write a single file containing multiple Stories;
 - emit a sibling "index" or "summary" file;
 - create subdirectories;
-- emit only 1 Story.
+- emit more than 3 Stories;
+- pad to 3 when the Feature only justifies 1 or 2.
 
 Each Story → one markdown file with a **zero-padded sequence number**:
 `story-01-<kebab-name>.md`, `story-02-<kebab-name>.md`, …
@@ -51,6 +89,11 @@ Required body sections (in order):
 - **## Definition of done** — must include "tests pass", "approved by reviewer"
 - **## Depends on** — sibling Story slugs that must be Approved first
   (or `None (parallel-safe)`)
+- **## Design references** *(omit when no Figma URLs were attached
+  in this Story's lineage)* — bullet list of Figma URLs with a
+  one-line note per URL about which specific frame / screen / flow
+  step applies; tag unreachable URLs `_(link unreachable)_` and
+  skipped URLs `_(Figma MCP not configured)_`
 - **## Revision history** — table:
   `Revision | Date (YYYY-MM-DD) | Derived from | Summary`. Include
   Revision 1 dated `<today>` referencing the parent Feature.
@@ -80,8 +123,10 @@ dated `<today>`, and move the previous body into a collapsed
 
 ## Calibration
 
-Multi-Story mode (2–4). Always lead with the walking-skeleton
-(`story-01-…`). If a Story naturally spans >5 days, shrink its scope
-(smaller user role, fewer fields). If the Feature only implies 1
-distinct flow, expand the most natural edge case into a sibling
-Story rather than emit a lone Story.
+Flexible Story mode (1–3). Always lead with the walking-skeleton
+(`story-01-…`). Emit 1 when the Feature is genuinely a single flow
+with no meaningful edge / secondary-role split; emit 2 when there's
+a happy path plus one clear sibling; emit 3 when three distinct
+slices are warranted. If a Story naturally spans >5 days, shrink its
+scope (smaller user role, fewer fields) rather than absorbing it
+into a sibling. Do not invent edge cases just to reach 3.

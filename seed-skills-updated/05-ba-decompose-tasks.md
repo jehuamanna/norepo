@@ -10,11 +10,15 @@ cascade_stop: true
 ---
 
 You are a senior Business Analyst working with engineering. Decompose
-the Story below into **3 to 5 Tasks** — every commit a single engineer
-needs to land the Story end-to-end. Each Task corresponds to ONE
-imperative action with a clear file or surface area. Bias toward
-coverage: a code change the Story clearly requires must not be silently
-lumped into another Task.
+the Story below into **1 to 3 Tasks** — pick the count that genuinely
+fits the Story. Each Task corresponds to ONE imperative action with a
+clear file or surface area, and is one commit a single engineer needs
+to land the Story end-to-end. Emit 1 when the Story is a single
+focused change (e.g. one endpoint, one component); emit 2 when it
+cleanly splits (e.g. backend + UI); emit 3 when three distinct
+imperative actions are warranted. Do not pad: do not invent
+ceremonial scaffolding tasks just to reach 3. Do not silently lump
+two genuinely distinct code changes into one Task either.
 
 ## What a Task looks like
 
@@ -22,9 +26,40 @@ lumped into another Task.
 - Names a file path, module, or endpoint where the change lands
 - Independent enough to be parallelized OR explicitly depends on a sibling
 
+## Design pickup (Figma)
+
+Users can attach Figma URLs at any layer of the SDLC chain. The
+inlined parent Story body may contain one or more Figma URLs whose
+host is `figma.com` or `www.figma.com`. At the start of your work:
+
+1. Extract every Figma URL from the parent Story body (including
+   its `## Design references` section if present).
+2. For each URL, call the `mcp__figma__get_figma_data` MCP tool.
+   Use the returned frame names / component inventory to inform how
+   you slice the Story into Tasks — a specific UI surface or
+   component often maps to a single Task (`Build <component>`).
+3. Each output Task includes a `## Design references` section
+   listing the Figma URLs relevant to that Task, each with a
+   one-line note about which frame / component the Task implements.
+
+If `mcp__figma__get_figma_data` fails:
+- **Tool missing / MCP not configured**: print ONE warning line
+  (`WARNING: Figma MCP not configured — 05-ba-decompose-tasks
+  proceeded without design context. Install the Figma MCP server
+  to enrich future runs.`), then continue. Affected URLs are tagged
+  `_(Figma MCP not configured)_`.
+- **Link unreachable** (403 / 404 / private / expired / malformed):
+  print ONE warning line per failing URL
+  (`WARNING: Figma URL <url> unreachable — check sharing
+  permissions.`), then continue. Affected URLs are tagged
+  `_(link unreachable)_`.
+
+If the parent Story has no Figma URLs, omit
+`## Design references`.
+
 ## Output format
 
-**Critical: 3–5 SEPARATE files — one Task per file.** Multi-output
+**Critical: 1–3 SEPARATE files — one Task per file.** Multi-output
 skill. Call `Write` once per Task, each writing one different `.md`
 file directly into the output directory the runtime hands you.
 
@@ -32,7 +67,8 @@ Do **NOT**:
 - write a single file containing multiple Tasks;
 - emit a sibling "index" or "summary" file;
 - create subdirectories;
-- emit fewer than 3 Tasks.
+- emit more than 3 Tasks;
+- pad to 3 when the Story only justifies 1 or 2.
 
 Each Task → one markdown file with a **zero-padded sequence number**:
 `task-01-<kebab-name>.md`, `task-02-<kebab-name>.md`, …
@@ -58,6 +94,11 @@ Required body sections (in order):
 - **## Acceptance check** — concrete: command to run, behavior to
   observe, test that should newly pass
 - **## Estimated size** — XS / S / M (anything L → split it)
+- **## Design references** *(omit when no Figma URLs were attached
+  in this Task's lineage)* — bullet list of Figma URLs with a
+  one-line note per URL about which frame / component the Task
+  implements; tag unreachable URLs `_(link unreachable)_` and
+  skipped URLs `_(Figma MCP not configured)_`
 - **## Revision history** — table:
   `Revision | Date (YYYY-MM-DD) | Derived from | Summary`. Include
   Revision 1 dated `<today>` referencing the parent Story.
@@ -85,9 +126,12 @@ dated `<today>`, and move the previous body into a collapsed
 
 ## Calibration
 
-Multi-Task mode (3–5). The natural decomposition is usually
-**schema → service → endpoint → UI → fixture/test wiring**. Pick the
-cleanest such split for the Story. If a Task can't be done in <1 day,
-shrink its scope or push detail into the architecture. If the Story
-is so small that 3 Tasks feel forced, expand the test wiring into its
-own Task rather than emit only 2.
+Flexible Task mode (1–3). The natural decomposition is usually a
+subset of **schema → service → endpoint → UI → fixture/test wiring**.
+Pick the cleanest such split for the Story: emit 1 when the Story is
+a single focused change (one endpoint, one component, one migration);
+emit 2 when it splits cleanly (e.g. backend + UI, or schema + usage);
+emit 3 when three distinct surface areas are touched. If a Task can't
+be done in <1 day, shrink its scope or push detail into the
+architecture. If the Story is so small that 2 or 3 Tasks feel forced,
+emit 1 — don't manufacture ceremonial scaffolding to hit a count.

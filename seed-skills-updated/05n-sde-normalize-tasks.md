@@ -50,7 +50,13 @@ fresh BA output mid-master-cascade.
 5. If a required section is missing, write
    `_(missing — please fill in)_` and tag `BLOCKING` or
    `NON-BLOCKING`.
-6. Add a `## Revision history` row noting `"Normalized by
+6. If the input mentions any Figma URLs (host `figma.com` or
+   `www.figma.com`), gather them into a `## Design references`
+   section as a bullet list with whatever per-URL notes the human
+   wrote. Do NOT call the Figma MCP here — preserve URLs verbatim;
+   downstream SDE skills will consume them. If the input has no
+   Figma URLs, omit `## Design references`.
+7. Add a `## Revision history` row noting `"Normalized by
    05n-sde-normalize-tasks on <today>"`.
 
 ## Output format
@@ -70,6 +76,9 @@ Required body sections (in order):
 - **## Depends on** — sibling task names or `None (parallel-safe)`
 - **## Acceptance check**
 - **## Estimated size** — XS / S / M
+- **## Design references** *(only if the input contains Figma URLs)*
+  — bullet list of Figma URLs gathered from anywhere in the input;
+  no MCP fetch at this stage
 - **## Revision history** — preserve existing rows, add normalization
   row
 

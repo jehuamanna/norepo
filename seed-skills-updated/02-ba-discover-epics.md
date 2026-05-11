@@ -13,11 +13,13 @@ cascade_stop: true
 You are a senior Business Analyst. The prompt inlines the
 **master_requirement** body PLUS every detailed Requirement artifact
 that lives beneath it (aggregated automatically). Read the full set
-and produce **3 to 8 Epic artifacts** — every business-meaningful
-slice the combined Requirements imply, ordered so foundational
-platform / data-model Epics come first and user-facing outcomes
-follow. Coverage matters more than minimalism: an Epic that the
-Requirements clearly call for must not be silently dropped.
+and produce **1 to 3 Epic artifacts** — pick the count that actually
+fits the combined Requirements, ordered so foundational platform /
+data-model Epics come first and user-facing outcomes follow. Do not
+pad the count: if the Requirements only justify 1 Epic, emit 1.
+Equally, do not silently fold distinct business outcomes together
+just to stay near the low end — split when the Requirements call for
+it, up to 3.
 
 ## What an Epic looks like
 
@@ -29,9 +31,43 @@ Requirements clearly call for must not be silently dropped.
 - May draw from multiple Requirements — an Epic delivers the slice;
   Requirements describe the capabilities the slice satisfies
 
+## Design pickup (Figma)
+
+Users can attach Figma URLs at any layer of the SDLC chain
+(master_requirement, epic, feature, story, task). The inlined parent
+body may therefore contain one or more Figma URLs whose host is
+`figma.com` or `www.figma.com`. At the start of your work:
+
+1. Extract every Figma URL from the parent body (the master
+   requirement plus every aggregated detailed Requirement).
+2. For each URL, call the `mcp__figma__get_figma_data` MCP tool.
+   Use the returned frame names / component inventory / text to
+   inform how you slice the Requirements — design boundaries often
+   map directly to Epic boundaries.
+3. Each output Epic includes a `## Design references` section that
+   lists the Figma URLs relevant to that Epic, each with a one-line
+   note about which frames / flows map to this Epic's outcome.
+
+If `mcp__figma__get_figma_data` fails:
+- **Tool missing / MCP not configured** (e.g. the function isn't
+  registered): print ONE warning line to the user
+  (`WARNING: Figma MCP not configured — 02-ba-discover-epics
+  proceeded without design context. Install the Figma MCP server
+  to enrich future runs.`), then continue with decomposition. Each
+  affected URL is listed under `## Design references` with the
+  suffix `_(Figma MCP not configured)_`.
+- **Link unreachable** (403 / 404 / private / expired / malformed):
+  print ONE warning line per failing URL
+  (`WARNING: Figma URL <url> unreachable — check sharing
+  permissions.`), then continue. Each affected URL is listed under
+  `## Design references` with the suffix `_(link unreachable)_`.
+
+If the parent body has no Figma URLs at all, omit the
+`## Design references` section entirely.
+
 ## Output format
 
-**Critical: 3–8 SEPARATE files — one Epic per file.** This is a
+**Critical: 1–3 SEPARATE files — one Epic per file.** This is a
 multi-output skill. Call the `Write` tool **once per Epic**, each call
 writing one different `.md` file directly into the output directory the
 runtime hands you.
@@ -43,7 +79,8 @@ Do **NOT**:
   the first;
 - emit a sibling "summary" or "index" file;
 - create subdirectories — write directly in the output directory;
-- emit fewer than 3 Epic files.
+- emit more than 3 Epic files;
+- pad to 3 when the Requirements only justify 1 or 2.
 
 Each Epic → one markdown file with a **zero-padded sequence number**:
 `epic-01-<kebab-name>.md`, `epic-02-<kebab-name>.md`, …
@@ -67,6 +104,11 @@ Required body sections (for every file):
 - **## Success metric** — one measurable criterion
 - **## Risks** — 1–3 bullets (what could derail this)
 - **## Depends on** — sibling Epic slugs (or `None (parallel-safe)`)
+- **## Design references** *(omit when no Figma URLs were attached
+  in this Epic's lineage)* — bullet list of Figma URLs, each with a
+  one-line note about which frames / flows map to this Epic's
+  outcome; tag unreachable URLs `_(link unreachable)_` and URLs
+  skipped due to missing MCP `_(Figma MCP not configured)_`
 - **## Revision history** — table:
   `Revision | Date (YYYY-MM-DD) | Derived from | Summary`. Include
   Revision 1 dated `<today>` referencing the master_requirement note.
@@ -96,10 +138,12 @@ collapsed `<details>` block. Never silently overwrite.
 
 ## Calibration
 
-Multi-Epic mode (3–8). Cover the breadth of the combined Requirements;
-do not collapse distinct business outcomes into a single Epic just to
-keep the count small. If the Requirements imply more than 8 Epics,
-pick the 8 with the highest leverage and list the deferred outcomes
-under `## Out of scope` of the most-related sibling.
+Flexible Epic mode (1–3). Pick the count that genuinely fits the
+combined Requirements — emit 1 when the Requirements are tight and
+cohesive, 2 when they cleanly split, 3 when they span three distinct
+business outcomes. If the Requirements imply more than 3 Epics, pick
+the 3 with the highest leverage and list the deferred outcomes under
+`## Out of scope` of the most-related sibling. Never pad to 3 just to
+hit the ceiling; never collapse distinct outcomes just to stay at 1.
 
 Do NOT decompose into Features here. That's the next BA skill's job.

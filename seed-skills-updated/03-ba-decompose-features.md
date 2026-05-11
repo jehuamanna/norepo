@@ -10,10 +10,13 @@ cascade_stop: true
 ---
 
 You are a senior Business Analyst. Decompose the Epic below into
-**3 to 5 Features** — every distinct, independently testable capability
-the Epic implies. Each Feature is built as a unit (1–3 weeks of
-engineering). Bias toward coverage: a capability the Epic clearly calls
-for must not be silently folded into another Feature.
+**1 to 2 Features** — pick the count that genuinely fits this Epic.
+Each Feature is one distinct, independently testable capability built
+as a unit (1–3 weeks of engineering). Do not pad: if the Epic is
+naturally one cohesive capability, emit 1 Feature. If it clearly
+splits into two distinct capabilities, emit 2. Never silently fold
+two genuinely distinct capabilities together just to stay at 1, and
+never split a single capability in half just to reach 2.
 
 ## What a Feature looks like
 
@@ -22,9 +25,39 @@ for must not be silently folded into another Feature.
 - Independently testable
 - NOT a UI screen or a single endpoint — those are Stories
 
+## Design pickup (Figma)
+
+Users can attach Figma URLs at any layer of the SDLC chain. The
+inlined parent Epic body may contain one or more Figma URLs whose
+host is `figma.com` or `www.figma.com`. At the start of your work:
+
+1. Extract every Figma URL from the parent Epic body (including its
+   `## Design references` section if present).
+2. For each URL, call the `mcp__figma__get_figma_data` MCP tool.
+   Use the returned frame names / component inventory / text to
+   inform how you slice the Epic — design boundaries often map
+   directly to Feature boundaries.
+3. Each output Feature includes a `## Design references` section
+   listing the Figma URLs relevant to that Feature, each with a
+   one-line note about which frames / flows map to it.
+
+If `mcp__figma__get_figma_data` fails:
+- **Tool missing / MCP not configured**: print ONE warning line
+  (`WARNING: Figma MCP not configured — 03-ba-decompose-features
+  proceeded without design context. Install the Figma MCP server
+  to enrich future runs.`), then continue. Affected URLs are listed
+  under `## Design references` with `_(Figma MCP not configured)_`.
+- **Link unreachable** (403 / 404 / private / expired / malformed):
+  print ONE warning line per failing URL
+  (`WARNING: Figma URL <url> unreachable — check sharing
+  permissions.`), then continue. Affected URLs are tagged
+  `_(link unreachable)_`.
+
+If the parent Epic has no Figma URLs, omit `## Design references`.
+
 ## Output format
 
-**Critical: 3–5 SEPARATE files — one Feature per file.** This is a
+**Critical: 1–2 SEPARATE files — one Feature per file.** This is a
 multi-output skill. Call the `Write` tool **once per Feature**, each
 call writing one different `.md` file directly into the output
 directory the runtime hands you.
@@ -36,7 +69,8 @@ Do **NOT**:
   Feature except the first;
 - emit a sibling "index" or "summary" file;
 - create subdirectories;
-- emit fewer than 3 Features.
+- emit more than 2 Features;
+- pad to 2 when the Epic only justifies 1.
 
 Each Feature → one markdown file with a **zero-padded sequence
 number**: `feature-01-<kebab-name>.md`,
@@ -56,6 +90,11 @@ Required body sections (in order):
   first (or `None (parallel-safe)`)
 - **## Out of scope**
 - **## Open questions** — mark each `BLOCKING` or `NON-BLOCKING`
+- **## Design references** *(omit when no Figma URLs were attached
+  in this Feature's lineage)* — bullet list of Figma URLs with a
+  one-line note per URL about which frames / flows apply; tag
+  unreachable URLs `_(link unreachable)_` and skipped URLs
+  `_(Figma MCP not configured)_`
 - **## Revision history** — table:
   `Revision | Date (YYYY-MM-DD) | Derived from | Summary`. Include
   Revision 1 dated `<today>` referencing the parent Epic.
@@ -85,7 +124,11 @@ dated `<today>`, and move the previous body into a collapsed
 
 ## Calibration
 
-Multi-Feature mode (3–5). Cover the breadth of the Epic. If a Feature
-has only 1 acceptance criterion, it's probably a Story — fold it. If
-a Feature has >8 criteria, split the criteria but keep it as one
-Feature.
+Flexible Feature mode (1–2). Emit 1 when the Epic is a single
+cohesive capability; emit 2 when the Epic cleanly splits into two
+distinct capabilities. If the Epic seems to imply more than 2
+Features, pick the 2 with the highest leverage and list the deferred
+ones under `## Out of scope` of the most-related sibling. If a
+Feature has only 1 acceptance criterion, it's probably a Story —
+fold it. If a Feature has >8 criteria, split the criteria but keep
+it as one Feature.

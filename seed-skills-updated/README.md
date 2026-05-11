@@ -55,13 +55,13 @@ master_requirement   [PROJECT ROOT — the only Play button]
 | Order | Skill | Phase | input_kind | output_kind | Count | Gate | Persona |
 |---|---|---|---|---|---|---|---|
 | 00 | `00-coherence-check` | BA | master_requirement (aggregator over `task`) | clarification | many (0–N) | approval | BA |
-| 02 | `02-ba-discover-epics` | BA | master_requirement (aggregator over `requirements`) | epic | many (3–8) | approval | BA |
+| 02 | `02-ba-discover-epics` | BA | master_requirement (aggregator over `requirements`) | epic | many (1–3) | approval | BA |
 | 02n | `02n-ba-normalize-epics` | BA | epic | epic | one | auto | BA |
-| 03 | `03-ba-decompose-features` | BA | epic | feature | many (3–5) | approval | BA |
+| 03 | `03-ba-decompose-features` | BA | epic | feature | many (1–2) | approval | BA |
 | 03n | `03n-ba-normalize-features` | BA | feature | feature | one | auto | BA |
-| 04 | `04-ba-decompose-stories` | BA | feature | story | many (2–4) | approval | BA |
+| 04 | `04-ba-decompose-stories` | BA | feature | story | many (1–3) | approval | BA |
 | 04n | `04n-ba-normalize-stories` | BA | story | story | one | auto | BA |
-| 05 | `05-ba-decompose-tasks` | BA | story | task | many (3–5) | approval | BA |
+| 05 | `05-ba-decompose-tasks` | BA | story | task | many (1–3) | approval | BA |
 | 06 | `06-sa-draft-architecture` | BA | master_requirement (aggregator over `requirements`) | architecture | one | approval | SA |
 | 05n | `05n-sde-normalize-tasks` | SDE | task | task | one | auto | SDE |
 | 07 | `07-sde-implement-task` | SDE | task (inherits `architecture`) | implementation | one | approval | SDE |
@@ -128,6 +128,63 @@ Implementation, Test Cases, Test Results, Bug, Clarification) keeps
 just Approve / Reject / Mark dirty / Revise — the workflow is
 fully driven by master Play (BA phase) and per-task Play (SDE
 phase).
+
+## Design pickup (Figma)
+
+Users can paste Figma URLs (host `figma.com` or `www.figma.com`)
+into any artifact in the BA chain — the master_requirement, any
+detailed Requirement, an Epic, a Feature, a Story, or a Task.
+On the next cascade step, the downstream skill scans its parent
+body for those URLs, calls the Figma MCP server
+(`mcp__figma__get_figma_data`), and folds the returned frame
+inventory / text into how it decomposes:
+
+- design boundaries → Epic boundaries (in `02-ba-discover-epics`)
+- screens / flows → Story boundaries (in `04-ba-decompose-stories`)
+- specific frames / components → Task scope (in
+  `05-ba-decompose-tasks`)
+
+Each output artifact carries a `## Design references` section
+listing the Figma URLs relevant to it with one-line per-URL notes.
+
+**Setup.** The Figma MCP server must be configured in the user's
+Claude Code MCP config (`mcp servers add figma …`) so that
+`mcp__figma__get_figma_data` resolves. See
+<https://github.com/figma/mcp-server-figma> (or your org's pinned
+fork) for setup.
+
+**Failure handling.** If the MCP tool isn't available or a URL is
+unreachable, the skill does NOT block decomposition. It:
+
+1. Prints a single `WARNING: …` line to the user during the run
+   (`WARNING: Figma MCP not configured — <skill> proceeded without
+   design context.` or `WARNING: Figma URL <url> unreachable —
+   check sharing permissions.`).
+2. Lists the affected URL under `## Design references` of the
+   produced artifact with a tag —
+   `_(Figma MCP not configured)_` or `_(link unreachable)_` — so
+   the gap is preserved in the artifact body and the next reviewer
+   sees what was skipped.
+
+**Normalizers (`02n` / `03n` / `04n` / `05n`)** preserve any Figma
+URLs they find in hand-authored artifacts by gathering them into
+`## Design references`, but they do NOT call MCP — they leave
+fetching to the next decomposition skill in the chain.
+
+**SDE phase.** `07-sde-implement-task` re-fetches Figma URLs from
+the Task body (and from the inherited Architecture) to drive
+implementation: it calls `mcp__figma__get_figma_data` for exact
+component / layout / copy values, and
+`mcp__figma__download_figma_images` to pull assets the design owns
+(logos, illustrations, exported PNG / SVG) into the appropriate
+`assets/` directory. The Implementation note records every
+consulted URL under `## Design references` with a per-URL note
+about how the design informed the code. Failure handling is the
+same warn-and-continue pattern as BA-phase skills. Test
+generation (`08`), test execution (`09`), and bug-fix (`10`) do
+not consume Figma — tests should validate the implementation, and
+acceptance criteria from the Story already encode the testable
+behavior.
 
 ## Required code-level changes
 

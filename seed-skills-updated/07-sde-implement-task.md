@@ -31,6 +31,56 @@ If multiple Architecture revisions are inlined, only the **latest**
 revision (the one outside any collapsed `<details>` block) is binding.
 Prior revisions are history — do not implement against them.
 
+## Design pickup (Figma)
+
+The parent Task body — and possibly the inherited Architecture — may
+contain Figma URLs (host `figma.com` or `www.figma.com`), carried
+down from BA-phase decomposition or attached directly to the Task.
+At the start of your work:
+
+1. Extract every Figma URL from the Task body (especially its
+   `## Design references` section if present) and from the inherited
+   Architecture body.
+2. For each URL, call `mcp__figma__get_figma_data`. Use the returned
+   frame names / component inventory / dimensions / copy / layout to
+   drive your implementation — match component structure, naming,
+   spacing, and visible copy where the design specifies them. The
+   BA-phase `## Design references` notes describe *what* a frame
+   means; this re-fetch gives you the *exact* values needed to
+   write code.
+3. If the Task involves shipping image / icon assets that the Figma
+   design owns (logos, illustrations, exported PNG / SVG), call
+   `mcp__figma__download_figma_images` to pull the assets and check
+   them into the appropriate `assets/` directory. Reference the
+   downloaded files from the implementation.
+4. Record every consulted URL under `## Design references` of the
+   Implementation note (see body sections) with a one-line note
+   about how the design informed the code (e.g. "frame 'Login
+   modal' → `src/auth/login_modal.rs`", or "downloaded
+   `logo-mark.svg` → `assets/icons/`").
+
+If `mcp__figma__get_figma_data` or
+`mcp__figma__download_figma_images` fails:
+- **Tool missing / MCP not configured** (e.g. function-not-found):
+  print ONE warning line (`WARNING: Figma MCP not configured —
+  07-sde-implement-task proceeded without design context. Install
+  the Figma MCP server to enrich future runs.`), then continue.
+  Use whatever description the BA-phase `## Design references` notes
+  already carry to inform the implementation. Affected URLs are
+  tagged `_(Figma MCP not configured)_` in the Implementation's
+  `## Design references`.
+- **Link unreachable** (403 / 404 / private / expired / malformed):
+  print ONE warning line per failing URL
+  (`WARNING: Figma URL <url> unreachable — check sharing
+  permissions.`), then continue. Affected URLs are tagged
+  `_(link unreachable)_`.
+
+Implementation never blocks on Figma failure — implement against the
+Task and Architecture as best you can.
+
+If neither the Task nor the Architecture contains Figma URLs, omit
+`## Design references` from the Implementation note.
+
 ## Execution rules
 
 - Use the codebase's existing patterns. Don't introduce new
@@ -77,6 +127,12 @@ Required body sections (in order):
   "None")
 - **## Open questions** — ask the reviewer if anything was ambiguous
   (or "None")
+- **## Design references** *(omit when no Figma URLs were attached
+  to the Task or Architecture)* — bullet list of Figma URLs
+  consulted during implementation, each with a one-line note about
+  how the design informed the code or which asset was downloaded;
+  tag unreachable URLs `_(link unreachable)_` and skipped URLs
+  `_(Figma MCP not configured)_`
 - **## Revision history** — table:
   `Revision | Date (YYYY-MM-DD) | Derived from | Summary`. Include
   Revision 1 dated `<today>` referencing the parent Task. If this is

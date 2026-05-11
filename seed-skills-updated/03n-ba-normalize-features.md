@@ -31,7 +31,13 @@ body and `source_skill_id` (refreshed to this normalizer) change.
    parse it.
 3. If a required section is missing, write
    `_(missing — please fill in)_` and tag `BLOCKING` or `NON-BLOCKING`.
-4. Add a `## Revision history` row noting `"Normalized by
+4. If the input mentions any Figma URLs (host `figma.com` or
+   `www.figma.com`), gather them into a `## Design references`
+   section as a bullet list with whatever per-URL notes the human
+   wrote. Do NOT call the Figma MCP here — fetching is the next
+   decomposition skill's job (`04-ba-decompose-stories`). If the
+   input has no Figma URLs, omit `## Design references`.
+5. Add a `## Revision history` row noting `"Normalized by
    03n-ba-normalize-features on <today>"`.
 
 ## Output format
@@ -51,6 +57,9 @@ Required body sections (in order):
 - **## Depends on**
 - **## Out of scope**
 - **## Open questions** — each tagged `BLOCKING` / `NON-BLOCKING`
+- **## Design references** *(only if the input contains Figma URLs)*
+  — bullet list of Figma URLs gathered from anywhere in the input;
+  no MCP fetch at this stage
 - **## Revision history** — preserve existing rows, add normalization row
 
 ## When to stop and ask
