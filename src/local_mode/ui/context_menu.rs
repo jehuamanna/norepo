@@ -63,7 +63,16 @@ pub struct ContextMenuProps {
 
 #[component]
 pub fn ContextMenu(props: ContextMenuProps) -> Element {
-    let style = format!("position: fixed; left: {}px; top: {}px;", props.x, props.y);
+    // Render initially hidden so the post-mount JS adjustment doesn't
+    // produce a one-frame flash at the unadjusted position. The
+    // `onmounted` handler runs `clamp_into_viewport_script` which
+    // measures the rendered menu against `window.innerWidth/Height`,
+    // moves it up / left whenever it would overflow, and finally
+    // flips visibility back to visible.
+    let style = format!(
+        "position: fixed; left: {}px; top: {}px; visibility: hidden;",
+        props.x, props.y
+    );
     let items = props.items.clone();
     let on_dismiss = props.on_dismiss;
     // Tracks which row index in this menu currently has its submenu open.
@@ -104,6 +113,11 @@ pub fn ContextMenu(props: ContextMenuProps) -> Element {
                 style: "{style}",
                 "data-testid": "context-menu",
                 tabindex: "-1",
+                onmounted: move |_| {
+                    let _ = dioxus::prelude::document::eval(
+                        &clamp_into_viewport_script("[data-testid=\"context-menu\"]")
+                    );
+                },
                 onclick: move |evt| evt.stop_propagation(),
                 for (idx, item) in items.into_iter().enumerate() {
                     ContextMenuRow {
@@ -117,6 +131,54 @@ pub fn ContextMenu(props: ContextMenuProps) -> Element {
             }
         }
     }
+}
+
+/// JS one-shot that pins a fixed-positioned context menu inside the
+/// viewport. Measures the matched element with
+/// `getBoundingClientRect`, shifts it up / left whenever it would
+/// overflow `window.innerWidth/Height`, leaves an 8px margin from the
+/// edge, and unhides the element. Called from each menu component's
+/// `onmounted` so the very first paint shows the menu in the final
+/// (adjusted) position rather than flashing at the cursor coords
+/// before the post-render correction lands.
+///
+/// Pure-function so we can unit-test the script template without a
+/// Dioxus runtime; the actual execution happens via
+/// `document::eval`.
+pub fn clamp_into_viewport_script(selector: &str) -> String {
+    // 8px is the breathing-room gap we want between the menu's edge
+    // and the viewport edge. Tweaked alongside the menu's CSS shadow
+    // — small enough that "near the edge" feels natural, large
+    // enough that no shadow gets clipped.
+    const EDGE_PAD: i32 = 8;
+    format!(
+        r#"(() => {{
+            const el = document.querySelector('{selector}');
+            if (!el) return;
+            const rect = el.getBoundingClientRect();
+            const vw = window.innerWidth;
+            const vh = window.innerHeight;
+            let top = rect.top;
+            let left = rect.left;
+            if (rect.bottom > vh) {{
+                top = Math.max({pad}, vh - rect.height - {pad});
+            }}
+            if (top < {pad}) {{
+                top = {pad};
+            }}
+            if (rect.right > vw) {{
+                left = Math.max({pad}, vw - rect.width - {pad});
+            }}
+            if (left < {pad}) {{
+                left = {pad};
+            }}
+            el.style.top = top + 'px';
+            el.style.left = left + 'px';
+            el.style.visibility = 'visible';
+        }})();"#,
+        selector = selector,
+        pad = EDGE_PAD,
+    )
 }
 
 /// Render a nested submenu floating at the right edge of the parent row.
@@ -133,8 +195,11 @@ struct SubMenuProps {
 
 #[component]
 fn SubMenu(props: SubMenuProps) -> Element {
+    // Same hidden-until-clamped pattern as the parent ContextMenu so a
+    // deep submenu near the screen edge doesn't flash at its anchor
+    // point before flipping into the viewport.
     let style = format!(
-        "position: fixed; left: {}px; top: {}px;",
+        "position: fixed; left: {}px; top: {}px; visibility: hidden;",
         props.anchor_x, props.anchor_y
     );
     let items = props.items.clone();
@@ -149,6 +214,11 @@ fn SubMenu(props: SubMenuProps) -> Element {
             style: "{style}",
             "data-testid": "context-submenu",
             tabindex: "-1",
+            onmounted: move |_| {
+                let _ = dioxus::prelude::document::eval(
+                    &clamp_into_viewport_script("[data-testid=\"context-submenu\"]")
+                );
+            },
             onclick: move |evt| evt.stop_propagation(),
             for (idx, item) in items.into_iter().enumerate() {
                 ContextMenuRow {
@@ -297,3 +367,36 @@ fn ContextMenuRow(props: ContextMenuRowProps) -> Element {
 // NB: Constructor unit tests for ContextMenuItem live in `tests-wasm/`
 // because `Callback::new` requires a Dioxus runtime — Phase-1 TestCase U-1
 // is exercised there alongside the Playwright submenu reveal spec.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_script_includes_selector_and_viewport_checks() {
+        let script = clamp_into_viewport_script("[data-testid=\"ctx\"]");
+        // Selector wired through verbatim.
+        assert!(script.contains("[data-testid=\"ctx\"]"));
+        // Reads viewport dimensions both ways.
+        assert!(script.contains("window.innerWidth"));
+        assert!(script.contains("window.innerHeight"));
+        // Checks both overflow directions.
+        assert!(script.contains("rect.bottom > vh"));
+        assert!(script.contains("rect.right > vw"));
+        // Always unhides at the end (so the visibility:hidden seed
+        // style we set in the component doesn't leave the menu
+        // permanently invisible if the clamp branches all skip).
+        assert!(script.contains("visibility = 'visible'"));
+    }
+
+    #[test]
+    fn clamp_script_pads_against_top_left_edge() {
+        // Edge case: an open submenu near the top-left would have
+        // its `top`/`left` driven negative by the overflow branches
+        // without a lower-bound clamp. We guard against that with
+        // explicit `< pad` checks; verify those are present.
+        let script = clamp_into_viewport_script("anything");
+        assert!(script.contains("top < 8"));
+        assert!(script.contains("left < 8"));
+    }
+}
