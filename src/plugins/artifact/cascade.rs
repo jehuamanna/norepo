@@ -137,6 +137,28 @@ fn is_sde_input_kind(kind: &str) -> bool {
     )
 }
 
+/// `true` when the cascade should pre-flight check for at least one
+/// `requirements` artifact under the cascade root. Triggers only on a
+/// BA-phase run rooted on a `master_requirement` — legacy
+/// `requirements`-root cascades and SDE-phase task runs don't apply.
+/// Extracted from the inline gate logic so it stays unit-testable.
+pub fn needs_requirements_gate(phase: SkillPhase, root_kind: Option<&str>) -> bool {
+    matches!(phase, SkillPhase::Ba) && root_kind == Some("master_requirement")
+}
+
+/// Human-readable error surfaced when the master-requirement
+/// readiness gate finds zero `requirements` descendants. Phrased as
+/// a fix-it instruction so the BA can resolve it without leaving
+/// the cascade-status row.
+pub fn empty_requirements_message() -> String {
+    "No `requirements` artifacts exist under this master_requirement. \
+     Right-click the master in the explorer \u{2192} Add child note, \
+     then set `artifact_kind: requirements` + `status: approved` in \
+     the new note's frontmatter. Add as many as you need, then click \
+     Play again."
+        .into()
+}
+
 /// Drop skills whose `input_kind` doesn't belong to the active
 /// phase. Skills with no declared `input_kind` always survive — they
 /// run at any phase as utility skills (e.g. a global summarizer).
@@ -229,6 +251,30 @@ pub async fn run_cascade(
     let phase = SkillPhase::for_root_kind(root_kind_str.as_deref());
     let skills = filter_skills_for_phase(skills, phase);
     let by_input = group_by_input_kind(&skills);
+
+    // 1b. Master-requirement readiness gate. The BA hand-authors each
+    //     detail Requirement under master_requirement; there's no AI
+    //     step that produces them. If the user clicks Play with zero
+    //     `requirements` children, the empty-aggregation gate further
+    //     down (`count_descendant_artifacts_of_kind` check on each
+    //     aggregator skill) would silently skip
+    //     `02-ba-discover-epics` + `06-sa-draft-architecture` and the
+    //     cascade would complete with no work done. That's a
+    //     confusing failure mode; halt loudly here instead so the BA
+    //     gets a clear message in the cascade-status row.
+    if needs_requirements_gate(phase, root_kind_str.as_deref()) {
+        let req_count = count_descendant_artifacts_of_kind(
+            note_repo,
+            persistence,
+            project_id,
+            root_artifact_id,
+            "requirements",
+        )
+        .await;
+        if req_count == 0 {
+            return Err(CascadeError::SkillRun(empty_requirements_message()));
+        }
+    }
 
     let mut graph_writer = graph_writer;
     let mut queue: VecDeque<(Uuid, u32)> = VecDeque::from([(root_artifact_id, 0u32)]);
@@ -1692,5 +1738,56 @@ mod tests {
         assert_eq!(kept.len(), 1);
         let kept_ba = filter_skills_for_phase(vec![utility], SkillPhase::Ba);
         assert_eq!(kept_ba.len(), 1);
+    }
+
+    #[test]
+    fn requirements_gate_triggers_on_ba_master_requirement_root() {
+        assert!(needs_requirements_gate(
+            SkillPhase::Ba,
+            Some("master_requirement"),
+        ));
+    }
+
+    #[test]
+    fn requirements_gate_skips_legacy_requirements_root() {
+        // A `requirements` artifact at the project root is the
+        // legacy seed-skills-employee entry. Even though it gets
+        // bucketed into the BA phase, the BA-authored-requirements
+        // model doesn't apply there — the legacy chain *is* the
+        // requirements doc. Skipping prevents a false-positive
+        // cascade halt.
+        assert!(!needs_requirements_gate(
+            SkillPhase::Ba,
+            Some("requirements"),
+        ));
+    }
+
+    #[test]
+    fn requirements_gate_skips_sde_phase() {
+        // Per-task Play (SDE phase) has nothing to do with
+        // requirements authoring — the BA tree should already exist.
+        assert!(!needs_requirements_gate(
+            SkillPhase::Sde,
+            Some("task"),
+        ));
+    }
+
+    #[test]
+    fn requirements_gate_skips_mixed_phase_and_unknown_roots() {
+        assert!(!needs_requirements_gate(SkillPhase::Mixed, Some("plan")));
+        assert!(!needs_requirements_gate(SkillPhase::Mixed, None));
+        assert!(!needs_requirements_gate(SkillPhase::Ba, None));
+    }
+
+    #[test]
+    fn empty_requirements_message_mentions_artifact_kind_and_status() {
+        // The error message is surfaced verbatim in the
+        // cascade-status row — verify it tells the BA what
+        // frontmatter fields to set so the fix is actionable
+        // without consulting docs.
+        let msg = empty_requirements_message();
+        assert!(msg.contains("artifact_kind: requirements"));
+        assert!(msg.contains("status: approved"));
+        assert!(msg.contains("Add child note"));
     }
 }

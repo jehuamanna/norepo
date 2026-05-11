@@ -55,7 +55,6 @@ master_requirement   [PROJECT ROOT — the only Play button]
 | Order | Skill | Phase | input_kind | output_kind | Count | Gate | Persona |
 |---|---|---|---|---|---|---|---|
 | 00 | `00-coherence-check` | BA | master_requirement (aggregator over `task`) | clarification | many (0–N) | approval | BA |
-| 01 | `01-ba-aggregate-requirements` | BA | master_requirement | requirements | many (3–8) | approval | BA |
 | 02 | `02-ba-discover-epics` | BA | master_requirement (aggregator over `requirements`) | epic | many (3–8) | approval | BA |
 | 02n | `02n-ba-normalize-epics` | BA | epic | epic | one | auto | BA |
 | 03 | `03-ba-decompose-features` | BA | epic | feature | many (3–5) | approval | BA |
@@ -73,7 +72,33 @@ master_requirement   [PROJECT ROOT — the only Play button]
 ## Two-phase workflow
 
 The pipeline splits at the Architecture boundary. Which skills run
-is determined entirely by where the user clicks Play:
+is determined entirely by where the user clicks Play.
+
+**Authoring step (before BA phase Play).** The BA hand-creates each
+detailed requirement under the project's `master_requirement` — there
+is no AI step that produces `requirements` artifacts. Workflow:
+
+1. Right-click the `master_requirement` in the explorer.
+2. **Add child note** → **Markdown**.
+3. Open the new note and set its frontmatter:
+   ```markdown
+   ---
+   artifact_kind: requirements
+   status: approved
+   ---
+   ```
+4. Author the body (sections like `## Capability`, `## Acceptance
+   criteria`, `## Constraints`, `## Stakeholders`, `## Out of scope`,
+   `## Depends on`, `## Revision history` — see existing skills for
+   the canonical shape).
+5. Repeat for every coherent capability the project needs.
+6. Then click Play on `master_requirement` to start the BA cascade.
+
+If the BA clicks Play before authoring any requirements, the cascade
+halts immediately with: *"No `requirements` artifacts exist under
+this master_requirement…"* The error surfaces in the cascade-status
+row of the master_requirement view; fix by following step 1–5 above
+and clicking Play again.
 
 **BA phase — triggered by Play on a `master_requirement` artifact.**
 Runs every skill whose `input_kind` is `master_requirement` /
