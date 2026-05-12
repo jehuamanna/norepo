@@ -97,6 +97,33 @@ pub fn register_builtin_commands(reg: &mut CommandRegistry) -> Result<(), String
     })?;
 
     reg.register(Command {
+        // App-wide cascade step-mode toggle. Three-state cycle:
+        //   None         → use per-graph defaults / heuristic.
+        //   Some(true)   → step-mode ON (cascade pauses after every
+        //                  skill firing; granular debugging).
+        //   Some(false)  → step-mode OFF (cascade level-batches the
+        //                  cascade_stop pauses; all sibling artifacts
+        //                  at a level get processed in one Play).
+        // Per-workflow `view_state.step_mode` overrides the global
+        // signal, so users who set a specific workflow card to a
+        // particular mode keep that override regardless of menu state.
+        // Read by `workflow::state::effective_step_mode`.
+        id: "cascade.toggleStepMode".into(),
+        title: "Toggle Cascade Step Mode".into(),
+        category: "View".into(),
+        handler: Box::new(|_ctx: &CommandContext| {
+            crate::shell::companion_state::CASCADE_STEP_MODE_OVERRIDE
+                .with_mut(|opt| {
+                    *opt = match *opt {
+                        None => Some(true),
+                        Some(true) => Some(false),
+                        Some(false) => None,
+                    };
+                });
+        }),
+    })?;
+
+    reg.register(Command {
         id: "view.toggleSideBar".into(),
         title: "Toggle Side Bar".into(),
         category: "View".into(),
@@ -220,7 +247,8 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "file.exit".to_string(),
+                "cascade.toggleStepMode".to_string(),
+                "file.exit".into(),
                 "file.saveNote".into(),
                 "help.about".into(),
                 "notes.openSample".into(),

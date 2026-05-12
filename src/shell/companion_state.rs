@@ -95,6 +95,30 @@ pub static LOCAL_NOTE_VERSION: GlobalSignal<u64> = Signal::global(|| 0);
 /// not values.
 pub static SAVE_REQUEST_TICK: GlobalSignal<u64> = Signal::global(|| 0);
 
+/// User's app-wide cascade step-mode preference. Toggled via the
+/// View menu's `cascade.toggleStepMode` command. Read by
+/// `workflow::state::effective_step_mode` after the per-graph
+/// `view_state.step_mode` check, before the heuristic.
+///
+/// `None`         → no override; per-workflow `view_state.step_mode`
+///                   and the heuristic apply as before.
+/// `Some(true)`   → step-mode ON globally (cascade pauses after every
+///                   skill firing — granular debugging).
+/// `Some(false)`  → step-mode OFF globally (cascade level-batches
+///                   `cascade_stop` pauses; all sibling artifacts at
+///                   a level get processed in one Play).
+///
+/// Per-workflow `view_state.step_mode` overrides this signal — set
+/// it on a specific cascade workflow note to opt that one cascade
+/// out of the global preference.
+///
+/// `GlobalSignal` and not a context-provided `Signal` for the same
+/// reason as `CASCADE_STATE` etc. — read from the cascade's
+/// `spawn_forever` task, which lives in the virtual root scope.
+/// Resets to `None` on app restart (no persistence in v1).
+pub static CASCADE_STEP_MODE_OVERRIDE: GlobalSignal<Option<bool>> =
+    Signal::global(|| None);
+
 /// State of the most recent artifact-skill run for a given source
 /// artifact. The artifact view reads this to render its inline
 /// status pill (`Running…` / `Created N artifact(s)` / `Run failed:

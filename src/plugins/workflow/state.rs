@@ -9,6 +9,7 @@
 //! body lets us show the last-known state immediately on reopen
 //! without recomputing every node's hash.
 
+use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -95,8 +96,31 @@ impl WorkflowViewState {
 ///   designing the chain.
 /// - Empty graphs default to `false` (no skills to step through).
 pub fn effective_step_mode(graph: &WorkflowGraph) -> bool {
+    // Reads the app-wide override from a `GlobalSignal`, which
+    // requires a Dioxus runtime to be present. Splitting the actual
+    // decision into the pure `decide_step_mode` keeps the rule
+    // unit-testable without spinning up a runtime — tests pass
+    // their own override value and assert on the result.
+    let global_override = *crate::shell::companion_state::
+        CASCADE_STEP_MODE_OVERRIDE
+        .read();
+    decide_step_mode(graph, global_override)
+}
+
+/// Pure decision: priority order is per-graph explicit
+/// (`graph.view_state.step_mode`) > app-wide override > heuristic.
+/// Heuristic returns `true` iff the graph has at least one
+/// non-artifact-snapshot node (a hand-built workflow needs
+/// step-by-step review while it's being designed).
+pub fn decide_step_mode(
+    graph: &WorkflowGraph,
+    global_override: Option<bool>,
+) -> bool {
     if let Some(explicit) = graph.view_state.step_mode {
         return explicit;
+    }
+    if let Some(global) = global_override {
+        return global;
     }
     graph.nodes.values().any(|n| !n.is_artifact_snapshot)
 }
@@ -391,13 +415,44 @@ mod tests {
         }
     }
 
+    // Step-mode tests target the pure `decide_step_mode` so they
+    // run without a Dioxus runtime (the public `effective_step_mode`
+    // reads a `GlobalSignal`, which panics outside a runtime).
+    // Pass `None` for the override to mean "no app-wide preference".
+
     #[test]
     fn effective_step_mode_explicit_choice_wins() {
         let mut g = WorkflowGraph::new();
         g.view_state.step_mode = Some(true);
-        assert!(effective_step_mode(&g));
+        assert!(decide_step_mode(&g, None));
         g.view_state.step_mode = Some(false);
-        assert!(!effective_step_mode(&g));
+        assert!(!decide_step_mode(&g, None));
+    }
+
+    #[test]
+    fn effective_step_mode_explicit_overrides_global() {
+        // Per-graph explicit must beat the app-wide override. Set
+        // global to ON, graph-explicit to OFF — graph-explicit wins.
+        let mut g = WorkflowGraph::new();
+        g.view_state.step_mode = Some(false);
+        assert!(!decide_step_mode(&g, Some(true)));
+        // Mirror: graph explicit ON overrides global OFF.
+        g.view_state.step_mode = Some(true);
+        assert!(decide_step_mode(&g, Some(false)));
+    }
+
+    #[test]
+    fn effective_step_mode_global_override_used_when_no_explicit() {
+        // Per-graph explicit is None and a skill node is present
+        // (heuristic would say true). Global override OFF must
+        // win over the heuristic.
+        let mut g = WorkflowGraph::new();
+        let id = Uuid::new_v4();
+        g.nodes.insert(id, node(id));
+        assert!(!decide_step_mode(&g, Some(false)));
+        // Empty graph (heuristic = false) but global = true → true.
+        let g2 = WorkflowGraph::new();
+        assert!(decide_step_mode(&g2, Some(true)));
     }
 
     #[test]
@@ -407,7 +462,7 @@ mod tests {
         let mut g = WorkflowGraph::new();
         let id = Uuid::new_v4();
         g.nodes.insert(id, artifact_tile_node(id));
-        assert!(!effective_step_mode(&g));
+        assert!(!decide_step_mode(&g, None));
     }
 
     #[test]
@@ -416,13 +471,13 @@ mod tests {
         let mut g = WorkflowGraph::new();
         let id = Uuid::new_v4();
         g.nodes.insert(id, node(id));
-        assert!(effective_step_mode(&g));
+        assert!(decide_step_mode(&g, None));
     }
 
     #[test]
     fn effective_step_mode_defaults_false_for_empty_graph() {
         let g = WorkflowGraph::new();
-        assert!(!effective_step_mode(&g));
+        assert!(!decide_step_mode(&g, None));
     }
 
     #[test]
