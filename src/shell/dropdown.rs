@@ -34,7 +34,30 @@ pub fn Dropdown(menu: MenuId) -> Element {
     let items: Vec<(String, String)> = cmd_reg
         .iter()
         .filter(|c| c.category.eq_ignore_ascii_case(category))
-        .map(|c| (c.id.clone(), c.title.clone()))
+        .map(|c| {
+            // Toggle commands get a state-aware label so the user can
+            // see at a glance whether they're on/off/unset. The
+            // CommandRegistry stores static titles; rather than
+            // refactoring Command to hold a closure, we look up the
+            // GlobalSignal state at render time and decorate the
+            // displayed string. Each open of the View dropdown
+            // re-renders this match, so the indicator stays current.
+            let title = match c.id.as_str() {
+                "cascade.toggleStepMode" => {
+                    let state = *crate::shell::companion_state::
+                        CASCADE_STEP_MODE_OVERRIDE
+                        .read();
+                    let suffix = match state {
+                        None => "(default)",
+                        Some(true) => "ON \u{2014} pause every skill",
+                        Some(false) => "OFF \u{2014} batch by level",
+                    };
+                    format!("{} \u{2022} {}", c.title, suffix)
+                }
+                _ => c.title.clone(),
+            };
+            (c.id.clone(), title)
+        })
         .collect();
     let empty = items.is_empty();
     let label = menu.label();
