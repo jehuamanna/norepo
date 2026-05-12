@@ -826,11 +826,15 @@ fn ForbiddenIndicator() -> Element {
 }
 
 /// Walk `folder` for top-level `.md` files and create a `NoteKind::Skill`
-/// note under `project_id` for each one. Title = file stem; body = full
-/// file contents. Idempotent: skills with a matching title already
-/// present in the project are left alone, so the user can re-run the
-/// import after pulling new skill files. `README.md` is always
-/// skipped. Returns the number of skill rows actually created.
+/// note under a project-root `SKILLS` index note for each one. Title =
+/// file stem; body = full file contents. Idempotent: skills with a
+/// matching title already present in the project are left alone, so
+/// the user can re-run the import after pulling new skill files. The
+/// `SKILLS` parent note is found-or-created on each run; its body is
+/// regenerated from the folder's `README.md` (when present) plus an
+/// auto-generated list of every skill child as clickable
+/// `operon://note/<uuid>` links. Returns the number of skill rows
+/// actually created.
 async fn import_skills_from_folder(
     note_repo: &Arc<dyn LocalNoteRepository>,
     persistence: &Arc<dyn Persistence>,
@@ -848,6 +852,21 @@ async fn import_skills_from_folder(
             return 0;
         }
     };
+
+    // Find-or-create the SKILLS container so every imported skill
+    // becomes a child of one index note instead of cluttering the
+    // project root. Re-imports reuse the existing container.
+    let skills_parent_id =
+        match find_or_create_skills_parent(note_repo, persistence, project_id).await {
+            Some(id) => id,
+            None => {
+                tracing::warn!(
+                    target: "operon::explorer",
+                    "import_skills: failed to find or create SKILLS parent note"
+                );
+                return 0;
+            }
+        };
 
     let existing_titles: HashSet<String> = note_repo
         .list_for_project(project_id)
@@ -886,7 +905,12 @@ async fn import_skills_from_folder(
                 continue;
             }
         };
-        match note_repo.create_with_kind(project_id, None, &stem, NoteKind::Skill) {
+        match note_repo.create_with_kind(
+            project_id,
+            Some(skills_parent_id),
+            &stem,
+            NoteKind::Skill,
+        ) {
             Ok(row) => {
                 if let Err(e) = persistence
                     .save(&row.id.to_string(), body.as_bytes())
@@ -902,5 +926,182 @@ async fn import_skills_from_folder(
             }
         }
     }
+
+    // Regenerate the SKILLS index body. If the source folder ships a
+    // `README.md`, it becomes the prose preamble (the user's authored
+    // documentation about the chain). The auto-generated section
+    // below it lists every current skill child as an
+    // `operon://note/<uuid>` link so the renderer surfaces clickable
+    // navigation. Re-imports overwrite the body — manual edits to
+    // SKILLS are not preserved across re-imports; that's the
+    // tradeoff for keeping the index honest.
+    let readme = read_folder_readme(folder);
+    let body = build_skills_index_body(note_repo, project_id, skills_parent_id, readme.as_deref());
+    if let Err(e) = persistence
+        .save(&skills_parent_id.to_string(), body.as_bytes())
+        .await
+    {
+        tracing::warn!(
+            target: "operon::explorer",
+            "import_skills: SKILLS index save failed: {e}"
+        );
+    }
+
     count
+}
+
+/// Title used for the auto-managed skill index note. Stored at project
+/// root with `NoteKind::Markdown`. Re-imports look up by exact title +
+/// kind + root-level position so renamed / moved indexes get a new one
+/// rather than colliding.
+const SKILLS_PARENT_TITLE: &str = "SKILLS";
+
+/// Find the project's `SKILLS` index note (root-level Markdown note
+/// titled `SKILLS`), or create one if absent. Returns its id, or
+/// `None` if the repo lookup / creation failed.
+async fn find_or_create_skills_parent(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    persistence: &Arc<dyn Persistence>,
+    project_id: Uuid,
+) -> Option<Uuid> {
+    let all = note_repo.list_for_project(project_id).ok()?;
+    if let Some(existing) = all.iter().find(|n| {
+        n.parent_id.is_none()
+            && n.title == SKILLS_PARENT_TITLE
+            && matches!(n.kind, NoteKind::Markdown)
+    }) {
+        return Some(existing.id);
+    }
+    let row = note_repo
+        .create_with_kind(project_id, None, SKILLS_PARENT_TITLE, NoteKind::Markdown)
+        .ok()?;
+    // Seed an empty body — `import_skills_from_folder` rewrites the
+    // body at the end of the import with the README + auto-list. The
+    // seed exists only so opening the note before the first import
+    // shows something rather than an empty file.
+    let _ = persistence
+        .save(&row.id.to_string(), b"# SKILLS\n")
+        .await;
+    Some(row.id)
+}
+
+/// Read the import folder's `README.md` (case-insensitive on the
+/// stem and extension) into a string. Returns `None` if no README is
+/// present or it can't be read — callers fall back to a minimal
+/// auto-generated header.
+fn read_folder_readme(folder: &Path) -> Option<String> {
+    let entries = std::fs::read_dir(folder).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if stem.eq_ignore_ascii_case("readme") && ext.eq_ignore_ascii_case("md") {
+            return std::fs::read_to_string(&path).ok();
+        }
+    }
+    None
+}
+
+/// Build the SKILLS index body. Composition: README prose (when the
+/// folder shipped one) + an auto-generated `## Imported skills`
+/// section listing every skill child as an `operon://note/<uuid>`
+/// markdown link the renderer wires up to navigation.
+fn build_skills_index_body(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    project_id: Uuid,
+    skills_parent_id: Uuid,
+    readme: Option<&str>,
+) -> String {
+    let all = note_repo.list_for_project(project_id).unwrap_or_default();
+    let mut children: Vec<(String, Uuid)> = all
+        .into_iter()
+        .filter(|n| {
+            n.parent_id == Some(skills_parent_id) && matches!(n.kind, NoteKind::Skill)
+        })
+        .map(|n| (n.title, n.id))
+        .collect();
+    children.sort_by(|a, b| a.0.cmp(&b.0));
+    render_skills_index_body(readme, &children)
+}
+
+/// Pure renderer for the SKILLS index body. Split from
+/// `build_skills_index_body` so the formatting (preamble, marker
+/// lines, fallback when no children exist) is unit-testable without
+/// a repo.
+fn render_skills_index_body(readme: Option<&str>, children: &[(String, Uuid)]) -> String {
+    let mut out = match readme {
+        Some(r) => {
+            let trimmed = r.trim_end();
+            if trimmed.is_empty() {
+                String::from("# SKILLS\n")
+            } else {
+                let mut s = String::with_capacity(trimmed.len() + 64);
+                s.push_str(trimmed);
+                s.push('\n');
+                s
+            }
+        }
+        None => String::from("# SKILLS\n"),
+    };
+    out.push_str("\n## Imported skills\n\n");
+    if children.is_empty() {
+        out.push_str("_(no skills imported yet — re-run \"Import skills…\" to add some)_\n");
+    } else {
+        for (title, id) in children {
+            out.push_str(&format!("- [{title}](operon://note/{id})\n"));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skills_index_lists_children_as_operon_links() {
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let body = render_skills_index_body(
+            None,
+            &[("02-discover-epics".into(), id_a), ("03-decompose-features".into(), id_b)],
+        );
+        assert!(body.contains("# SKILLS"));
+        assert!(body.contains("## Imported skills"));
+        assert!(body.contains(&format!("- [02-discover-epics](operon://note/{id_a})")));
+        assert!(body.contains(&format!("- [03-decompose-features](operon://note/{id_b})")));
+    }
+
+    #[test]
+    fn skills_index_uses_readme_as_preamble_when_present() {
+        let readme = "# Seed skills\n\nThis chain decomposes requirements into tasks.\n";
+        let body = render_skills_index_body(Some(readme), &[]);
+        assert!(body.starts_with("# Seed skills\n"));
+        assert!(body.contains("This chain decomposes requirements"));
+        assert!(body.contains("## Imported skills"));
+        assert!(body.contains("_(no skills imported yet"));
+    }
+
+    #[test]
+    fn skills_index_falls_back_to_default_header_when_readme_blank() {
+        let body = render_skills_index_body(Some("   \n\n  "), &[]);
+        assert!(body.starts_with("# SKILLS\n"));
+        assert!(body.contains("## Imported skills"));
+    }
+
+    #[test]
+    fn skills_index_separates_readme_from_auto_section() {
+        // The README's last line should not bleed into the
+        // `## Imported skills` heading. A blank line must sit
+        // between them.
+        let id = Uuid::new_v4();
+        let body = render_skills_index_body(
+            Some("# Pipeline\n\nNarrative ends here."),
+            &[("02-discover-epics".into(), id)],
+        );
+        assert!(body.contains("Narrative ends here.\n\n## Imported skills"));
+    }
 }
