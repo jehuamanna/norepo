@@ -43,6 +43,7 @@ async fn live_claude_responds_in_bound_repo() {
     let plugin = Arc::new(ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
         claude_bin: bin,
         model: None,
+        shim_bin: None,
     }));
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -76,6 +77,7 @@ async fn live_claude_responds_in_bound_repo() {
                 break;
             }
             ChatDelta::ToolUse { .. } => {}
+            ChatDelta::Thinking(_) => {}
         }
     }
     assert!(saw_stop, "expected Stop delta");
@@ -94,6 +96,7 @@ async fn live_claude_errors_when_session_not_bound() {
     let plugin = Arc::new(ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
         claude_bin: bin,
         model: None,
+        shim_bin: None,
     }));
     let session = Uuid::new_v4();
     // Intentionally do NOT call bind_session.
@@ -130,6 +133,7 @@ async fn live_claude_two_sessions_share_no_state() {
     let plugin = Arc::new(ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
         claude_bin: bin,
         model: None,
+        shim_bin: None,
     }));
 
     let tmp_a = tempfile::tempdir().expect("tempdir A");

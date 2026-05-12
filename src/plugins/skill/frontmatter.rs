@@ -224,6 +224,54 @@ pub fn contract(lines: &[&str]) -> SkillContract {
     }
 }
 
+/// Per-skill agent configuration. Lets each SDLC phase pick its own
+/// provider / model / persona / mode without touching the skill body.
+///
+/// **Parse-only as of the agent-runtime work** — the cascade still
+/// dispatches via the legacy `ClaudeCodeChatPlugin`; the new runtime
+/// (Slice A14) reads these fields when picking a provider per skill.
+///
+/// Frontmatter shape (all optional, top-level keys):
+/// ```yaml
+/// agent_backend: anthropic   # anthropic | openai | google | local | claude-code
+/// agent_provider: anthropic  # alias for agent_backend (we accept either)
+/// agent_model: claude-sonnet-4-6
+/// agent_persona: ba-disect-prompt   # built-in id or skill slug
+/// agent_mode: plan           # plan | build
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SkillAgentConfig {
+    pub backend: Option<String>,
+    pub model: Option<String>,
+    pub persona: Option<String>,
+    pub mode: Option<String>,
+}
+
+impl SkillAgentConfig {
+    pub fn is_empty(&self) -> bool {
+        self.backend.is_none() && self.model.is_none() && self.persona.is_none() && self.mode.is_none()
+    }
+}
+
+/// Read the agent-config fields from a skill note's frontmatter. Always
+/// succeeds; missing fields land as `None`. `agent_provider` is accepted as
+/// an alias for `agent_backend` so skill authors can use whichever name reads
+/// naturally.
+pub fn agent_config(lines: &[&str]) -> SkillAgentConfig {
+    let backend = field(lines, "agent_backend")
+        .or_else(|| field(lines, "agent_provider"))
+        .map(str::to_string);
+    let model = field(lines, "agent_model").map(str::to_string);
+    let persona = field(lines, "agent_persona").map(str::to_string);
+    let mode = field(lines, "agent_mode").map(str::to_string);
+    SkillAgentConfig {
+        backend,
+        model,
+        persona,
+        mode,
+    }
+}
+
 /// Slug a string for use as a filename: lowercase, replace non-alnum with
 /// `-`, collapse runs of dashes, trim leading/trailing dashes. Empty
 /// inputs become "untitled".
@@ -427,5 +475,41 @@ mod tests {
         assert_eq!(slugify("___"), "untitled");
         assert_eq!(slugify(""), "untitled");
         assert_eq!(slugify("a--b"), "a-b");
+    }
+
+    #[test]
+    fn agent_config_default_when_fields_absent() {
+        let lines = vec!["skill_name: x"];
+        let cfg = agent_config(&lines);
+        assert!(cfg.is_empty());
+    }
+
+    #[test]
+    fn agent_config_reads_all_fields() {
+        let lines = vec![
+            "agent_backend: openai",
+            "agent_model: gpt-5",
+            "agent_persona: ba-disect-prompt",
+            "agent_mode: plan",
+        ];
+        let cfg = agent_config(&lines);
+        assert_eq!(cfg.backend.as_deref(), Some("openai"));
+        assert_eq!(cfg.model.as_deref(), Some("gpt-5"));
+        assert_eq!(cfg.persona.as_deref(), Some("ba-disect-prompt"));
+        assert_eq!(cfg.mode.as_deref(), Some("plan"));
+    }
+
+    #[test]
+    fn agent_provider_is_alias_for_backend() {
+        let lines = vec!["agent_provider: anthropic"];
+        let cfg = agent_config(&lines);
+        assert_eq!(cfg.backend.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn agent_backend_takes_precedence_over_provider_alias() {
+        let lines = vec!["agent_backend: openai", "agent_provider: anthropic"];
+        let cfg = agent_config(&lines);
+        assert_eq!(cfg.backend.as_deref(), Some("openai"));
     }
 }

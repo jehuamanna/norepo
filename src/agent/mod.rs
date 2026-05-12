@@ -46,6 +46,15 @@ pub mod runtime {
     pub use operon_core::runtime::*;
 }
 
+pub mod persona {
+    pub use operon_core::persona::*;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod permission {
+    pub use operon_core::permission::*;
+}
+
 pub mod plugins {
     pub use operon_core::echo::{EchoChatPlugin, EchoToolPlugin};
     pub use operon_core::mock::MockChatPlugin;

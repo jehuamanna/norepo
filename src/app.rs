@@ -190,8 +190,12 @@ pub fn App() -> Element {
     let panel: Signal<PanelManager> = use_signal(PanelManager::new);
     use_context_provider(|| panel);
 
-    let layout: Signal<LayoutState> = use_signal(LayoutState::default);
+    let layout: Signal<LayoutState> = use_signal(LayoutState::load_or_default);
     use_context_provider(|| layout);
+    use_effect(move || {
+        let snapshot = *layout.read();
+        snapshot.save();
+    });
 
     let drag: Signal<Option<DragState>> = use_signal(|| None);
     use_context_provider(|| drag);

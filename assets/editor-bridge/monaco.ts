@@ -67,6 +67,29 @@ export function mountMonaco(target: HTMLElement, init: BackendInit): Handle {
       if (disposed) return "";
       return editor.getValue();
     },
+    replaceRange(start: number, end: number, text: string) {
+      if (disposed) return;
+      const model = editor.getModel();
+      if (!model) return;
+      const total = model.getValueLength();
+      const s = Math.max(0, Math.min(start, total));
+      const e = Math.max(s, Math.min(end, total));
+      const startPos = model.getPositionAt(s);
+      const endPos = model.getPositionAt(e);
+      const range = new monaco.Range(
+        startPos.lineNumber,
+        startPos.column,
+        endPos.lineNumber,
+        endPos.column,
+      );
+      // executeEdits routes through the editor's command stack so the
+      // edit lands in the undo history; setContent / model.setValue
+      // would replace the entire model and reset that history,
+      // which is why paste / cut / splice must use this entry point.
+      editor.executeEdits("operon-bridge", [
+        { range, text, forceMoveMarkers: true },
+      ]);
+    },
     onChange(cb) {
       if (disposed) return () => {};
       const sub = editor.onDidChangeModelContent(() => cb(editor.getValue()));

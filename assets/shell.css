@@ -408,6 +408,11 @@ html, body {
  * note rows visually nest without per-row inline padding. */
 .notes-explorer-panel {
   padding: 6px 8px;
+  box-sizing: border-box;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 .notes-explorer-row {
   position: relative;
@@ -3119,4 +3124,219 @@ html, body {
   stroke-width: 1.5;
   stroke-dasharray: 6 4;
   opacity: 0.85;
+}
+
+/* ============================================================
+ * MCP settings panel — modal opened from the chat-header MCP
+ * button. List of configured servers + add form. Reuses the
+ * .operon-modal-* classes for the card frame.
+ * ============================================================ */
+.operon-companion-mcp-button {
+  padding: 2px 8px;
+  font: inherit;
+  font-size: 11px;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.operon-companion-mcp-button:hover {
+  background: var(--vscode-list-inactiveselectionbackground, var(--vscode-activitybar-activebackground));
+}
+.operon-mcp-card {
+  /* Wider than the default modal card — the server list rows need
+     room for the dot + name + status text + action buttons all on
+     one line. */
+  min-width: 32rem;
+  max-width: min(40rem, 92vw);
+  max-height: 80vh;
+  overflow: auto;
+}
+.operon-mcp-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.operon-mcp-header-actions {
+  display: flex;
+  gap: 6px;
+}
+.operon-modal-help {
+  font-size: 11px;
+  opacity: 0.75;
+  margin: 4px 0 8px 0;
+}
+.operon-modal-info {
+  font-size: 11px;
+  color: var(--vscode-debugIcon-startForeground, #7eb36a);
+  margin: 4px 0 6px 0;
+}
+.operon-modal-section {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.65;
+  margin: 12px 0 6px 0;
+}
+.operon-mcp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 6px 0;
+}
+.operon-mcp-card-row {
+  padding: 8px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  background: var(--vscode-editor-background, transparent);
+}
+.operon-mcp-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.operon-mcp-status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #888;
+  flex: 0 0 auto;
+}
+.operon-mcp-dot-connected {
+  background: #57a64a;
+  box-shadow: 0 0 0 2px rgba(87, 166, 74, 0.18);
+}
+.operon-mcp-dot-failed {
+  background: #d05a4f;
+  box-shadow: 0 0 0 2px rgba(208, 90, 79, 0.18);
+}
+.operon-mcp-dot-auth {
+  background: #d99a3c;
+  box-shadow: 0 0 0 2px rgba(217, 154, 60, 0.18);
+}
+.operon-mcp-dot-idle {
+  background: #888;
+}
+.operon-mcp-server-name {
+  font-weight: 600;
+}
+.operon-mcp-status-text {
+  font-size: 11px;
+  opacity: 0.75;
+  flex: 1 1 auto;
+}
+.operon-mcp-card-actions {
+  display: flex;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.operon-mcp-server-meta {
+  font-size: 11px;
+  opacity: 0.7;
+  margin: 4px 0 0 16px;
+  font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, monospace);
+  word-break: break-all;
+}
+.operon-mcp-tools-block {
+  margin: 6px 0 0 16px;
+}
+.operon-mcp-tools-toggle {
+  font: inherit;
+  font-size: 11px;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  opacity: 0.85;
+}
+.operon-mcp-tools-toggle:hover {
+  opacity: 1;
+  text-decoration: underline;
+}
+.operon-mcp-tools-list {
+  list-style: disc inside;
+  margin: 4px 0 0 8px;
+  padding: 0;
+  font-size: 11px;
+  font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, monospace);
+  opacity: 0.85;
+}
+.operon-mcp-details {
+  margin: 8px 0 0 16px;
+  padding: 6px 8px;
+  background: var(--vscode-textCodeBlock-background, rgba(255, 255, 255, 0.04));
+  border-radius: 3px;
+}
+.operon-mcp-details-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 12px;
+  font-size: 11px;
+  margin: 0;
+}
+.operon-mcp-details-grid dt {
+  font-weight: 600;
+  opacity: 0.75;
+}
+.operon-mcp-details-grid dd {
+  margin: 0;
+  word-break: break-word;
+  font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, monospace);
+}
+.operon-mcp-kv-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, monospace);
+}
+.operon-mcp-footer {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.operon-mcp-add-form {
+  padding: 10px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  background: var(--vscode-editor-background, transparent);
+}
+.operon-mcp-form-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.operon-mcp-form-row > .operon-modal-label {
+  flex: 0 0 6.5rem;
+  margin-bottom: 0;
+}
+.operon-mcp-form-row > .operon-modal-input {
+  margin-bottom: 0;
+  flex: 1 1 auto;
+}
+.operon-mcp-form-kv {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.operon-mcp-kv-row {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+.operon-mcp-kv-row .operon-modal-input {
+  margin-bottom: 0;
+}
+.operon-mcp-kv-key {
+  flex: 0 0 9rem;
+}
+.operon-mcp-kv-val {
+  flex: 1 1 auto;
 }

@@ -3,6 +3,8 @@
 //! This crate is forbidden from depending on `dioxus` or any GUI crate.
 //! `cargo-deny` enforces this at the workspace level (see `deny.toml`).
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod agent_event;
 pub mod budget;
 pub mod bus;
 pub mod config;
@@ -10,6 +12,9 @@ pub mod echo;
 pub mod error;
 pub mod memory;
 pub mod mock;
+pub mod persona;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod permission;
 pub mod registry;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod runtime;
@@ -30,8 +35,13 @@ pub use memory::InMemoryStore;
 #[cfg(all(feature = "sqlite-memory", not(target_arch = "wasm32")))]
 pub use memory::SqliteMemoryStore;
 pub use mock::MockChatPlugin;
+pub use persona::{AgentMode, AgentPersona, PersonaRegistry};
+#[cfg(not(target_arch = "wasm32"))]
+pub use agent_event::{AgentBackend, AgentEvent};
+#[cfg(not(target_arch = "wasm32"))]
+pub use permission::{AskInput, PermissionDecision, PermissionGate, PermissionRule, RuleSet};
 pub use registry::{register_agent_plugins, AgentRegistry};
-pub use secrets::{EnvSecretStore, MockSecretStore, SecretStore};
+pub use secrets::{keys as secret_keys, EnvSecretStore, LayeredSecretStore, MockSecretStore, SecretStore};
 pub use traits::{
     Capabilities, ChatDelta, ChatPlugin, ChatRequest, ChatStream, ContentBlock, Hit, McpClient,
     Message, MemoryPlugin, Plugin, Role, Scope, StopReason, ToolDef, ToolPlugin, Usage,
@@ -39,4 +49,4 @@ pub use traits::{
 };
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use secrets::KeyringSecretStore;
+pub use secrets::{JsonFileSecretStore, KeyringSecretStore};

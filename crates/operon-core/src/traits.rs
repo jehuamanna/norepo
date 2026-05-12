@@ -91,6 +91,10 @@ pub enum StopReason {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ChatDelta {
     Text(String),
+    /// Extended-thinking content (Claude `thinking_delta`, OpenAI o-series
+    /// reasoning summary, Gemini equivalents). The runtime forwards these to
+    /// `Step::Thinking` so UIs can render them as collapsible reasoning.
+    Thinking(String),
     ToolUse {
         id: String,
         name: String,

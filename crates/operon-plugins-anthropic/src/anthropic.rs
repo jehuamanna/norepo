@@ -26,6 +26,13 @@ pub struct AnthropicConfig {
     pub max_tokens: u32,
     pub anthropic_version: String,
     pub anthropic_beta: Option<String>,
+    /// Extended-thinking budget. When `Some(n)`, the request body includes
+    /// `thinking: { type: "enabled", budget_tokens: n }` and the model
+    /// streams `thinking_delta` events that the plugin maps to
+    /// `ChatDelta::Thinking`. `None` keeps thinking disabled (default).
+    ///
+    /// Slice A1.1 wiring. Requires Sonnet 4.x / Opus 4.x; Haiku 3.5 ignores it.
+    pub thinking_budget_tokens: Option<u32>,
 }
 
 impl Default for AnthropicConfig {
@@ -36,6 +43,7 @@ impl Default for AnthropicConfig {
             max_tokens: 4096,
             anthropic_version: "2023-06-01".to_string(),
             anthropic_beta: None,
+            thinking_budget_tokens: None,
         }
     }
 }
@@ -134,6 +142,17 @@ impl AnthropicChatPlugin {
         if !tools.is_empty() {
             body["tools"] = serde_json::Value::Array(tools);
         }
+        if let Some(budget) = self.cfg.thinking_budget_tokens {
+            // The Messages API requires `temperature: 1` when thinking is on,
+            // and `max_tokens` must be larger than `budget_tokens`. The caller
+            // is responsible for picking a sensible `max_tokens` — we surface
+            // the constraint via the field doc.
+            body["thinking"] = serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            });
+            body["temperature"] = serde_json::json!(1);
+        }
         body
     }
 }
@@ -202,13 +221,23 @@ impl ChatPlugin for AnthropicChatPlugin {
         let resp = req_builder
             .send()
             .await
-            .map_err(|e| OperonError::Provider {
-                provider: "anthropic".into(),
-                message: format!("send: {e}"),
-                retryable: matches!(
-                    e.status(),
-                    Some(s) if s.as_u16() >= 500 || s.as_u16() == 429
-                ),
+            .map_err(|e| {
+                let mut detail = e.to_string();
+                let mut src: Option<&(dyn std::error::Error + 'static)> =
+                    std::error::Error::source(&e);
+                while let Some(s) = src {
+                    detail.push_str(": ");
+                    detail.push_str(&s.to_string());
+                    src = s.source();
+                }
+                OperonError::Provider {
+                    provider: "anthropic".into(),
+                    message: format!("send: {detail}"),
+                    retryable: matches!(
+                        e.status(),
+                        Some(s) if s.as_u16() >= 500 || s.as_u16() == 429
+                    ),
+                }
             })?;
 
         if !resp.status().is_success() {
@@ -354,6 +383,12 @@ fn handle_event<S>(state: &mut AnthropicStream<S>, ev: &SseEvent) -> Option<Oper
                 "text_delta" => {
                     let text = delta.get("text").and_then(|v| v.as_str()).unwrap_or("");
                     Some(Ok(ChatDelta::Text(text.to_string())))
+                }
+                "thinking_delta" => {
+                    // Extended thinking content (Claude Sonnet/Opus 4.x with
+                    // `thinking: { type: "enabled", ... }` request param).
+                    let text = delta.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
+                    Some(Ok(ChatDelta::Thinking(text.to_string())))
                 }
                 "input_json_delta" => {
                     let partial = delta
@@ -532,5 +567,44 @@ mod tests {
             StopReason::Other(s) => assert_eq!(s, "custom"),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn build_body_omits_thinking_when_budget_unset() {
+        let secrets: Arc<dyn SecretStore> = Arc::new(MockSecretStore::new());
+        let p = AnthropicChatPlugin::new(AnthropicConfig::default(), secrets).unwrap();
+        let req = ChatRequest {
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            model: None,
+            max_tokens: None,
+        };
+        let body = p.build_body(&req);
+        assert!(body.get("thinking").is_none());
+        // No temperature override either when thinking is off.
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn build_body_emits_thinking_when_budget_set() {
+        let secrets: Arc<dyn SecretStore> = Arc::new(MockSecretStore::new());
+        let cfg = AnthropicConfig {
+            thinking_budget_tokens: Some(8000),
+            ..Default::default()
+        };
+        let p = AnthropicChatPlugin::new(cfg, secrets).unwrap();
+        let req = ChatRequest {
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            model: None,
+            max_tokens: None,
+        };
+        let body = p.build_body(&req);
+        assert_eq!(body["thinking"]["type"].as_str(), Some("enabled"));
+        assert_eq!(body["thinking"]["budget_tokens"].as_u64(), Some(8000));
+        // Anthropic requires temperature: 1 with extended thinking.
+        assert_eq!(body["temperature"].as_u64(), Some(1));
     }
 }

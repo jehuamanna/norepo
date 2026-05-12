@@ -43,6 +43,11 @@ pub type SkillBag = HashMap<Uuid, SkillSnapshot>;
 pub enum EngineError {
     UnknownSkill(Uuid),
     UnknownNode(NodeId),
+    Cycle(CycleError),
+    /// Catch-all for run-time failures inside `run_dirty_levels_parallel` —
+    /// node closures returning errors, tokio join failures, etc.
+    NodeRun(String),
+    Other(String),
 }
 
 impl std::fmt::Display for EngineError {
@@ -50,11 +55,20 @@ impl std::fmt::Display for EngineError {
         match self {
             Self::UnknownSkill(id) => write!(f, "no SkillSnapshot for skill_note_id {id}"),
             Self::UnknownNode(id) => write!(f, "no node with id {id} in graph"),
+            Self::Cycle(c) => write!(f, "{c}"),
+            Self::NodeRun(msg) => write!(f, "node run failed: {msg}"),
+            Self::Other(msg) => write!(f, "{msg}"),
         }
     }
 }
 
 impl std::error::Error for EngineError {}
+
+impl From<CycleError> for EngineError {
+    fn from(c: CycleError) -> Self {
+        Self::Cycle(c)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CycleError {
@@ -207,6 +221,162 @@ pub fn topo_order_dirty(graph: &WorkflowGraph) -> Result<Vec<NodeId>, CycleError
         return Err(CycleError { residual });
     }
     Ok(out)
+}
+
+/// Topologically group the currently-dirty nodes into depth-levels
+/// (a.k.a. "waves"). Every node in level `i` has all its dirty
+/// predecessors in levels `< i`, so all nodes inside one level can run
+/// concurrently. Returns `CycleError` on any cycle through the dirty subset.
+///
+/// Slice B6 — used by the cascade runner to fan out within a level via
+/// `tokio::spawn` (bounded by a `Semaphore`) and `join_all` before
+/// advancing to the next level.
+///
+/// Mirrors `topo_order_dirty`'s edge-restriction policy: only edges
+/// between two dirty endpoints contribute to the indegree count, so a
+/// node whose only predecessors are clean lands at level 0.
+pub fn topo_levels_dirty(graph: &WorkflowGraph) -> Result<Vec<Vec<NodeId>>, CycleError> {
+    let dirty: BTreeSet<NodeId> = graph
+        .nodes
+        .iter()
+        .filter(|(_, n)| matches!(n.status, NodeStatus::Dirty))
+        .map(|(id, _)| *id)
+        .collect();
+    if dirty.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut indeg: BTreeMap<NodeId, usize> = dirty.iter().map(|id| (*id, 0usize)).collect();
+    let mut adj: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+    for e in &graph.edges {
+        if dirty.contains(&e.from) && dirty.contains(&e.to) {
+            adj.entry(e.from).or_default().push(e.to);
+            *indeg.entry(e.to).or_default() += 1;
+        }
+    }
+
+    // Stable level construction: snapshot the current zero-indegree set,
+    // emit it as one level, then decrement neighbours and repeat.
+    let mut levels: Vec<Vec<NodeId>> = Vec::new();
+    let mut placed: BTreeSet<NodeId> = BTreeSet::new();
+    loop {
+        // Zero-indeg nodes that haven't been placed yet — sorted so output
+        // is deterministic across runs.
+        let mut current: Vec<NodeId> = indeg
+            .iter()
+            .filter(|(id, d)| **d == 0 && !placed.contains(id))
+            .map(|(id, _)| *id)
+            .collect();
+        if current.is_empty() {
+            break;
+        }
+        current.sort();
+        for n in &current {
+            placed.insert(*n);
+            if let Some(nexts) = adj.get(n) {
+                for next in nexts {
+                    if let Some(d) = indeg.get_mut(next) {
+                        *d -= 1;
+                    }
+                }
+            }
+        }
+        levels.push(current);
+    }
+
+    if placed.len() != dirty.len() {
+        let residual: BTreeSet<NodeId> = dirty.difference(&placed).copied().collect();
+        return Err(CycleError { residual });
+    }
+    Ok(levels)
+}
+
+/// Drive a workflow's dirty nodes through `topo_levels_dirty`, fanning out
+/// each level's nodes concurrently up to `max_concurrent` at a time, then
+/// `join_all` before advancing.
+///
+/// The caller supplies `run_node` — a closure that knows how to run a
+/// single node's skill against the agent runtime. We don't reach into the
+/// cascade orchestrator to keep the engine layer dependency-free.
+///
+/// **Failure semantics**: by default, one node failure aborts the rest of
+/// the *current* level (other in-flight nodes are awaited but their errors
+/// are surfaced via the next return) and no further levels are scheduled.
+/// Set `continue_on_error: true` to keep going past failures within a level.
+///
+/// Returns the list of node ids that completed successfully, in the order
+/// they finished.
+///
+/// **Slice B6** primitive — dead code until the cascade runner adopts it
+/// (Slice A14 follow-up).
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn run_dirty_levels_parallel<F>(
+    graph: &WorkflowGraph,
+    max_concurrent: usize,
+    continue_on_error: bool,
+    run_node: F,
+) -> Result<Vec<NodeId>, EngineError>
+where
+    F: Fn(
+            NodeId,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), EngineError>> + Send>,
+        > + Send
+        + Sync
+        + 'static,
+{
+    let levels = topo_levels_dirty(graph)?;
+    if levels.is_empty() {
+        return Ok(Vec::new());
+    }
+    let max_concurrent = max_concurrent.max(1);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+    let run_node = std::sync::Arc::new(run_node);
+
+    let mut completed: Vec<NodeId> = Vec::new();
+
+    for level in levels {
+        let mut handles = Vec::with_capacity(level.len());
+        for id in level {
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore closed unexpectedly");
+            let run_node = run_node.clone();
+            handles.push((
+                id,
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    run_node(id).await
+                }),
+            ));
+        }
+        let mut level_failed: Option<EngineError> = None;
+        for (id, h) in handles {
+            match h.await {
+                Ok(Ok(())) => completed.push(id),
+                Ok(Err(e)) => {
+                    if level_failed.is_none() {
+                        level_failed = Some(e);
+                    }
+                }
+                Err(join_err) => {
+                    if level_failed.is_none() {
+                        level_failed = Some(EngineError::NodeRun(format!(
+                            "join error on node {id}: {join_err}"
+                        )));
+                    }
+                }
+            }
+        }
+        if let Some(err) = level_failed {
+            if !continue_on_error {
+                return Err(err);
+            }
+        }
+    }
+    Ok(completed)
 }
 
 /// Compute the body hash a `SkillSnapshot` should carry. Provided here
@@ -552,6 +722,124 @@ mod tests {
         assert!(topo_order_dirty(&g).unwrap().is_empty());
     }
 
+    // ---- topo_levels_dirty (Slice B6) ----
+
+    #[test]
+    fn topo_levels_dirty_groups_concurrent_siblings() {
+        // a → c, b → c. a and b share level 0; c is level 1.
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let mut g = graph_with(&[(a, s), (b, s), (c, s)], &[(a, c), (b, c)]);
+        for id in [a, b, c] {
+            g.nodes.get_mut(&id).unwrap().status = NodeStatus::Dirty;
+        }
+        let levels = topo_levels_dirty(&g).unwrap();
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[0].len(), 2, "a and b run concurrently at depth 0");
+        assert!(levels[0].contains(&a));
+        assert!(levels[0].contains(&b));
+        assert_eq!(levels[1], vec![c]);
+    }
+
+    #[test]
+    fn topo_levels_dirty_diamond_has_three_levels() {
+        // a → b, a → c, b → d, c → d
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let d = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let mut g = graph_with(
+            &[(a, s), (b, s), (c, s), (d, s)],
+            &[(a, b), (a, c), (b, d), (c, d)],
+        );
+        for id in [a, b, c, d] {
+            g.nodes.get_mut(&id).unwrap().status = NodeStatus::Dirty;
+        }
+        let levels = topo_levels_dirty(&g).unwrap();
+        assert_eq!(levels.len(), 3);
+        assert_eq!(levels[0], vec![a]);
+        assert_eq!(levels[1].len(), 2);
+        assert!(levels[1].contains(&b) && levels[1].contains(&c));
+        assert_eq!(levels[2], vec![d]);
+    }
+
+    #[test]
+    fn topo_levels_dirty_chain_each_node_its_own_level() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let mut g = graph_with(&[(a, s), (b, s), (c, s)], &[(a, b), (b, c)]);
+        for id in [a, b, c] {
+            g.nodes.get_mut(&id).unwrap().status = NodeStatus::Dirty;
+        }
+        let levels = topo_levels_dirty(&g).unwrap();
+        assert_eq!(levels, vec![vec![a], vec![b], vec![c]]);
+    }
+
+    #[test]
+    fn topo_levels_dirty_empty_when_nothing_dirty() {
+        let a = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let mut g = graph_with(&[(a, s)], &[]);
+        g.nodes.get_mut(&a).unwrap().status = NodeStatus::Fresh;
+        assert!(topo_levels_dirty(&g).unwrap().is_empty());
+    }
+
+    #[test]
+    fn topo_levels_dirty_detects_cycle() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let mut g = graph_with(&[(a, s), (b, s)], &[(a, b), (b, a)]);
+        for id in [a, b] {
+            g.nodes.get_mut(&id).unwrap().status = NodeStatus::Dirty;
+        }
+        let err = topo_levels_dirty(&g).unwrap_err();
+        assert_eq!(err.residual.len(), 2);
+    }
+
+    #[test]
+    fn topo_levels_dirty_clean_predecessor_doesnt_delay_dirty_node() {
+        // a (fresh) → b (dirty) → c (dirty). b should land at level 0
+        // because the dirty-restricted indegree is zero.
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let mut g = graph_with(&[(a, s), (b, s), (c, s)], &[(a, b), (b, c)]);
+        g.nodes.get_mut(&a).unwrap().status = NodeStatus::Fresh;
+        g.nodes.get_mut(&b).unwrap().status = NodeStatus::Dirty;
+        g.nodes.get_mut(&c).unwrap().status = NodeStatus::Dirty;
+        let levels = topo_levels_dirty(&g).unwrap();
+        assert_eq!(levels, vec![vec![b], vec![c]]);
+    }
+
+    #[test]
+    fn topo_levels_dirty_total_node_count_matches_topo_order() {
+        // Both functions should agree on which nodes are emitted.
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let d = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let mut g = graph_with(
+            &[(a, s), (b, s), (c, s), (d, s)],
+            &[(a, b), (a, c), (b, d), (c, d)],
+        );
+        for id in [a, b, c, d] {
+            g.nodes.get_mut(&id).unwrap().status = NodeStatus::Dirty;
+        }
+        let order = topo_order_dirty(&g).unwrap();
+        let levels = topo_levels_dirty(&g).unwrap();
+        let flat: Vec<NodeId> = levels.into_iter().flatten().collect();
+        assert_eq!(flat.len(), order.len());
+        assert_eq!(flat.iter().collect::<BTreeSet<_>>(), order.iter().collect::<BTreeSet<_>>());
+    }
+
     #[test]
     fn canonical_json_sorts_object_keys() {
         let v1: serde_json::Value = serde_json::from_str(r#"{"b": 1, "a": 2}"#).unwrap();
@@ -566,5 +854,168 @@ mod tests {
         assert_ne!(hash_body("x"), hash_body("y"));
         // sha256("") prefix sanity check:
         assert!(hash_body("").starts_with("e3b0c44"));
+    }
+
+    // ---- run_dirty_levels_parallel (Slice B6) ----
+
+    #[tokio::test]
+    async fn run_levels_parallel_visits_every_dirty_node() {
+        // Diamond a → b, a → c, b → d, c → d. Each node calls its closure;
+        // we assert all four ran exactly once.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let d = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let mut g = graph_with(
+            &[(a, s), (b, s), (c, s), (d, s)],
+            &[(a, b), (a, c), (b, d), (c, d)],
+        );
+        for id in [a, b, c, d] {
+            g.nodes.get_mut(&id).unwrap().status = NodeStatus::Dirty;
+        }
+        let counter = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter_for_closure = counter.clone();
+        let completed = run_dirty_levels_parallel(&g, 4, false, move |_id| {
+            let counter_for_closure = counter_for_closure.clone();
+            Box::pin(async move {
+                counter_for_closure.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(completed.len(), 4);
+        assert_eq!(counter.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn run_levels_parallel_aborts_on_failure_by_default() {
+        // Two nodes at level 0 (a, b), one at level 1 (c, depending on a).
+        // Make `a` fail; `c` should never run.
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let mut g = graph_with(&[(a, s), (b, s), (c, s)], &[(a, c)]);
+        for id in [a, b, c] {
+            g.nodes.get_mut(&id).unwrap().status = NodeStatus::Dirty;
+        }
+        let a_id = a;
+        let c_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c_ran_for_closure = c_ran.clone();
+        let res = run_dirty_levels_parallel(&g, 2, false, move |id| {
+            let c_ran = c_ran_for_closure.clone();
+            Box::pin(async move {
+                if id == a_id {
+                    Err(EngineError::NodeRun("boom".into()))
+                } else if id == c {
+                    c_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            })
+        })
+        .await;
+        assert!(matches!(res, Err(EngineError::NodeRun(_))));
+        assert!(!c_ran.load(std::sync::atomic::Ordering::SeqCst), "c must not run after a's failure");
+    }
+
+    #[tokio::test]
+    async fn run_levels_parallel_continue_on_error_skips_failed_node() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let mut g = graph_with(&[(a, s), (b, s)], &[]);
+        for id in [a, b] {
+            g.nodes.get_mut(&id).unwrap().status = NodeStatus::Dirty;
+        }
+        let a_id = a;
+        let completed = run_dirty_levels_parallel(&g, 2, true, move |id| {
+            Box::pin(async move {
+                if id == a_id {
+                    Err(EngineError::NodeRun("fail".into()))
+                } else {
+                    Ok(())
+                }
+            })
+        })
+        .await
+        .unwrap();
+        // b succeeds; a fails — completed has only b.
+        assert_eq!(completed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_levels_parallel_respects_concurrency_cap() {
+        // 6 nodes at level 0; with max_concurrent = 2, no more than 2 run
+        // simultaneously. We track current vs peak.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let s = Uuid::new_v4();
+        let ids: Vec<Uuid> = (0..6).map(|_| Uuid::new_v4()).collect();
+        let mut entries: Vec<(Uuid, Uuid)> = ids.iter().map(|i| (*i, s)).collect();
+        // No edges → all at level 0.
+        let mut g = graph_with(&entries.as_slice(), &[]);
+        for id in &ids {
+            g.nodes.get_mut(id).unwrap().status = NodeStatus::Dirty;
+        }
+        let _ = entries.drain(..);
+
+        let current = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let current_c = current.clone();
+        let peak_c = peak.clone();
+        let _ = run_dirty_levels_parallel(&g, 2, false, move |_id| {
+            let current = current_c.clone();
+            let peak = peak_c.clone();
+            Box::pin(async move {
+                let n = current.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut p = peak.load(Ordering::SeqCst);
+                while p < n {
+                    match peak.compare_exchange(p, n, Ordering::SeqCst, Ordering::SeqCst) {
+                        Ok(_) => break,
+                        Err(actual) => p = actual,
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                current.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        assert!(
+            peak.load(Ordering::SeqCst) <= 2,
+            "expected peak ≤ 2 with max_concurrent=2, got {}",
+            peak.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_levels_parallel_empty_graph_returns_empty() {
+        let a = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let mut g = graph_with(&[(a, s)], &[]);
+        g.nodes.get_mut(&a).unwrap().status = NodeStatus::Fresh;
+        let completed = run_dirty_levels_parallel(&g, 2, false, |_id| Box::pin(async { Ok(()) }))
+            .await
+            .unwrap();
+        assert!(completed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_levels_parallel_propagates_cycle_error() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let mut g = graph_with(&[(a, s), (b, s)], &[(a, b), (b, a)]);
+        for id in [a, b] {
+            g.nodes.get_mut(&id).unwrap().status = NodeStatus::Dirty;
+        }
+        let res = run_dirty_levels_parallel(&g, 2, false, |_id| Box::pin(async { Ok(()) })).await;
+        assert!(matches!(res, Err(EngineError::Cycle(_))));
     }
 }

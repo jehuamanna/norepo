@@ -1,0 +1,26 @@
+[package]
+name = "operon-agent-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI front-end for the Operon agent runtime — picks a provider, assembles tools, runs a single turn from a prompt."
+
+[[bin]]
+name = "operon-agent"
+path = "src/main.rs"
+
+[dependencies]
+operon-core = { path = "../operon-core" }
+operon-plugins-tools = { path = "../operon-plugins-tools" }
+operon-plugins-anthropic = { path = "../operon-plugins-anthropic" }
+operon-plugins-openai = { path = "../operon-plugins-openai" }
+operon-plugins-google = { path = "../operon-plugins-google" }
+
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "io-std", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }

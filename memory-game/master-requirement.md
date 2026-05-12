@@ -20,13 +20,23 @@ and theme packs.
 ## Inputs from CE
 
 > "Want it to feel snappy — card flip under 200ms, no loading
-> spinner between rounds." — design lead
+> spinner between rounds." — design lead, kickoff transcript
 
 > "Highscores need to survive a browser refresh but we are NOT
-> standing up an auth system in v1." — PM
+> standing up an auth system in v1." — PM, scoping doc
 
 > "Mobile-first. Most of our pilot users are on phones." — pilot
-> coordinator
+> coordinator, intake form
 
 > RFP snippet: "Accessible to WCAG AA. Keyboard navigation required;
 > screen-reader card announcements optional in v1 but flagged for v2."
+
+> Competitive note: a similar match-pairs game from $COMPETITOR was
+> reported to feel laggy on iPhone 11; pilot users specifically
+> called out wanting "instant" feedback.
+
+## Constraints carried forward
+
+- No backend / no auth (compliance hard line from PM).
+- WCAG AA color contrast minimum.
+- Bundle size budget: 150 KB gzipped (mobile-first).

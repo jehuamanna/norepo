@@ -3,6 +3,7 @@
 use crate::budget::Budget;
 use crate::bus::{BusEvent, EventBus};
 use crate::error::OperonResult;
+use crate::permission::{AskInput, PermissionDecision, PermissionGate};
 use crate::traits::{
     CancellationToken, ChatDelta, ChatPlugin, ChatRequest, ContentBlock, MemoryPlugin, Message,
     Role, Scope, ToolPlugin, Usage,
@@ -16,6 +17,14 @@ use uuid::Uuid;
 pub enum Step {
     Started,
     StreamDelta(String),
+    /// Extended-thinking content streamed by the model (Claude `thinking` blocks,
+    /// OpenAI o-series reasoning summaries, Gemini equivalents). Distinct from
+    /// `StreamDelta` so the UI can render it as collapsible reasoning rather
+    /// than mixing it into the visible response.
+    ///
+    /// Added in Slice A0 — emitted starting in Slice A1 once provider plugins
+    /// surface thinking deltas.
+    Thinking(String),
     ToolCall {
         id: String,
         name: String,
@@ -25,6 +34,19 @@ pub enum Step {
         tool_use_id: String,
         output: serde_json::Value,
         is_error: bool,
+    },
+    /// Agent is asking the user to approve a privileged tool call. The runtime
+    /// blocks (via `crate::permission::PermissionGate`) until a decision arrives
+    /// or the request times out.
+    ///
+    /// Added in Slice A0 — emitted starting in Slice A3 when the permission
+    /// gate is wired into the run loop.
+    PermissionRequest {
+        id: String,
+        title: String,
+        kind: String,
+        locations: Vec<String>,
+        raw_input: serde_json::Value,
     },
     Done(StopReason),
 }
@@ -43,6 +65,9 @@ pub struct AgentRuntime {
     pub memory: Arc<dyn MemoryPlugin>,
     pub bus: EventBus,
     pub max_iterations: u32,
+    /// Per-runtime permission gate. Defaults to an auto-allow gate so existing
+    /// callers see no behaviour change. Slice A12 wires the UI to a real gate.
+    pub permission: PermissionGate,
 }
 
 impl AgentRuntime {
@@ -58,7 +83,13 @@ impl AgentRuntime {
             memory,
             bus,
             max_iterations: 32,
+            permission: PermissionGate::default(),
         }
+    }
+
+    pub fn with_permission(mut self, gate: PermissionGate) -> Self {
+        self.permission = gate;
+        self
     }
 
     fn now_ms() -> u64 {
@@ -191,6 +222,9 @@ async fn run_loop(
                             bus.publish(BusEvent::ChatStreamDelta { session, text: t.clone() });
                             text_acc.push_str(&t);
                         }
+                        Ok(ChatDelta::Thinking(t)) => {
+                            let _ = tx.send(Step::Thinking(t.clone())).await;
+                        }
                         Ok(ChatDelta::ToolUse { id, name, input }) => {
                             tool_calls.push((id.clone(), name.clone(), input.clone()));
                         }
@@ -277,6 +311,35 @@ async fn run_loop(
                     })
                     .await;
                 let started = web_time::Instant::now();
+                // ---- Permission gate ----
+                let decision = runtime
+                    .permission
+                    .ask(AskInput {
+                        kind: name.clone(),
+                        title: format!("{name}({})", input.to_string().chars().take(60).collect::<String>()),
+                        locations: extract_paths(input),
+                        raw_input: input.clone(),
+                    })
+                    .await
+                    .unwrap_or(PermissionDecision::Reject);
+                if decision == PermissionDecision::Reject {
+                    let output = serde_json::json!({
+                        "error": format!("permission denied: tool {name} was rejected by the user"),
+                    });
+                    let _ = tx
+                        .send(Step::ToolResult {
+                            tool_use_id: id.clone(),
+                            output: output.clone(),
+                            is_error: true,
+                        })
+                        .await;
+                    tool_result_blocks.push(ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: output.to_string(),
+                        is_error: true,
+                    });
+                    continue;
+                }
                 let (output, is_error) = match runtime.tool_by_name(name) {
                     Some(t) => {
                         tracing::info!(target: "operon::agent", tool = %name, "tool.invoke");
@@ -327,4 +390,25 @@ async fn run_loop(
         let _ = tx.send(Step::Done(StopReason::EndTurn)).await;
         return Ok(());
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Best-effort extraction of paths from a tool-call input for the permission UI.
+/// Looks at common keys (`path`, `cwd`, `paths[]`).
+fn extract_paths(input: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
+        out.push(p.to_string());
+    }
+    if let Some(c) = input.get("cwd").and_then(|v| v.as_str()) {
+        out.push(c.to_string());
+    }
+    if let Some(arr) = input.get("paths").and_then(|v| v.as_array()) {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                out.push(s.to_string());
+            }
+        }
+    }
+    out
 }

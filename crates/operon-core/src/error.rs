@@ -11,6 +11,12 @@ pub enum OperonError {
     #[error("secret: {0}")]
     Secret(String),
 
+    /// A `SecretStore` layer doesn't support writes (e.g. `EnvSecretStore`).
+    /// Distinct from `Secret` so `LayeredSecretStore` can skip read-only
+    /// layers without swallowing real failures from writable ones.
+    #[error("read-only: {0}")]
+    ReadOnly(String),
+
     #[error("plugin '{plugin}': {source}")]
     Plugin {
         plugin: String,

@@ -5,6 +5,8 @@
 //! splitters in [`super::splitter`] mutate `LayoutState` while the user drags. Phase 4
 //! adds explicit toggle buttons that flip the `*_collapsed` flags via the helpers below.
 
+use serde::{Deserialize, Serialize};
+
 const SIDEBAR_DEFAULT: u32 = 280;
 const COMPANION_DEFAULT: u32 = 320;
 const PANEL_DEFAULT: u32 = 240;
@@ -12,11 +14,12 @@ const PANEL_DEFAULT: u32 = 240;
 const SIDEBAR_MIN: u32 = 160;
 const SIDEBAR_MAX: u32 = 600;
 const COMPANION_MIN: u32 = 160;
-const COMPANION_MAX: u32 = 600;
+const COMPANION_MAX: u32 = u32::MAX;
 const PANEL_MIN: u32 = 96;
 const PANEL_MAX: u32 = 600;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LayoutState {
     pub sidebar_width: u32,
     pub companion_width: u32,
@@ -146,6 +149,47 @@ impl LayoutState {
             self.panel_collapsed = false;
         }
     }
+
+    /// Load persisted layout from `~/.local/share/operon/layout.json`,
+    /// falling back to `Default` if the file is missing or unreadable.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_or_default() -> Self {
+        let Some(path) = persisted_path() else { return Self::default() };
+        let Ok(raw) = std::fs::read_to_string(&path) else { return Self::default() };
+        serde_json::from_str(&raw).unwrap_or_default()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn load_or_default() -> Self {
+        Self::default()
+    }
+
+    /// Persist this layout to `~/.local/share/operon/layout.json`. Errors
+    /// are swallowed — a write failure shouldn't break the UI.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn save(&self) {
+        let Some(path) = persisted_path() else { return };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn save(&self) {}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn persisted_path() -> Option<std::path::PathBuf> {
+    if let Ok(home) = std::env::var("HOME") {
+        return Some(std::path::PathBuf::from(home).join(".local/share/operon/layout.json"));
+    }
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        return Some(std::path::PathBuf::from(home).join("AppData/Local/operon/layout.json"));
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,7 +244,7 @@ mod tests {
         s.set_companion_width(50);
         assert_eq!(s.companion_width, COMPANION_MIN);
         s.set_companion_width(999);
-        assert_eq!(s.companion_width, COMPANION_MAX);
+        assert_eq!(s.companion_width, 999);
     }
 
     #[test]

@@ -9,6 +9,7 @@ async-trait = "0.1"
 bitflags = "2"
 figment = { version = "0.10", features = ["toml", "env"] }
 futures = "0.3"
+regex = { version = "1", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
@@ -20,7 +21,7 @@ web-time = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 keyring = { version = "2", default-features = false, features = ["linux-secret-service-rt-tokio-crypto-rust"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "fs"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 rusqlite_migration = { version = "1", optional = true }

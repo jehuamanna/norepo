@@ -71,6 +71,46 @@ pub fn read_clipboard_image_png() -> Result<(Vec<u8>, &'static str), String> {
     Ok((out, "image/png"))
 }
 
+/// Write UTF-8 text to the OS clipboard via `arboard` (bypassing the
+/// webview). Counterpart to `read_clipboard_text` for the same
+/// reason: Monaco's `Cmd+C` / `Cmd+X` use `document.execCommand` /
+/// `clipboardData` which silently no-op in WebKitGTK. The Monaco
+/// host intercepts copy/cut, derives the selected text JS-side,
+/// and routes it here so arboard hits the OS clipboard directly.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_clipboard_text(text: &str) -> Result<(), String> {
+    let mut clip = arboard::Clipboard::new()
+        .map_err(|e| format!("[arboard] Could not open clipboard: {e}"))?;
+    clip.set_text(text.to_string())
+        .map_err(|e| format!("[arboard] Clipboard write failed: {e}"))
+}
+
+/// Read UTF-8 text out of the OS clipboard (bypassing the webview).
+///
+/// Counterpart to `read_clipboard_image_png` for plain text. The
+/// Monaco editor host needs this because wry/WebKitGTK silently
+/// drops text from `clipboardData.getData('text/plain')` on `paste`
+/// events, so Monaco's native `Cmd+V` produces nothing. Routing
+/// through arboard sidesteps the webview's broken clipboard bridge.
+///
+/// Returns the text as `String`. Errors map to short user-facing
+/// strings prefixed with `[arboard]`. The `ContentNotAvailable`
+/// case (clipboard has only image / file / nothing) returns an
+/// error so callers can short-circuit silently — image-only
+/// clipboards are handled by the separate image-paste path.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn read_clipboard_text() -> Result<String, String> {
+    let mut clip = arboard::Clipboard::new()
+        .map_err(|e| format!("[arboard] Could not open clipboard: {e}"))?;
+    match clip.get_text() {
+        Ok(t) => Ok(t),
+        Err(arboard::Error::ContentNotAvailable) => {
+            Err("[arboard] No text on the clipboard.".into())
+        }
+        Err(e) => Err(format!("[arboard] Clipboard text read failed: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// `copy_text` calls `document::eval` which requires a Dioxus runtime to

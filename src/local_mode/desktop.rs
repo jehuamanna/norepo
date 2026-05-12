@@ -262,6 +262,10 @@ pub fn SettingsPanel(open: Signal<bool>, username: Signal<String>) -> Element {
                     style: "font-size: 0.8em; color: var(--operon-fg-muted, #666); margin-top: 0.25rem;",
                     "Changing the vault re-points new writes; existing notes stay in their previous location."
                 }
+                // Slice A4b: provider API keys. The section reads
+                // `SettingsServiceCtx` from context so we don't have to
+                // pass a non-PartialEq prop through Dioxus.
+                crate::shell::settings::ProvidersSection {}
                 div {
                     class: "operon-modal-actions",
                     button {
@@ -530,11 +534,41 @@ pub fn provide_local_app_signals() {
                 operon_plugins_claude_code::ClaudeCodeConfig {
                     claude_bin: crate::shell::companion_chat::resolve_claude_bin(),
                     model: None,
+                    shim_bin: crate::shell::companion_chat::resolve_mcp_permission_shim(),
                 },
             ),
         )
     });
-    use_context_provider(|| crate::shell::companion_state::ClaudeCodePluginCtx(claude_plugin));
+    use_context_provider(|| {
+        crate::shell::companion_state::ClaudeCodePluginCtx(claude_plugin.clone())
+    });
+
+    // Slice A14 cutover: build the in-process runtime backend alongside
+    // the legacy subprocess plugin. Both are made available via
+    // `BackendsCtx`; `AgentBackendCtx` (a Signal) tracks the user's
+    // current choice. Default = ClaudeCode for safety.
+    let (backends, settings_service) =
+        use_hook(|| build_backends_and_settings(claude_plugin.clone()));
+    use_context_provider(|| backends.clone());
+    let active_backend: Signal<std::sync::Arc<dyn operon_core::agent_event::AgentBackend>> =
+        use_signal(|| backends.claude_code.clone());
+    use_context_provider(|| crate::shell::companion_state::AgentBackendCtx(active_backend));
+    // Settings service (Slice A4b) shares the same `LayeredSecretStore` as
+    // the runtime backend's factory so a key written from the settings
+    // page takes effect on the next runtime turn without an app restart.
+    use_context_provider(|| {
+        crate::shell::settings::SettingsServiceCtx(settings_service.clone())
+    });
+    // MCP settings service — wraps the `claude mcp ...` CLI. The cwd is
+    // initialised to None and re-resolved per call against the active
+    // repo path; we don't bake it in here because the panel is shared
+    // across project switches.
+    use_context_provider(|| {
+        let claude_bin = crate::shell::companion_chat::resolve_claude_bin();
+        crate::shell::mcp_settings::McpServiceCtx(std::sync::Arc::new(
+            crate::shell::mcp_settings::McpService::new(claude_bin),
+        ))
+    });
     let selected_note: Signal<Option<Uuid>> = use_signal(|| None);
     use_context_provider(|| SelectedNote(selected_note));
     // Plans-Phase-4-multiselect-aria: parallel multi-selection set.
@@ -1141,4 +1175,70 @@ pub fn LocalShellOverlay(children: Element) -> Element {
             }
         }
     }
+}
+
+/// Slice A14 cutover + Slice A4b: assemble the `BackendsCtx` and the
+/// `SettingsService` together, sharing one `LayeredSecretStore`. The
+/// factory closure used to construct per-session runtimes captures the
+/// same store, so a key written from the settings page is visible the
+/// next time `bind_session` causes a runtime to be built.
+fn build_backends_and_settings(
+    claude_plugin: std::sync::Arc<operon_plugins_claude_code::ClaudeCodeChatPlugin>,
+) -> (
+    crate::shell::companion_state::BackendsCtx,
+    crate::shell::settings::SettingsService,
+) {
+    use operon_core::agent_event::AgentBackend;
+    use std::sync::Arc;
+    eprintln!("[desktop] build_backends_and_settings invoked");
+
+    // Claude-code adapter: the existing Arc already implements `AgentBackend`
+    // via the `agent_backend.rs` adapter — coerce to the trait object.
+    let claude_code: Arc<dyn AgentBackend> = claude_plugin;
+
+    // Layered secret store: keyring (OS) → JSON file → env vars → in-memory.
+    // The JSON-file layer (mode 0600 at `$XDG_CONFIG_HOME/operon/secrets.json`)
+    // is the persistent fallback for machines where Secret Service / KWallet
+    // is locked or unavailable. Env vars stay read-only. The in-memory mock
+    // is last-resort so `put` never fails outright.
+    let secrets: Arc<dyn operon_core::secrets::SecretStore> = Arc::new(
+        operon_core::secrets::LayeredSecretStore::new(vec![
+            Arc::new(operon_core::secrets::KeyringSecretStore::new("operon")),
+            Arc::new(operon_core::secrets::JsonFileSecretStore::new(
+                operon_core::secrets::JsonFileSecretStore::default_path(),
+            )),
+            Arc::new(operon_core::secrets::EnvSecretStore::new("")),
+            Arc::new(operon_core::secrets::MockSecretStore::new()),
+        ]),
+    );
+
+    let factory: operon_plugins_tools::RuntimeFactory = {
+        let secrets = secrets.clone();
+        Arc::new(move |_args| {
+            let chat = operon_plugins_anthropic::AnthropicChatPlugin::new(
+                operon_plugins_anthropic::AnthropicConfig::default(),
+                secrets.clone(),
+            )?;
+            let chat: Arc<dyn operon_core::traits::ChatPlugin> = Arc::new(chat);
+            let tools = operon_plugins_tools::default_tools();
+            let memory: Arc<dyn operon_core::traits::MemoryPlugin> =
+                Arc::new(operon_core::InMemoryStore::new());
+            let bus = operon_core::EventBus::new(64);
+            Ok(Arc::new(operon_core::runtime::AgentRuntime::new(
+                chat, tools, memory, bus,
+            )))
+        })
+    };
+    let runtime: Arc<dyn AgentBackend> =
+        Arc::new(operon_plugins_tools::RuntimeAgentBackend::new(factory));
+
+    let settings_service = crate::shell::settings::SettingsService::new(secrets);
+
+    (
+        crate::shell::companion_state::BackendsCtx {
+            claude_code,
+            runtime,
+        },
+        settings_service,
+    )
 }

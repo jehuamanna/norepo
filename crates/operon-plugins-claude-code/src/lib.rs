@@ -9,7 +9,11 @@
 //! `result` event as `ChatDelta::Stop` with usage info.
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod agent_backend;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod event;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod permission_bridge;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod plugin;
 #[cfg(not(target_arch = "wasm32"))]
@@ -17,5 +21,10 @@ pub mod stream;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use event::ClaudeCodeEvent;
+#[cfg(not(target_arch = "wasm32"))]
+pub use permission_bridge::{
+    build_mcp_config, permission_prompt_tool_arg, PermissionBridge, PermissionDecision,
+    PermissionHandler, PermissionRequest, MCP_SERVER_NAME, PERMISSION_TOOL_NAME,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use plugin::{ClaudeCodeChatPlugin, ClaudeCodeConfig};

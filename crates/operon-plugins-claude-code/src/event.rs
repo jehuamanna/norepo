@@ -9,10 +9,19 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use operon_core::agent_event::McpServerStatus;
 use operon_core::traits::{StopReason, Usage};
 
 #[derive(Debug, Clone)]
 pub enum ClaudeCodeEvent {
+    /// Initial `system/init` line from claude's stream-json. Reports the
+    /// MCP servers that connected and the full tool inventory available to
+    /// this turn. Surfaced so the companion's MCP panel can render live
+    /// "is this server up + which tools" indicators.
+    SessionInit {
+        mcp_servers: Vec<McpServerStatus>,
+        tools: Vec<String>,
+    },
     /// Streamed assistant text delta. Multiple `Text` events from one turn
     /// concat to the full assistant response (which may also be
     /// interleaved with `ToolUse` / `Thinking`).

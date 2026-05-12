@@ -1,0 +1,38 @@
+[package]
+name = "operon-plugins-tools"
+version = "0.1.0"
+edition = "2021"
+description = "Built-in ToolPlugins for Operon: file ops (read/write/edit/glob/grep), shell, git, web (search/fetch), task (sub-agent)"
+
+[dependencies]
+operon-core = { path = "../operon-core" }
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "fs", "process"] }
+# File globbing for the `glob` tool (Slice A2).
+globwalk = "0.9"
+# Ripgrep-family in-process search for the `grep` tool (Slice A3).
+grep = "0.3"
+ignore = "0.4"
+globset = "0.4"
+# git2-rs for the `git` tool (Slice A3).
+git2 = { version = "0.19", default-features = false }
+# Web (Slice A4).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+html2md = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.thiserror]
+version = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.uuid]
+version = "1"
+features = ["v4"]
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

@@ -14,6 +14,8 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use futures::StreamExt;
+use operon_core::agent_event::{AgentBackend, AgentEvent};
+#[allow(unused_imports)]
 use operon_plugins_claude_code::{ClaudeCodeChatPlugin, ClaudeCodeEvent};
 use operon_store::repos::{ChatMessageKind, ChatMessageRepository};
 use std::path::{Path, PathBuf};
@@ -108,7 +110,7 @@ impl From<std::io::Error> for ExecError {
 ///   based on the returned `Result`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_node(
-    plugin: Arc<ClaudeCodeChatPlugin>,
+    plugin: Arc<dyn AgentBackend>,
     operon_session: Uuid,
     repo_path: PathBuf,
     workflow_id: Uuid,
@@ -264,20 +266,22 @@ pub async fn run_node(
     };
 
     let mut events = 0usize;
-    while let Some(ev) = rx.next().await {
+    while let Some(ev) = rx.recv().await {
         events += 1;
         let kind = match &ev {
-            ClaudeCodeEvent::Done { .. } => "Done",
-            ClaudeCodeEvent::Error(_) => "Error",
-            ClaudeCodeEvent::Text(_) => "Text",
-            ClaudeCodeEvent::Thinking(_) => "Thinking",
-            ClaudeCodeEvent::ToolUse { .. } => "ToolUse",
-            ClaudeCodeEvent::ToolResult { .. } => "ToolResult",
+            AgentEvent::Done { .. } => "Done",
+            AgentEvent::Error(_) => "Error",
+            AgentEvent::Text(_) => "Text",
+            AgentEvent::Thinking(_) => "Thinking",
+            AgentEvent::ToolUse { .. } => "ToolUse",
+            AgentEvent::ToolResult { .. } => "ToolResult",
+            AgentEvent::PermissionRequest { .. } => "PermissionRequest",
+            AgentEvent::SessionInit { .. } => "SessionInit",
         };
         eprintln!("operon: executor::run_node [{node_id}] event {events}: {kind}");
         // Persist + apply the event's effect.
         match ev {
-            ClaudeCodeEvent::Text(t) => {
+            AgentEvent::Text(t) => {
                 assistant_buf.push_str(&t);
                 // Stream the delta into the in-progress map so the
                 // companion's render shows letter-by-letter typing.
@@ -292,7 +296,7 @@ pub async fn run_node(
                     });
                 }
             }
-            ClaudeCodeEvent::Thinking(t) => {
+            AgentEvent::Thinking(t) => {
                 flush_assistant(&mut assistant_buf);
                 if let Some(sink) = transcript_sink.as_ref() {
                     let _ = sink.chat_repo.append(
@@ -304,7 +308,7 @@ pub async fn run_node(
                     bump_message_version();
                 }
             }
-            ClaudeCodeEvent::ToolUse { id, name, input } => {
+            AgentEvent::ToolUse { id, name, input } => {
                 flush_assistant(&mut assistant_buf);
                 if let Some(sink) = transcript_sink.as_ref() {
                     let _ = sink.chat_repo.append(
@@ -347,7 +351,7 @@ pub async fn run_node(
                     }
                 }
             }
-            ClaudeCodeEvent::ToolResult { tool_use_id, content, is_error } => {
+            AgentEvent::ToolResult { tool_use_id, content, is_error } => {
                 if let Some(sink) = transcript_sink.as_ref() {
                     // Patch the prior ToolCall row so the rail reads as
                     // a complete round-trip card. Same shape regular
@@ -366,11 +370,39 @@ pub async fn run_node(
                     bump_message_version();
                 }
             }
-            ClaudeCodeEvent::Done { .. } => {
+            AgentEvent::Done { .. } => {
                 flush_assistant(&mut assistant_buf);
                 break;
             }
-            ClaudeCodeEvent::Error(msg) => {
+            AgentEvent::SessionInit { mcp_servers, tools } => {
+                // Surface the per-turn MCP roster + tool inventory to the
+                // shared global signal so the MCP settings panel can
+                // render live status. Cascade nodes don't have a
+                // user-facing chat session, so leave `session` as None.
+                *crate::shell::companion_state::MCP_LIVE_STATUS.write() =
+                    crate::shell::companion_state::McpLiveStatus {
+                        mcp_servers,
+                        tools,
+                        session: None,
+                    };
+            }
+            AgentEvent::PermissionRequest { id, kind, title, .. } => {
+                // For now, surface as a system message in the rail. Slice
+                // A12 wires the inline approval UI; the runtime backend
+                // currently auto-allows so this arm is mostly informational.
+                if let Some(sink) = transcript_sink.as_ref() {
+                    let _ = sink.chat_repo.append(
+                        sink.chat_session_id,
+                        ChatMessageKind::System,
+                        Some(&id),
+                        &serde_json::json!({
+                            "text": format!("permission asked: {kind} ({title})"),
+                        }),
+                    );
+                    bump_message_version();
+                }
+            }
+            AgentEvent::Error(msg) => {
                 flush_assistant(&mut assistant_buf);
                 if let Some(sink) = transcript_sink.as_ref() {
                     let _ = sink.chat_repo.append(

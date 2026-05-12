@@ -120,6 +120,7 @@ pub(crate) fn parse_line(
         "assistant" => parse_assistant_blocks(&v),
         "user" => parse_user_blocks(&v),
         "result" => parse_result(&v, state, operon_session),
+        "system" => parse_system(&v),
         "error" => {
             let msg = v
                 .get("error")
@@ -132,9 +133,48 @@ pub(crate) fn parse_line(
                 .to_string();
             vec![ClaudeCodeEvent::Error(msg)]
         }
-        // system / rate_limit_event / unknown — drop silently
+        // rate_limit_event / unknown — drop silently
         _ => Vec::new(),
     }
+}
+
+/// Parse a claude `system` envelope. Only the `init` subtype carries the
+/// MCP server roster + tool inventory we care about; other subtypes are
+/// dropped silently to preserve current behaviour.
+fn parse_system(v: &serde_json::Value) -> Vec<ClaudeCodeEvent> {
+    let subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
+    if subtype != "init" {
+        return Vec::new();
+    }
+    let mcp_servers = v
+        .get("mcp_servers")
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let name = entry.get("name").and_then(|n| n.as_str())?;
+                    let status = entry
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("unknown");
+                    Some(operon_core::agent_event::McpServerStatus {
+                        name: name.to_string(),
+                        status: status.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let tools = v
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    vec![ClaudeCodeEvent::SessionInit { mcp_servers, tools }]
 }
 
 fn parse_assistant_blocks(v: &serde_json::Value) -> Vec<ClaudeCodeEvent> {
@@ -319,6 +359,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp/repo"),
                 claude_session_id: None,
                 permission_mode: None,
+                bridge: None,
             },
         );
         Arc::new(Mutex::new(state))
@@ -442,6 +483,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp/other"),
                 claude_session_id: Some("preexisting-B".into()),
                 permission_mode: None,
+                bridge: None,
             },
         );
         let _ = parse_line(line, &state, sid_a);
@@ -467,11 +509,53 @@ mod tests {
     }
 
     #[test]
-    fn drops_system_and_rate_limit_events() {
+    fn drops_rate_limit_events_and_unknown_system_subtypes() {
         let sid = Uuid::new_v4();
         let state = fresh_state_with_binding(sid);
-        assert!(parse_line(r#"{"type":"system","subtype":"init"}"#, &state, sid).is_empty());
+        // Non-init system frames stay dropped — the chat surface only
+        // consumes the init payload.
+        assert!(parse_line(r#"{"type":"system","subtype":"compact"}"#, &state, sid).is_empty());
         assert!(parse_line(r#"{"type":"rate_limit_event"}"#, &state, sid).is_empty());
+    }
+
+    #[test]
+    fn parses_system_init_into_session_init_event() {
+        let sid = Uuid::new_v4();
+        let state = fresh_state_with_binding(sid);
+        let line = r#"{"type":"system","subtype":"init","mcp_servers":[{"name":"fs","status":"connected"},{"name":"http","status":"failed"}],"tools":["Bash","mcp__fs__read","mcp__fs__write","mcp__http__fetch"]}"#;
+        let events = parse_line(line, &state, sid);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ClaudeCodeEvent::SessionInit { mcp_servers, tools } => {
+                assert_eq!(mcp_servers.len(), 2);
+                assert_eq!(mcp_servers[0].name, "fs");
+                assert_eq!(mcp_servers[0].status, "connected");
+                assert_eq!(mcp_servers[1].name, "http");
+                assert_eq!(mcp_servers[1].status, "failed");
+                assert_eq!(tools.len(), 4);
+                assert!(tools.iter().any(|t| t == "mcp__fs__read"));
+            }
+            other => panic!("expected SessionInit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn system_init_with_no_mcp_servers_is_still_emitted() {
+        let sid = Uuid::new_v4();
+        let state = fresh_state_with_binding(sid);
+        let events = parse_line(
+            r#"{"type":"system","subtype":"init","tools":["Bash"]}"#,
+            &state,
+            sid,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ClaudeCodeEvent::SessionInit { mcp_servers, tools } => {
+                assert!(mcp_servers.is_empty());
+                assert_eq!(tools, &vec!["Bash".to_string()]);
+            }
+            other => panic!("expected SessionInit, got {other:?}"),
+        }
     }
 
     #[test]

@@ -7,7 +7,6 @@
   color: var(--vscode-editor-foreground);
   line-height: 1.55;
   font-size: 14px;
-  max-width: 80ch;
 }
 
 .markdown-prose h1,

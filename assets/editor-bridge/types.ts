@@ -23,6 +23,14 @@ export interface Handle {
   ready: Promise<void>;
   setContent(content: string): void;
   getContent(): string;
+  /** Replace the model text in `[start, end)` with `text`, pushing the
+   * edit through the editor's executeEdits API so it joins the
+   * native undo/redo stack. Used by paste/cut/splice paths that need
+   * Ctrl+Z to round-trip cleanly — `setContent` clobbers history, so
+   * those paths must not use it. Offsets are 0-based UTF-16 code-unit
+   * positions in the model (same units `snapshot.cursor` /
+   * `snapshot.selection` use). */
+  replaceRange(start: number, end: number, text: string): void;
   /** Subscribe to content changes. Returns an unsubscribe fn that disposes the
    * registered closure on the JS side. */
   onChange(cb: (content: string) => void): () => void;

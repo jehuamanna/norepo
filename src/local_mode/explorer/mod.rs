@@ -2311,7 +2311,7 @@ pub fn ExplorerPanel() -> Element {
                     }
                 }
             },
-            style: "list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column;",
+            style: "list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; flex: 1; min-height: 0;",
             // Header — search input + checkbox + "+" button. Borderless to match
             // Cloud's notes-explorer chrome density.
             div {
@@ -2343,6 +2343,7 @@ pub fn ExplorerPanel() -> Element {
             } else {
             div {
                 class: "flex-1 overflow-y-auto",
+                style: "min-height: 0;",
                 // Plans-Phase-4: WAI-ARIA tree pattern. Multi-select isn't
                 // wired yet (single-selection signals still in place) so we
                 // advertise aria-multiselectable=false for now; flipping it

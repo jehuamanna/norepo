@@ -14,7 +14,13 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "io-std", "process", "net", "fs"] }
+tempfile = "3"
+
+[[bin]]
+name = "operon-mcp-permission"
+path = "src/bin/operon_mcp_permission.rs"
+required-features = []
 
 [dev-dependencies]
 tempfile = "3"

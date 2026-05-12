@@ -1,5 +1,22 @@
 [workspace]
-members = [".", "tests-wasm", "crates/operon-core", "crates/operon-plugins-anthropic", "crates/operon-plugins-claude-code", "crates/operon-plugins-mcp", "crates/operon-store", "crates/operon-auth", "crates/operon-api-server", "crates/operon-notes", "crates/operon-export"]
+members = [
+    ".",
+    "tests-wasm",
+    "crates/operon-core",
+    "crates/operon-plugins-anthropic",
+    "crates/operon-plugins-claude-code",
+    "crates/operon-plugins-mcp",
+    "crates/operon-plugins-openai",
+    "crates/operon-plugins-google",
+    "crates/operon-plugins-tools",
+    "crates/operon-plugins-lsp",
+    "crates/operon-agent-cli",
+    "crates/operon-store",
+    "crates/operon-auth",
+    "crates/operon-api-server",
+    "crates/operon-notes",
+    "crates/operon-export",
+]
 default-members = ["."]
 
 [package]
@@ -100,6 +117,12 @@ operon-store = { path = "crates/operon-store" }
 # Vault directory picker (seed `Notes`, Plans-Phase-1-vault-dir). Desktop-only;
 # web uses `Window::show_directory_picker()` via web-sys.
 rfd = { version = "0.14", default-features = false, features = ["xdg-portal", "tokio"] }
+# Slice A14 cutover: built-in tool plugins for the in-process runtime backend.
+# Provides read/write/edit/glob/grep/shell/git/web tools + the runtime adapter.
+operon-plugins-tools = { path = "crates/operon-plugins-tools" }
+# Slice A4b settings page: HTTP client used to verify API keys against
+# each provider's models endpoint. Same TLS stack as the rest of the deps.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 # Plans-Phase-6-image-notes: SHA-256 content addressing for image blobs.
 sha2 = "0.10"
 # Read images out of the OS clipboard for the image-note "paste" affordance.

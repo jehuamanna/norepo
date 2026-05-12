@@ -32,6 +32,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 use crate::event::ClaudeCodeEvent;
+use crate::permission_bridge::{
+    build_mcp_config, permission_prompt_tool_arg, PermissionBridge,
+};
 use crate::stream::{drive_stream, ClaudeProcess};
 
 #[derive(Clone, Debug)]
@@ -41,6 +44,12 @@ pub struct ClaudeCodeConfig {
     pub claude_bin: PathBuf,
     /// Optional model override (forwarded as `--model`).
     pub model: Option<String>,
+    /// Absolute path to the `operon-mcp-permission` shim binary. When
+    /// `None`, the inline-permission-prompt wiring is skipped entirely
+    /// (claude falls back to whatever its `--permission-mode` says).
+    /// Set this once at app startup; the spawn flow reads it on every
+    /// turn alongside any session-bound `PermissionBridge`.
+    pub shim_bin: Option<PathBuf>,
 }
 
 pub struct ClaudeCodeChatPlugin {
@@ -65,7 +74,7 @@ pub(crate) struct PluginState {
     pub permission_mode: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct SessionBinding {
     pub cwd: PathBuf,
     pub claude_session_id: Option<String>,
@@ -78,6 +87,14 @@ pub(crate) struct SessionBinding {
     /// they picked from the toolbar. `None` = fall back to the
     /// global `PluginState.permission_mode`.
     pub permission_mode: Option<String>,
+    /// When set + `ClaudeCodeConfig.shim_bin` is also set, the next
+    /// `spawn_turn` writes a per-turn MCP config pointing at the shim
+    /// binary which proxies stdio to this bridge's socket, and adds
+    /// `--permission-prompt-tool mcp__operon__permission_prompt` so
+    /// claude routes every gated tool-use through the bridge instead
+    /// of silently denying. Skipped when `permission_mode` is
+    /// `bypassPermissions` (claude won't ask in that mode anyway).
+    pub bridge: Option<Arc<PermissionBridge>>,
 }
 
 impl ClaudeCodeChatPlugin {
@@ -96,14 +113,15 @@ impl ClaudeCodeChatPlugin {
     pub fn bind_session(&self, operon_session: Uuid, cwd: PathBuf) {
         let mut s = self.state.lock().expect("plugin state mutex poisoned");
         let existing = s.bindings.get(&operon_session).cloned();
-        let (claude_session_id, permission_mode) = match existing {
-            Some(b) if b.cwd == cwd => (b.claude_session_id, b.permission_mode),
+        let (claude_session_id, permission_mode, bridge) = match existing {
+            Some(b) if b.cwd == cwd => (b.claude_session_id, b.permission_mode, b.bridge),
             // cwd changed: invalidate the cached claude session id (it
             // was tied to the previous directory) but keep the
-            // permission-mode override — that's a deliberate caller
-            // decision that doesn't depend on the working directory.
-            Some(b) => (None, b.permission_mode),
-            None => (None, None),
+            // permission-mode override + bridge — those are deliberate
+            // caller decisions that don't depend on the working
+            // directory.
+            Some(b) => (None, b.permission_mode, b.bridge),
+            None => (None, None, None),
         };
         s.bindings.insert(
             operon_session,
@@ -111,6 +129,7 @@ impl ClaudeCodeChatPlugin {
                 cwd,
                 claude_session_id,
                 permission_mode,
+                bridge,
             },
         );
     }
@@ -167,6 +186,23 @@ impl ClaudeCodeChatPlugin {
         let mut s = self.state.lock().expect("plugin state mutex poisoned");
         if let Some(b) = s.bindings.get_mut(&operon_session) {
             b.permission_mode = mode;
+        }
+    }
+
+    /// Attach (or detach) a `PermissionBridge` to a session. While set,
+    /// `spawn_turn` writes a per-turn MCP config pointing at
+    /// `cfg.shim_bin` and adds `--permission-prompt-tool` so claude
+    /// routes gated tool-uses through the bridge instead of silently
+    /// failing in `--print` mode. No-op if `bind_session` hasn't run
+    /// yet — call `bind_session` first, then this.
+    pub fn set_session_bridge(
+        &self,
+        operon_session: Uuid,
+        bridge: Option<Arc<PermissionBridge>>,
+    ) {
+        let mut s = self.state.lock().expect("plugin state mutex poisoned");
+        if let Some(b) = s.bindings.get_mut(&operon_session) {
+            b.bridge = bridge;
         }
     }
 
@@ -242,7 +278,9 @@ impl ChatPlugin for ClaudeCodeChatPlugin {
                     message: msg,
                     retryable: false,
                 })),
-                ClaudeCodeEvent::Thinking(_) | ClaudeCodeEvent::ToolResult { .. } => None,
+                ClaudeCodeEvent::Thinking(_)
+                | ClaudeCodeEvent::ToolResult { .. }
+                | ClaudeCodeEvent::SessionInit { .. } => None,
             }
         });
         Ok(Box::pin(stream))
@@ -259,7 +297,7 @@ impl ClaudeCodeChatPlugin {
         operon_session: Uuid,
         ct: CancellationToken,
     ) -> OperonResult<UnboundedReceiver<ClaudeCodeEvent>> {
-        let (cwd, claude_session_id, model_override, permission_mode) = {
+        let (cwd, claude_session_id, model_override, permission_mode, bridge) = {
             let s = self.state.lock().expect("plugin state mutex poisoned");
             let binding = s.bindings.get(&operon_session).ok_or_else(|| {
                 OperonError::Provider {
@@ -285,6 +323,7 @@ impl ClaudeCodeChatPlugin {
                 binding.claude_session_id.clone(),
                 s.default_model.clone(),
                 effective_mode,
+                binding.bridge.clone(),
             )
         };
 
@@ -314,6 +353,47 @@ impl ClaudeCodeChatPlugin {
         }
         if let Some(mode) = &permission_mode {
             cmd.arg("--permission-mode").arg(mode);
+        }
+
+        // Wire the inline-permission-prompt MCP tool when a session has
+        // a `PermissionBridge` attached AND the runtime knows where the
+        // shim binary lives AND we're not in `bypassPermissions` mode
+        // (claude won't ask in that mode anyway). The tempfile holding
+        // the generated MCP config is kept alive in the spawned task
+        // below so it outlives claude's startup read.
+        let mut mcp_config_keepalive: Option<tempfile::NamedTempFile> = None;
+        let bridge_active = bridge.is_some()
+            && self.cfg.shim_bin.is_some()
+            && permission_mode.as_deref() != Some("bypassPermissions");
+        if bridge_active {
+            // Both checked above — unwraps are infallible here.
+            let shim = self.cfg.shim_bin.as_ref().expect("shim_bin");
+            let socket = bridge.as_ref().expect("bridge").socket_path().to_path_buf();
+            match tempfile::Builder::new()
+                .prefix("operon-mcp-")
+                .suffix(".json")
+                .tempfile()
+            {
+                Ok(mut f) => {
+                    let cfg_json = build_mcp_config(shim, &socket).to_string();
+                    use std::io::Write;
+                    if let Err(e) = f.write_all(cfg_json.as_bytes()) {
+                        tracing::warn!(
+                            target: "operon::permission",
+                            "write mcp config tempfile: {e}; skipping prompt-tool wiring"
+                        );
+                    } else {
+                        cmd.arg("--mcp-config").arg(f.path());
+                        cmd.arg("--permission-prompt-tool")
+                            .arg(permission_prompt_tool_arg());
+                        mcp_config_keepalive = Some(f);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    target: "operon::permission",
+                    "create mcp config tempfile: {e}; skipping prompt-tool wiring"
+                ),
+            }
         }
 
         let mut child = cmd.spawn().map_err(|e| OperonError::Provider {
@@ -353,6 +433,11 @@ impl ClaudeCodeChatPlugin {
         let state = self.state.clone();
         let claude_bin_diag = self.cfg.claude_bin.clone();
         tokio::spawn(async move {
+            // Hold the MCP config tempfile alive until claude exits.
+            // Dropping it inside the task (rather than after `cmd.spawn`)
+            // avoids a TOCTOU where claude tries to read the path after
+            // the file is unlinked.
+            let _mcp_config_keepalive = mcp_config_keepalive;
             // Push the user frame, then close stdin so claude --print emits
             // its result and exits.
             if let Err(e) = stdin.write_all(frame_line.as_bytes()).await {
@@ -490,6 +575,7 @@ mod tests {
         let plugin = ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
             claude_bin: "/usr/bin/false".into(),
             model: None,
+            shim_bin: None,
         });
         let sid = Uuid::new_v4();
         plugin.bind_session(sid, "/tmp/repo-a".into());
@@ -504,6 +590,7 @@ mod tests {
         let plugin = ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
             claude_bin: "/usr/bin/false".into(),
             model: None,
+            shim_bin: None,
         });
         let sid = Uuid::new_v4();
         plugin.bind_session(sid, "/tmp/repo-a".into());
@@ -523,6 +610,7 @@ mod tests {
         let plugin = ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
             claude_bin: "/usr/bin/false".into(),
             model: None,
+            shim_bin: None,
         });
         let sid = Uuid::new_v4();
         plugin.bind_session(sid, "/tmp/repo-a".into());
@@ -541,6 +629,7 @@ mod tests {
         let plugin = ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
             claude_bin: "/usr/bin/false".into(),
             model: None,
+            shim_bin: None,
         });
         let sid = Uuid::new_v4();
         plugin.set_permission_mode(Some("default".into()));
@@ -560,6 +649,7 @@ mod tests {
         let plugin = ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
             claude_bin: "/usr/bin/false".into(),
             model: None,
+            shim_bin: None,
         });
         let sid = Uuid::new_v4();
         plugin.set_permission_mode(Some("default".into()));
@@ -578,6 +668,7 @@ mod tests {
         let plugin = ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
             claude_bin: "/usr/bin/false".into(),
             model: None,
+            shim_bin: None,
         });
         let sid = Uuid::new_v4();
         plugin.bind_session(sid, "/tmp/repo-a".into());
@@ -598,6 +689,7 @@ mod tests {
         let plugin = ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
             claude_bin: "/usr/bin/false".into(),
             model: None,
+            shim_bin: None,
         });
         let sid = Uuid::new_v4();
         plugin.bind_session(sid, "/tmp/repo".into());
@@ -606,11 +698,93 @@ mod tests {
         assert!(plugin.state.lock().unwrap().bindings.get(&sid).is_none());
     }
 
+    #[tokio::test]
+    async fn set_session_bridge_attaches_and_clears() {
+        use crate::permission_bridge::{PermissionBridge, PermissionDecision, PermissionRequest};
+        use tempfile::tempdir;
+        use tokio::sync::oneshot;
+
+        let plugin = ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
+            claude_bin: "/usr/bin/false".into(),
+            model: None,
+            shim_bin: None,
+        });
+        let sid = Uuid::new_v4();
+        plugin.bind_session(sid, "/tmp/repo".into());
+
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("perm.sock");
+        let handler = |_req: PermissionRequest, respond: oneshot::Sender<PermissionDecision>| {
+            let _ = respond.send(PermissionDecision::Allow { updated_input: None });
+        };
+        let bridge = Arc::new(
+            PermissionBridge::bind(sock, handler).await.unwrap(),
+        );
+        plugin.set_session_bridge(sid, Some(bridge));
+        assert!(plugin
+            .state
+            .lock()
+            .unwrap()
+            .bindings
+            .get(&sid)
+            .and_then(|b| b.bridge.as_ref())
+            .is_some());
+
+        plugin.set_session_bridge(sid, None);
+        assert!(plugin
+            .state
+            .lock()
+            .unwrap()
+            .bindings
+            .get(&sid)
+            .and_then(|b| b.bridge.as_ref())
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn bind_session_with_new_cwd_preserves_bridge() {
+        use crate::permission_bridge::{PermissionBridge, PermissionDecision, PermissionRequest};
+        use tempfile::tempdir;
+        use tokio::sync::oneshot;
+
+        let plugin = ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
+            claude_bin: "/usr/bin/false".into(),
+            model: None,
+            shim_bin: None,
+        });
+        let sid = Uuid::new_v4();
+        plugin.bind_session(sid, "/tmp/repo-a".into());
+
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("perm.sock");
+        let handler = |_req: PermissionRequest, respond: oneshot::Sender<PermissionDecision>| {
+            let _ = respond.send(PermissionDecision::Allow { updated_input: None });
+        };
+        let bridge = Arc::new(
+            PermissionBridge::bind(sock, handler).await.unwrap(),
+        );
+        plugin.set_session_bridge(sid, Some(bridge));
+
+        // Re-bind with a different cwd. The cached claude_session_id
+        // gets cleared but the bridge — like permission_mode — is a
+        // caller intent unrelated to the working directory.
+        plugin.bind_session(sid, "/tmp/repo-b".into());
+        assert!(plugin
+            .state
+            .lock()
+            .unwrap()
+            .bindings
+            .get(&sid)
+            .and_then(|b| b.bridge.as_ref())
+            .is_some());
+    }
+
     #[test]
     fn parallel_sessions_have_isolated_state() {
         let plugin = ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
             claude_bin: "/usr/bin/false".into(),
             model: None,
+            shim_bin: None,
         });
         let s_a = Uuid::new_v4();
         let s_b = Uuid::new_v4();

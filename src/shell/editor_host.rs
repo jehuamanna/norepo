@@ -98,12 +98,23 @@ impl MonacoChannel {
                     const state = h.snapshot(); \
                     const old = h.getContent(); \
                     const text = {text_json}; \
-                    const pos = Math.min((state && state.cursor) || 0, old.length); \
-                    const next = old.slice(0, pos) + text + old.slice(pos); \
-                    h.setContent(next); \
-                    try {{ h.restore({{cursor: pos + text.length, selection: null, scroll: (state && state.scroll) || 0}}); }} catch (e) {{}} \
+                    let s, e; \
+                    if (state && state.selection) {{ \
+                        s = state.selection[0]; e = state.selection[1]; \
+                    }} else {{ \
+                        const pos = Math.min((state && state.cursor) || 0, old.length); \
+                        s = pos; e = pos; \
+                    }} \
+                    if (typeof h.replaceRange === 'function') {{ \
+                        h.replaceRange(s, e, text); \
+                    }} else {{ \
+                        /* legacy bridge fallback — non-undoable */ \
+                        const next = old.slice(0, s) + text + old.slice(e); \
+                        h.setContent(next); \
+                        try {{ h.restore({{cursor: s + text.length, selection: null, scroll: (state && state.scroll) || 0}}); }} catch (e2) {{}} \
+                    }} \
                     try {{ if (typeof h.layout === 'function') h.layout(); }} catch (e) {{}} \
-                    console.log('operon: direct splice OK', hid, 'oldLen', old.length, 'textLen', text.length, 'nextLen', next.length); \
+                    console.log('operon: direct splice OK', hid, 'textLen', text.length); \
                 }} catch (e) {{ \
                     console.warn('operon: direct splice threw', hid, e); \
                 }} \
@@ -281,6 +292,129 @@ pub fn MonacoEditorHost(
                             const meta = ev.metaKey || ev.ctrlKey;
                             if (meta) {{
                                 const key = ev.key && ev.key.toLowerCase();
+                                // Cmd/Ctrl+V: Linux WebKitGTK silently
+                                // drops text from `clipboardData.getData`,
+                                // so Monaco's native paste produces
+                                // nothing. Bypass by routing through
+                                // Rust's arboard reader. We `preventDefault`
+                                // (kills native paste) but do NOT
+                                // `stopPropagation` so the document-level
+                                // image-paste handler in LocalNoteEditor
+                                // (and the artifact view) still fires
+                                // afterwards and can claim image bytes.
+                                if (key === "v" && !ev.shiftKey && !ev.altKey) {{
+                                    try {{ console.log("operon: monaco capture Ctrl+V", '{host_id}', "target_contains_active=", target.contains(document.activeElement)); }} catch (e) {{}}
+                                    ev.preventDefault();
+                                    // Block Monaco's bubble-phase Ctrl+V
+                                    // keybinding from also firing — its
+                                    // native paste action reads an empty
+                                    // clipboardData on wry/WebKitGTK and
+                                    // silently deletes the selection
+                                    // (looks like an undo to the user).
+                                    // Document-level image-paste rides on
+                                    // the `paste` event, not keydown, so
+                                    // it is not affected.
+                                    ev.stopImmediatePropagation();
+                                    safeSend({{type:"paste"}});
+                                    return;
+                                }}
+                                // Cmd/Ctrl+Z (undo) and Cmd+Shift+Z /
+                                // Cmd+Y (redo): Monaco's native undo
+                                // keybindings ride on browser commands
+                                // that WebKitGTK doesn't always wire
+                                // through to focused contenteditable
+                                // textareas in wry. Bypass by triggering
+                                // the bridge's undo/redo command directly
+                                // — same path the bridge's `dispatch`
+                                // entry point uses.
+                                if (key === "z" && !ev.altKey) {{
+                                    ev.preventDefault();
+                                    try {{
+                                        handle.dispatch(ev.shiftKey ? "Redo" : "Undo");
+                                    }} catch (e) {{ console.warn("operon: undo/redo dispatch threw", e); }}
+                                    return;
+                                }}
+                                if (key === "y" && !ev.shiftKey && !ev.altKey) {{
+                                    ev.preventDefault();
+                                    try {{ handle.dispatch("Redo"); }}
+                                    catch (e) {{ console.warn("operon: redo dispatch threw", e); }}
+                                    return;
+                                }}
+                                // Cmd/Ctrl+C (copy) and Cmd/Ctrl+X (cut):
+                                // same WebKitGTK clipboardData blackhole
+                                // breaks Monaco's native copy/cut. We
+                                // derive the selected text JS-side via
+                                // `handle.snapshot()` + `handle.getContent()`,
+                                // ship it to Rust which writes it to the
+                                // OS clipboard via arboard. For cut, we
+                                // also splice the selection out locally
+                                // so Monaco's view + undo stack stay in
+                                // sync. When the cursor has no selection,
+                                // we operate on the *current line* (cut)
+                                // or copy the line text — same convention
+                                // VSCode / JetBrains use.
+                                if ((key === "c" || key === "x") && !ev.shiftKey && !ev.altKey) {{
+                                    let snap, content;
+                                    try {{
+                                        snap = handle.snapshot();
+                                        content = handle.getContent();
+                                    }} catch (e) {{ return; }}
+                                    let selStart = 0;
+                                    let selEnd = 0;
+                                    if (snap && snap.selection) {{
+                                        selStart = snap.selection[0];
+                                        selEnd = snap.selection[1];
+                                    }}
+                                    const noSelection = selStart === selEnd;
+                                    let cutText;
+                                    let removeStart;
+                                    let removeEnd;
+                                    if (noSelection) {{
+                                        // Current-line behavior. Find
+                                        // line bounds around the caret;
+                                        // include the trailing newline
+                                        // so cutting the line collapses
+                                        // cleanly without leaving an
+                                        // empty hanger.
+                                        const cur = (snap && snap.cursor) || 0;
+                                        let lineStart = cur;
+                                        while (lineStart > 0 && content[lineStart - 1] !== "\n") lineStart--;
+                                        let lineEnd = cur;
+                                        while (lineEnd < content.length && content[lineEnd] !== "\n") lineEnd++;
+                                        const inclEnd = lineEnd < content.length ? lineEnd + 1 : lineEnd;
+                                        cutText = content.slice(lineStart, inclEnd);
+                                        removeStart = lineStart;
+                                        removeEnd = inclEnd;
+                                    }} else {{
+                                        cutText = content.slice(selStart, selEnd);
+                                        removeStart = selStart;
+                                        removeEnd = selEnd;
+                                    }}
+                                    ev.preventDefault();
+                                    // Same reason as the Ctrl+V branch
+                                    // above: stop Monaco's native
+                                    // copy/cut keybinding from running
+                                    // with empty clipboardData on wry.
+                                    ev.stopImmediatePropagation();
+                                    if (key === "x" && cutText.length > 0) {{
+                                        // Route through the bridge's
+                                        // `replaceRange` which uses
+                                        // `editor.executeEdits` — that
+                                        // pushes the deletion onto
+                                        // Monaco's undo stack, so
+                                        // Ctrl+Z restores the cut text
+                                        // (the previous setContent
+                                        // path reset the model and
+                                        // wiped undo history).
+                                        try {{ handle.replaceRange(removeStart, removeEnd, ""); }}
+                                        catch (e) {{ console.warn("operon: cut replaceRange threw", e); }}
+                                    }}
+                                    if (cutText.length > 0) {{
+                                        try {{ console.log("operon: clipboard-write dispatch", "len", cutText.length); }} catch (_) {{}}
+                                        safeSend({{type:"clipboard-write", text: cutText}});
+                                    }}
+                                    return;
+                                }}
                                 let action = null;
                                 if (key === "s" && !ev.shiftKey) action = "save";
                                 else if (key === "k" && !ev.shiftKey) action = "linkpicker";
@@ -616,8 +750,10 @@ pub fn MonacoEditorHost(
         // above skips its setContent push — and Monaco's caret stays
         // where the user left it instead of collapsing to position 0.
         let last_pushed_for_loop = last_pushed.clone();
+        let host_id_for_loop = host_id.clone();
         use_future(move || {
             let last_pushed_for_loop = last_pushed_for_loop.clone();
+            let host_id_for_loop = host_id_for_loop.clone();
             async move {
             loop {
                 let msg: serde_json::Value = match eval_for_loop.recv().await {
@@ -647,6 +783,98 @@ pub fn MonacoEditorHost(
                                 .unwrap_or("")
                                 .to_string();
                             handler.call(action);
+                        }
+                    }
+                    Some("paste") => {
+                        eprintln!("operon: monaco paste arm hit (host {})", host_id_for_loop);
+                        // Cmd/Ctrl+V on a Monaco surface. Because
+                        // wry/WebKitGTK silently drops text from
+                        // `clipboardData.getData`, Monaco's native
+                        // paste produces nothing on Linux. Bypass by
+                        // reading the OS clipboard via arboard and
+                        // splicing the text into Monaco directly via
+                        // a fresh `document::eval` (the same proven
+                        // path `MonacoChannel::splice` uses — bypasses
+                        // the unreliable bootstrap recv queue).
+                        // Image-only clipboards return
+                        // `ContentNotAvailable` from arboard's text
+                        // reader; we silently skip and let the
+                        // document-level image-paste handler in
+                        // LocalNoteEditor / artifact-view claim the
+                        // bytes via `read_clipboard_image_png`.
+                        let text = match crate::util::clipboard::read_clipboard_text() {
+                            Ok(t) if !t.is_empty() => {
+                                eprintln!("operon: monaco paste clipboard text len={}", t.len());
+                                t
+                            }
+                            Ok(_) => {
+                                eprintln!("operon: monaco paste clipboard returned EMPTY string");
+                                continue;
+                            }
+                            Err(e) => {
+                                eprintln!("operon: monaco paste clipboard read failed: {e}");
+                                continue;
+                            }
+                        };
+                        let host_id_json = serde_json::to_string(&host_id_for_loop)
+                            .unwrap_or_else(|_| String::from("\"\""));
+                        let text_json = serde_json::to_string(&text)
+                            .unwrap_or_else(|_| String::from("\"\""));
+                        let direct_script = format!(
+                            "(function() {{ \
+                                const hid = {host_id_json}; \
+                                const h = (window.__operon_monaco_handles || {{}})[hid]; \
+                                if (!h) {{ console.warn('operon: paste-text: no handle for', hid); return; }} \
+                                try {{ \
+                                    const state = h.snapshot(); \
+                                    const old = h.getContent(); \
+                                    const text = {text_json}; \
+                                    let s, e; \
+                                    if (state && state.selection) {{ \
+                                        s = state.selection[0]; e = state.selection[1]; \
+                                    }} else {{ \
+                                        const pos = Math.min((state && state.cursor) || 0, old.length); \
+                                        s = pos; e = pos; \
+                                    }} \
+                                    if (typeof h.replaceRange === 'function') {{ \
+                                        h.replaceRange(s, e, text); \
+                                    }} else {{ \
+                                        /* legacy bridge fallback — non-undoable */ \
+                                        const next = old.slice(0, s) + text + old.slice(e); \
+                                        h.setContent(next); \
+                                        try {{ h.restore({{cursor: s + text.length, selection: null, scroll: (state && state.scroll) || 0}}); }} catch (e2) {{}} \
+                                    }} \
+                                    console.log('operon: paste-text OK', hid, 'len', text.length); \
+                                }} catch (e) {{ \
+                                    console.warn('operon: paste-text threw', hid, e); \
+                                }} \
+                            }})();",
+                        );
+                        let _ = document::eval(&direct_script);
+                    }
+                    Some("clipboard-write") => {
+                        // Cmd/Ctrl+C or Cmd/Ctrl+X: the bootstrap
+                        // already derived the selected (or current-
+                        // line) text JS-side and, for cut, spliced it
+                        // out of Monaco. All that's left is writing
+                        // the bytes to the OS clipboard via arboard
+                        // — Monaco's native copy/cut path is broken
+                        // in WebKitGTK the same way paste is.
+                        let text = msg
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if text.is_empty() {
+                            eprintln!("operon: clipboard-write skipped (empty text)");
+                            continue;
+                        }
+                        match crate::util::clipboard::write_clipboard_text(&text) {
+                            Ok(()) => eprintln!(
+                                "operon: clipboard-write OK len={}",
+                                text.len()
+                            ),
+                            Err(e) => eprintln!("operon: clipboard write failed: {e}"),
                         }
                     }
                     Some("error") => {
