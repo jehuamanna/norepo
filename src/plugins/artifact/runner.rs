@@ -175,17 +175,23 @@ pub async fn run_skill_on_source_with_revision_notes(
     let source_body =
         String::from_utf8(source_bytes).map_err(|e| RunnerError::Plugin(format!("utf8: {e}")))?;
 
-    // 2a. Pipeline gate: refuse runs when the source is not Approved
-    //     unless it's a root seed (no upstream parent — e.g. a
-    //     user-authored Requirements note). Mirrors the UI-side gate
-    //     in `src/plugins/artifact/view.rs`. Skip the check entirely
-    //     when the source isn't even an Artifact-frontmatter note —
-    //     the workflow canvas reuses some of these paths for plain
-    //     Markdown sources.
+    // 2a. Pipeline gate: refuse runs when the source isn't a runnable
+    //     status (Approved or Dirty) unless it's a root seed (no
+    //     upstream parent — e.g. a user-authored Requirements note).
+    //     Mirrors the UI-side gate in `src/plugins/artifact/view.rs`.
+    //     Skip the check entirely when the source isn't even an
+    //     Artifact-frontmatter note — the workflow canvas reuses
+    //     some of these paths for plain Markdown sources.
+    //
+    //     `is_runnable_source` accepts Approved + Dirty so the user
+    //     can mark an existing artifact Dirty after editing it and
+    //     trigger a re-execution that preserves the existing
+    //     children with new revision rows (see cascade.rs source-
+    //     dirty regen for the full mechanism).
     let source_fm = crate::plugins::artifact::frontmatter::parse(&source_body);
     if source_fm.artifact_kind.is_some()
         && source_fm.source_artifact_id.is_some()
-        && source_fm.status != ArtifactStatus::Approved
+        && !source_fm.status.is_runnable_source()
     {
         let path_label =
             build_artifact_path_label(note_repo, project_repo, project_id, source_note_id);
@@ -206,6 +212,38 @@ pub async fn run_skill_on_source_with_revision_notes(
     let (skill_fm_lines, _) = split_skill(&skill_body);
     let lines = skill_fm_lines.unwrap_or_default();
     let contract = parse_skill_contract(&lines);
+
+    // 3aa. Normalizer-idempotence gate. A normalizer (input_kind ==
+    //      output_kind, output_count: one) overwrites the source
+    //      artifact in place rather than producing children. The
+    //      cascade's skip-already-produced gate keys off children, so
+    //      it can't detect that a normalizer already ran on this
+    //      artifact — re-firing it just appends another identical
+    //      `## Revision history` row and (with step-mode on) traps the
+    //      cascade in a no-op checkpoint loop. Skip whenever the
+    //      source's `source_skill_id` is already set: that means some
+    //      upstream skill produced it (BA-produced artifact = canonical
+    //      by construction, with the producer pointer preserved by
+    //      `import_normalizer_rewrite` per commit 68c349c) or this
+    //      normalizer has already run (subsequent runs would just
+    //      duplicate revision rows). Hand-authored artifacts
+    //      (`source_skill_id.is_none()`) still trigger the normalizer
+    //      once. Re-canonicalising a hand-edited descendant requires
+    //      marking the cascade root Dirty (existing
+    //      `regenerate-on-dirty` flow at `cascade.rs:380-431`).
+    if is_normalizer_contract(&contract)
+        && decide_normalizer_skip(source_fm.source_skill_id)
+    {
+        tracing::debug!(
+            target: "operon::artifact",
+            "normalizer-idempotence: skipping skill {skill_note_id} on \
+             {source_note_id} (source_skill_id already set — body is canonical)"
+        );
+        return Ok(RunOutcome {
+            created_artifact_ids: Vec::new(),
+            artifacts_dir: repo_path.clone(),
+        });
+    }
 
     // 3a. Aggregator skills: collect every descendant artifact under
     //     the source seed whose `artifact_kind` matches the declared
@@ -884,6 +922,23 @@ pub async fn import_produced_artifacts(
 /// `input_kind` / `output_kind` (rare; usually means the skill
 /// hand-rolled the frontmatter) doesn't qualify — both fields must
 /// be set and equal.
+/// Decide whether a normalizer-skill run on the source artifact should
+/// be skipped as redundant. Returns `true` whenever the source's
+/// `source_skill_id` is already set — meaning some upstream skill has
+/// already produced (or normalized) the artifact, so its body is
+/// canonical and re-running the normalizer would only append an
+/// identical `## Revision history` row.
+///
+/// Hand-authored artifacts (`source_skill_id.is_none()`) return
+/// `false` so the normalizer runs once to canonicalise the body.
+///
+/// Pure function — split off the runner's normalizer-idempotence gate
+/// in `run_skill_on_source_with_revision_notes` so the rule is
+/// trivially unit-testable.
+pub fn decide_normalizer_skip(source_skill_id: Option<Uuid>) -> bool {
+    source_skill_id.is_some()
+}
+
 pub fn is_normalizer_contract(
     contract: &crate::plugins::skill::frontmatter::SkillContract,
 ) -> bool {
@@ -1752,6 +1807,31 @@ mod tests {
             Some("epic"),
         );
         assert_eq!(resolved, normalizer_id);
+    }
+
+    #[test]
+    fn decide_normalizer_skip_skips_when_source_skill_id_set() {
+        // Any prior producer pointer means the body is canonical;
+        // re-running the normalizer would only append a duplicate
+        // revision row.
+        assert!(decide_normalizer_skip(Some(Uuid::new_v4())));
+    }
+
+    #[test]
+    fn decide_normalizer_skip_runs_when_source_skill_id_absent() {
+        // Hand-authored artifact (no upstream producer) — let the
+        // normalizer canonicalise the body once.
+        assert!(!decide_normalizer_skip(None));
+    }
+
+    #[test]
+    fn decide_normalizer_skip_treats_self_as_already_done() {
+        // The gate doesn't care which skill produced the artifact —
+        // any `Some(_)` short-circuits, including the case where the
+        // pointer happens to be the normalizer itself (artifact was
+        // hand-authored, then normalized once before).
+        let normalizer_id = Uuid::new_v4();
+        assert!(decide_normalizer_skip(Some(normalizer_id)));
     }
 
     #[test]

@@ -430,29 +430,42 @@ pub async fn run_cascade(
             }
         }
 
-        // Approval gate: non-root artifacts must be `Approved` for the
-        // cascade to run skills on them. Lets the user approve a subset
-        // of newly-produced children and re-click Play (at any level)
-        // to walk only the approved subtrees. The explicit play
-        // target (`root_artifact_id`) is exempt — it's the entry point
-        // the user just clicked, so it always runs (the toolbar's
-        // `is_runnable_source` check already gated the click on
-        // Approved-or-root anyway). Skipped artifacts stay untouched
-        // visually — the existing status pill on the snapshot already
-        // surfaces "Pending" / "Rejected" without extra UI.
+        // Approval gate: non-root artifacts must be a *runnable
+        // source* (Approved or Dirty) for the cascade to run skills
+        // on them. Approved is the normal first-time decomposition
+        // path; Dirty is the re-execution path (the user edited the
+        // body and explicitly marked it dirty to request a regen
+        // that preserves existing children with revision-row
+        // appends — see the source-dirty regen branch below). Lets
+        // the user approve a subset of newly-produced children and
+        // re-click Play (at any level) to walk only the runnable
+        // subtrees. The explicit play target (`root_artifact_id`) is
+        // exempt — it's the entry point the user just clicked, so
+        // it always runs (the toolbar's `is_runnable_source` check
+        // already gated the click on Approved-or-root anyway).
+        // Skipped artifacts (Pending, Rejected, Running, Error) stay
+        // untouched visually — the existing status pill on the
+        // snapshot already surfaces them without extra UI.
+        let source_status_at_pop: Option<ArtifactStatus> =
+            read_status(persistence, art_id).await;
         if art_id != root_artifact_id {
-            let approved = matches!(
-                read_status(persistence, art_id).await,
-                Some(ArtifactStatus::Approved)
-            );
-            if !approved {
+            let runnable = source_status_at_pop
+                .map(|s| s.is_runnable_source())
+                .unwrap_or(false);
+            if !runnable {
                 tracing::debug!(
                     target: "operon::cascade",
-                    "approval gate: skipping {art_id} (not Approved)"
+                    "approval gate: skipping {art_id} (status {:?} not runnable)",
+                    source_status_at_pop
                 );
                 continue 'outer;
             }
         }
+        // Captured here so the source-dirty regen branch + the
+        // post-loop Dirty→Approved flip both see the same status
+        // snapshot (in case the artifact gets touched mid-loop).
+        let source_dirty_at_pop: bool =
+            matches!(source_status_at_pop, Some(ArtifactStatus::Dirty));
 
         let kind_str = match read_kind(persistence, art_id).await {
             Some(k) => k,
@@ -513,8 +526,17 @@ pub async fn run_cascade(
                     }
                 }
             }
-            let (any_dirty, dirty_notes) = select_dirty_regen_seed(&child_bodies);
-            if !already_produced.is_empty() && !any_dirty {
+            let (any_child_dirty, dirty_notes) = select_dirty_regen_seed(&child_bodies);
+            // Source-dirty force-regen: when the source artifact
+            // itself is Dirty (the user edited its body and clicked
+            // Mark Dirty), force the regen path even if no
+            // individual child is Dirty. The seed-skill prompts
+            // re-emit every sibling on a fan-out run, so a changed
+            // source body invalidates every existing child's
+            // subtree downstream — handled below by the
+            // mark-descendants-Dirty step.
+            let regen = any_child_dirty || source_dirty_at_pop;
+            if !already_produced.is_empty() && !regen {
                 for child_id in &already_produced {
                     queue.push_back((*child_id, level + 1));
                 }
@@ -529,62 +551,63 @@ pub async fn run_cascade(
             // Populated only on the dirty-regen branch — fresh runs
             // have nothing to preserve.
             let mut previous_outputs: Vec<(String, String)> = Vec::new();
-            if any_dirty {
-                // Wipe each dirty child's subtree — its descendants
-                // were derived from the about-to-be-regenerated body
-                // and would be stale after the rerun. Keep the dirty
-                // node itself; the runner's import dedup overwrites
-                // it in place by title. Use the already-loaded
-                // `child_bodies` so we don't re-read status from
-                // disk.
+            if regen {
+                // Preserve-and-mark regen.
+                //
+                // The seed-skill prompts re-emit every sibling on a
+                // fan-out run, so when this regen completes every
+                // existing child of `art_id` has a fresh body
+                // appended with a new revision-history row. Their
+                // existing descendants (grandchildren of `art_id`)
+                // were derived from the now-stale child bodies and
+                // are themselves stale.
+                //
+                // We do NOT delete those descendants — the user's
+                // policy is "don't destroy". Instead we flip each
+                // currently-Approved descendant's status to Dirty so
+                // the cascade's natural BFS re-runs the same
+                // preserve-and-mark step on the next level when it
+                // pops them, propagating the dirtiness wave one
+                // layer deeper per Play.
+                //
+                // Still load the project notes snapshot once so the
+                // descendants walk and the title-by-id lookup share
+                // it.
                 let project_notes_snapshot =
                     note_repo.list_for_project(project_id).unwrap_or_default();
-                // Index titles by id once so we can resolve each
-                // child's title in O(1) below.
                 let title_by_id: std::collections::HashMap<Uuid, String> =
                     project_notes_snapshot
                         .iter()
                         .map(|n| (n.id, n.title.clone()))
                         .collect();
-                // Capture every child being regenerated (Dirty AND
-                // non-Dirty siblings whose body the prompt should
-                // preserve). The seed-skill prompts re-emit every
-                // sibling on a fan-out run, so any non-dirty body
-                // whose subtree we keep would otherwise be silently
-                // replaced.
+                // Capture every existing child as a previous output
+                // so the regen prompt sees their bodies and the
+                // seed-skill convention of "append a Revision N row,
+                // tuck the prior body into a collapsed <details>"
+                // works.
                 for (child_id, body) in &child_bodies {
                     if let Some(title) = title_by_id.get(child_id) {
                         previous_outputs.push((title.clone(), body.clone()));
                     }
                 }
-                let mut wiped: usize = 0;
-                for (child_id, body) in &child_bodies {
-                    if !matches!(parse_artifact_fm(body).status, ArtifactStatus::Dirty) {
-                        continue;
-                    }
-                    for desc_id in subtree_ids(&project_notes_snapshot, *child_id) {
-                        if desc_id == *child_id {
-                            continue;
-                        }
-                        if let Err(e) = persistence.delete(&desc_id.to_string()).await {
-                            tracing::warn!(
-                                target: "operon::cascade",
-                                "dirty-regen: persistence.delete({desc_id}) failed: {e}"
-                            );
-                        }
-                        if let Err(e) = note_repo.delete(desc_id) {
-                            tracing::warn!(
-                                target: "operon::cascade",
-                                "dirty-regen: note_repo.delete({desc_id}) failed: {e}"
-                            );
-                        } else {
-                            wiped += 1;
-                        }
-                    }
-                }
+                let already_produced_set: HashSet<Uuid> =
+                    already_produced.iter().copied().collect();
+                let descendants_to_mark = compute_descendants_excluding_roots(
+                    &project_notes_snapshot,
+                    &already_produced_set,
+                );
+                let marked = mark_artifacts_dirty_if_approved(
+                    persistence,
+                    &descendants_to_mark,
+                )
+                .await;
                 tracing::info!(
                     target: "operon::cascade",
-                    "dirty-regen on {art_id} via skill {}: wiped {wiped} stale descendant(s) before rerun; captured {} prior body(ies) for revision-history preservation",
+                    "preserve-and-mark regen on {art_id} via skill {} \
+                     (source_dirty={source_dirty_at_pop}, \
+                     any_child_dirty={any_child_dirty}): marked {marked} \
+                     descendant(s) Dirty; captured {} prior body(ies) \
+                     for revision-history preservation",
                     skill.title,
                     previous_outputs.len()
                 );
@@ -812,6 +835,24 @@ pub async fn run_cascade(
                     }
                     return Err(CascadeError::SkillRun(msg));
                 }
+            }
+        }
+
+        // Post-regen status flip. If the source was Dirty when we
+        // popped it, every matching skill has now successfully
+        // re-executed (any failure would have returned via the
+        // SkillRun error branch above). The user opted into
+        // "auto-accept the regen", so flip the source back to
+        // Approved here. The regenerated children stayed Pending
+        // (subject to cascade_stop human review) or got
+        // auto-approved per the per-skill loop above — that's
+        // independent of the source's own status.
+        if source_dirty_at_pop && art_id != root_artifact_id {
+            if let Err(e) = approve_artifact(persistence, art_id).await {
+                tracing::warn!(
+                    target: "operon::cascade",
+                    "post-regen Dirty->Approved flip failed for {art_id}: {e}"
+                );
             }
         }
 
@@ -1230,6 +1271,93 @@ fn select_dirty_regen_seed(
     (any_dirty, dirty_notes)
 }
 
+/// Pure tree walk: every descendant id reachable from any of the
+/// `roots`, excluding the roots themselves. Used by the
+/// preserve-and-mark regen branch to find the grandchildren-and-
+/// below set whose `status` should be flipped Dirty when their
+/// parents get regenerated. Splitting this off the orchestrator's
+/// async I/O keeps the descendants computation unit-testable.
+pub fn compute_descendants_excluding_roots(
+    notes: &[LocalNote],
+    roots: &HashSet<Uuid>,
+) -> Vec<Uuid> {
+    let mut out: Vec<Uuid> = Vec::new();
+    let mut seen: HashSet<Uuid> = HashSet::new();
+    for &root in roots {
+        for desc in subtree_ids(notes, root) {
+            if desc == root {
+                continue;
+            }
+            // Skip ids that are themselves roots — a sibling root's
+            // own subtree owns them, and the caller wants to
+            // preserve roots in place (they're being regenerated by
+            // the skill itself).
+            if roots.contains(&desc) {
+                continue;
+            }
+            if seen.insert(desc) {
+                out.push(desc);
+            }
+        }
+    }
+    out
+}
+
+/// For each id in `descendants`, load its body, parse the
+/// frontmatter, and flip status to Dirty **iff currently Approved**.
+/// Already-Dirty / Pending / Rejected / Running / Error are left
+/// untouched — marking them Dirty would either be a no-op or wrong
+/// (the user has already taken some other state on the artifact).
+/// Returns the count of artifacts actually flipped. Failures are
+/// logged at warn and silently skipped — best-effort, never blocks
+/// the regen.
+async fn mark_artifacts_dirty_if_approved(
+    persistence: &Arc<dyn Persistence>,
+    descendants: &[Uuid],
+) -> usize {
+    let mut marked: usize = 0;
+    for &id in descendants {
+        let bytes = match persistence.load(&id.to_string()).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    target: "operon::cascade",
+                    "preserve-and-mark: load {id} failed: {e}"
+                );
+                continue;
+            }
+        };
+        let body = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    target: "operon::cascade",
+                    "preserve-and-mark: utf8 {id}: {e}"
+                );
+                continue;
+            }
+        };
+        let mut fm = parse_artifact_fm(&body);
+        if fm.status != ArtifactStatus::Approved {
+            continue;
+        }
+        fm.status = ArtifactStatus::Dirty;
+        let new_body = rewrite_artifact_fm(&body, &fm);
+        if let Err(e) = persistence
+            .save(&id.to_string(), new_body.as_bytes())
+            .await
+        {
+            tracing::warn!(
+                target: "operon::cascade",
+                "preserve-and-mark: save {id} failed: {e}"
+            );
+            continue;
+        }
+        marked += 1;
+    }
+    marked
+}
+
 /// All note ids reachable from `seed_id` via the `parent_id` chain
 /// (the seed itself plus every descendant). Used to scope dep
 /// scanning to the current cascade's tree.
@@ -1531,6 +1659,126 @@ mod tests {
         let ids = subtree_ids(&notes, seed);
         assert_eq!(ids.len(), 1);
         assert!(ids.contains(&seed));
+    }
+
+    #[test]
+    fn descendants_excluding_roots_returns_only_grandchildren_and_below() {
+        // Epic (root) → Feature × 2 → Story × 2-each. With both
+        // Features as the regen-target roots, descendants should
+        // be the 4 Stories (and any deeper nodes) — Features
+        // themselves are excluded.
+        let epic = Uuid::from_bytes([1; 16]);
+        let feat_a = Uuid::from_bytes([2; 16]);
+        let feat_b = Uuid::from_bytes([3; 16]);
+        let story_a1 = Uuid::from_bytes([4; 16]);
+        let story_a2 = Uuid::from_bytes([5; 16]);
+        let story_b1 = Uuid::from_bytes([6; 16]);
+        let story_b2 = Uuid::from_bytes([7; 16]);
+        let task_a1a = Uuid::from_bytes([8; 16]);
+        let notes = vec![
+            note(epic, None, "Epic"),
+            note(feat_a, Some(epic), "Feature A"),
+            note(feat_b, Some(epic), "Feature B"),
+            note(story_a1, Some(feat_a), "Story A1"),
+            note(story_a2, Some(feat_a), "Story A2"),
+            note(story_b1, Some(feat_b), "Story B1"),
+            note(story_b2, Some(feat_b), "Story B2"),
+            note(task_a1a, Some(story_a1), "Task A1a"),
+        ];
+        let roots: HashSet<Uuid> =
+            [feat_a, feat_b].into_iter().collect();
+        let descendants = compute_descendants_excluding_roots(&notes, &roots);
+        let descendants_set: HashSet<Uuid> = descendants.iter().copied().collect();
+        // 4 Stories + 1 Task — 5 total descendants.
+        assert_eq!(descendants_set.len(), 5);
+        assert!(descendants_set.contains(&story_a1));
+        assert!(descendants_set.contains(&story_a2));
+        assert!(descendants_set.contains(&story_b1));
+        assert!(descendants_set.contains(&story_b2));
+        assert!(descendants_set.contains(&task_a1a));
+        // Roots themselves are excluded.
+        assert!(!descendants_set.contains(&feat_a));
+        assert!(!descendants_set.contains(&feat_b));
+        // Epic (parent of roots) is also excluded.
+        assert!(!descendants_set.contains(&epic));
+    }
+
+    #[test]
+    fn descendants_excluding_roots_drops_sibling_root_overlap() {
+        // If Feature B is somehow nested under Feature A's subtree
+        // (pathological but the helper should handle it),
+        // marking Feature B as a root should still exclude it
+        // from Feature A's descendants list.
+        let feat_a = Uuid::from_bytes([1; 16]);
+        let feat_b = Uuid::from_bytes([2; 16]);
+        let story = Uuid::from_bytes([3; 16]);
+        let notes = vec![
+            note(feat_a, None, "Feature A"),
+            note(feat_b, Some(feat_a), "Feature B (nested)"),
+            note(story, Some(feat_b), "Story"),
+        ];
+        let roots: HashSet<Uuid> =
+            [feat_a, feat_b].into_iter().collect();
+        let descendants = compute_descendants_excluding_roots(&notes, &roots);
+        let descendants_set: HashSet<Uuid> = descendants.iter().copied().collect();
+        // Only Story is a descendant; both Features are roots.
+        assert_eq!(descendants_set, [story].into_iter().collect());
+    }
+
+    #[test]
+    fn descendants_excluding_roots_empty_roots_yields_empty() {
+        let only = Uuid::from_bytes([1; 16]);
+        let notes = vec![note(only, None, "Only")];
+        let roots: HashSet<Uuid> = HashSet::new();
+        let descendants = compute_descendants_excluding_roots(&notes, &roots);
+        assert!(descendants.is_empty());
+    }
+
+    #[test]
+    fn descendants_excluding_roots_handles_leaf_roots() {
+        // Roots that have no children should contribute zero
+        // descendants, not error.
+        let leaf_a = Uuid::from_bytes([1; 16]);
+        let leaf_b = Uuid::from_bytes([2; 16]);
+        let notes = vec![
+            note(leaf_a, None, "Leaf A"),
+            note(leaf_b, None, "Leaf B"),
+        ];
+        let roots: HashSet<Uuid> =
+            [leaf_a, leaf_b].into_iter().collect();
+        let descendants = compute_descendants_excluding_roots(&notes, &roots);
+        assert!(descendants.is_empty());
+    }
+
+    #[test]
+    fn descendants_excluding_roots_dedupes_overlapping_subtrees() {
+        // If two roots' subtrees overlap (a deep node is reachable
+        // from both), the result should list that node only once.
+        let root_a = Uuid::from_bytes([1; 16]);
+        let root_b = Uuid::from_bytes([2; 16]);
+        let shared_parent = Uuid::from_bytes([3; 16]);
+        let shared_child = Uuid::from_bytes([4; 16]);
+        // Both roots point at `shared_parent` via different
+        // intermediate paths — synthetic, but makes the dedup
+        // assertion concrete.
+        let notes = vec![
+            note(root_a, None, "Root A"),
+            note(root_b, None, "Root B"),
+            // shared_parent's parent is root_a.
+            note(shared_parent, Some(root_a), "Shared Parent"),
+            note(shared_child, Some(shared_parent), "Shared Child"),
+        ];
+        // Both roots include root_a's subtree because we walk from
+        // each root independently. Even with only root_a in the
+        // set, dedup matters when the walker hits the same id via
+        // two paths within one subtree (it doesn't here, but we
+        // still verify the output is duplicate-free).
+        let roots: HashSet<Uuid> = [root_a].into_iter().collect();
+        let descendants = compute_descendants_excluding_roots(&notes, &roots);
+        let mut sorted = descendants.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), descendants.len(), "no duplicates");
     }
 
     /// Build a minimal artifact body with the given status + optional

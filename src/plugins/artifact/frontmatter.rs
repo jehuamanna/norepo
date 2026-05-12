@@ -179,6 +179,22 @@ impl ArtifactStatus {
             _ => Self::Pending,
         }
     }
+
+    /// `true` when the cascade orchestrator (and the runner's
+    /// pipeline gate) should let this artifact serve as a *source*
+    /// for a downstream skill run. `Approved` artifacts execute
+    /// downstream skills the normal "first time" way; `Dirty`
+    /// artifacts trigger a re-execution that preserves the existing
+    /// children in place (revision-history append) and marks their
+    /// existing descendants Dirty so the wave propagates downward
+    /// on the next BFS pop. Everything else (Pending, Rejected,
+    /// Running, Error) blocks downstream execution: the user hasn't
+    /// approved the source body yet, or it's mid-flight, or it
+    /// failed. Shared by `cascade.rs` and `runner.rs` so both gates
+    /// agree on the rule.
+    pub fn is_runnable_source(&self) -> bool {
+        matches!(self, Self::Approved | Self::Dirty)
+    }
 }
 
 impl Default for ArtifactStatus {
@@ -431,6 +447,24 @@ pub fn rewrite(body: &str, next: &ArtifactFrontmatter) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_runnable_source_accepts_approved_and_dirty() {
+        // The cascade's approval gate + the runner's pipeline gate
+        // both consult this. Approved is the normal first-time
+        // execution path; Dirty triggers the preserve-and-mark
+        // regen path. Anything else blocks downstream execution.
+        assert!(ArtifactStatus::Approved.is_runnable_source());
+        assert!(ArtifactStatus::Dirty.is_runnable_source());
+    }
+
+    #[test]
+    fn is_runnable_source_blocks_pending_rejected_running_error() {
+        assert!(!ArtifactStatus::Pending.is_runnable_source());
+        assert!(!ArtifactStatus::Rejected.is_runnable_source());
+        assert!(!ArtifactStatus::Running.is_runnable_source());
+        assert!(!ArtifactStatus::Error.is_runnable_source());
+    }
 
     #[test]
     fn parse_extracts_artifact_kind_and_status() {
