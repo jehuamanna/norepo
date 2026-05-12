@@ -2483,15 +2483,42 @@ pub fn spawn_cascade(
         match result {
             Ok(crate::plugins::artifact::cascade::CascadeOutcome::Completed {
                 artifacts_produced,
+                errors,
             }) => {
-                crate::shell::companion_state::CASCADE_STATE.with_mut(|m| {
-                    m.insert(
-                        root_artifact_id,
-                        crate::shell::companion_state::CascadePhase::Completed {
-                            artifacts_produced,
-                        },
+                // Surface every level-batched error to the bottom
+                // panel's Problems tab. The cascade itself didn't
+                // bail (level-batched mode), so the user can review
+                // the failures alongside the artifacts that did
+                // succeed.
+                for err in errors {
+                    crate::problems::push_cascade_problem(
+                        Some(err.artifact_id),
+                        Some(err.skill_title),
+                        err.message,
                     );
-                });
+                }
+                // The cascade may have set CASCADE_STATE → Paused
+                // already (level-batched cascade_stop). Don't
+                // overwrite that with Completed — Paused is the
+                // user-visible state we want when there's pending
+                // human review. Otherwise mark Completed so the
+                // toolbar flips back to ▶ Play.
+                let already_paused = matches!(
+                    crate::shell::companion_state::CASCADE_STATE
+                        .read()
+                        .get(&root_artifact_id),
+                    Some(crate::shell::companion_state::CascadePhase::Paused { .. })
+                );
+                if !already_paused {
+                    crate::shell::companion_state::CASCADE_STATE.with_mut(|m| {
+                        m.insert(
+                            root_artifact_id,
+                            crate::shell::companion_state::CascadePhase::Completed {
+                                artifacts_produced,
+                            },
+                        );
+                    });
+                }
             }
             Ok(crate::plugins::artifact::cascade::CascadeOutcome::Cancelled { .. }) => {
                 crate::shell::companion_state::CASCADE_STATE.with_mut(|m| {
@@ -2502,12 +2529,19 @@ pub fn spawn_cascade(
                 });
             }
             Err(e) => {
+                let reason = format!("{e}");
+                // Mirror the failure into Problems so the user can
+                // see it in the bottom panel even if they're not
+                // looking at the artifact view.
+                crate::problems::push_cascade_problem(
+                    Some(root_artifact_id),
+                    None,
+                    reason.clone(),
+                );
                 crate::shell::companion_state::CASCADE_STATE.with_mut(|m| {
                     m.insert(
                         root_artifact_id,
-                        crate::shell::companion_state::CascadePhase::Failed {
-                            reason: format!("{e}"),
-                        },
+                        crate::shell::companion_state::CascadePhase::Failed { reason },
                     );
                 });
             }

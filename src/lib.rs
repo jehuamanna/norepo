@@ -13,6 +13,7 @@ pub mod panel;
 pub mod persistence;
 pub mod plugin;
 pub mod plugins;
+pub mod problems;
 pub mod rbag;
 pub mod shell;
 pub mod tabs;

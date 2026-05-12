@@ -5,9 +5,11 @@
 //! [`crate::plugin::PluginSurface::PanelTabContent`] without touching `PanelStrip`.
 
 mod logs;
+mod problems;
 mod strip;
 
 pub use logs::LogsView;
+pub use problems::ProblemsView;
 pub use strip::PanelStrip;
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]

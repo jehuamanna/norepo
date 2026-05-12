@@ -2,7 +2,7 @@
 
 use dioxus::prelude::*;
 
-use super::{LogsView, PanelManager, PanelTabId};
+use super::{LogsView, PanelManager, PanelTabId, ProblemsView};
 use crate::shell::layout::LayoutState;
 
 #[component]
@@ -30,6 +30,7 @@ pub fn PanelStrip() -> Element {
 
     let body: Element = match active.0 {
         "logs" => rsx! { LogsView {} },
+        "problems" => rsx! { ProblemsView {} },
         _ => rsx! {
             div { class: "operon-panel-empty",
                 "No content yet for this tab."

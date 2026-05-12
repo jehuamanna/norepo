@@ -43,8 +43,33 @@ use crate::shell::companion_state::{CascadePhase, CASCADE_STATE};
 
 #[derive(Debug, Clone)]
 pub enum CascadeOutcome {
-    Completed { artifacts_produced: usize },
-    Cancelled { artifacts_produced: usize },
+    Completed {
+        artifacts_produced: usize,
+        /// Per-skill failures that occurred during the run but
+        /// didn't stop the cascade. Populated only when step-mode
+        /// is OFF (level-batched mode); step-mode aborts on the
+        /// first error and surfaces it via `CascadeError`. Empty
+        /// vec is the happy path.
+        errors: Vec<CascadeRunError>,
+    },
+    Cancelled {
+        artifacts_produced: usize,
+    },
+}
+
+/// One skill-firing failure captured during a level-batched cascade
+/// run. Surfaced to the bottom-panel Problems tab via the
+/// view.rs::spawn_cascade result handler.
+#[derive(Debug, Clone)]
+pub struct CascadeRunError {
+    /// The artifact the failing skill was running on.
+    pub artifact_id: Uuid,
+    /// Skill title (e.g. "04-decompose-stories"), for the Problems
+    /// label.
+    pub skill_title: String,
+    /// Formatted error message, same string today's CascadeError
+    /// would carry.
+    pub message: String,
 }
 
 #[derive(Debug)]
@@ -296,6 +321,33 @@ pub async fn run_cascade(
     // all become `done`, the artifact is re-enqueued.
     let mut deferred: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
 
+    // Level-batching state. When step-mode is OFF, `cascade_stop`
+    // signals don't pause the cascade immediately — they're recorded
+    // here and flushed only when the BFS transitions to a deeper
+    // level (or runs out of work). This lets every artifact at the
+    // current depth produce its children before the user sees the
+    // pause prompt, instead of pausing once per artifact.
+    //
+    // `current_level` is the level of the most-recently-popped
+    // artifact; the queue starts at level 0 (root), so the first
+    // pop also sets this to 0 (no transition fires).
+    //
+    // `pending_pause` records the FIRST `cascade_stop` tuple at the
+    // current level — when the level ends we surface that one
+    // (subsequent stops in the same level keep the original pointer
+    // so the user lands on a consistent artifact).
+    //
+    // `level_errors` accumulates per-skill failures at the current
+    // level. Pushed into the bottom-panel Problems tab when the
+    // level ends; doesn't block the cascade when step-mode is OFF.
+    //
+    // Step-mode ON keeps today's behavior (pause / return on every
+    // hit). The branches that consult these fields are gated by the
+    // step-mode read at each callsite.
+    let mut current_level: u32 = 0;
+    let mut pending_pause: Option<(Uuid, Uuid, u32)> = None;
+    let mut level_errors: Vec<CascadeRunError> = Vec::new();
+
     'outer: loop {
         if cancel.is_cancelled() {
             return Ok(CascadeOutcome::Cancelled {
@@ -335,6 +387,45 @@ pub async fn run_cascade(
                 )));
             }
         };
+
+        // Level-transition flush. If we just popped an item at a
+        // deeper BFS level than the previous one, every artifact at
+        // the prior level has been processed. If a `cascade_stop`
+        // fired during that prior level (level-batched mode only —
+        // step-mode returns immediately at each stop), surface the
+        // pause now before doing any work at the new level. Errors
+        // accumulated at the prior level ride along regardless of
+        // pause state — they always surface to Problems via the
+        // returned `errors` vec.
+        if level > current_level {
+            if let Some((art, skill, lvl)) = pending_pause.take() {
+                CASCADE_STATE.with_mut(|m| {
+                    m.insert(
+                        root_artifact_id,
+                        CascadePhase::Paused {
+                            artifact_id: art,
+                            skill_id: skill,
+                            level: lvl,
+                        },
+                    );
+                });
+                if let Some(writer) = graph_writer.as_deref_mut() {
+                    writer.finalize_depends_on(&titles);
+                    writer.finalize_cross_tree_deps(&titles);
+                    if let Err(e) = writer.flush(persistence).await {
+                        tracing::warn!(
+                            target: "operon::cascade",
+                            "graph paused-flush failed: {e}"
+                        );
+                    }
+                }
+                return Ok(CascadeOutcome::Completed {
+                    artifacts_produced: produced,
+                    errors: std::mem::take(&mut level_errors),
+                });
+            }
+            current_level = level;
+        }
 
         // Dep gate: before processing this artifact, check that every
         // declared dep (artifact body's `## Depends on` ∪ cross-tree
@@ -710,6 +801,24 @@ pub async fn run_cascade(
                 .await
             };
 
+            // Read step-mode once per skill firing — needed by both
+            // the success arm (for the checkpoint_hit decision) and
+            // the error arm (to decide between immediate-bail vs
+            // accumulate-into-level_errors). Cheap; the workflow
+            // graph state is already in memory.
+            //
+            // Step-mode (read off the cascade workflow note's
+            // view_state) makes every skill that produced artifacts
+            // become a checkpoint, so the user can review each
+            // stage independently before continuing. When OFF, the
+            // cascade batches per-level instead (see the level-
+            // transition flush at the top of the loop). Defaults
+            // off when there's no graph writer or the user hasn't
+            // enabled it.
+            let step_mode_on = graph_writer
+                .as_deref()
+                .map(|w| crate::plugins::workflow::state::effective_step_mode(&w.graph))
+                .unwrap_or(false);
             match outcome {
                 Ok(o) => {
                     // Resolve titles + bodies once per child for the
@@ -723,20 +832,9 @@ pub async fn run_cascade(
                     // Pending, the cascade does not enqueue them, and
                     // the run ends with a Paused phase so the UI can
                     // surface "review the new backlog and approve to
-                    // continue".
-                    //
-                    // Step mode (read off the cascade workflow note's
-                    // view_state) widens this: every skill that
-                    // produced artifacts becomes a checkpoint, so the
-                    // user can review each stage independently before
-                    // continuing. Defaults off when there's no graph
-                    // writer or the user hasn't enabled it.
-                    let step_mode_on = graph_writer
-                        .as_deref()
-                        .map(|w| {
-                            crate::plugins::workflow::state::effective_step_mode(&w.graph)
-                        })
-                        .unwrap_or(false);
+                    // continue". (See the checkpoint_hit handling
+                    // further down for the step-mode vs level-
+                    // batched split.)
                     let checkpoint_hit = (skill.contract.cascade_stop || step_mode_on)
                         && !o.created_artifact_ids.is_empty();
                     for child_id in &o.created_artifact_ids {
@@ -783,43 +881,69 @@ pub async fn run_cascade(
                         }
                     }
                     if checkpoint_hit {
-                        // Surface a Paused phase so the view can
-                        // print the "review and approve" status line.
-                        // We deliberately do NOT enqueue produced
-                        // children — the cascade stops here until
-                        // the user approves and re-runs.
-                        CASCADE_STATE.with_mut(|m| {
-                            m.insert(
-                                root_artifact_id,
-                                CascadePhase::Paused {
-                                    artifact_id: o
-                                        .created_artifact_ids
-                                        .first()
-                                        .copied()
-                                        .unwrap_or(art_id),
-                                    skill_id: skill.id,
-                                    level,
-                                },
-                            );
-                        });
-                        // Final flush of any in-flight graph state
-                        // before bailing — keeps the canvas honest.
-                        if let Some(writer) = graph_writer.as_deref_mut() {
-                            writer.finalize_depends_on(&titles);
-                            writer.finalize_cross_tree_deps(&titles);
-                            if let Err(e) = writer.flush(persistence).await {
-                                tracing::warn!(
-                                    target: "operon::cascade",
-                                    "graph paused-flush failed: {e}"
+                        let pause_target_id = o
+                            .created_artifact_ids
+                            .first()
+                            .copied()
+                            .unwrap_or(art_id);
+                        if step_mode_on {
+                            // Step-mode: pause immediately so the
+                            // user can review every skill firing
+                            // before downstream work. Today's
+                            // behavior, preserved verbatim. We
+                            // deliberately do NOT enqueue produced
+                            // children — the cascade stops here
+                            // until the user approves and re-runs.
+                            CASCADE_STATE.with_mut(|m| {
+                                m.insert(
+                                    root_artifact_id,
+                                    CascadePhase::Paused {
+                                        artifact_id: pause_target_id,
+                                        skill_id: skill.id,
+                                        level,
+                                    },
                                 );
+                            });
+                            // Final flush of any in-flight graph
+                            // state before bailing — keeps the
+                            // canvas honest.
+                            if let Some(writer) = graph_writer.as_deref_mut() {
+                                writer.finalize_depends_on(&titles);
+                                writer.finalize_cross_tree_deps(&titles);
+                                if let Err(e) = writer.flush(persistence).await {
+                                    tracing::warn!(
+                                        target: "operon::cascade",
+                                        "graph paused-flush failed: {e}"
+                                    );
+                                }
                             }
+                            return Ok(CascadeOutcome::Completed {
+                                artifacts_produced: produced,
+                                errors: std::mem::take(&mut level_errors),
+                            });
                         }
-                        return Ok(CascadeOutcome::Completed {
-                            artifacts_produced: produced,
-                        });
-                    }
-                    for child_id in o.created_artifact_ids {
-                        queue.push_back((child_id, level + 1));
+                        // Level-batched mode (step-mode OFF): defer
+                        // the pause to the level transition. Record
+                        // the FIRST cascade_stop tuple in this level
+                        // so the user lands on a consistent
+                        // artifact when the level ends. Subsequent
+                        // hits in the same level keep the original
+                        // pointer. Children are NOT enqueued —
+                        // cascade_stop's "needs human review before
+                        // downstream" semantic stays intact; we
+                        // just batch the pauses across siblings.
+                        if pending_pause.is_none() {
+                            pending_pause =
+                                Some((pause_target_id, skill.id, level));
+                        }
+                        // Continue to the next matching skill / next
+                        // queued artifact. The level-transition
+                        // flush at the top of the loop will surface
+                        // the pause when we move to a deeper level.
+                    } else {
+                        for child_id in o.created_artifact_ids {
+                            queue.push_back((child_id, level + 1));
+                        }
                     }
                 }
                 Err(e) => {
@@ -833,7 +957,27 @@ pub async fn run_cascade(
                             );
                         }
                     }
-                    return Err(CascadeError::SkillRun(msg));
+                    if step_mode_on {
+                        // Step-mode: bail on the first error so the
+                        // user can fix and re-Play. Today's
+                        // behavior, preserved verbatim.
+                        return Err(CascadeError::SkillRun(msg));
+                    }
+                    // Level-batched mode (step-mode OFF): record
+                    // the failure, surface it via the Problems
+                    // panel at level-end, but keep processing the
+                    // rest of the level. Skip enqueuing any
+                    // children for this failed skill (the runner
+                    // didn't produce a valid output anyway).
+                    level_errors.push(CascadeRunError {
+                        artifact_id: art_id,
+                        skill_title: skill.title.clone(),
+                        message: msg,
+                    });
+                    // Continue to the next matching skill / next
+                    // queued artifact. The level-transition flush
+                    // surfaces accumulated errors when the level
+                    // ends.
                 }
             }
         }
@@ -893,8 +1037,29 @@ pub async fn run_cascade(
         }
     }
 
+    // Final pause-or-completed decision. The level-transition flush
+    // at the top of the loop catches `pending_pause` whenever the
+    // BFS moves to a deeper level, but if the cascade's last work
+    // was a `cascade_stop` at the deepest level (no further pops),
+    // the queue exhausts naturally and we land here with
+    // `pending_pause` still set. Surface the Paused phase so the
+    // UI's "review and approve" prompt fires.
+    if let Some((art, skill, lvl)) = pending_pause {
+        CASCADE_STATE.with_mut(|m| {
+            m.insert(
+                root_artifact_id,
+                CascadePhase::Paused {
+                    artifact_id: art,
+                    skill_id: skill,
+                    level: lvl,
+                },
+            );
+        });
+    }
+
     Ok(CascadeOutcome::Completed {
         artifacts_produced: produced,
+        errors: level_errors,
     })
 }
 
