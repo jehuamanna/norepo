@@ -960,7 +960,9 @@ async fn import_normalizer_rewrite(
     let existing_fm = crate::plugins::artifact::frontmatter::parse(&existing_body);
     // Build the final frontmatter: kind from contract (== input kind
     // == output kind), parent linkage from existing source, producer
-    // pointer from the normalizer skill that just ran. Status from
+    // pointer resolved against the existing source (preserve a real
+    // upstream producer when present — see
+    // `resolve_normalizer_source_skill_id` for why), status from
     // skill gate so an auto-gate normalizer leaves the artifact
     // ready to feed downstream, and an approval-gate one parks it
     // Pending for a human review pass.
@@ -972,7 +974,14 @@ async fn import_normalizer_rewrite(
             .map(ArtifactKind::parse);
     }
     fm.source_artifact_id = existing_fm.source_artifact_id;
-    fm.source_skill_id = Some(skill_note_id);
+    let resolved_source_skill_id = resolve_normalizer_source_skill_id(
+        persistence,
+        existing_fm.source_skill_id,
+        skill_note_id,
+        contract.input_kind.as_deref(),
+    )
+    .await;
+    fm.source_skill_id = Some(resolved_source_skill_id);
     fm.status = match contract.gate {
         crate::plugins::skill::frontmatter::SkillGate::Auto => {
             ArtifactStatus::Approved
@@ -996,6 +1005,106 @@ async fn import_normalizer_rewrite(
     // `scan_produced_files` doesn't import it again on a later run.
     let _ = std::fs::remove_file(first);
     vec![source_note_id]
+}
+
+/// Decide which `source_skill_id` to stamp on an artifact a normalizer
+/// just rewrote. Loads the prior pointer's skill contract from
+/// persistence and delegates the actual decision to the pure
+/// `decide_normalizer_source_skill_id` so the rule stays
+/// unit-testable. Falls back to "stamp this normalizer" on any I/O
+/// or parse failure — the conservative default keeps the original
+/// behaviour for hand-authored artifacts that have no prior
+/// producer.
+async fn resolve_normalizer_source_skill_id(
+    persistence: &Arc<dyn Persistence>,
+    existing_source_skill_id: Option<Uuid>,
+    this_normalizer_id: Uuid,
+    this_normalizer_input_kind: Option<&str>,
+) -> Uuid {
+    let Some(prior) = existing_source_skill_id else {
+        return this_normalizer_id;
+    };
+    if prior == this_normalizer_id {
+        return this_normalizer_id;
+    }
+    let producer_contract = load_skill_contract(persistence, prior).await;
+    decide_normalizer_source_skill_id(
+        existing_source_skill_id,
+        this_normalizer_id,
+        producer_contract.as_ref(),
+        this_normalizer_input_kind,
+    )
+}
+
+/// Pure decision: given the artifact's prior `source_skill_id`, this
+/// normalizer's id, the prior producer's contract (if loadable), and
+/// this normalizer's `input_kind`, return the id to stamp.
+///
+/// Preserves the prior pointer when it resolves to a real upstream
+/// producer (a non-normalizer skill whose `output_kind` matches this
+/// normalizer's `input_kind`). Otherwise stamps this normalizer.
+///
+/// Why preserve: the cascade pipes a freshly-produced artifact
+/// straight into its sibling normalizer (e.g. an Epic from
+/// `02-discover-epics` into `02n-normalize-epics`). If the
+/// normalizer overwrites `source_skill_id` to its own id, the next
+/// cascade pass calls `existing_children_with_skill(parent, 02)` and
+/// fails to recognize the artifact as already produced by `02` —
+/// the parent's skip-already-produced gate then orphans the
+/// artifact from cascade traversal, and once every sibling has been
+/// orphaned the gate falls through and re-fires `02`, regenerating
+/// duplicates.
+fn decide_normalizer_source_skill_id(
+    existing_source_skill_id: Option<Uuid>,
+    this_normalizer_id: Uuid,
+    producer_contract: Option<&crate::plugins::skill::frontmatter::SkillContract>,
+    this_normalizer_input_kind: Option<&str>,
+) -> Uuid {
+    let Some(prior) = existing_source_skill_id else {
+        return this_normalizer_id;
+    };
+    if prior == this_normalizer_id {
+        return this_normalizer_id;
+    }
+    let Some(producer) = producer_contract else {
+        return this_normalizer_id;
+    };
+    // Reject prior pointers that are themselves normalizers
+    // (input_kind == output_kind). We only want to preserve real
+    // upstream producers — a chain of normalizers all sharing the
+    // same kind has no "true" producer to keep, so just stamp this
+    // normalizer.
+    if producer
+        .input_kind
+        .as_deref()
+        .zip(producer.output_kind.as_deref())
+        .map(|(i, o)| i == o)
+        .unwrap_or(false)
+    {
+        return this_normalizer_id;
+    }
+    let Some(this_input) = this_normalizer_input_kind else {
+        return this_normalizer_id;
+    };
+    if matches!(producer.output_kind.as_deref(), Some(k) if k == this_input) {
+        prior
+    } else {
+        this_normalizer_id
+    }
+}
+
+/// Load a skill note's parsed contract from persistence. Returns
+/// `None` on any I/O / utf8 / frontmatter-split failure so callers
+/// can degrade gracefully rather than panic.
+async fn load_skill_contract(
+    persistence: &Arc<dyn Persistence>,
+    skill_id: Uuid,
+) -> Option<crate::plugins::skill::frontmatter::SkillContract> {
+    let bytes = persistence.load(&skill_id.to_string()).await.ok()?;
+    let body = String::from_utf8(bytes).ok()?;
+    let (lines, _) = crate::plugins::skill::frontmatter::split(&body);
+    let lines = lines?;
+    Some(crate::plugins::skill::frontmatter::contract(&lines))
 }
 
 /// Clear the `revision_notes` field on an artifact whose body we
@@ -1555,5 +1664,109 @@ mod tests {
     fn is_normalizer_contract_rejects_missing_kinds() {
         let c = crate::plugins::skill::frontmatter::SkillContract::default();
         assert!(!is_normalizer_contract(&c));
+    }
+
+    fn make_producer_contract(input: &str, output: &str) -> crate::plugins::skill::frontmatter::SkillContract {
+        let mut c = crate::plugins::skill::frontmatter::SkillContract::default();
+        c.input_kind = Some(input.into());
+        c.output_kind = Some(output.into());
+        c
+    }
+
+    #[test]
+    fn normalizer_source_skill_preserves_real_upstream_producer() {
+        // 02 (master_requirement → epic) produced this artifact;
+        // 02n (epic → epic) is now rewriting it. Preserve 02 so the
+        // parent's skip-already-produced gate keeps recognising the
+        // artifact as a child of 02.
+        let producer_id = Uuid::new_v4();
+        let normalizer_id = Uuid::new_v4();
+        let producer = make_producer_contract("master_requirement", "epic");
+        let resolved = decide_normalizer_source_skill_id(
+            Some(producer_id),
+            normalizer_id,
+            Some(&producer),
+            Some("epic"),
+        );
+        assert_eq!(resolved, producer_id);
+    }
+
+    #[test]
+    fn normalizer_source_skill_stamps_self_when_no_prior_producer() {
+        // Hand-authored artifact with no source_skill_id — the
+        // normalizer is the only producer pointer we can offer, so
+        // stamp it.
+        let normalizer_id = Uuid::new_v4();
+        let resolved = decide_normalizer_source_skill_id(
+            None,
+            normalizer_id,
+            None,
+            Some("epic"),
+        );
+        assert_eq!(resolved, normalizer_id);
+    }
+
+    #[test]
+    fn normalizer_source_skill_idempotent_on_self() {
+        // Re-running the same normalizer on its own output: the prior
+        // pointer already points at us. Stamp ourselves (a no-op
+        // semantically).
+        let normalizer_id = Uuid::new_v4();
+        let resolved = decide_normalizer_source_skill_id(
+            Some(normalizer_id),
+            normalizer_id,
+            None,
+            Some("epic"),
+        );
+        assert_eq!(resolved, normalizer_id);
+    }
+
+    #[test]
+    fn normalizer_source_skill_stamps_self_when_producer_is_normalizer() {
+        // The prior pointer is itself a normalizer (input == output).
+        // No real producer to preserve, so stamp this normalizer.
+        let prior_normalizer_id = Uuid::new_v4();
+        let this_normalizer_id = Uuid::new_v4();
+        let prior = make_producer_contract("epic", "epic");
+        let resolved = decide_normalizer_source_skill_id(
+            Some(prior_normalizer_id),
+            this_normalizer_id,
+            Some(&prior),
+            Some("epic"),
+        );
+        assert_eq!(resolved, this_normalizer_id);
+    }
+
+    #[test]
+    fn normalizer_source_skill_stamps_self_when_producer_kind_misaligned() {
+        // Prior pointer's output_kind doesn't match this normalizer's
+        // input_kind (e.g. an artifact that was copied across kinds).
+        // Stamp this normalizer rather than preserve a stale link.
+        let producer_id = Uuid::new_v4();
+        let normalizer_id = Uuid::new_v4();
+        let producer = make_producer_contract("master_requirement", "feature");
+        let resolved = decide_normalizer_source_skill_id(
+            Some(producer_id),
+            normalizer_id,
+            Some(&producer),
+            Some("epic"),
+        );
+        assert_eq!(resolved, normalizer_id);
+    }
+
+    #[test]
+    fn normalizer_source_skill_stamps_self_when_producer_unloadable() {
+        // Producer skill couldn't be loaded (deleted, IO error, etc.).
+        // Degrade to "stamp this normalizer" rather than preserve a
+        // dangling pointer.
+        let producer_id = Uuid::new_v4();
+        let normalizer_id = Uuid::new_v4();
+        let resolved = decide_normalizer_source_skill_id(
+            Some(producer_id),
+            normalizer_id,
+            None,
+            Some("epic"),
+        );
+        assert_eq!(resolved, normalizer_id);
     }
 }
