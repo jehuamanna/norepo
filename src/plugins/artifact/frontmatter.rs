@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! ---
-//! artifact_kind: epic           # epic | feature | story | task | plan | test_cases | summary | requirements
+//! artifact_kind: epic           # epic | feature | story | task | plan | implementation_plan | implementation | test_cases | summary | requirements
 //! status: pending               # pending | approved | rejected | dirty | running | error
 //! source_artifact_id: <uuid>    # the artifact this was derived from (root artifacts have None)
 //! source_skill_id: <uuid>       # the skill that produced this
@@ -51,6 +51,12 @@ pub enum ArtifactKind {
     Story,
     Task,
     Plan,
+    /// SDE plan-only artifact produced by `07a-sde-plan-task`. Captures
+    /// the implementation approach (files to touch, design notes, test
+    /// cues) without any code edits or commit. The Play button on this
+    /// kind drives the actual code work via `07b-sde-execute-implementation`,
+    /// which produces the downstream `Implementation` artifact.
+    ImplementationPlan,
     Implementation,
     TestCases,
     TestResults,
@@ -89,6 +95,7 @@ impl ArtifactKind {
             Self::Story => "story",
             Self::Task => "task",
             Self::Plan => "plan",
+            Self::ImplementationPlan => "implementation_plan",
             Self::Implementation => "implementation",
             Self::TestCases => "test_cases",
             Self::TestResults => "test_results",
@@ -110,6 +117,7 @@ impl ArtifactKind {
             "story" => Self::Story,
             "task" => Self::Task,
             "plan" => Self::Plan,
+            "implementation_plan" => Self::ImplementationPlan,
             "implementation" => Self::Implementation,
             "test_cases" => Self::TestCases,
             "test_results" => Self::TestResults,
@@ -131,6 +139,7 @@ impl ArtifactKind {
             Self::Story => "Story".into(),
             Self::Task => "Task".into(),
             Self::Plan => "Plan".into(),
+            Self::ImplementationPlan => "Implementation Plan".into(),
             Self::Implementation => "Implementation".into(),
             Self::TestCases => "Test Cases".into(),
             Self::TestResults => "Test Results".into(),
@@ -493,6 +502,22 @@ mod tests {
         assert_eq!(
             ArtifactKind::Implementation.display_name(),
             "Implementation"
+        );
+    }
+
+    #[test]
+    fn parse_extracts_implementation_plan_kind() {
+        let body =
+            "---\nartifact_kind: implementation_plan\nstatus: pending\n---\nbody";
+        let fm = parse(body);
+        assert_eq!(fm.artifact_kind, Some(ArtifactKind::ImplementationPlan));
+        assert_eq!(
+            ArtifactKind::ImplementationPlan.as_str(),
+            "implementation_plan"
+        );
+        assert_eq!(
+            ArtifactKind::ImplementationPlan.display_name(),
+            "Implementation Plan"
         );
     }
 

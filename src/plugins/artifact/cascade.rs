@@ -130,6 +130,11 @@ impl SkillPhase {
             Some("master_requirement") => Self::Ba,
             Some("requirements") => Self::Ba,
             Some("task") => Self::Sde,
+            // Play rooted on a plan or executed Implementation runs
+            // the SDE tail of the chain (07b → 08 → 09). Keep them
+            // SDE-typed so BA skills can't accidentally fire.
+            Some("implementation_plan") => Self::Sde,
+            Some("implementation") => Self::Sde,
             _ => Self::Mixed,
         }
     }
@@ -152,13 +157,20 @@ fn is_ba_input_kind(kind: &str) -> bool {
 }
 
 /// `true` when a skill's `input_kind` belongs to the SDE arm
-/// (task, implementation, test_cases, bug, test_results). Test
-/// results' downstream skills (e.g. legacy `10-sum-summarize-task`)
-/// stay in the SDE arm.
+/// (task, implementation_plan, implementation, test_cases, bug,
+/// test_results). Test results' downstream skills (e.g. legacy
+/// `10-sum-summarize-task`) stay in the SDE arm. `implementation_plan`
+/// is the new plan-only artifact `07a-sde-plan-task` produces, fed
+/// into `07b-sde-execute-implementation` to do the real code work.
 fn is_sde_input_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "task" | "implementation" | "test_cases" | "test_results" | "bug"
+        "task"
+            | "implementation_plan"
+            | "implementation"
+            | "test_cases"
+            | "test_results"
+            | "bug"
     )
 }
 
@@ -182,6 +194,74 @@ pub fn empty_requirements_message() -> String {
      the new note's frontmatter. Add as many as you need, then click \
      Play again."
         .into()
+}
+
+/// Per-task SDE sub-modes. `SkillPhase::Sde` already filters skills to
+/// the SDE arm (implementation_plan / implementation / test_cases /
+/// test_results / bug); this further narrows by `output_kind` so a
+/// Play button can fire one surgical slice of the chain instead of the
+/// full Task→Plan→Implementation→TestCases→TestResults sweep.
+///
+/// Driven by the play button the user clicked and the source
+/// artifact's status. The chain is split so the user reviews each
+/// stage before the next one fires:
+///
+///   - `Full`: legacy / BA-phase / no extra filtering. Every skill the
+///     phase filter let through fires.
+///   - `TaskPlanOnly`: Task ▶ Play. Runs `07a-sde-plan-task` only
+///     (output_kind `implementation_plan`) and **stops before** any
+///     code work — the plan note is the review checkpoint.
+///   - `PlanExecuteAndTest`: ImplementationPlan ▶ Play. Runs the
+///     execute-and-test tail: `07b-sde-execute-implementation`
+///     (code edits + commit, output_kind `implementation`),
+///     `08-sde-generate-tests` (`test_cases`), and
+///     `09-sde-execute-tests` (`test_results`). Dirty plans trigger
+///     the cascade's revision-history machinery automatically.
+///   - `ImplementationRetest`: Implementation ▶ Play. Runs only `08`
+///     and `09` (test_cases + test_results), regenerating tests
+///     against the current Implementation body without re-executing
+///     code. Useful when the user edited the code in the repo and
+///     wants fresh tests + a fresh run.
+///   - `GenerateTestCasesOnly`: "Create test cases" button on a
+///     Dirty Implementation. Runs only `08` to regenerate TestCases;
+///     the user runs them manually afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    Full,
+    TaskPlanOnly,
+    PlanExecuteAndTest,
+    ImplementationRetest,
+    GenerateTestCasesOnly,
+}
+
+impl Default for RunMode {
+    fn default() -> Self {
+        Self::Full
+    }
+}
+
+/// Drop skills whose `output_kind` isn't allowed by the current
+/// [`RunMode`]. Skills with no declared `output_kind` always survive
+/// — they're utility skills the run-mode contract has no opinion on.
+/// `RunMode::Full` is the no-op identity case.
+pub fn filter_skills_for_run_mode(skills: Vec<SkillRef>, mode: RunMode) -> Vec<SkillRef> {
+    if matches!(mode, RunMode::Full) {
+        return skills;
+    }
+    let allowed: &[&str] = match mode {
+        RunMode::Full => return skills,
+        RunMode::TaskPlanOnly => &["implementation_plan"],
+        RunMode::PlanExecuteAndTest => &["implementation", "test_cases", "test_results"],
+        RunMode::ImplementationRetest => &["test_cases", "test_results"],
+        RunMode::GenerateTestCasesOnly => &["test_cases"],
+    };
+    skills
+        .into_iter()
+        .filter(|s| match s.contract.output_kind.as_deref() {
+            None => true,
+            Some(k) => allowed.iter().any(|a| *a == k),
+        })
+        .collect()
 }
 
 /// Drop skills whose `input_kind` doesn't belong to the active
@@ -234,6 +314,7 @@ pub async fn run_cascade(
     graph_writer: Option<&mut CascadeGraphWriter>,
     max_depth: Option<u32>,
     cascade_session_id: Uuid,
+    run_mode: RunMode,
 ) -> Result<CascadeOutcome, CascadeError> {
     // 0. Clarification gate. The `00-coherence-check` skill produces
     //    `clarification` artifacts when it detects cross-level
@@ -275,6 +356,14 @@ pub async fn run_cascade(
     let root_kind_str = read_kind(persistence, root_artifact_id).await;
     let phase = SkillPhase::for_root_kind(root_kind_str.as_deref());
     let skills = filter_skills_for_phase(skills, phase);
+    // 1c. Run-mode filter (per-task SDE sub-modes — Task Play stops
+    //     at the plan, Plan Play runs `07b+08+09`, Implementation Play
+    //     runs `08+09` (retest), "Create test cases" button runs `08`
+    //     only). Default `RunMode::Full` is a no-op. Layered on top of
+    //     the phase filter so a master_requirement cascade can't
+    //     accidentally fire SDE skills via a non-Full mode that slips
+    //     through.
+    let skills = filter_skills_for_run_mode(skills, run_mode);
     let by_input = group_by_input_kind(&skills);
 
     // 1b. Master-requirement readiness gate. The BA hand-authors each
@@ -1762,6 +1851,112 @@ mod tests {
         weird.contract.input_kind = None;
         let idx = group_by_input_kind(&[weird]);
         assert!(idx.is_empty());
+    }
+
+    fn sde_chain_skills() -> Vec<SkillRef> {
+        vec![
+            skill_ref(1, "07a-sde-plan-task", "task", "implementation_plan"),
+            skill_ref(
+                2,
+                "07b-sde-execute-implementation",
+                "implementation_plan",
+                "implementation",
+            ),
+            skill_ref(3, "08-sde-generate-tests", "implementation", "test_cases"),
+            skill_ref(4, "09-sde-execute-tests", "test_cases", "test_results"),
+            // 10-sde-fix-bug — legacy, output also `implementation`
+            skill_ref(5, "10-sde-fix-bug", "bug", "implementation"),
+        ]
+    }
+
+    fn output_kinds(skills: &[SkillRef]) -> Vec<&str> {
+        skills
+            .iter()
+            .map(|s| s.contract.output_kind.as_deref().unwrap_or(""))
+            .collect()
+    }
+
+    #[test]
+    fn run_mode_full_is_identity() {
+        let skills = sde_chain_skills();
+        let filtered = filter_skills_for_run_mode(skills.clone(), RunMode::Full);
+        assert_eq!(filtered.len(), skills.len());
+    }
+
+    #[test]
+    fn task_plan_only_keeps_07a_and_drops_07b_08_09() {
+        let filtered = filter_skills_for_run_mode(
+            sde_chain_skills(),
+            RunMode::TaskPlanOnly,
+        );
+        let out = output_kinds(&filtered);
+        // Only the plan producer survives. The executor (07b →
+        // `implementation`), test-case generator (08), and test
+        // executor (09) are all dropped — Task Play stops at the
+        // plan note so the user can review before code work runs.
+        assert!(out.contains(&"implementation_plan"));
+        assert!(!out.contains(&"implementation"));
+        assert!(!out.contains(&"test_cases"));
+        assert!(!out.contains(&"test_results"));
+    }
+
+    #[test]
+    fn plan_execute_and_test_keeps_07b_08_09_drops_07a() {
+        let filtered = filter_skills_for_run_mode(
+            sde_chain_skills(),
+            RunMode::PlanExecuteAndTest,
+        );
+        let out = output_kinds(&filtered);
+        // The execute tail runs: 07b (`implementation`), 08
+        // (`test_cases`), 09 (`test_results`). The plan producer
+        // (07a → `implementation_plan`) is dropped — the plan
+        // already exists; this mode runs against it.
+        assert!(out.contains(&"implementation"));
+        assert!(out.contains(&"test_cases"));
+        assert!(out.contains(&"test_results"));
+        assert!(!out.contains(&"implementation_plan"));
+    }
+
+    #[test]
+    fn implementation_retest_keeps_08_09_drops_07a_07b() {
+        let filtered = filter_skills_for_run_mode(
+            sde_chain_skills(),
+            RunMode::ImplementationRetest,
+        );
+        let out = output_kinds(&filtered);
+        // Retest mode regenerates tests against an existing
+        // Implementation and runs them — 08 + 09 only. Both 07a
+        // (`implementation_plan`) and 07b (`implementation`) are
+        // dropped so the code work isn't repeated.
+        assert!(out.contains(&"test_cases"));
+        assert!(out.contains(&"test_results"));
+        assert!(!out.contains(&"implementation_plan"));
+        assert!(!out.contains(&"implementation"));
+    }
+
+    #[test]
+    fn generate_test_cases_only_keeps_08() {
+        let filtered = filter_skills_for_run_mode(
+            sde_chain_skills(),
+            RunMode::GenerateTestCasesOnly,
+        );
+        let out = output_kinds(&filtered);
+        assert_eq!(out, vec!["test_cases"]);
+    }
+
+    #[test]
+    fn run_mode_filter_preserves_skills_with_no_output_kind() {
+        // Utility skills (no declared output_kind) should never be
+        // filtered out — the run-mode contract has no opinion on
+        // them. Tested with the most restrictive mode.
+        let mut util = skill_ref(99, "utility", "ignored", "ignored");
+        util.contract.output_kind = None;
+        let filtered = filter_skills_for_run_mode(
+            vec![util.clone()],
+            RunMode::TaskPlanOnly,
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].title, util.title);
     }
 
     fn note(id: Uuid, parent: Option<Uuid>, title: &str) -> LocalNote {

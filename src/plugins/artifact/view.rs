@@ -114,6 +114,25 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
     let monaco_body = body_only.clone();
     let fm_for_monaco = fm.clone();
     let content_for_monaco = content_for_actions.clone();
+
+    // Revision dropdown state. `None` (default) = Current — the head
+    // body editable as today. `Some(i)` (where `i >= 1`) = view the
+    // i-th entry returned by `revisions::parse_revisions` (the
+    // 0-index is always "Current", surfaced as `None` here). Selecting
+    // a prior revision swaps the body conditional to read-only
+    // `MarkdownView` of that revision's content.
+    let revisions =
+        crate::plugins::artifact::revisions::parse_revisions(&body_only);
+    let mut selected_revision: Signal<Option<usize>> = use_signal(|| None);
+    let active_revision_idx = *selected_revision.read();
+    let viewing_prior_revision = active_revision_idx
+        .map(|i| i >= 1 && i < revisions.len())
+        .unwrap_or(false);
+    let prior_revision_body: Option<String> = if viewing_prior_revision {
+        active_revision_idx.and_then(|i| revisions.get(i).map(|r| r.body.clone()))
+    } else {
+        None
+    };
     // Plans-Phase-9-monaco-desktop (rev 1): signal sink for the
     // MonacoChannel handle. Populated once the editor mounts; used by
     // the link picker (Task #3) to splice picked targets at the
@@ -162,11 +181,24 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
     let is_master_requirement =
         matches!(fm.artifact_kind, Some(ArtifactKind::MasterRequirement));
     let is_task = matches!(fm.artifact_kind, Some(ArtifactKind::Task));
-    // Cascade-root artifacts are the only places the SDLC skill
+    let is_implementation =
+        matches!(fm.artifact_kind, Some(ArtifactKind::Implementation));
+    let is_implementation_plan =
+        matches!(fm.artifact_kind, Some(ArtifactKind::ImplementationPlan));
+    // Cascade-root artifacts are the only places the full SDLC skill
     // toolbar (Run skill / Generate Cascade / Play) is shown:
     //   - master_requirement (project root, runs A0→A4 + Architecture)
-    //   - task (runs the per-task SDE chain: implementation → tests
-    //     → results)
+    //   - task (runs only `07a-sde-plan-task` to produce an
+    //     ImplementationPlan note; the user reviews the plan before
+    //     pressing Play on the plan to execute it)
+    // ImplementationPlan artifacts get a **Play button only**: it
+    // kicks off the execute tail (`07b-sde-execute-implementation`
+    // → `08-sde-generate-tests` → `09-sde-execute-tests`).
+    // Implementation artifacts (the executed record) also get a Play
+    // button that regenerates TestCases + reruns them without
+    // redoing the code work, so a user who hand-edited the
+    // Implementation body or the source can refresh tests in one
+    // click.
     // Every other artifact kind — including a `Requirements` artifact
     // at the tree root, which used to be the entry point in the
     // legacy seed-skills-employee chain — hides the entire toolbar.
@@ -212,17 +244,60 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
     // current step.
     let cascade_state_view: Option<crate::shell::companion_state::CascadePhase> = source_uuid
         .and_then(|sid| crate::shell::companion_state::CASCADE_STATE.read().get(&sid).cloned());
+    // TEMP DIAGNOSTIC: surface the body-editable computation as data
+    // attributes so the user can confirm via DevTools whether
+    // `props.edit` and `on_change.is_some()` are both true at runtime
+    // (the artifact-can't-type bug). Remove once the root cause is
+    // fixed.
+    let dbg_edit = if props.edit { "true" } else { "false" };
+    let dbg_on_change_some = if on_change.is_some() { "true" } else { "false" };
+    let dbg_body_editable = if body_editable { "true" } else { "false" };
     rsx! {
         div { class: "operon-artifact-surface",
             "data-testid": "artifact-surface",
             "data-artifact-status": "{status.as_str()}",
             "data-artifact-kind": "{fm.artifact_kind.as_ref().map(|k| k.as_str().to_string()).unwrap_or_default()}",
+            "data-debug-edit": "{dbg_edit}",
+            "data-debug-on-change-some": "{dbg_on_change_some}",
+            "data-debug-body-editable": "{dbg_body_editable}",
             div { class: "operon-artifact-header",
                 span { class: "operon-artifact-kind-badge", "{kind_label}" }
                 span {
                     class: "operon-artifact-status-pill {status_class}",
                     "data-testid": "artifact-status-pill",
                     "{status_label}"
+                }
+                // Revision dropdown: only show when the body has stashed
+                // prior revisions (i.e. the seed-skills re-run path
+                // emitted `<details><summary>Revision N…</summary>`
+                // blocks). Selecting Current returns the editable head
+                // body; selecting a prior revision swaps the body to
+                // read-only MarkdownView of that revision.
+                if revisions.len() > 1 {
+                    select {
+                        class: "operon-artifact-revision-select",
+                        "data-testid": "artifact-revision-select",
+                        title: "View a prior revision of this artifact (read-only).",
+                        value: match active_revision_idx {
+                            None => "0".to_string(),
+                            Some(i) => i.to_string(),
+                        },
+                        onchange: move |evt| {
+                            match evt.value().parse::<usize>() {
+                                Ok(0) => selected_revision.set(None),
+                                Ok(i) if i < revisions.len() => {
+                                    selected_revision.set(Some(i));
+                                }
+                                _ => selected_revision.set(None),
+                            }
+                        },
+                        for (i, rev) in revisions.iter().enumerate() {
+                            option {
+                                value: "{i}",
+                                "{rev.label}"
+                            }
+                        }
+                    }
                 }
                 {
                     let parent = fm.source_artifact_id;
@@ -300,7 +375,67 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                             if let Some(uuid) = source_uuid {
                                 if is_runnable_source {
                                     GenerateCascadeButton { root_artifact_id: uuid }
-                                    CascadePlayButton { root_artifact_id: uuid }
+                                    // Task Play stops at the
+                                    // ImplementationPlan note; the
+                                    // master_requirement / other
+                                    // cascade roots keep the legacy
+                                    // Full sweep.
+                                    {
+                                        let mode = if is_task {
+                                            crate::plugins::artifact::cascade::RunMode::TaskPlanOnly
+                                        } else {
+                                            crate::plugins::artifact::cascade::RunMode::Full
+                                        };
+                                        rsx! {
+                                            CascadePlayButton {
+                                                root_artifact_id: uuid,
+                                                run_mode: mode,
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // ImplementationPlan: Play kicks off the
+                        // execute tail (07b code edits + commit, 08
+                        // generate tests, 09 run tests). Pending /
+                        // Rejected plans get no Play (user is still
+                        // in initial review of the plan body).
+                        if is_implementation_plan && !is_cascade_root {
+                            if let Some(uuid) = source_uuid {
+                                if matches!(
+                                    status,
+                                    ArtifactStatus::Approved | ArtifactStatus::Dirty
+                                ) {
+                                    CascadePlayButton {
+                                        root_artifact_id: uuid,
+                                        run_mode: crate::plugins::artifact::cascade::RunMode::PlanExecuteAndTest,
+                                    }
+                                }
+                            }
+                        }
+                        // Implementation (post-execution record):
+                        // Play regenerates TestCases + reruns them
+                        // (ImplementationRetest). "Create test cases"
+                        // extra button on Dirty offers the regen-only
+                        // variant (no rerun). Pending / Rejected
+                        // Implementations get no SDLC toolbar.
+                        if is_implementation && !is_cascade_root {
+                            if let Some(uuid) = source_uuid {
+                                if matches!(
+                                    status,
+                                    ArtifactStatus::Approved | ArtifactStatus::Dirty
+                                ) {
+                                    CascadePlayButton {
+                                        root_artifact_id: uuid,
+                                        run_mode: crate::plugins::artifact::cascade::RunMode::ImplementationRetest,
+                                    }
+                                    if matches!(status, ArtifactStatus::Dirty) {
+                                        CascadePlayButton {
+                                            root_artifact_id: uuid,
+                                            run_mode: crate::plugins::artifact::cascade::RunMode::GenerateTestCasesOnly,
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -504,12 +639,17 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                 // its parent is positioned. The `-edit` modifier also
                 // drops the body padding so Monaco fills the surface
                 // edge to edge — preview mode keeps the padded layout.
-                class: if body_editable {
+                // When viewing a prior revision from the dropdown we
+                // never mount Monaco — the historical body is render-
+                // only — so we always pick the padded preview class.
+                class: if body_editable && !viewing_prior_revision {
                     "operon-artifact-body operon-artifact-body-edit"
                 } else {
                     "operon-artifact-body"
                 },
-                if body_editable {
+                if let Some(rev_body) = prior_revision_body.clone() {
+                    MarkdownView { content: rev_body }
+                } else if body_editable {
                     {
                         // Monaco edits the BODY only; we re-attach the
                         // (untouched) frontmatter before pushing the
@@ -526,7 +666,31 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                             let content_for_monaco = content_for_monaco.clone();
                             let fm_for_monaco = fm_for_monaco.clone();
                             EventHandler::new(move |new_body: String| {
-                                let recombined = rewrite(&content_for_monaco, &fm_for_monaco);
+                                // Auto-mark Dirty when an Approved
+                                // ImplementationPlan / Implementation
+                                // body changes. For a plan, this
+                                // flips the Play button so the next
+                                // click re-executes against the
+                                // edited plan; for an executed
+                                // Implementation, it surfaces the
+                                // "Create test cases" button + keeps
+                                // the retest Play active. Restricted to
+                                // those kinds + Approved so editing a
+                                // Pending / Rejected artifact (i.e.
+                                // the user is still in initial review)
+                                // doesn't silently mark it Dirty.
+                                let mut fm_for_save = fm_for_monaco.clone();
+                                let auto_dirty_kind = matches!(
+                                    fm_for_save.artifact_kind,
+                                    Some(ArtifactKind::Implementation)
+                                        | Some(ArtifactKind::ImplementationPlan)
+                                );
+                                if auto_dirty_kind
+                                    && fm_for_save.status == ArtifactStatus::Approved
+                                {
+                                    fm_for_save.status = ArtifactStatus::Dirty;
+                                }
+                                let recombined = rewrite(&content_for_monaco, &fm_for_save);
                                 let final_doc = replace_body(&recombined, &new_body);
                                 if let Some(handler) = on_change {
                                     handler.call(final_doc);
@@ -1483,8 +1647,11 @@ pub fn format_clarification_answer_block(answer: &ClarificationAnswer) -> String
 
 /// `YYYY-MM-DD` today in UTC. Done by hand rather than via `chrono`
 /// because the dependency isn't already in `operon-dioxus` and this
-/// is the only date-format consumer for now.
-fn current_iso_date() -> String {
+/// is the only date-format consumer for now. Also reused by the
+/// typed-artifact scaffold builder in
+/// `src/local_mode/explorer/creatable_kind.rs` to stamp the seed
+/// `## Revision history` row.
+pub(crate) fn current_iso_date() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1709,6 +1876,21 @@ pub async fn mark_descendants_dirty(
 #[derive(Props, Clone, PartialEq)]
 struct CascadePlayButtonProps {
     root_artifact_id: Uuid,
+    /// Which slice of the SDLC chain this Play click should run. The
+    /// parent (`ArtifactView`) picks the mode from the artifact's kind
+    /// + status:
+    ///   - Task → `TaskPlanOnly` (07a only — produces the
+    ///     ImplementationPlan note, stops for review)
+    ///   - ImplementationPlan + Approved/Dirty → `PlanExecuteAndTest`
+    ///     (07b code + commit, 08 tests, 09 run)
+    ///   - Implementation + Approved/Dirty → `ImplementationRetest`
+    ///     (08 + 09: regen tests against current code + rerun)
+    ///   - Master / legacy → `Full`
+    /// `GenerateTestCasesOnly` (08 only) is dispatched by the separate
+    /// "Create test cases" button on Dirty Implementations, not this
+    /// Play one.
+    #[props(default)]
+    run_mode: crate::plugins::artifact::cascade::RunMode,
 }
 
 #[component]
@@ -1782,18 +1964,47 @@ fn CascadePlayButton(props: CascadePlayButtonProps) -> Element {
         String::new()
     };
 
+    // Label / testid / class vary by run mode so a single component
+    // serves the ▶ Play button on most artifacts AND the
+    // "Create test cases" button on a Dirty Implementation. Other
+    // run-mode behaviours (which skills fire) are handled inside
+    // `run_cascade`'s `filter_skills_for_run_mode` step.
+    let is_test_cases_button = matches!(
+        props.run_mode,
+        crate::plugins::artifact::cascade::RunMode::GenerateTestCasesOnly
+    );
+    let (label_play, label_stop, idle_class, idle_title, testid_attr) =
+        if is_test_cases_button {
+            (
+                "Create test cases",
+                "\u{23F9} Stop",
+                "operon-artifact-cascade-generate-tests",
+                "Regenerate test cases against the current Implementation body."
+                    .to_string(),
+                "artifact-generate-test-cases",
+            )
+        } else {
+            (
+                "\u{25B6} Play",
+                "\u{23F9} Stop",
+                "operon-artifact-cascade-play",
+                "Run the SDLC pipeline from this artifact \u{2014} every produced child auto-approves."
+                    .to_string(),
+                "artifact-cascade-play",
+            )
+        };
     rsx! {
         button {
             r#type: "button",
-            class: if is_running { "operon-artifact-cascade-stop" } else { "operon-artifact-cascade-play" },
-            "data-testid": "artifact-cascade-play",
+            class: if is_running { "operon-artifact-cascade-stop" } else { idle_class },
+            "data-testid": "{testid_attr}",
             disabled: blocked && !is_running,
             title: if is_running {
                 "Stop the cascade at the next skill boundary.".to_string()
             } else if blocked {
                 blocked_tooltip.clone()
             } else {
-                "Run the entire SDLC pipeline from this artifact \u{2014} every produced child auto-approves.".to_string()
+                idle_title.clone()
             },
             onclick: {
                 let note_repo = note_repo.clone();
@@ -1836,19 +2047,26 @@ fn CascadePlayButton(props: CascadePlayButtonProps) -> Element {
                             &mut active_session_setter,
                             &mut active_scope_setter,
                             None, // full cascade — no depth cap
+                            props.run_mode,
                         );
                     }
                 }
             },
-            if is_running { "\u{23F9} Stop" } else { "\u{25B6} Play" }
+            if is_running { "{label_stop}" } else { "{label_play}" }
         }
-        button {
-            r#type: "button",
-            class: "operon-artifact-cascade-stages-toggle",
-            "data-testid": "artifact-cascade-stages-toggle",
-            title: "Configure which pipeline stages run when you click Play.",
-            onclick: move |_| stages_open.with_mut(|v| *v = !*v),
-            "\u{25BE}"
+        // Stage-picker chevron only makes sense for the generic Play
+        // button — the "Create test cases" variant runs a fixed
+        // single-skill mode (08), so exposing a stage picker would
+        // confuse users into thinking they can toggle stages off.
+        if !is_test_cases_button {
+            button {
+                r#type: "button",
+                class: "operon-artifact-cascade-stages-toggle",
+                "data-testid": "artifact-cascade-stages-toggle",
+                title: "Configure which pipeline stages run when you click Play.",
+                onclick: move |_| stages_open.with_mut(|v| *v = !*v),
+                "\u{25BE}"
+            }
         }
         if *stages_open.read() {
             // Click-outside dismissal: a transparent fixed-position
@@ -2326,6 +2544,7 @@ pub fn spawn_cascade(
     active_session: &mut Signal<Option<Uuid>>,
     active_scope: &mut Signal<operon_store::repos::ChatScope>,
     max_depth: Option<u32>,
+    run_mode: crate::plugins::artifact::cascade::RunMode,
 ) {
     // Resolve project + repo path up front so a missing binding fails
     // loudly rather than silently no-op'ing inside the spawned task.
@@ -2556,6 +2775,7 @@ pub fn spawn_cascade(
             writer.as_mut(),
             max_depth,
             cascade_session_id,
+            run_mode,
         )
         .await;
         match result {

@@ -29,11 +29,13 @@ Compared to `seed-skills-employee/`:
   prior body under a collapsed `<details>` block.
 - **SA** produces **one** `architecture` artifact, iteratively
   revised in-place from `master_requirement`. No HLD / LLD split.
-- **SDE** consumes a Task + inherits the latest Architecture revision
-  to produce an Implementation. Tests are generated and executed by
-  the SDE persona (not a separate TST persona). Bugs are first-class
-  `bug` artifacts; the bug-fix skill emits a new Implementation
-  revision.
+- **SDE** consumes a Task in **two stages**: first `07a-sde-plan-task`
+  writes an Implementation Plan (no code), the user reviews it, then
+  `07b-sde-execute-implementation` does the actual code edits + commit.
+  Both stages inherit the latest Architecture revision. Tests are
+  generated and executed by the SDE persona (not a separate TST
+  persona). Bugs are first-class `bug` artifacts; the bug-fix skill
+  emits a new Implementation revision.
 
 ```
 master_requirement   [PROJECT ROOT — the only Play button]
@@ -42,11 +44,12 @@ master_requirement   [PROJECT ROOT — the only Play button]
 │       └── feature × N          [A2]
 │           └── story × N         [A3]
 │               └── task × N      [A4]
-│                   └── implementation
-│                       ├── test_cases
-│                       │   └── test_results
-│                       └── bug × N
-│                           └── implementation (revision, via 10-sde-fix-bug)
+│                   └── implementation_plan         [07a, plan only — no code]
+│                       └── implementation         [07b, code edits + commit]
+│                           ├── test_cases
+│                           │   └── test_results
+│                           └── bug × N
+│                               └── implementation (revision, via 10-sde-fix-bug)
 └── architecture                 [SA, iteratively revised in-place]
 ```
 
@@ -64,7 +67,8 @@ master_requirement   [PROJECT ROOT — the only Play button]
 | 05 | `05-ba-decompose-tasks` | BA | story | task | many (1–3) | approval | BA |
 | 06 | `06-sa-draft-architecture` | BA | master_requirement (aggregator over `requirements`) | architecture | one | approval | SA |
 | 05n | `05n-sde-normalize-tasks` | SDE | task | task | one | auto | SDE |
-| 07 | `07-sde-implement-task` | SDE | task (inherits `architecture`) | implementation | one | approval | SDE |
+| 07a | `07a-sde-plan-task` | SDE | task (inherits `architecture`) | implementation_plan | one | approval | SDE |
+| 07b | `07b-sde-execute-implementation` | SDE | implementation_plan (inherits `architecture`) | implementation | one | approval | SDE |
 | 08 | `08-sde-generate-tests` | SDE | implementation | test_cases | one | approval | SDE |
 | 09 | `09-sde-execute-tests` | SDE | test_cases | test_results | one | approval | SDE |
 | 10 | `10-sde-fix-bug` | SDE | bug (inherits `architecture`) | implementation | one | approval | SDE |
@@ -111,23 +115,62 @@ and ends. At every level transition (A0→A1→A2→A3→A4) `cascade_stop:
 true` pauses for human review.
 
 **SDE phase — triggered by Play on a `task` artifact.**
-Runs every skill whose `input_kind` is `task` / `implementation` /
-`test_cases` / `test_results` / `bug`. Per-task chain:
-`task → implementation → test_cases → test_results`, with
-`05n-sde-normalize-tasks` running first as a pre-flight reformat
+Runs every skill whose `input_kind` is `task` / `implementation_plan`
+/ `implementation` / `test_cases` / `test_results` / `bug`. Per-task
+chain:
+`task → implementation_plan → implementation → test_cases → test_results`,
+with `05n-sde-normalize-tasks` running first as a pre-flight reformat
 (idempotent for tasks already produced by `05-ba-decompose-tasks`).
-For bug-fix work: file a `bug` artifact under the buggy
-implementation, click Play on the parent task — `10-sde-fix-bug`
-emits a new implementation revision, the dirty cascade regenerates
-the downstream test_cases + test_results.
 
-Only `master_requirement` and `task` artifacts show the Play /
-Generate Cascade / Run skill toolbar. Every other artifact
-(Requirements, Epics, Features, Stories, Architecture,
-Implementation, Test Cases, Test Results, Bug, Clarification) keeps
-just Approve / Reject / Mark dirty / Revise — the workflow is
-fully driven by master Play (BA phase) and per-task Play (SDE
-phase).
+**Task Play stops at the plan.** When you click Play on a task, the
+runtime fires `07a-sde-plan-task` and **stops** — it writes an
+Implementation Plan note (files to change, approach, test cues) but
+does NOT touch source code, does NOT run tests, does NOT make a
+commit. The user reviews the plan, then clicks Play on the
+Implementation Plan to execute it (see below).
+
+**Implementation Plan Play executes + tests.** When you click Play
+on an Implementation Plan (Approved or Dirty), the runtime fires:
+1. `07b-sde-execute-implementation` — does the actual code edits,
+   runs the project's tests as a sanity check, makes one commit,
+   and writes an Implementation note.
+2. `08-sde-generate-tests` — generates TestCases against the
+   freshly-implemented code.
+3. `09-sde-execute-tests` — runs those TestCases and writes a
+   TestResults note.
+
+Dirty plans (the user edited the plan body, or added an inline
+`## Bug` section) trigger the cascade's revision-history machinery
+automatically — `07b` sees the prior Implementation body inlined
+and appends a new `## Revision N` row.
+
+**Implementation Play regenerates + reruns tests.** When you click
+Play on the executed Implementation note (Approved or Dirty), the
+runtime fires only `08-sde-generate-tests` + `09-sde-execute-tests`:
+regenerate TestCases against the current Implementation body, then
+run them. Code work is NOT repeated — to re-execute the code, go
+back to the Implementation Plan and Play there.
+
+When an Implementation is Dirty a second button — **"Create test
+cases"** — appears next to Play. Clicking it runs `08` only,
+regenerating TestCases without running them. Use this when you want
+to review the regenerated test bodies before they fire.
+
+**Inline `## Bug` flow.** To request a bug fix, paste a `## Bug`
+section at the top of the Implementation Plan's body describing
+what's broken. The auto-mark-Dirty save path flips the plan to
+Dirty, and pressing Play on the plan re-runs `07b` (which treats
+the `## Bug` section as the primary change driver) + `08` + `09`.
+The legacy standalone `bug` artifact path (`10-sde-fix-bug`) still
+works for back-compat but is deprecated.
+
+Only `master_requirement` and `task` artifacts show the full Play /
+Generate Cascade / Run skill toolbar. **Implementation Plan** and
+**Implementation** each show just a Play button (Implementation
+also surfaces the conditional "Create test cases" button on Dirty).
+Every other artifact (Requirements, Epics, Features, Stories,
+Architecture, Test Cases, Test Results, Bug, Clarification) keeps
+just Approve / Reject / Mark dirty / Revise.
 
 ## Design pickup (Figma)
 
@@ -135,9 +178,11 @@ Users can paste Figma URLs (host `figma.com` or `www.figma.com`)
 into any artifact in the BA chain — the master_requirement, any
 detailed Requirement, an Epic, a Feature, a Story, or a Task.
 On the next cascade step, the downstream skill scans its parent
-body for those URLs, calls the Figma MCP server
-(`mcp__figma__get_figma_data`), and folds the returned frame
-inventory / text into how it decomposes:
+body for those URLs, calls the Figma MCP "get figma data" tool
+(name: `mcp__<server>__get_figma_data` — `<server>` depends on
+the user's config, commonly `figma`, `figma-mcp`, or
+`figma-developer-mcp`), and folds the returned frame inventory /
+text into how it decomposes:
 
 - design boundaries → Epic boundaries (in `02-ba-discover-epics`)
 - screens / flows → Story boundaries (in `04-ba-decompose-stories`)
@@ -148,10 +193,13 @@ Each output artifact carries a `## Design references` section
 listing the Figma URLs relevant to it with one-line per-URL notes.
 
 **Setup.** The Figma MCP server must be configured in the user's
-Claude Code MCP config (`mcp servers add figma …`) so that
-`mcp__figma__get_figma_data` resolves. See
-<https://github.com/figma/mcp-server-figma> (or your org's pinned
-fork) for setup.
+Claude Code MCP config (e.g. `claude mcp add figma -- npx -y
+figma-developer-mcp --stdio`) so a `mcp__<server>__get_figma_data`
+tool appears in the model's tool list. The skill looks up the tool
+by suffix (`get_figma_data`) and works regardless of whether the
+user registered the server as `figma`, `figma-mcp`, or
+`figma-developer-mcp`. See <https://github.com/GLips/Figma-Context-MCP>
+(or your org's pinned fork) for setup.
 
 **Failure handling.** If the MCP tool isn't available or a URL is
 unreachable, the skill does NOT block decomposition. It:
@@ -171,16 +219,18 @@ URLs they find in hand-authored artifacts by gathering them into
 `## Design references`, but they do NOT call MCP — they leave
 fetching to the next decomposition skill in the chain.
 
-**SDE phase.** `07-sde-implement-task` re-fetches Figma URLs from
-the Task body (and from the inherited Architecture) to drive
-implementation: it calls `mcp__figma__get_figma_data` for exact
-component / layout / copy values, and
-`mcp__figma__download_figma_images` to pull assets the design owns
-(logos, illustrations, exported PNG / SVG) into the appropriate
-`assets/` directory. The Implementation note records every
-consulted URL under `## Design references` with a per-URL note
-about how the design informed the code. Failure handling is the
-same warn-and-continue pattern as BA-phase skills. Test
+**SDE phase.** Both `07a-sde-plan-task` and
+`07b-sde-execute-implementation` re-fetch Figma URLs to inform the
+work — `07a` reads them to plan which frames map to which files;
+`07b` re-reads the same URLs at execute time to pick up exact
+component / layout / copy values, and uses
+`mcp__<server>__download_figma_images` to pull assets the design
+owns (logos, illustrations, exported PNG / SVG) into the appropriate
+`assets/` directory (asset downloads happen only at execute time,
+not at planning time). The Plan and Implementation notes each
+record consulted URLs under `## Design references` with per-URL
+notes about how the design informed the work. Failure handling is
+the same warn-and-continue pattern as BA-phase skills. Test
 generation (`08`), test execution (`09`), and bug-fix (`10`) do
 not consume Figma — tests should validate the implementation, and
 acceptance criteria from the Story already encode the testable
