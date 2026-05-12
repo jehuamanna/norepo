@@ -58,20 +58,56 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
     let on_change = props.on_change;
     let content_for_actions = props.content.clone();
 
+    // Status-change buttons (Approve / Reject / Mark dirty) write
+    // straight to disk via `Persistence::save` so the new status
+    // sticks immediately, without waiting on the user to press
+    // Ctrl+S. Necessary in two cases:
+    //   - View mode: `on_change` is `None` here (the artifact-plugin's
+    //     `render` doesn't supply one), so the legacy on-change-only
+    //     path silently dropped the status flip.
+    //   - Edit mode with `manual_save` tabs: `on_change` updates the
+    //     in-memory tab but the SaveScheduler short-circuits for
+    //     manual-save tabs, so the bytes never reached disk until
+    //     Ctrl+S.
+    // We still call `on_change` afterwards so the open editor tab's
+    // visible content reflects the patched body without a reload.
+    let persistence_for_status: Arc<dyn Persistence> = use_context();
+    let note_id_for_status = props.note_id.clone();
     let approve = {
-        let content_for_actions = content_for_actions.clone();
-        let on_change = on_change;
-        move |_| patch_status(&content_for_actions, ArtifactStatus::Approved, on_change)
+        let content = content_for_actions.clone();
+        let persistence = persistence_for_status.clone();
+        let note_id = note_id_for_status.clone();
+        move |_| save_status_change(
+            &persistence,
+            &note_id,
+            &content,
+            ArtifactStatus::Approved,
+            on_change,
+        )
     };
     let reject = {
-        let content_for_actions = content_for_actions.clone();
-        let on_change = on_change;
-        move |_| patch_status(&content_for_actions, ArtifactStatus::Rejected, on_change)
+        let content = content_for_actions.clone();
+        let persistence = persistence_for_status.clone();
+        let note_id = note_id_for_status.clone();
+        move |_| save_status_change(
+            &persistence,
+            &note_id,
+            &content,
+            ArtifactStatus::Rejected,
+            on_change,
+        )
     };
     let mark_dirty = {
-        let content_for_actions = content_for_actions.clone();
-        let on_change = on_change;
-        move |_| patch_status(&content_for_actions, ArtifactStatus::Dirty, on_change)
+        let content = content_for_actions.clone();
+        let persistence = persistence_for_status.clone();
+        let note_id = note_id_for_status.clone();
+        move |_| save_status_change(
+            &persistence,
+            &note_id,
+            &content,
+            ArtifactStatus::Dirty,
+            on_change,
+        )
     };
 
     let body_editable = props.edit && on_change.is_some();
@@ -603,6 +639,42 @@ fn patch_status(
     if let Some(handler) = on_change {
         handler.call(new_body);
     }
+}
+
+/// Persist a status flip immediately and notify the open editor tab.
+/// Saves bypass the SaveScheduler so the new state sticks in
+/// View-mode (no `on_change`) and in Edit-mode manual-save tabs (the
+/// scheduler short-circuits there). The `on_change` notification
+/// keeps the in-memory tab content in sync so the visible body
+/// reflects the patched frontmatter without a reload.
+///
+/// `note_id` is the artifact's UUID-string (the persistence key);
+/// `content` is the current body. The save is fire-and-forget via
+/// `dioxus::prelude::spawn` — failures are logged at warn and
+/// silently ignored (matches the rest of the artifact view's
+/// best-effort save calls).
+fn save_status_change(
+    persistence: &Arc<dyn Persistence>,
+    note_id: &str,
+    content: &str,
+    next: ArtifactStatus,
+    on_change: Option<EventHandler<String>>,
+) {
+    let new_body = patch_status_text(content, next);
+    if let Some(handler) = on_change {
+        handler.call(new_body.clone());
+    }
+    let persistence = persistence.clone();
+    let note_id = note_id.to_string();
+    let body = new_body;
+    dioxus::prelude::spawn(async move {
+        if let Err(e) = persistence.save(&note_id, body.as_bytes()).await {
+            tracing::warn!(
+                target: "operon::artifact",
+                "save_status_change: persistence.save({note_id}) failed: {e}"
+            );
+        }
+    });
 }
 
 /// Pure-text variant of `patch_status` — returns the rewritten body

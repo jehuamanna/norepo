@@ -85,6 +85,16 @@ pub static CHAT_MESSAGE_VERSION: GlobalSignal<u64> = Signal::global(|| 0);
 /// application-wide, safe to write from any scope.
 pub static LOCAL_NOTE_VERSION: GlobalSignal<u64> = Signal::global(|| 0);
 
+/// Bumped by the window-level Ctrl+S capture listener (installed in
+/// `shell::install_global_shortcuts`) so the keypress reaches the
+/// save flow even when Monaco / a focused input would otherwise
+/// swallow it. The Shell component subscribes to this via
+/// `use_effect` and dispatches the active tab through the
+/// already-installed `LocalSaveAction` callback. Single counter
+/// (saturating add) is enough — the effect cares about transitions,
+/// not values.
+pub static SAVE_REQUEST_TICK: GlobalSignal<u64> = Signal::global(|| 0);
+
 /// State of the most recent artifact-skill run for a given source
 /// artifact. The artifact view reads this to render its inline
 /// status pill (`Running…` / `Created N artifact(s)` / `Run failed:

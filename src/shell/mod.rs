@@ -111,6 +111,33 @@ pub fn Shell() -> Element {
     // (focus.activitybar) are executed in JS to avoid a round-trip.
     install_global_shortcuts(tabs, active, layout, app_state);
 
+    // Window-capture Ctrl+S → SAVE_REQUEST_TICK bridge. The capture
+    // listener installed by `install_global_shortcuts` bumps the
+    // tick when Ctrl+S fires (so Monaco / focused inputs can't
+    // swallow the keypress). This effect observes the tick and
+    // dispatches through `LocalSaveAction` — the same callback the
+    // shell-level onkeydown handler uses, so the save flow is
+    // unified regardless of where focus lives.
+    {
+        let local_save_for_tick = local_save.clone();
+        use_effect(move || {
+            // Subscribe — read forces a dependency on the signal.
+            let _tick = *crate::shell::companion_state::SAVE_REQUEST_TICK.read();
+            // Skip the initial render's value (tick starts at 0);
+            // only react to subsequent bumps. We can't know "this
+            // is the first run" without a side-channel, so the
+            // tick start is treated as the no-op baseline: the JS
+            // listener bumps to 1 on the user's first Ctrl+S, which
+            // re-runs this effect and triggers the save.
+            if _tick == 0 {
+                return;
+            }
+            if let Some(action) = &local_save_for_tick {
+                action.callback.call(());
+            }
+        });
+    }
+
     rsx! {
         div {
             id: "operon-shell",
@@ -402,6 +429,13 @@ fn install_global_shortcuts(
                         action = 'focus.explorer';
                     } else if (!shift && key === '0') {
                         action = 'focus.activitybar';
+                    } else if (!shift && (key === 's' || key === 'S')) {
+                        // Ctrl/Cmd+S: route through this capture-phase
+                        // listener so Monaco / focused inputs can't
+                        // swallow the keypress. The Shell component's
+                        // use_effect on SAVE_REQUEST_TICK fires the
+                        // active tab through LocalSaveAction.
+                        action = 'file.save';
                     } else if (!shift && key.length === 1 && '123456789'.indexOf(key) >= 0) {
                         action = 'tab.' + key;
                     }
@@ -484,6 +518,19 @@ fn install_global_shortcuts(
                             })();
                             "#,
                         );
+                    }
+                    "file.save" => {
+                        // Ctrl/Cmd+S: bump the global save-request
+                        // tick. The Shell component watches it via
+                        // use_effect and dispatches the active tab
+                        // through LocalSaveAction. Going through the
+                        // tick (instead of calling the save callback
+                        // here) keeps this recv loop free of the
+                        // LocalSaveAction context — that lives at
+                        // Shell scope, which isn't reachable from
+                        // this hook installed at App scope.
+                        crate::shell::companion_state::SAVE_REQUEST_TICK
+                            .with_mut(|n| *n = n.saturating_add(1));
                     }
                     other => {
                         if let Some(num) = other.strip_prefix("tab.") {
