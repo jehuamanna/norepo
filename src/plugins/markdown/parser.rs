@@ -84,7 +84,60 @@ pub fn parse(input: &str) -> Vec<MdNode> {
         }
     }
 
-    stack.into_iter().next().unwrap_or_default()
+    let nodes = stack.into_iter().next().unwrap_or_default();
+    dedupe_rules(nodes)
+}
+
+/// Collapse runs of consecutive `MdNode::Rule` to a single rule and trim
+/// leading/trailing rules at the top level. Recurses into container variants
+/// so a run inside a blockquote or list item is also collapsed. LLM-authored
+/// markdown often emits decorative `---` runs (or surrounding rules at the
+/// start/end of a section) that render as a wall of `<hr>` elements; this
+/// pass keeps a single divider where the source had many.
+fn dedupe_rules(nodes: Vec<MdNode>) -> Vec<MdNode> {
+    let mut out: Vec<MdNode> = Vec::with_capacity(nodes.len());
+    let mut prev_was_rule = false;
+    for node in nodes {
+        let collapsed = match node {
+            MdNode::Rule => {
+                if prev_was_rule {
+                    continue;
+                }
+                prev_was_rule = true;
+                MdNode::Rule
+            }
+            other => {
+                prev_was_rule = false;
+                recurse_dedupe(other)
+            }
+        };
+        out.push(collapsed);
+    }
+    while matches!(out.first(), Some(MdNode::Rule)) {
+        out.remove(0);
+    }
+    while matches!(out.last(), Some(MdNode::Rule)) {
+        out.pop();
+    }
+    out
+}
+
+fn recurse_dedupe(node: MdNode) -> MdNode {
+    match node {
+        MdNode::BlockQuote(children) => MdNode::BlockQuote(dedupe_rules(children)),
+        MdNode::List { ordered, items } => MdNode::List {
+            ordered,
+            items: items.into_iter().map(dedupe_rules).collect(),
+        },
+        MdNode::Paragraph { children } => MdNode::Paragraph {
+            children: dedupe_rules(children),
+        },
+        MdNode::Heading { level, children } => MdNode::Heading {
+            level,
+            children: dedupe_rules(children),
+        },
+        other => other,
+    }
 }
 
 /// A tag plus the data we need to build the corresponding [`MdNode`] when it closes.
@@ -333,6 +386,76 @@ mod tests {
     fn horizontal_rule_present() {
         let nodes = parse("a\n\n---\n\nb");
         assert!(nodes.iter().any(|n| matches!(n, MdNode::Rule)));
+    }
+
+    // `parse` runs `strip_frontmatter` first, which strips an input that
+    // starts with `---\n...\n---\n`. The dedupe tests below intentionally
+    // avoid a leading `---\n` so they exercise the rule-collapse logic
+    // rather than the frontmatter shortcut.
+
+    #[test]
+    fn collapses_consecutive_rules() {
+        // Prefix with a paragraph so `strip_frontmatter` doesn't eat the run.
+        let nodes = parse("intro\n\n---\n\n---\n\n---\n\n---\n\n---");
+        let rule_count = nodes.iter().filter(|n| matches!(n, MdNode::Rule)).count();
+        assert_eq!(
+            rule_count, 0,
+            "trailing-rule run after a paragraph must be trimmed entirely: {nodes:?}"
+        );
+        let paragraph_count = nodes
+            .iter()
+            .filter(|n| matches!(n, MdNode::Paragraph { .. }))
+            .count();
+        assert_eq!(paragraph_count, 1, "want the intro paragraph kept: {nodes:?}");
+    }
+
+    #[test]
+    fn trims_leading_and_trailing_rule() {
+        // Use `***` for the leading rule so it doesn't collide with the
+        // frontmatter prefix sentinel (`---\n`) that `strip_frontmatter`
+        // looks for at the very start of the input.
+        let nodes = parse("***\n\nhello\n\n---");
+        assert!(
+            !matches!(nodes.first(), Some(MdNode::Rule)),
+            "leading rule not trimmed: {nodes:?}"
+        );
+        assert!(
+            !matches!(nodes.last(), Some(MdNode::Rule)),
+            "trailing rule not trimmed: {nodes:?}"
+        );
+        let paragraph_count = nodes
+            .iter()
+            .filter(|n| matches!(n, MdNode::Paragraph { .. }))
+            .count();
+        assert_eq!(paragraph_count, 1, "want one paragraph: {nodes:?}");
+    }
+
+    #[test]
+    fn preserves_single_rule_between_paragraphs() {
+        let nodes = parse("a\n\n---\n\nb");
+        let rule_count = nodes.iter().filter(|n| matches!(n, MdNode::Rule)).count();
+        assert_eq!(rule_count, 1, "want one rule between paragraphs: {nodes:?}");
+    }
+
+    #[test]
+    fn collapses_run_with_surrounding_content() {
+        let nodes = parse("a\n\n---\n\n---\n\n---\n\nb");
+        let rule_count = nodes.iter().filter(|n| matches!(n, MdNode::Rule)).count();
+        assert_eq!(rule_count, 1, "want one rule after collapse: {nodes:?}");
+    }
+
+    #[test]
+    fn preserves_rule_inside_blockquote_single() {
+        let nodes = parse("> a\n>\n> ---\n>\n> ---\n>\n> b");
+        let bq = nodes
+            .iter()
+            .find_map(|n| match n {
+                MdNode::BlockQuote(inner) => Some(inner),
+                _ => None,
+            })
+            .expect("blockquote");
+        let inner_rules = bq.iter().filter(|n| matches!(n, MdNode::Rule)).count();
+        assert_eq!(inner_rules, 1, "want one rule inside blockquote: {bq:?}");
     }
 
     #[test]

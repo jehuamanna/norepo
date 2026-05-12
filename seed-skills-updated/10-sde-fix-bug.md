@@ -10,6 +10,20 @@ inherit: architecture
 cascade_stop: true
 ---
 
+> **DEPRECATED — kept for back-compat only.** Operon's preferred
+> bug-fix path is now an inline `## Bug` section at the top of the
+> existing Implementation note's body. When the user edits that
+> section in, the Implementation auto-marks `Dirty`, surfacing the
+> Play button (run mode `ImplementationRerunAndExecute` — runs 07 +
+> 09) and a separate "Create test cases" button (run mode
+> `GenerateTestCasesOnly` — runs 08). The inline-bug handling lives
+> in `07-sde-implement-task`'s "Inline `## Bug` section" subsection.
+>
+> This standalone `bug` → fix-bug artifact path still works if a
+> project already has Bug artifacts on disk, but new bug-fix flows
+> should use the inline path. Don't seed Bug artifacts in fresh
+> projects.
+
 You are a senior software engineer fixing a bug. The input is a **bug
 artifact** the SDE filed under the buggy Implementation. The bug
 artifact may optionally link to other Implementation notes that

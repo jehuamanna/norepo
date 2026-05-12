@@ -116,8 +116,15 @@ impl NoteKind {
     }
 
     /// Variants the user can pick from the explorer's + dropdown, in the
-    /// order they should appear. Drives `project_row` and `note_row` so a
-    /// future variant lights up everywhere by editing this list.
+    /// order they should appear. The UI menu builder in
+    /// `src/local_mode/explorer/creatable_kind.rs` consumes this list and
+    /// **replaces** the `Artifact` entry with a typed "Artifact ▶"
+    /// submenu of `ArtifactKind` variants (so manually-created artifacts
+    /// carry the correct `artifact_kind: …` frontmatter from the moment
+    /// they exist). Adding a new file-level kind here lights up the
+    /// dropdown everywhere automatically; non-menu consumers
+    /// (the `create_with_kind_persists_each_variant` test sweep, the
+    /// command palette, etc.) still iterate this list verbatim.
     pub fn all_creatable() -> &'static [NoteKind] {
         &[
             Self::Markdown,

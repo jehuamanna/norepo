@@ -14,6 +14,7 @@ pub enum MenuId {
     Selection,
     View,
     Run,
+    Tools,
     Help,
 }
 
@@ -24,6 +25,7 @@ impl MenuId {
         Self::Selection,
         Self::View,
         Self::Run,
+        Self::Tools,
         Self::Help,
     ];
 
@@ -34,6 +36,7 @@ impl MenuId {
             Self::Selection => "Selection",
             Self::View => "View",
             Self::Run => "Run",
+            Self::Tools => "Tools",
             Self::Help => "Help",
         }
     }
@@ -165,15 +168,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn menu_ids_are_six_in_order() {
-        assert_eq!(MenuId::ALL.len(), 6);
+    fn menu_ids_are_seven_in_order() {
+        assert_eq!(MenuId::ALL.len(), 7);
         let labels: Vec<_> = MenuId::ALL.iter().map(|m| m.label()).collect();
-        assert_eq!(labels, vec!["File", "Edit", "Selection", "View", "Run", "Help"]);
+        assert_eq!(
+            labels,
+            vec!["File", "Edit", "Selection", "View", "Run", "Tools", "Help"]
+        );
     }
 
     #[test]
     fn help_maps_to_palette_category() {
         assert_eq!(MenuId::Help.category_label(), "Palette");
         assert_eq!(MenuId::View.category_label(), "View");
+    }
+
+    #[test]
+    fn tools_category_label_is_tools() {
+        // Tools menu hosts a real `Tools` command category (currently
+        // just `tools.openRepoPermissions`). It does NOT fall through
+        // to Palette like Help does.
+        assert_eq!(MenuId::Tools.category_label(), "Tools");
     }
 }

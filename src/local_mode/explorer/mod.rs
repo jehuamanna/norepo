@@ -4,6 +4,7 @@
 
 mod backlinks;
 mod bulk_rename;
+pub mod creatable_kind;
 pub mod history;
 mod note_row;
 mod project_row;
@@ -33,6 +34,7 @@ use uuid::Uuid;
 use crate::editor::EditorMode;
 use crate::local_mode::desktop::{LocalNoteRepo, LocalProjectRepo, LocalTreeStateRepo};
 use crate::local_mode::editor::{open_local_note_tab, LocalSaveAction};
+use crate::local_mode::explorer::creatable_kind::CreatableKind;
 use crate::local_mode::ui::{
     resolve_drop_parent, ClipKind, ClipPayload, Clipboard, ConfirmDialog, DragKind, DragSession,
     DropPosition, LocalClipboard,
@@ -762,11 +764,16 @@ pub fn ExplorerPanel() -> Element {
     // time via NoteKind::format_id().
     let note_repo_for_add_project = note_repo.clone();
     let mut open_project_for_add = open_project_workspace.clone();
+    let persistence_for_add_project: Arc<dyn Persistence> = use_context();
     let on_add_project_note =
-        use_callback(move |(project_id, kind): (Uuid, NoteKind)| match kind {
-            NoteKind::Markdown => on_add_root_markdown_note.call(project_id),
-            NoteKind::Image => on_pick_image_note.call((project_id, None, None)),
-            other => {
+        use_callback(move |(project_id, kind): (Uuid, CreatableKind)| match kind {
+            CreatableKind::Plain(NoteKind::Markdown) => {
+                on_add_root_markdown_note.call(project_id);
+            }
+            CreatableKind::Plain(NoteKind::Image) => {
+                on_pick_image_note.call((project_id, None, None));
+            }
+            CreatableKind::Plain(other) => {
                 open_project_for_add(project_id);
                 match note_repo_for_add_project.create_with_kind(project_id, None, "", other) {
                     Ok(n) => {
@@ -778,6 +785,41 @@ pub fn ExplorerPanel() -> Element {
                         renaming_note_setter.set(Some(n.id));
                     }
                     Err(e) => eprintln!("operon: create root {} note failed: {e}", other.as_str()),
+                }
+            }
+            CreatableKind::Artifact(akind) => {
+                open_project_for_add(project_id);
+                match note_repo_for_add_project.create_with_kind(
+                    project_id,
+                    None,
+                    "",
+                    NoteKind::Artifact,
+                ) {
+                    Ok(n) => {
+                        history.write().push(history::ExplorerAction::Create {
+                            id: n.id,
+                            blob_path: None,
+                        });
+                        let body = creatable_kind::scaffold_body(&akind);
+                        let persistence = persistence_for_add_project.clone();
+                        let new_id = n.id;
+                        spawn(async move {
+                            if let Err(e) = persistence
+                                .save(&new_id.to_string(), body.as_bytes())
+                                .await
+                            {
+                                eprintln!(
+                                    "operon: write scaffold body for root artifact {new_id}: {e}"
+                                );
+                            }
+                        });
+                        note_version.with_mut(|v| *v += 1);
+                        renaming_note_setter.set(Some(n.id));
+                    }
+                    Err(e) => eprintln!(
+                        "operon: create root artifact ({}) failed: {e}",
+                        akind.as_str()
+                    ),
                 }
             }
         });
@@ -1013,10 +1055,13 @@ pub fn ExplorerPanel() -> Element {
     let note_repo_for_add_child = note_repo.clone();
     let mut expand_ancestors_for_child = expand_ancestors.clone();
     let mut open_project_for_child = open_project_workspace.clone();
-    // Plans-Phase-1-note-creation-context-menu: kind-aware add-child dispatch.
-    // Markdown → existing fast path with auto-rename. Image → drives the
-    // file picker via on_pick_image_note (item 2 — picker for child).
-    let on_add_child_note = use_callback(move |(parent_id, kind): (Uuid, NoteKind)| {
+    let persistence_for_add_child: Arc<dyn Persistence> = use_context();
+    // Kind-aware add-child dispatch. `Plain(Image)` opens the picker;
+    // other plain kinds take the existing create_with_kind fast path;
+    // `Artifact(kind)` creates a NoteKind::Artifact + writes the
+    // matching scaffold body via Persistence so the note slots into
+    // the cascade pipeline immediately.
+    let on_add_child_note = use_callback(move |(parent_id, kind): (Uuid, CreatableKind)| {
         let project_id = notes_by_project
             .read()
             .iter()
@@ -1028,10 +1073,10 @@ pub fn ExplorerPanel() -> Element {
         open_project_for_child(project_id);
         expand_ancestors_for_child(project_id, Some(parent_id));
         match kind {
-            NoteKind::Image => {
+            CreatableKind::Plain(NoteKind::Image) => {
                 on_pick_image_note.call((project_id, Some(parent_id), None));
             }
-            other => {
+            CreatableKind::Plain(other) => {
                 match note_repo_for_add_child.create_with_kind(project_id, Some(parent_id), "", other) {
                     Ok(n) => {
                         history.write().push(history::ExplorerAction::Create {
@@ -1042,6 +1087,45 @@ pub fn ExplorerPanel() -> Element {
                         renaming_note_setter.set(Some(n.id));
                     }
                     Err(e) => eprintln!("operon: create child {} note failed: {e}", other.as_str()),
+                }
+            }
+            CreatableKind::Artifact(akind) => {
+                match note_repo_for_add_child.create_with_kind(
+                    project_id,
+                    Some(parent_id),
+                    "",
+                    NoteKind::Artifact,
+                ) {
+                    Ok(n) => {
+                        history.write().push(history::ExplorerAction::Create {
+                            id: n.id,
+                            blob_path: None,
+                        });
+                        // Seed the body with frontmatter + section
+                        // headers before the user opens the note,
+                        // so the cascade engine recognises its
+                        // `artifact_kind` on the next pass and the
+                        // user sees the right scaffold on click.
+                        let body = creatable_kind::scaffold_body(&akind);
+                        let persistence = persistence_for_add_child.clone();
+                        let new_id = n.id;
+                        spawn(async move {
+                            if let Err(e) = persistence
+                                .save(&new_id.to_string(), body.as_bytes())
+                                .await
+                            {
+                                eprintln!(
+                                    "operon: write scaffold body for artifact {new_id}: {e}"
+                                );
+                            }
+                        });
+                        note_version.with_mut(|v| *v += 1);
+                        renaming_note_setter.set(Some(n.id));
+                    }
+                    Err(e) => eprintln!(
+                        "operon: create child artifact ({}) failed: {e}",
+                        akind.as_str()
+                    ),
                 }
             }
         }
@@ -1055,11 +1139,12 @@ pub fn ExplorerPanel() -> Element {
     let note_repo_for_add_sibling = note_repo.clone();
     let mut expand_ancestors_for_sibling = expand_ancestors.clone();
     let mut open_project_for_sibling = open_project_workspace.clone();
-    // Plans-Phase-1-note-creation-context-menu: kind-aware add-sibling.
-    // Markdown branch creates + move_to(target_idx+1) + auto-rename.
-    // Image branch routes through on_pick_image_note with the target's
-    // sibling-index+1 as the anchor (item 2 — picker for sibling).
-    let on_add_sibling_note = use_callback(move |(target_id, kind): (Uuid, NoteKind)| {
+    let persistence_for_add_sibling: Arc<dyn Persistence> = use_context();
+    // Kind-aware add-sibling. Mirrors `on_add_child_note`: Plain(Image)
+    // routes through the picker; other Plain kinds take the
+    // create-then-move_to path; `Artifact(kind)` additionally writes
+    // the scaffold body via Persistence.
+    let on_add_sibling_note = use_callback(move |(target_id, kind): (Uuid, CreatableKind)| {
         let snapshot = notes_by_project.read();
         let mut found: Option<(Uuid, Option<Uuid>, i64)> = None;
         for (pid, list) in snapshot.iter() {
@@ -1076,10 +1161,10 @@ pub fn ExplorerPanel() -> Element {
         open_project_for_sibling(project_id);
         expand_ancestors_for_sibling(project_id, parent_id);
         match kind {
-            NoteKind::Image => {
+            CreatableKind::Plain(NoteKind::Image) => {
                 on_pick_image_note.call((project_id, parent_id, Some(target_idx + 1)));
             }
-            other => {
+            CreatableKind::Plain(other) => {
                 match note_repo_for_add_sibling.create_with_kind(project_id, parent_id, "", other) {
                     Ok(n) => {
                         if let Err(e) = note_repo_for_add_sibling.move_to(
@@ -1098,6 +1183,48 @@ pub fn ExplorerPanel() -> Element {
                         renaming_note_setter.set(Some(n.id));
                     }
                     Err(e) => eprintln!("operon: create sibling {} note failed: {e}", other.as_str()),
+                }
+            }
+            CreatableKind::Artifact(akind) => {
+                match note_repo_for_add_sibling.create_with_kind(
+                    project_id,
+                    parent_id,
+                    "",
+                    NoteKind::Artifact,
+                ) {
+                    Ok(n) => {
+                        if let Err(e) = note_repo_for_add_sibling.move_to(
+                            n.id,
+                            project_id,
+                            parent_id,
+                            target_idx + 1,
+                        ) {
+                            eprintln!("operon: add sibling: move_to failed: {e}");
+                        }
+                        history.write().push(history::ExplorerAction::Create {
+                            id: n.id,
+                            blob_path: None,
+                        });
+                        let body = creatable_kind::scaffold_body(&akind);
+                        let persistence = persistence_for_add_sibling.clone();
+                        let new_id = n.id;
+                        spawn(async move {
+                            if let Err(e) = persistence
+                                .save(&new_id.to_string(), body.as_bytes())
+                                .await
+                            {
+                                eprintln!(
+                                    "operon: write scaffold body for artifact {new_id}: {e}"
+                                );
+                            }
+                        });
+                        note_version.with_mut(|v| *v += 1);
+                        renaming_note_setter.set(Some(n.id));
+                    }
+                    Err(e) => eprintln!(
+                        "operon: create sibling artifact ({}) failed: {e}",
+                        akind.as_str()
+                    ),
                 }
             }
         }
@@ -2696,7 +2823,7 @@ struct ProjectSubtreeProps {
     on_request_rename_project: Callback<Uuid>,
     on_request_delete_project: Callback<Uuid>,
     on_toggle_project: Callback<Uuid>,
-    on_add_project_note: Callback<(Uuid, NoteKind)>,
+    on_add_project_note: Callback<(Uuid, CreatableKind)>,
     on_drop_image_into_note: Callback<(Uuid, Vec<u8>, String)>,
     on_drop_image_into_project: Callback<(Uuid, Vec<u8>, String)>,
     on_select_note: Callback<Uuid>,
@@ -2704,8 +2831,8 @@ struct ProjectSubtreeProps {
     on_rename_note: Callback<(Uuid, String)>,
     on_request_rename_note: Callback<Uuid>,
     on_request_delete_note: Callback<Uuid>,
-    on_add_child_note: Callback<(Uuid, NoteKind)>,
-    on_add_sibling_note: Callback<(Uuid, NoteKind)>,
+    on_add_child_note: Callback<(Uuid, CreatableKind)>,
+    on_add_sibling_note: Callback<(Uuid, CreatableKind)>,
     on_indent_note: Callback<Uuid>,
     on_outdent_note: Callback<Uuid>,
     on_move_up_note: Callback<Uuid>,

@@ -1767,6 +1767,10 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                         &mut active_session,
                                         &mut active_scope,
                                         Some(1), // one level per click
+                                        // Workflow canvas's per-node ▶ is the
+                                        // generic step-through — no
+                                        // SDE sub-filter applies here.
+                                        crate::plugins::artifact::cascade::RunMode::Full,
                                     );
                                     return;
                                 }

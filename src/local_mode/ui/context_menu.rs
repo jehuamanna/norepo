@@ -205,18 +205,38 @@ fn SubMenu(props: SubMenuProps) -> Element {
     let items = props.items.clone();
     let on_dismiss = props.on_dismiss;
     // Each SubMenu owns its own active-child tracker so a deeper nested
-    // submenu (if a leaf were ever promoted to `submenu(...)`) wouldn't
-    // collide with the parent menu's tracker.
+    // submenu (the typed-Artifact submenu nested inside "Add child note"
+    // is exactly such a case) doesn't collide with the parent menu's
+    // tracker.
     let open_submenu: Signal<Option<usize>> = use_signal(|| None);
+    // Per-instance DOM id used by the viewport-clamp script. The
+    // script calls `document.querySelector(...)` which returns the
+    // *first* matching element in DOM order. When two SubMenus are
+    // mounted simultaneously (e.g. "Add child note ▶ Artifact ▶ …" —
+    // three menu levels) a shared selector would make the newer
+    // SubMenu's clamp call unhide the older one instead of itself, so
+    // the new submenu would stay at `visibility: hidden`. Bumping a
+    // process-wide counter per SubMenu construction gives each one a
+    // unique `id` to target. `data-testid` stays the static
+    // `context-submenu` string so existing Playwright selectors
+    // (`e2e/specs/explorer-context-menu-submenu.spec.ts`) keep working.
+    let clamp_id = use_hook(|| {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("operon-context-submenu-{n}")
+    });
+    let clamp_id_for_mount = clamp_id.clone();
     rsx! {
         div {
             class: "operon-context-menu operon-context-submenu",
+            id: "{clamp_id}",
             style: "{style}",
             "data-testid": "context-submenu",
             tabindex: "-1",
             onmounted: move |_| {
                 let _ = dioxus::prelude::document::eval(
-                    &clamp_into_viewport_script("[data-testid=\"context-submenu\"]")
+                    &clamp_into_viewport_script(&format!("#{clamp_id_for_mount}"))
                 );
             },
             onclick: move |evt| evt.stop_propagation(),

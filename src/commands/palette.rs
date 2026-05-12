@@ -142,6 +142,13 @@ pub fn CommandPalette() -> Element {
     let LastActiveActivity(last_active) = use_context();
     let layout: Signal<LayoutState> = use_context();
     let crate::shell::about::AboutOpen(about_open) = use_context();
+    #[cfg(not(target_arch = "wasm32"))]
+    let repo_permissions_open: Option<Signal<bool>> = {
+        let crate::shell::repo_permissions::RepoPermissionsOpen(s) = use_context();
+        Some(s)
+    };
+    #[cfg(target_arch = "wasm32")]
+    let repo_permissions_open: Option<Signal<bool>> = None;
 
     let snapshot = palette.read();
     let open = snapshot.open;
@@ -303,6 +310,7 @@ pub fn CommandPalette() -> Element {
                                                 layout,
                                                 theme_registry: theme_reg_for_keydown.clone(),
                                                 about_open,
+                                                repo_permissions_open,
                                                 local_save: try_consume_context(),
                                             };
                                             let _ = cmd_reg_for_keydown.execute(&c.id, &context);

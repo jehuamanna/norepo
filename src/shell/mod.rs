@@ -35,6 +35,8 @@ pub mod permission_persist;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod permission_prompt;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod repo_permissions;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod clarification_prompt;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod settings;

@@ -231,6 +231,21 @@ pub fn register_builtin_commands(reg: &mut CommandRegistry) -> Result<(), String
         }),
     })?;
 
+    // Tools → Repo Permissions. Desktop-only because the panel writes to
+    // per-repo `.claude/settings.local.json`. On wasm the command still
+    // registers (so menus don't have to be conditional) but the panel
+    // host renders nothing, so flipping the signal is a harmless no-op.
+    reg.register(Command {
+        id: "tools.openRepoPermissions".into(),
+        title: "Repo Permissions".into(),
+        category: "Tools".into(),
+        handler: Box::new(|ctx: &CommandContext| {
+            if let Some(mut open) = ctx.repo_permissions_open {
+                open.set(true);
+            }
+        }),
+    })?;
+
     Ok(())
 }
 
@@ -254,6 +269,7 @@ mod tests {
                 "notes.openSample".into(),
                 "palette.show".into(),
                 "palette.showCommands".into(),
+                "tools.openRepoPermissions".into(),
                 "view.closeActiveTab".into(),
                 "view.toggleCompanion".into(),
                 "view.togglePanel".into(),

@@ -40,17 +40,21 @@ body may therefore contain one or more Figma URLs whose host is
 
 1. Extract every Figma URL from the parent body (the master
    requirement plus every aggregated detailed Requirement).
-2. For each URL, call the `mcp__figma__get_figma_data` MCP tool.
-   Use the returned frame names / component inventory / text to
-   inform how you slice the Requirements — design boundaries often
-   map directly to Epic boundaries.
+2. For each URL, find the Figma "get figma data" MCP tool in your
+   available tools — its full name is `mcp__<server>__get_figma_data`
+   where `<server>` is whatever the user named their Figma MCP server
+   (commonly `figma`, `figma-mcp`, or `figma-developer-mcp`). Call
+   that tool with each URL. Use the returned frame names / component
+   inventory / text to inform how you slice the Requirements —
+   design boundaries often map directly to Epic boundaries.
 3. Each output Epic includes a `## Design references` section that
    lists the Figma URLs relevant to that Epic, each with a one-line
    note about which frames / flows map to this Epic's outcome.
 
-If `mcp__figma__get_figma_data` fails:
-- **Tool missing / MCP not configured** (e.g. the function isn't
-  registered): print ONE warning line to the user
+If no `mcp__*__get_figma_data` tool is available, or the call fails:
+- **Tool missing / MCP not configured** (no matching tool in your
+  tool list, or the function isn't registered): print ONE warning
+  line to the user
   (`WARNING: Figma MCP not configured — 02-ba-discover-epics
   proceeded without design context. Install the Figma MCP server
   to enrich future runs.`), then continue with decomposition. Each

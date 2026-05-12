@@ -5,10 +5,11 @@
 use dioxus::prelude::*;
 use dioxus::html::HasFileData;
 use keyboard_types::Modifiers;
-use operon_store::repos::{LocalNote, NoteKind};
+use operon_store::repos::LocalNote;
 use uuid::Uuid;
 
 use crate::editor::EditorMode;
+use crate::local_mode::explorer::creatable_kind::{build_creatable_menu, CreatableKind};
 use crate::local_mode::explorer::{
     extend_keyboard_selection, ExplorerUndoCtx, FocusedNode, LastClicked, MultiSelected, NodeKey,
     NotesByProjectCtx, VisibleFlat,
@@ -45,16 +46,19 @@ pub struct NoteRowProps {
     pub on_rename: Callback<(Uuid, String)>,
     pub on_request_rename: Callback<Uuid>,
     pub on_request_delete: Callback<Uuid>,
-    /// Plans-Phase-1-note-creation-context-menu: kind-aware add-child. The
-    /// submenu's Markdown / Image leaves dispatch with the chosen NoteKind;
-    /// the handler in `explorer/mod.rs` branches on kind (Markdown takes
-    /// the existing fast path, Image opens a file picker before creation).
-    pub on_add_child: Callback<(Uuid, NoteKind)>,
-    /// Plans-Phase-1-note-creation-context-menu: kind-aware add-sibling.
-    /// Same dispatch contract as `on_add_child`. The Markdown branch creates
-    /// then `move_to(.., target.sibling_index + 1)`; Image goes via the
-    /// project-scoped picker plumbing with the target's `parent_id`.
-    pub on_add_sibling: Callback<(Uuid, NoteKind)>,
+    /// Kind-aware add-child. Submenu leaves dispatch with a
+    /// [`CreatableKind`] — `Plain(NoteKind)` for the file-level kinds
+    /// (Markdown / Image / etc.) and `Artifact(ArtifactKind)` for the
+    /// typed-pipeline submenu under "Artifact ▶". The handler in
+    /// `explorer/mod.rs` branches: Plain takes the existing fast path
+    /// (Image opens a file picker), Artifact creates an Artifact note
+    /// + writes the scaffold body via `Persistence::save`.
+    pub on_add_child: Callback<(Uuid, CreatableKind)>,
+    /// Kind-aware add-sibling. Same dispatch contract as `on_add_child`.
+    /// The Plain branch creates then `move_to(.., target.sibling_index + 1)`;
+    /// Image goes via the project-scoped picker plumbing with the target's
+    /// `parent_id`; Artifact creates + writes scaffold + repositions.
+    pub on_add_sibling: Callback<(Uuid, CreatableKind)>,
     pub on_indent: Callback<Uuid>,
     pub on_outdent: Callback<Uuid>,
     pub on_move_up: Callback<Uuid>,
@@ -212,23 +216,15 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let dismiss_menu = use_callback(move |_: ()| menu_pos_setter.set(None));
     let dismiss_add_menu = use_callback(move |_: ()| add_menu_pos_setter.set(None));
 
-    // Operon-Phase-3: the + dropdown creates a CHILD note (matches the
-    // historical default behavior of this button). Items mirror
-    // `NoteKind::all_creatable()` so adding a future variant lights up
-    // here automatically.
-    let add_menu_items: Vec<ContextMenuItem> = NoteKind::all_creatable()
-        .iter()
-        .copied()
-        .map(|kind| {
-            let label = kind.display_name();
-            ContextMenuItem::new(
-                label,
-                Callback::new(move |_| {
-                    on_add_child.call((id, kind));
-                }),
-            )
-        })
-        .collect();
+    // The "+" dropdown creates a CHILD note. Built from the shared
+    // layout in `creatable_kind.rs` so the same shape (plain kinds +
+    // typed-Artifact submenu) appears in every creation surface
+    // (right-click "Add child"/"Add sibling", this dropdown, and the
+    // project-row "+" dropdown).
+    let on_pick_for_add_dropdown: Callback<CreatableKind> = Callback::new(move |kind| {
+        on_add_child.call((id, kind));
+    });
+    let add_menu_items: Vec<ContextMenuItem> = build_creatable_menu(on_pick_for_add_dropdown);
 
     let mut paste_item = ContextMenuItem::new(
         "Paste",
@@ -312,33 +308,15 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
         ),
         ContextMenuItem::submenu(
             "Add child note",
-            NoteKind::all_creatable()
-                .iter()
-                .copied()
-                .map(|kind| {
-                    ContextMenuItem::new(
-                        kind.display_name(),
-                        Callback::new(move |_| {
-                            on_add_child.call((id, kind));
-                        }),
-                    )
-                })
-                .collect(),
+            build_creatable_menu(Callback::new(move |kind| {
+                on_add_child.call((id, kind));
+            })),
         ),
         ContextMenuItem::submenu(
             "Add sibling note",
-            NoteKind::all_creatable()
-                .iter()
-                .copied()
-                .map(|kind| {
-                    ContextMenuItem::new(
-                        kind.display_name(),
-                        Callback::new(move |_| {
-                            on_add_sibling.call((id, kind));
-                        }),
-                    )
-                })
-                .collect(),
+            build_creatable_menu(Callback::new(move |kind| {
+                on_add_sibling.call((id, kind));
+            })),
         ),
         if is_bulk {
             ContextMenuItem::new(

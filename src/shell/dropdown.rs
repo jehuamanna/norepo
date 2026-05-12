@@ -28,6 +28,13 @@ pub fn Dropdown(menu: MenuId) -> Element {
     let palette: Signal<PaletteState> = use_context();
     let layout: Signal<LayoutState> = use_context();
     let crate::shell::about::AboutOpen(about_open) = use_context();
+    #[cfg(not(target_arch = "wasm32"))]
+    let repo_permissions_open: Option<Signal<bool>> = {
+        let crate::shell::repo_permissions::RepoPermissionsOpen(s) = use_context();
+        Some(s)
+    };
+    #[cfg(target_arch = "wasm32")]
+    let repo_permissions_open: Option<Signal<bool>> = None;
     let mut open_menu: Signal<Option<MenuId>> = use_context();
 
     let category = menu.category_label();
@@ -177,6 +184,7 @@ pub fn Dropdown(menu: MenuId) -> Element {
                                     layout,
                                     theme_registry: theme_reg.clone(),
                                     about_open,
+                                    repo_permissions_open,
                                     local_save: try_consume_context(),
                                 };
                                 let _ = cmd_reg.execute(&id, &context);
@@ -196,6 +204,7 @@ pub fn Dropdown(menu: MenuId) -> Element {
                                         layout,
                                         theme_registry: theme_reg_keys.clone(),
                                         about_open,
+                                        repo_permissions_open,
                                         local_save: try_consume_context(),
                                     };
                                     let _ = cmd_reg_keys.execute(&id_for_keys, &context);
@@ -233,6 +242,10 @@ mod tests {
             "Help maps to Palette which has built-ins"
         );
         assert!(!empty_for(&r, MenuId::File), "File now hosts file.saveNote");
+        assert!(
+            !empty_for(&r, MenuId::Tools),
+            "Tools hosts tools.openRepoPermissions"
+        );
         assert!(empty_for(&r, MenuId::Edit));
         assert!(empty_for(&r, MenuId::Selection));
         assert!(empty_for(&r, MenuId::Run));

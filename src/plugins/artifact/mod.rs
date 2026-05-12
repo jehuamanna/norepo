@@ -12,6 +12,8 @@ use crate::plugin::{FormatCaps, FormatPlugin, PluginManifest, PluginSurface};
 #[cfg(not(target_arch = "wasm32"))]
 pub mod aggregation;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod revisions;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod cascade;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod cascade_graph;

@@ -2329,6 +2329,18 @@ html, body {
   text-transform: lowercase;
   border: 1px solid currentColor;
 }
+.operon-artifact-revision-select {
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-editor-background, #1e1e1e);
+  color: inherit;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.operon-artifact-revision-select:focus {
+  outline: 1px solid var(--operon-accent);
+}
 .operon-artifact-status-pending  { color: #d99a3c; }
 .operon-artifact-status-approved { color: var(--operon-accent); }
 .operon-artifact-status-rejected { color: var(--vscode-errorforeground, #f48771); }

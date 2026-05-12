@@ -7,6 +7,7 @@ use dioxus::prelude::*;
 
 use crate::shell::companion_state::ActiveRepoPath;
 use crate::shell::mcp_settings::{AddArgs, McpServiceCtx, Scope, Transport};
+use crate::shell::permission_persist::{append_allow_rule, mcp_wildcard_rule};
 
 #[derive(Props, Clone, PartialEq)]
 pub struct AddFormProps {
@@ -30,6 +31,12 @@ pub fn AddForm(props: AddFormProps) -> Element {
     let header_rows: Signal<Vec<(String, String)>> = use_signal(Vec::new);
     let mut submitting: Signal<bool> = use_signal(|| false);
     let mut err: Signal<Option<String>> = use_signal(|| None);
+    // Default-on: when the user adds an MCP, also append `mcp__<name>__*`
+    // to the active repo's `.claude/settings.local.json` allow list so
+    // skill runs (which run in `acceptEdits` mode and don't auto-approve
+    // MCP tool calls) stop blocking on permission prompts. Toggleable
+    // per-add so the user can opt out for a particular server.
+    let mut auto_allow: Signal<bool> = use_signal(|| true);
 
     let on_cancel = {
         let on_done = props.on_done;
@@ -75,11 +82,38 @@ pub fn AddForm(props: AddFormProps) -> Element {
             let on_done = on_done;
             let saved_name = args.name.clone();
             let cwd = active_repo.read().clone();
+            let allow_after_add = *auto_allow.read();
             submitting.set(true);
             err.set(None);
             spawn(async move {
                 match service.add(&args, cwd.as_deref()).await {
-                    Ok(()) => on_done.call(Some(format!("Added `{saved_name}`."))),
+                    Ok(()) => {
+                        let mut toast = format!("Added `{saved_name}`.");
+                        if allow_after_add {
+                            if let (Some(repo), Some(rule)) =
+                                (cwd.as_ref(), mcp_wildcard_rule(&saved_name))
+                            {
+                                match append_allow_rule(repo, &rule) {
+                                    Ok(_) => {
+                                        toast.push_str(&format!(
+                                            " Allow-listed `{rule}` in this repo."
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            target: "operon::mcp",
+                                            "auto-allow {rule} in {}: {e}",
+                                            repo.display()
+                                        );
+                                        toast.push_str(
+                                            " (couldn't auto-allow — see logs)",
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        on_done.call(Some(toast));
+                    }
                     Err(e) => {
                         submitting.set(false);
                         err.set(Some(e));
@@ -182,6 +216,18 @@ pub fn AddForm(props: AddFormProps) -> Element {
                     placeholder_key: "Authorization",
                     placeholder_value: "Bearer …",
                     test_id_prefix: "mcp-add-header",
+                }
+            }
+            div { class: "operon-mcp-form-row",
+                label { class: "operon-modal-label", "Permissions" }
+                label { class: "operon-mcp-form-toggle",
+                    input {
+                        r#type: "checkbox",
+                        "data-testid": "mcp-add-auto-allow",
+                        checked: *auto_allow.read(),
+                        onchange: move |e| auto_allow.set(e.checked()),
+                    }
+                    " Allow all tools from this server in the active repo"
                 }
             }
             if let Some(msg) = err.read().clone() {

@@ -114,6 +114,17 @@ pub fn App() -> Element {
     let about_open: Signal<bool> = use_signal(|| false);
     use_context_provider(|| crate::shell::about::AboutOpen(about_open));
 
+    // App-scope visibility for the Repo Permissions panel (Tools menu +
+    // `tools.openRepoPermissions` command). Desktop-only — the panel
+    // reads/writes per-repo `.claude/settings.local.json` files which
+    // don't exist on wasm.
+    #[cfg(not(target_arch = "wasm32"))]
+    let repo_permissions_open: Signal<bool> = use_signal(|| false);
+    #[cfg(not(target_arch = "wasm32"))]
+    use_context_provider(|| {
+        crate::shell::repo_permissions::RepoPermissionsOpen(repo_permissions_open)
+    });
+
     #[cfg(not(target_arch = "wasm32"))]
     let initial_mode_remembered: Option<Mode> = {
         let crate::local_mode::LocalSettingsRepo(settings) = use_context();
@@ -301,6 +312,25 @@ pub fn App() -> Element {
         // Workspace alike. Component returns an empty fragment when the
         // signal is false.
         crate::shell::about::AboutDialog {}
+        // Same pattern for the Tools → Repo Permissions panel. Desktop-
+        // only because the panel touches the filesystem; the wasm stub
+        // renders nothing.
+        RepoPermissionsPanelHost {}
+    }
+}
+
+/// Thin host that mounts `RepoPermissionsPanel` on desktop only. The
+/// panel itself reads/writes per-repo `.claude/settings.local.json`
+/// files which don't exist in the wasm sandbox.
+#[component]
+fn RepoPermissionsPanelHost() -> Element {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        rsx! { crate::shell::repo_permissions::RepoPermissionsPanel {} }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        rsx! {}
     }
 }
 

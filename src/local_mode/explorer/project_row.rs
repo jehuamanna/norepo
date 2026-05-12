@@ -13,6 +13,7 @@ use operon_store::repos::NoteKind;
 use keyboard_types::Modifiers;
 
 use crate::local_mode::desktop::LocalNoteRepo;
+use crate::local_mode::explorer::creatable_kind::{build_creatable_menu, CreatableKind};
 use crate::local_mode::explorer::{
     ExplorerUndoCtx, FocusedNode, LastClicked, LocalNoteVersion, MultiSelected, NodeKey,
     NotesByProjectCtx, VisibleFlat,
@@ -48,8 +49,10 @@ pub struct ProjectRowProps {
     /// now kind-aware. The submenu's Markdown leaf goes through the existing
     /// `note_repo.create` path (auto-rename triggered on the new row); the
     /// Image leaf opens the same native file picker that the old standalone
-    /// `Add image note…` item used.
-    pub on_add_note: Callback<(Uuid, NoteKind)>,
+    /// `Add image note…` item used. The "Artifact ▶" submenu's children
+    /// dispatch with `CreatableKind::Artifact(...)` so the handler can
+    /// inject the matching scaffold body.
+    pub on_add_note: Callback<(Uuid, CreatableKind)>,
     /// Plans-Phase-6-image-notes: external image-file drops onto this
     /// project row land as top-level image-notes in the project. Tuple is
     /// (project_id, bytes, suggested filename).
@@ -156,22 +159,14 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     let dismiss_menu = use_callback(move |_: ()| menu_pos_setter.set(None));
     let dismiss_add_menu = use_callback(move |_: ()| add_menu_pos_setter.set(None));
 
-    // Operon-Phase-3: dropdown items, one per creatable kind. Driven by
-    // `NoteKind::all_creatable()` so adding a future variant lights up
-    // the dropdown automatically.
-    let add_menu_items: Vec<ContextMenuItem> = NoteKind::all_creatable()
-        .iter()
-        .copied()
-        .map(|kind| {
-            let label = kind.display_name();
-            ContextMenuItem::new(
-                label,
-                Callback::new(move |_| {
-                    on_add_note.call((id, kind));
-                }),
-            )
-        })
-        .collect();
+    // Dropdown items built from the shared layout in `creatable_kind.rs`
+    // — top-level plain kinds plus the typed "Artifact ▶" submenu —
+    // so this project-level "+" stays in lockstep with the per-note "+"
+    // dropdown and the right-click "Add child / sibling" submenus.
+    let add_menu_items: Vec<ContextMenuItem> =
+        build_creatable_menu(Callback::new(move |kind| {
+            on_add_note.call((id, kind));
+        }));
 
     let mut paste_item = ContextMenuItem::new(
         "Paste",
@@ -266,18 +261,9 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
         },
         ContextMenuItem::submenu(
             "Add note",
-            NoteKind::all_creatable()
-                .iter()
-                .copied()
-                .map(|kind| {
-                    ContextMenuItem::new(
-                        kind.display_name(),
-                        Callback::new(move |_| {
-                            on_add_note.call((id, kind));
-                        }),
-                    )
-                })
-                .collect(),
+            build_creatable_menu(Callback::new(move |kind| {
+                on_add_note.call((id, kind));
+            })),
         ),
         ContextMenuItem::new("Import skills\u{2026}", import_skills),
         if is_bulk {

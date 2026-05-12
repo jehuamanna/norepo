@@ -34,17 +34,22 @@ host is `figma.com` or `www.figma.com`. At the start of your work:
 
 1. Extract every Figma URL from the parent Feature body (including
    its `## Design references` section if present).
-2. For each URL, call the `mcp__figma__get_figma_data` MCP tool.
-   Use the returned frame names / screens / component inventory to
-   inform how you slice the Feature into Stories — individual
-   screens or user-flow steps often map directly to Stories.
+2. For each URL, find the Figma "get figma data" MCP tool in your
+   available tools — its full name is `mcp__<server>__get_figma_data`
+   where `<server>` is whatever the user named their Figma MCP server
+   (commonly `figma`, `figma-mcp`, or `figma-developer-mcp`). Call
+   that tool with each URL. Use the returned frame names / screens /
+   component inventory to inform how you slice the Feature into
+   Stories — individual screens or user-flow steps often map directly
+   to Stories.
 3. Each output Story includes a `## Design references` section
    listing the Figma URLs relevant to that Story, each with a
    one-line note about which specific frame / screen / flow step
    maps to it.
 
-If `mcp__figma__get_figma_data` fails:
-- **Tool missing / MCP not configured**: print ONE warning line
+If no `mcp__*__get_figma_data` tool is available, or the call fails:
+- **Tool missing / MCP not configured** (no matching tool in your
+  tool list): print ONE warning line
   (`WARNING: Figma MCP not configured — 04-ba-decompose-stories
   proceeded without design context. Install the Figma MCP server
   to enrich future runs.`), then continue. Affected URLs are tagged
