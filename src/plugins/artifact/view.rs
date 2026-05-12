@@ -1242,6 +1242,11 @@ fn spawn_runner(
                 return;
             }
         }
+        // Single-skill Re-run from the artifact view's "Re-run" /
+        // "Run skill" buttons. No Stop UI here yet, so pass a fresh
+        // CancellationToken — the runner's signature requires one.
+        // Once a per-artifact Stop button lands, wire it through.
+        let cancel = tokio_util::sync::CancellationToken::new();
         let result =
             crate::plugins::artifact::runner::run_skill_on_source_with_revision_notes(
                 &note_repo,
@@ -1254,6 +1259,7 @@ fn spawn_runner(
                 skill_note_id,
                 extra_revision_notes,
                 Vec::new(),
+                cancel,
             )
             .await;
         // Both Ok/Err writes go to the GlobalSignal map, so they

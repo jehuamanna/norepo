@@ -99,6 +99,7 @@ pub async fn run_skill_on_source(
     chat_session_id: Uuid,
     source_note_id: Uuid,
     skill_note_id: Uuid,
+    cancel: CancellationToken,
 ) -> Result<RunOutcome, RunnerError> {
     run_skill_on_source_with_revision_notes(
         note_repo,
@@ -111,6 +112,7 @@ pub async fn run_skill_on_source(
         skill_note_id,
         None,
         Vec::new(),
+        cancel,
     )
     .await
 }
@@ -150,6 +152,7 @@ pub async fn run_skill_on_source_with_revision_notes(
     skill_note_id: Uuid,
     extra_revision_notes: Option<(Uuid, String)>,
     previous_outputs: Vec<(String, String)>,
+    cancel: CancellationToken,
 ) -> Result<RunOutcome, RunnerError> {
     // 1. Resolve project + repo_path.
     let project_id = note_repo
@@ -372,7 +375,16 @@ pub async fn run_skill_on_source_with_revision_notes(
     //    chats keep using whatever the user picked, since they
     //    don't set a per-session override.
     plugin.set_session_permission_mode(chat_session_id, Some("acceptEdits".into()));
-    let ct = CancellationToken::new();
+    // Pass the caller's cancellation token straight through to the
+    // plugin so the in-flight `claude` subprocess dies when the user
+    // clicks Stop. `drive_stream` does `proc.child.start_kill()` on
+    // `ct.cancelled()` (claude-code/src/stream.rs:36-43); without
+    // routing the outer token here, the plugin watched a fresh token
+    // that no Stop click could ever cancel, so the subprocess kept
+    // running for up to 2 minutes after the user gave up.
+    // `CancellationToken` clones share state — when the cascade's
+    // outer token cancels, this clone fires too.
+    let ct = cancel.clone();
     let mut rx = plugin
         .send_rich(prompt, chat_session_id, ct)
         .await

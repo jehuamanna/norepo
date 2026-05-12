@@ -4914,6 +4914,13 @@ async fn run_one_node_sdlc(
         node_snapshot.skill_note_id,
     );
 
+    // Workflow-canvas single-node runs don't yet have a Stop UI of
+    // their own, so pass a fresh CancellationToken here. Once a
+    // canvas-level Stop button lands, swap this for the wired
+    // token. The runner's signature still requires SOMETHING — and
+    // the plugin's drive_stream watches whatever it's given, so a
+    // fresh token is a no-op cancel that compiles.
+    let cancel = tokio_util::sync::CancellationToken::new();
     let outcome = crate::plugins::artifact::runner::run_skill_on_source(
         note_repo,
         &project_repo,
@@ -4923,6 +4930,7 @@ async fn run_one_node_sdlc(
         operon_session,
         source_id,
         node_snapshot.skill_note_id,
+        cancel,
     )
     .await
     .map_err(|e| format!("run_skill_on_source: {e}"))?;

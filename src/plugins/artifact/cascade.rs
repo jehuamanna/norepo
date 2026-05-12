@@ -785,6 +785,7 @@ pub async fn run_cascade(
                     skill.id,
                     dirty_notes.clone(),
                     previous_outputs.clone(),
+                    cancel.clone(),
                 )
                 .await
             } else {
@@ -797,6 +798,7 @@ pub async fn run_cascade(
                     cascade_session_id,
                     art_id,
                     skill.id,
+                    cancel.clone(),
                 )
                 .await
             };
