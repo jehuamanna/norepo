@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 const SIDEBAR_DEFAULT: u32 = 280;
 const COMPANION_DEFAULT: u32 = 320;
 const PANEL_DEFAULT: u32 = 240;
+const RAIL_DEFAULT: u32 = 180;
 
 const SIDEBAR_MIN: u32 = 160;
 const SIDEBAR_MAX: u32 = 600;
@@ -17,6 +18,12 @@ const COMPANION_MIN: u32 = 160;
 const COMPANION_MAX: u32 = u32::MAX;
 const PANEL_MIN: u32 = 96;
 const PANEL_MAX: u32 = 600;
+const RAIL_MIN: u32 = 120;
+const RAIL_MAX: u32 = 480;
+
+fn default_rail_width() -> u32 {
+    RAIL_DEFAULT
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -30,6 +37,11 @@ pub struct LayoutState {
     pub last_sidebar_width: u32,
     pub last_companion_width: u32,
     pub last_panel_height: u32,
+    /// Width of the chat-session rail inside the companion area.
+    /// Field-level serde default so persisted layouts written before
+    /// this field existed load at `RAIL_DEFAULT` instead of 0.
+    #[serde(default = "default_rail_width")]
+    pub rail_width: u32,
 }
 
 impl Default for LayoutState {
@@ -49,6 +61,7 @@ impl Default for LayoutState {
             last_sidebar_width: SIDEBAR_DEFAULT,
             last_companion_width: COMPANION_DEFAULT,
             last_panel_height: PANEL_DEFAULT,
+            rail_width: RAIL_DEFAULT,
         }
     }
 }
@@ -72,6 +85,12 @@ impl LayoutState {
     }
     pub fn set_panel_height(&mut self, px: u32) {
         self.panel_height = px.clamp(PANEL_MIN, PANEL_MAX);
+    }
+    pub fn set_rail_width(&mut self, px: u32) {
+        self.rail_width = px.clamp(RAIL_MIN, RAIL_MAX);
+    }
+    pub fn drag_rail(&mut self, target_px: u32) {
+        self.rail_width = target_px.clamp(RAIL_MIN, RAIL_MAX);
     }
 
     pub fn toggle_sidebar(&mut self) {
@@ -197,6 +216,9 @@ pub enum SplitterKind {
     Left,
     Right,
     Bottom,
+    /// Vertical divider between the chat-session rail and the chat
+    /// surface, inside the companion area.
+    Rail,
 }
 
 #[derive(Clone, Copy, Debug)]

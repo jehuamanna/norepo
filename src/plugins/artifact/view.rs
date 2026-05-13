@@ -2516,6 +2516,48 @@ pub fn resolve_seed_id_sync(
     })
 }
 
+/// Load an artifact's body and pull its `artifact_kind` out of the
+/// frontmatter. Returns `None` if the persistence load fails or the
+/// frontmatter lacks an `artifact_kind` field. Sync via `block_on` for
+/// the same reason as `resolve_seed_id_sync`.
+fn resolve_artifact_kind_sync(
+    persistence: &Arc<dyn Persistence>,
+    artifact_id: Uuid,
+) -> Option<crate::plugins::artifact::frontmatter::ArtifactKind> {
+    let persistence = persistence.clone();
+    futures::executor::block_on(async move {
+        let body = persistence.load(&artifact_id.to_string()).await.ok()?;
+        let s = String::from_utf8(body).ok()?;
+        crate::plugins::artifact::frontmatter::parse(&s).artifact_kind
+    })
+}
+
+/// Short bracketed tag rendered into the chat-session rail title so two
+/// cascades on different artifacts under the same seed look different
+/// (otherwise everything reads `Cascade: <seed>` and collides).
+fn artifact_kind_tag(kind: &crate::plugins::artifact::frontmatter::ArtifactKind) -> &'static str {
+    use crate::plugins::artifact::frontmatter::ArtifactKind;
+    match kind {
+        ArtifactKind::MasterRequirement => "MR",
+        ArtifactKind::Requirements => "req",
+        ArtifactKind::Epic => "epic",
+        ArtifactKind::Feature => "feat",
+        ArtifactKind::Story => "story",
+        ArtifactKind::Task => "task",
+        ArtifactKind::Plan => "plan",
+        ArtifactKind::ImplementationPlan => "implplan",
+        ArtifactKind::Implementation => "imp",
+        ArtifactKind::TestCases => "tests",
+        ArtifactKind::TestResults => "tres",
+        ArtifactKind::Summary => "summary",
+        ArtifactKind::Architecture => "arch",
+        ArtifactKind::Bug => "bug",
+        ArtifactKind::Clarification => "clar",
+        ArtifactKind::PrioritizedBacklog => "backlog",
+        ArtifactKind::Other(_) => "art",
+    }
+}
+
 /// Spawn the autonomous cascade orchestrator in the background.
 /// Mirrors `spawn_runner`'s setup (binds the rail's chat session,
 /// auto-switches the rail's active session so transcripts stream
@@ -2631,26 +2673,22 @@ pub fn spawn_cascade(
 
     // Mint a fresh chat session per Play click. Two simultaneous
     // cascades — one per click — each get their own rail entry and
-    // their own transcript. We label the entry with both the seed
-    // title and the clicked artifact so the user can tell which
-    // run is which when several are in flight at once.
+    // their own transcript. The label encodes the clicked artifact's
+    // kind ([MR] / [epic] / [feat] / [story] / [task] / [imp] / …)
+    // and its title so two runs on different artifacts under the same
+    // seed are visually distinguishable in the rail; without this they
+    // all read `Cascade: <seed>` and pile up indistinguishable.
     let cascade_session_id = Uuid::new_v4();
-    let seed_label_short = note_repo
+    let clicked_title = note_repo
         .list_for_project(project_id)
         .ok()
-        .and_then(|all| all.into_iter().find(|n| n.id == seed_id))
+        .and_then(|all| all.into_iter().find(|n| n.id == root_artifact_id))
         .map(|n| n.title)
-        .unwrap_or_else(|| short_uuid(seed_id));
-    let click_label_short = if root_artifact_id == seed_id {
-        String::new()
-    } else {
-        note_repo
-            .list_for_project(project_id)
-            .ok()
-            .and_then(|all| all.into_iter().find(|n| n.id == root_artifact_id))
-            .map(|n| n.title)
-            .unwrap_or_else(|| short_uuid(root_artifact_id))
-    };
+        .unwrap_or_else(|| short_uuid(root_artifact_id));
+    let kind_tag = resolve_artifact_kind_sync(&persistence, root_artifact_id)
+        .as_ref()
+        .map(artifact_kind_tag)
+        .unwrap_or("art");
     let stamp = {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2665,14 +2703,7 @@ pub fn spawn_cascade(
         let s = secs_in_day % 60;
         format!("{:02}:{:02}:{:02}", h, m, s)
     };
-    let session_label = if click_label_short.is_empty() {
-        format!("Cascade: {} @ {}", seed_label_short, stamp)
-    } else {
-        format!(
-            "Cascade: {} \u{2192} {} @ {}",
-            seed_label_short, click_label_short, stamp
-        )
-    };
+    let session_label = format!("[{}] {} @ {}", kind_tag, clicked_title, stamp);
     let _ = chat_session_repo.create_with_id(
         cascade_session_id,
         operon_store::repos::ChatScope::Project(project_id),

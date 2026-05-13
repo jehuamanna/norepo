@@ -100,6 +100,44 @@ pub fn RightSplitter() -> Element {
 }
 
 #[component]
+pub fn RailSplitter() -> Element {
+    let mut layout: Signal<LayoutState> = use_context();
+    let mut drag: Signal<Option<DragState>> = use_context();
+    let cur = layout.read().rail_width as i32;
+    rsx! {
+        div {
+            class: "operon-splitter operon-splitter-vertical operon-splitter-inline",
+            "data-edge": "rail",
+            role: "separator",
+            "aria-orientation": "vertical",
+            "aria-label": "Resize chat session rail",
+            "aria-valuenow": "{cur}",
+            tabindex: "0",
+            onmousedown: move |e| {
+                let pos = e.client_coordinates().x as i32;
+                let size = layout.read().rail_width;
+                drag.set(Some(DragState { kind: SplitterKind::Rail, start_pos: pos, start_size: size }));
+                e.prevent_default();
+            },
+            onkeydown: move |e| {
+                let key = e.key().to_string();
+                let mods = e.modifiers();
+                let step = if mods.contains(keyboard_types::Modifiers::SHIFT) { STEP_FAST } else { STEP };
+                if key == "ArrowLeft" {
+                    e.prevent_default();
+                    let next = (layout.read().rail_width as i32 - step).max(0) as u32;
+                    layout.with_mut(|s| s.drag_rail(next));
+                } else if key == "ArrowRight" {
+                    e.prevent_default();
+                    let next = (layout.read().rail_width as i32 + step).max(0) as u32;
+                    layout.with_mut(|s| s.drag_rail(next));
+                }
+            },
+        }
+    }
+}
+
+#[component]
 pub fn BottomSplitter() -> Element {
     let mut layout: Signal<LayoutState> = use_context();
     let mut drag: Signal<Option<DragState>> = use_context();

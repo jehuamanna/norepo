@@ -42,6 +42,7 @@ use crate::shell::companion_state::{
     INPROGRESS_ASSISTANT, PERMISSION_DECISIONS, PERMISSION_PROMPTS,
 };
 use crate::shell::session_rail::SessionRail;
+use crate::shell::splitter::RailSplitter;
 use crate::shell::tool_card::{ToolCard, ToolResultBody};
 
 /// One visible entry in the chat transcript. `AssistantText` holds an
@@ -517,6 +518,7 @@ pub fn CompanionChat() -> Element {
     rsx! {
         div { class: "operon-companion-chat-grid",
             SessionRail {}
+            RailSplitter {}
             section { class: "operon-companion-chat",
                 "data-region": "companion-chat",
                 div { class: "operon-companion-chat-header",
@@ -568,13 +570,33 @@ pub fn CompanionChat() -> Element {
                                         selected: current_model.as_deref() == Some("claude-opus-4-7"),
                                         "Opus 4.7"
                                     }
+                                    option { value: "claude-opus-4-6",
+                                        selected: current_model.as_deref() == Some("claude-opus-4-6"),
+                                        "Opus 4.6"
+                                    }
                                     option { value: "claude-sonnet-4-6",
                                         selected: current_model.as_deref() == Some("claude-sonnet-4-6"),
                                         "Sonnet 4.6"
                                     }
+                                    option { value: "claude-sonnet-4-5",
+                                        selected: current_model.as_deref() == Some("claude-sonnet-4-5"),
+                                        "Sonnet 4.5"
+                                    }
                                     option { value: "claude-haiku-4-5",
                                         selected: current_model.as_deref() == Some("claude-haiku-4-5"),
                                         "Haiku 4.5"
+                                    }
+                                    option { value: "claude-3-5-sonnet-20241022",
+                                        selected: current_model.as_deref() == Some("claude-3-5-sonnet-20241022"),
+                                        "Sonnet 3.5 (2024-10-22)"
+                                    }
+                                    option { value: "claude-3-5-haiku-20241022",
+                                        selected: current_model.as_deref() == Some("claude-3-5-haiku-20241022"),
+                                        "Haiku 3.5 (2024-10-22)"
+                                    }
+                                    option { value: "claude-3-opus-20240229",
+                                        selected: current_model.as_deref() == Some("claude-3-opus-20240229"),
+                                        "Opus 3 (2024-02-29)"
                                     }
                                 }
                             }

@@ -127,6 +127,15 @@ html, body {
   bottom: calc(24px + var(--operon-panel-height, 240px) - 2px);
 }
 
+/* Inline splitter — sits in normal flow as a grid track (e.g. between
+ * the companion's session rail and the chat) instead of being absolutely
+ * positioned off the shell root. */
+.operon-splitter-inline {
+  position: relative;
+  height: auto;
+  width: auto;
+}
+
 .operon-panel {
   grid-area: panel;
   background: var(--vscode-panel-background);
@@ -473,6 +482,89 @@ html, body {
 .notes-explorer-row-cut {
   opacity: 0.5;
 }
+
+/* Leading bullet on a note row whose open tab has unsaved edits.
+ * Mirrors the tab strip's circle-dot dirty marker. Sized to sit
+ * inline with the kind badge without shifting the title baseline. */
+.operon-note-dirty-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 12px;
+  margin-right: 4px;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--vscode-tab-activeforeground, var(--vscode-focusborder));
+}
+
+/* SDLC role indicator, expressed two ways on each row:
+ *   1. A standalone `.operon-role-chip` between the disclosure caret
+ *      and the kind badge, with the role code (BA / SA / SDE).
+ *   2. A colored background on the existing `[ar]` / `[sk]` kind
+ *      badge, so the role color sits next to the title as well.
+ * Two visual hooks for the same datum — redundant on purpose so the
+ * role is visible whether the user scans left-to-right (chip first)
+ * or anchors on the kind badge. */
+.operon-role-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  height: 14px;
+  min-width: 22px;
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  color: #ffffff;
+  user-select: none;
+}
+.operon-role-chip.operon-note-role-ba {
+  background: var(--vscode-charts-blue, #1976d2);
+}
+.operon-role-chip.operon-note-role-sa {
+  background: var(--vscode-charts-purple, #8e24aa);
+}
+.operon-role-chip.operon-note-role-sde {
+  background: var(--vscode-charts-green, #2e7d32);
+}
+
+/* Artifact workflow status dot, anchored to the row's right edge.
+ * Sits to the left of the (hover-only) add-child button so it stays
+ * visible at rest. Colors mirror the artifact_status palette used by
+ * the artifact card's status pill. */
+.operon-status-dot {
+  display: inline-block;
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  margin-left: 4px;
+  border-radius: 50%;
+  background: var(--vscode-descriptionforeground, #999);
+}
+.operon-status-dot.operon-status-pending {
+  background: var(--vscode-descriptionforeground, #888);
+}
+.operon-status-dot.operon-status-approved {
+  background: var(--vscode-charts-green, #2ea043);
+}
+.operon-status-dot.operon-status-rejected {
+  background: var(--vscode-charts-red, #f85149);
+}
+.operon-status-dot.operon-status-dirty {
+  background: var(--vscode-charts-orange, #d18616);
+}
+.operon-status-dot.operon-status-running {
+  background: var(--vscode-charts-blue, #1f6feb);
+  box-shadow: 0 0 0 2px rgba(31, 111, 235, 0.25);
+}
+.operon-status-dot.operon-status-error {
+  background: var(--vscode-charts-red, #f85149);
+}
+
 .notes-explorer-toolbar {
   display: flex;
   align-items: center;
@@ -782,15 +874,25 @@ html, body {
   background: var(--vscode-tab-inactivebackground);
   border-bottom: 1px solid var(--vscode-panel-border);
   flex: 0 0 auto;
-  height: 32px;
-  /* Hide the horizontal scrollbar — the strip is still scrollable
-     via wheel/trackpad/keyboard, but the visible bar wastes a row of
-     vertical space and clashes with the OS chrome. */
-  scrollbar-width: none;          /* Firefox */
-  -ms-overflow-style: none;       /* legacy IE/Edge */
+  /* 32px tab row + 6px scroll track. The thin scrollbar at the bottom
+     telegraphs that overflow exists; without it users couldn't tell
+     the strip scrolls when many tabs are open. */
+  height: 38px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--vscode-scrollbarslider-background, rgba(121, 121, 121, 0.4)) transparent;
 }
 .operon-tab-strip::-webkit-scrollbar {
-  display: none;                  /* Chromium / WebKit */
+  height: 6px;
+}
+.operon-tab-strip::-webkit-scrollbar-track {
+  background: transparent;
+}
+.operon-tab-strip::-webkit-scrollbar-thumb {
+  background: var(--vscode-scrollbarslider-background, rgba(121, 121, 121, 0.4));
+  border-radius: 3px;
+}
+.operon-tab-strip::-webkit-scrollbar-thumb:hover {
+  background: var(--vscode-scrollbarslider-hoverbackground, rgba(100, 100, 100, 0.7));
 }
 
 .operon-tab {
@@ -798,7 +900,10 @@ html, body {
   align-items: center;
   gap: 6px;
   padding: 0 10px 0 12px;
-  height: 100%;
+  /* Fixed height so the tab keeps its row size when the strip grows to
+     accommodate the bottom scrollbar (height: 38px on the strip). */
+  height: 32px;
+  flex-shrink: 0;
   cursor: pointer;
   background: var(--vscode-tab-inactivebackground);
   color: var(--vscode-tab-inactiveforeground);
@@ -1184,7 +1289,7 @@ html, body {
 .operon-companion-chat-grid {
   flex: 1 1 auto;
   display: grid;
-  grid-template-columns: var(--operon-companion-rail-width, 180px) 1fr;
+  grid-template-columns: var(--operon-companion-rail-width, 180px) 4px 1fr;
   min-width: 0;
   min-height: 0;
 }

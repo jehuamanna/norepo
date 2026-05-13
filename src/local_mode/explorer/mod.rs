@@ -8,6 +8,7 @@ pub mod creatable_kind;
 pub mod history;
 mod note_row;
 mod project_row;
+mod role;
 mod search;
 mod tree_node;
 mod tree_state;
@@ -2291,6 +2292,52 @@ pub fn ExplorerPanel() -> Element {
             .iter()
             .find_map(|(pid, list)| list.iter().any(|n| n.id == nid).then_some(*pid))
     });
+    // Set of note UUIDs whose tabs are currently dirty (unsaved). The
+    // explorer renders a leading dot on rows in this set so users can
+    // see at a glance which notes have pending edits — same dirty
+    // signal that drives the tab strip's circle-dot marker, just
+    // surfaced in the tree as well.
+    let dirty_note_ids: Memo<std::collections::HashSet<Uuid>> = use_memo(move || {
+        tabs.read()
+            .iter()
+            .filter(|t| t.dirty)
+            .filter_map(|t| Uuid::parse_str(&t.note_id).ok())
+            .collect()
+    });
+    // Per-Artifact-note frontmatter cache. One sync `block_on` load
+    // per Artifact populates both the SDLC kind (drives the role chip
+    // + title/caret tint) and the status (drives the right-aligned
+    // status dot). Re-runs whenever `notes_by_project` changes.
+    // Synchronous reads are fine at local-mode scale; for hundreds of
+    // artifacts we'd move this to an async cache.
+    let persistence_for_kinds = persistence.clone();
+    let artifact_meta: Memo<HashMap<Uuid, role::ArtifactMeta>> = use_memo(move || {
+        let mut map = HashMap::new();
+        let snapshot = notes_by_project.read();
+        for (_, list) in snapshot.iter() {
+            for note in list.iter() {
+                if !matches!(note.kind, operon_store::repos::NoteKind::Artifact) {
+                    continue;
+                }
+                let id = note.id;
+                let body =
+                    futures::executor::block_on(persistence_for_kinds.load(&id.to_string()));
+                if let Ok(bytes) = body {
+                    if let Ok(s) = String::from_utf8(bytes) {
+                        let fm = crate::plugins::artifact::frontmatter::parse(&s);
+                        map.insert(
+                            id,
+                            role::ArtifactMeta {
+                                kind: fm.artifact_kind,
+                                status: fm.status,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        map
+    });
 
     let pending_delete_project_id = *pending_delete_project.read();
     let pending_delete_project_name = pending_delete_project_id.and_then(|did| {
@@ -2562,6 +2609,8 @@ pub fn ExplorerPanel() -> Element {
                             selected_note: selected_note_now,
                             active_tab_note: *active_tab_note.read(),
                             active_tab_project: *active_tab_project.read(),
+                            dirty_note_ids: dirty_note_ids.read().clone(),
+                            artifact_meta: artifact_meta.read().clone(),
                             clipboard: clipboard_snap,
                             has_clip_note: has_clip_note,
                             drag_session: drag_session_now,
@@ -2814,6 +2863,15 @@ struct ProjectSubtreeProps {
     /// Project that contains `active_tab_note`. ProjectRow uses this to
     /// mirror the same accent at the project level.
     active_tab_project: Option<Uuid>,
+    /// Note ids whose open tabs are dirty (unsaved). NoteRow renders a
+    /// leading dot for rows in this set.
+    dirty_note_ids: std::collections::HashSet<Uuid>,
+    /// Artifact-frontmatter snapshot used to drive each row's SDLC
+    /// role chip (BA / SA / SDE) and the right-aligned status dot.
+    /// Populated upstream by parsing each Artifact note's frontmatter.
+    /// Skill notes derive their role from the title's numeric prefix
+    /// and don't consult this map.
+    artifact_meta: HashMap<Uuid, role::ArtifactMeta>,
     clipboard: Option<Clipboard>,
     has_clip_note: bool,
     drag_session: Option<DragKind>,
@@ -2962,6 +3020,22 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
                             .unwrap_or(false),
                         selected: props.selected_note == Some(note.id),
                         tab_active: props.active_tab_note == Some(note.id),
+                        dirty: props.dirty_note_ids.contains(&note.id),
+                        role: match note.kind {
+                            operon_store::repos::NoteKind::Artifact => props
+                                .artifact_meta
+                                .get(&note.id)
+                                .and_then(|m| m.kind.as_ref())
+                                .and_then(role::role_for_artifact_kind),
+                            operon_store::repos::NoteKind::Skill => {
+                                role::role_for_skill_title(&note.title)
+                            }
+                            _ => None,
+                        },
+                        artifact_status: props
+                            .artifact_meta
+                            .get(&note.id)
+                            .map(|m| m.status),
                         in_rename: props.renaming_note == Some(note.id),
                         is_first_sibling: is_first,
                         is_last_sibling: is_last,

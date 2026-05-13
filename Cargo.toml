@@ -17,7 +17,7 @@ members = [
     "crates/operon-notes",
     "crates/operon-export",
 ]
-default-members = ["."]
+default-members = [".", "crates/operon-plugins-claude-code"]
 
 [package]
 name = "operon-dioxus"

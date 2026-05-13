@@ -35,6 +35,19 @@ pub struct NoteRowProps {
     /// a left accent bar + bold title to distinguish "open in editor" from
     /// the lighter "explorer click-selection" state.
     pub tab_active: bool,
+    /// True when this note has an open tab with unsaved edits. Renders a
+    /// leading dot ahead of the title, mirroring the dirty-marker dot on
+    /// the tab strip itself.
+    pub dirty: bool,
+    /// SDLC role bucket inferred from the note's artifact_kind (for
+    /// Artifact notes) or numeric title prefix (for Skill notes). Drives
+    /// a 3px left accent bar on the row. `None` skips the accent.
+    pub role: Option<super::role::Role>,
+    /// Frontmatter status for Artifact notes (Pending / Approved /
+    /// Dirty / Running / Error / Rejected). Drives a small colored
+    /// dot at the row's right edge so users can see workflow progress
+    /// at a glance. `None` for non-Artifact notes — no dot.
+    pub artifact_status: Option<crate::plugins::artifact::frontmatter::ArtifactStatus>,
     pub in_rename: bool,
     pub is_first_sibling: bool,
     pub is_last_sibling: bool,
@@ -144,6 +157,13 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let id = note.id;
     let id_str = id.to_string();
     let title = note.title.clone();
+    let dirty = props.dirty;
+    let role = props.role;
+    // The chip is informative only for Artifact notes — Skill notes
+    // already carry the role signal in their numeric prefix
+    // (01-/07-/…), so a chip there is redundant. The row's role color
+    // (title tint, caret tint) still applies to skills.
+    let show_role_chip = matches!(note.kind, operon_store::repos::NoteKind::Artifact);
     // Captured by Copy into the keydown closure so ArrowLeft (parent
     // navigation) can write the parent's NodeKey into `focused_node`
     // without re-borrowing `note`.
@@ -202,6 +222,10 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     }
     if cut {
         row_class.push_str(" notes-explorer-row-cut");
+    }
+    if let Some(r) = props.role {
+        row_class.push(' ');
+        row_class.push_str(r.css_class());
     }
     let style = format!("--depth: {depth};");
 
@@ -967,6 +991,32 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 },
                 "{caret_glyph}"
             }
+            // SDLC role chip (BA / SA / SDE). Sits between the disclosure
+            // caret and the kind badge so the role color is the first
+            // colored token on the row at any depth — the previous left-
+            // border accent was getting hidden behind padding on deep
+            // rows. The chip's background carries the role color; the
+            // text is the two/three-letter role code. Suppressed on
+            // Skill notes (their numeric prefix already encodes role).
+            if let Some(r) = role.filter(|_| show_role_chip) {
+                {
+                    let chip_class = r.css_class();
+                    let chip_label = match r {
+                        super::role::Role::Ba => "BA",
+                        super::role::Role::Sa => "SA",
+                        super::role::Role::Sde => "SDE",
+                    };
+                    rsx! {
+                        span {
+                            class: "operon-role-chip {chip_class}",
+                            "data-testid": "role-chip",
+                            "data-role": "{chip_label}",
+                            title: "{chip_label}",
+                            "{chip_label}"
+                        }
+                    }
+                }
+            }
             if cut {
                 span {
                     class: "sr-only",
@@ -989,6 +1039,15 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                 // markdown, `[im]` for image. Drives off `note.kind` so it
                 // updates as soon as the row is rendered with a refreshed
                 // record.
+                if dirty {
+                    span {
+                        class: "operon-note-dirty-dot",
+                        "data-testid": "note-row-dirty-dot",
+                        "aria-label": "Unsaved changes",
+                        title: "Unsaved changes",
+                        "\u{2022}"
+                    }
+                }
                 {
                     let icon = note.kind.icon();
                     let kind_str = note.kind.as_str();
@@ -1005,6 +1064,20 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                     class: "truncate flex-1",
                     "data-testid": "note-row-name",
                     "{title}"
+                }
+                if let Some(s) = props.artifact_status {
+                    {
+                        let status_str = s.as_str();
+                        rsx! {
+                            span {
+                                class: "operon-status-dot operon-status-{status_str}",
+                                "data-testid": "artifact-status-dot",
+                                "data-status": "{status_str}",
+                                title: "Status: {status_str}",
+                                "aria-label": "Status: {status_str}",
+                            }
+                        }
+                    }
                 }
                 button {
                     r#type: "button",

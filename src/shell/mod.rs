@@ -92,10 +92,11 @@ pub fn Shell() -> Element {
         layout_read.sidebar_track()
     };
     let layout_style = format!(
-        "--operon-side-bar-width: {}px; --operon-companion-width: {}px; --operon-panel-height: {}px;",
+        "--operon-side-bar-width: {}px; --operon-companion-width: {}px; --operon-panel-height: {}px; --operon-companion-rail-width: {}px;",
         side_track,
         layout_read.companion_track(),
         layout_read.panel_track(),
+        layout_read.rail_width,
     );
     let collapsed_attr = if layout_read.sidebar_collapsed || no_active {
         "true"
@@ -163,11 +164,16 @@ pub fn Shell() -> Element {
                             let dy = e.client_coordinates().y as i32 - d.start_pos;
                             (d.start_size as i32 - dy).max(0) as u32
                         }
+                        SplitterKind::Rail => {
+                            let dx = e.client_coordinates().x as i32 - d.start_pos;
+                            (d.start_size as i32 + dx).max(0) as u32
+                        }
                     };
                     layout.with_mut(|s| match d.kind {
                         SplitterKind::Left => s.drag_sidebar(new_size),
                         SplitterKind::Right => s.drag_companion(new_size),
                         SplitterKind::Bottom => s.drag_panel(new_size),
+                        SplitterKind::Rail => s.drag_rail(new_size),
                     });
                 }
             },
