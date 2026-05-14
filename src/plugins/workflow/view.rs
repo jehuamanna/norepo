@@ -3605,12 +3605,19 @@ fn infer_backlog_level(title: &str) -> Option<i32> {
 /// `plugins/artifact/frontmatter.rs:98-113`). Lower numbers are
 /// upstream / earlier in the cascade; nodes with the same priority go
 /// in the same horizontal swim lane.
+///
+/// `architecture` shares the Epic column (2) because both are
+/// depth-1 children of the master requirements — fan-out siblings,
+/// not a downstream chain. Without this, architecture defaulted to
+/// the catch-all "12" and rendered to the right of every other kind,
+/// which visually implied `Epic → Architecture` was a real
+/// dependency.
 fn kind_priority(label: Option<&str>) -> i32 {
     let key = label.map(|l| l.to_lowercase());
     match key.as_deref() {
         None | Some("artifact") => 0, // root seed / generic
-        Some("requirements") => 1,
-        Some("epic") => 2,
+        Some("requirements") | Some("master_requirement") => 1,
+        Some("epic") | Some("architecture") => 2,
         Some("feature") => 3,
         Some("story") => 4,
         Some("task") => 5,

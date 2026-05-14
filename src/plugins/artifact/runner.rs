@@ -67,6 +67,60 @@ impl From<std::io::Error> for RunnerError {
     }
 }
 
+/// Walk the parent chain from `start_id` looking for the first ancestor
+/// whose frontmatter `artifact_kind` equals `target_kind`. Returns
+/// `(effective_id, effective_body)` for that ancestor, or `Ok(None)` if
+/// no such ancestor exists. Stops at depth 32 to avoid pathological
+/// cycles.
+///
+/// Used by the runner to re-parent skill outputs when the user fires a
+/// skill from a wrong-kind source (e.g. clicks Play on an Epic for the
+/// architecture skill, which declares `input_kind: master_requirement`).
+/// Without this resolution the new artifact gets stamped as a child of
+/// the Epic, which shows up in the cascade canvas as
+/// `Epic → Architecture` — wrong both topologically and visually.
+async fn ascend_to_kind(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    persistence: &Arc<dyn Persistence>,
+    project_id: Uuid,
+    start_id: Uuid,
+    target_kind: &str,
+) -> Option<(Uuid, String)> {
+    let notes = note_repo.list_for_project(project_id).ok()?;
+    let by_id: std::collections::HashMap<Uuid, &LocalNote> =
+        notes.iter().map(|n| (n.id, n)).collect();
+    let mut cursor = by_id.get(&start_id).copied().and_then(|n| n.parent_id);
+    let mut steps = 0;
+    while let Some(id) = cursor {
+        if steps > 32 {
+            break;
+        }
+        steps += 1;
+        let Some(node) = by_id.get(&id).copied() else {
+            break;
+        };
+        // Only artifact notes carry the `artifact_kind` frontmatter we
+        // match on. A Skill or plain Markdown ancestor is skipped.
+        if matches!(node.kind, NoteKind::Artifact) {
+            if let Ok(bytes) = persistence.load(&id.to_string()).await {
+                if let Ok(body) = String::from_utf8(bytes) {
+                    let fm = crate::plugins::artifact::frontmatter::parse(&body);
+                    if fm
+                        .artifact_kind
+                        .as_ref()
+                        .map(|k| k.as_str() == target_kind)
+                        .unwrap_or(false)
+                    {
+                        return Some((id, body));
+                    }
+                }
+            }
+        }
+        cursor = node.parent_id;
+    }
+    None
+}
+
 /// Outcome of one artifact-skill run.
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
@@ -175,16 +229,76 @@ pub async fn run_skill_on_source_with_revision_notes(
         .load(&source_note_id.to_string())
         .await
         .map_err(|e| RunnerError::NotFound(format!("source body: {e}")))?;
-    let source_body =
-        String::from_utf8(source_bytes).map_err(|e| RunnerError::Plugin(format!("utf8: {e}")))?;
+    let mut source_body = String::from_utf8(source_bytes)
+        .map_err(|e| RunnerError::Plugin(format!("utf8: {e}")))?;
+    let mut source_note_id = source_note_id;
 
-    // 2a. Pipeline gate: refuse runs when the source isn't a runnable
-    //     status (Approved or Dirty) unless it's a root seed (no
-    //     upstream parent — e.g. a user-authored Requirements note).
-    //     Mirrors the UI-side gate in `src/plugins/artifact/view.rs`.
-    //     Skip the check entirely when the source isn't even an
-    //     Artifact-frontmatter note — the workflow canvas reuses
-    //     some of these paths for plain Markdown sources.
+    let skill_bytes = persistence
+        .load(&skill_note_id.to_string())
+        .await
+        .map_err(|e| RunnerError::NotFound(format!("skill body: {e}")))?;
+    let skill_body =
+        String::from_utf8(skill_bytes).map_err(|e| RunnerError::Plugin(format!("utf8: {e}")))?;
+
+    // 3. Parse skill contract — input/output kind, gate, etc.
+    let (skill_fm_lines, _) = split_skill(&skill_body);
+    let lines = skill_fm_lines.unwrap_or_default();
+    let contract = parse_skill_contract(&lines);
+
+    // 3-pre. Input-kind resolution. When the caller fires this skill
+    //   from a source whose `artifact_kind` doesn't match the skill's
+    //   declared `input_kind` (e.g. Play clicked on an Epic for the
+    //   architecture skill, which wants a `master_requirement`), walk
+    //   the parent chain to find the nearest matching ancestor and
+    //   re-parent the run there. Without this the artifact gets
+    //   stamped as a child of whatever the user clicked, which shows
+    //   up in the cascade canvas as `Epic → Architecture` — wrong
+    //   both topologically and visually. Sources without
+    //   `artifact_kind` frontmatter (plain markdown master-reqs) are
+    //   treated as wildcards, matching the view-side picker semantics.
+    {
+        let candidate_fm = crate::plugins::artifact::frontmatter::parse(&source_body);
+        if let Some(target) = contract.input_kind.as_deref() {
+            let source_kind_matches = candidate_fm
+                .artifact_kind
+                .as_ref()
+                .map(|k| k.as_str() == target)
+                .unwrap_or(true); // None = wildcard
+            if !source_kind_matches {
+                if let Some((effective_id, effective_body)) = ascend_to_kind(
+                    note_repo,
+                    persistence,
+                    project_id,
+                    source_note_id,
+                    target,
+                )
+                .await
+                {
+                    tracing::info!(
+                        target: "operon::artifact",
+                        "input_kind mismatch: re-parenting run from {source_note_id} \
+                         to ancestor {effective_id} (target kind: {target})"
+                    );
+                    source_note_id = effective_id;
+                    source_body = effective_body;
+                } else {
+                    return Err(RunnerError::NotFound(format!(
+                        "skill expects input_kind={target} but {source_note_id} \
+                         has no ancestor with that kind"
+                    )));
+                }
+            }
+        }
+    }
+
+    // 2a. Pipeline gate: refuse runs when the EFFECTIVE source (after
+    //     input-kind resolution above) isn't a runnable status
+    //     (Approved or Dirty) unless it's a root seed (no upstream
+    //     parent — e.g. a user-authored Requirements note). Mirrors
+    //     the UI-side gate in `src/plugins/artifact/view.rs`. Skip
+    //     when the source isn't even an Artifact-frontmatter note —
+    //     the workflow canvas reuses some of these paths for plain
+    //     Markdown sources.
     //
     //     `is_runnable_source` accepts Approved + Dirty so the user
     //     can mark an existing artifact Dirty after editing it and
@@ -203,18 +317,6 @@ pub async fn run_skill_on_source_with_revision_notes(
             source_fm.status.as_str()
         )));
     }
-
-    let skill_bytes = persistence
-        .load(&skill_note_id.to_string())
-        .await
-        .map_err(|e| RunnerError::NotFound(format!("skill body: {e}")))?;
-    let skill_body =
-        String::from_utf8(skill_bytes).map_err(|e| RunnerError::Plugin(format!("utf8: {e}")))?;
-
-    // 3. Parse skill contract — input/output kind, gate, etc.
-    let (skill_fm_lines, _) = split_skill(&skill_body);
-    let lines = skill_fm_lines.unwrap_or_default();
-    let contract = parse_skill_contract(&lines);
 
     // 3aa. Normalizer-idempotence gate. A normalizer (input_kind ==
     //      output_kind, output_count: one) overwrites the source
