@@ -53,6 +53,14 @@ pub struct ProjectRowProps {
     /// dispatch with `CreatableKind::Artifact(...)` so the handler can
     /// inject the matching scaffold body.
     pub on_add_note: Callback<(Uuid, CreatableKind)>,
+    /// Three-tier SDLC: project-level "New phase" command. Creates a
+    /// `NoteKind::Phase` note at project root seeded with empty phase
+    /// frontmatter and triggers inline rename so the user names the
+    /// phase. Kept distinct from `on_add_note` because phases are
+    /// hierarchical containers, not file-level kinds — they don't
+    /// belong in the generic "Add note" submenu alongside Markdown /
+    /// Code / Skill.
+    pub on_add_phase: Callback<Uuid>,
     /// Plans-Phase-6-image-notes: external image-file drops onto this
     /// project row land as top-level image-notes in the project. Tuple is
     /// (project_id, bytes, suggested filename).
@@ -130,6 +138,7 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     let on_request_delete = props.on_request_delete;
     let on_toggle = props.on_toggle;
     let on_add_note = props.on_add_note;
+    let on_add_phase = props.on_add_phase;
     let on_drop_image_file = props.on_drop_image_file;
     let on_cut = props.on_cut;
     let on_copy = props.on_copy;
@@ -264,6 +273,12 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
             build_creatable_menu(Callback::new(move |kind| {
                 on_add_note.call((id, kind));
             })),
+        ),
+        ContextMenuItem::new(
+            "New phase",
+            Callback::new(move |_| {
+                on_add_phase.call(id);
+            }),
         ),
         ContextMenuItem::new("Import skills\u{2026}", import_skills),
         if is_bulk {

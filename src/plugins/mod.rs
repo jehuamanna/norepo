@@ -12,6 +12,7 @@ pub mod local_search;
 pub mod markdown;
 pub mod mdx;
 pub mod notes_explorer;
+pub mod phase;
 pub mod plaintext;
 pub mod richtext_tiptap;
 pub mod skill;

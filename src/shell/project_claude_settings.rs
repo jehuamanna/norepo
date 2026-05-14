@@ -99,11 +99,11 @@ pub fn ProjectClaudeSettingsPanel() -> Element {
                             let cur_model = project.default_model.clone();
                             let cur_perm = project.default_permission_mode.clone();
                             let inherit_model_label = match global_model.as_deref() {
-                                Some(id) => format!("Inherit ({})", crate::shell::companion_chat::model_display(id)),
+                                Some(id) => format!("Inherit ({})", crate::shell::companion_settings::model_display(id)),
                                 None => "Inherit (Claude default)".to_string(),
                             };
                             let inherit_perm_label = match global_perm.as_deref() {
-                                Some(id) => format!("Inherit ({})", crate::shell::companion_chat::perm_display(id)),
+                                Some(id) => format!("Inherit ({})", crate::shell::companion_settings::perm_display(id)),
                                 None => "Inherit (Claude default)".to_string(),
                             };
                             let project_repo_model = project_repo.clone();

@@ -220,6 +220,7 @@ const fn path_extension_for_kind(k: NoteKind) -> &'static str {
         NoteKind::Skill => "md",
         NoteKind::Workflow => "json",
         NoteKind::Artifact => "md",
+        NoteKind::Phase => "md",
     }
 }
 

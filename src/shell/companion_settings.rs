@@ -47,6 +47,34 @@ pub fn resolve_inherited(
     global.map(str::to_string)
 }
 
+/// Map a claude model id to its dropdown-friendly label. Used to build
+/// the "Inherit (Opus 4.7)" option text in each tier's picker without
+/// hard-coding the ladder in multiple places.
+pub fn model_display(id: &str) -> String {
+    match id {
+        "claude-opus-4-7" => "Opus 4.7".into(),
+        "claude-opus-4-6" => "Opus 4.6".into(),
+        "claude-sonnet-4-6" => "Sonnet 4.6".into(),
+        "claude-sonnet-4-5" => "Sonnet 4.5".into(),
+        "claude-haiku-4-5" => "Haiku 4.5".into(),
+        "claude-3-5-sonnet-20241022" => "Sonnet 3.5".into(),
+        "claude-3-5-haiku-20241022" => "Haiku 3.5".into(),
+        "claude-3-opus-20240229" => "Opus 3".into(),
+        other => other.into(),
+    }
+}
+
+/// Mirror of `model_display` for `--permission-mode` values.
+pub fn perm_display(id: &str) -> String {
+    match id {
+        "default" => "Default".into(),
+        "acceptEdits" => "Accept edits".into(),
+        "plan" => "Plan".into(),
+        "bypassPermissions" => "Bypass".into(),
+        other => other.into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

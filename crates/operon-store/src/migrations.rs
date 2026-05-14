@@ -98,6 +98,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "019_local_project_claude_defaults",
         include_str!("../migrations/019_local_project_claude_defaults.sql"),
     ),
+    (
+        20,
+        "020_local_note_kind_phase",
+        include_str!("../migrations/020_local_note_kind_phase.sql"),
+    ),
 ];
 
 fn ensure_migrations_table(conn: &Connection) -> Result<(), StoreError> {

@@ -2459,6 +2459,16 @@ html, body {
   background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
   flex: 0 0 auto;
 }
+/* Phase notes stand out — they're project-root containers that group
+   a batch of requirements + epics together. Background highlight on
+   the `[ph]` badge makes them findable at a glance in the explorer. */
+.kind-phase {
+  background: var(--operon-accent, #4080dc);
+  color: var(--vscode-editor-background, #1e1e1e);
+  opacity: 0.85 !important;
+  font-weight: 600;
+}
+
 .operon-artifact-kind-badge {
   font-size: 11px;
   text-transform: uppercase;

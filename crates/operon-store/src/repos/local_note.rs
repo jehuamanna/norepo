@@ -43,6 +43,14 @@ pub enum NoteKind {
     /// surface; running a skill on a selected artifact produces N
     /// new artifact notes under it.
     Artifact,
+    /// Three-tier SDLC: a project-root container that groups one
+    /// batch of requirements + epics together (Discovery, Phase 1,
+    /// Multiplayer MVP, …). Ordering and label live in the body's
+    /// YAML frontmatter (`phase_order: <int>`, `phase_label:
+    /// <str>`), so the schema treats it as just another kind. The
+    /// cascade re-instances per phase by anchoring on the phase
+    /// note's master_requirement child.
+    Phase,
 }
 
 impl NoteKind {
@@ -58,6 +66,7 @@ impl NoteKind {
             Self::Skill => "skill",
             Self::Workflow => "workflow",
             Self::Artifact => "artifact",
+            Self::Phase => "phase",
         }
     }
 
@@ -72,6 +81,7 @@ impl NoteKind {
             "skill" => Self::Skill,
             "workflow" => Self::Workflow,
             "artifact" => Self::Artifact,
+            "phase" => Self::Phase,
             _ => Self::Markdown,
         }
     }
@@ -96,6 +106,7 @@ impl NoteKind {
             Self::Skill => "Skill",
             Self::Workflow => "Workflow",
             Self::Artifact => "Artifact",
+            Self::Phase => "Phase",
         }
     }
 
@@ -112,6 +123,7 @@ impl NoteKind {
             Self::Skill => "sk",
             Self::Workflow => "wf",
             Self::Artifact => "ar",
+            Self::Phase => "ph",
         }
     }
 

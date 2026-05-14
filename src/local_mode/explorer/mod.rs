@@ -874,6 +874,56 @@ pub fn ExplorerPanel() -> Element {
             }
         });
 
+    // Three-tier SDLC: dedicated "+ New phase" project action. Creates
+    // a `NoteKind::Phase` note at project root with an empty phase
+    // frontmatter (`phase_label: ""`), opens the project, and
+    // triggers inline rename so the user types the phase name
+    // (Discovery, Multiplayer MVP, …). Phase ordering falls back to
+    // `created_at_ms` until the user adds an explicit `phase_order`
+    // field — sufficient for the common case where phases are
+    // authored in chronological order.
+    let note_repo_for_add_phase = note_repo.clone();
+    let persistence_for_add_phase: Arc<dyn Persistence> = use_context();
+    let mut open_project_for_phase = open_project_workspace.clone();
+    let on_add_project_phase = use_callback(move |project_id: Uuid| {
+        open_project_for_phase(project_id);
+        match note_repo_for_add_phase.create_with_kind(
+            project_id,
+            None,
+            "",
+            NoteKind::Phase,
+        ) {
+            Ok(n) => {
+                history.write().push(history::ExplorerAction::Create {
+                    id: n.id,
+                    blob_path: None,
+                });
+                // Seed an empty phase frontmatter so downstream
+                // tooling (cascade re-instancing, phase listing) can
+                // parse the note before the user adds any content.
+                let body = crate::plugins::phase::serialize(
+                    &crate::plugins::phase::PhaseFrontmatter::default(),
+                    "",
+                );
+                let persistence = persistence_for_add_phase.clone();
+                let new_id = n.id;
+                spawn(async move {
+                    if let Err(e) = persistence
+                        .save(&new_id.to_string(), body.as_bytes())
+                        .await
+                    {
+                        eprintln!(
+                            "operon: write phase scaffold body for {new_id}: {e}"
+                        );
+                    }
+                });
+                note_version.with_mut(|v| *v += 1);
+                renaming_note_setter.set(Some(n.id));
+            }
+            Err(e) => eprintln!("operon: create phase failed: {e}"),
+        }
+    });
+
     // ===== Note handlers =====
     let mut tabs_for_select = tabs;
     let scheduler_for_select = save_scheduler.clone();
@@ -2670,6 +2720,7 @@ pub fn ExplorerPanel() -> Element {
                             on_request_delete_project: on_request_delete_project,
                             on_toggle_project: on_toggle_project,
                             on_add_project_note: on_add_project_note,
+                            on_add_project_phase: on_add_project_phase,
                             on_drop_image_into_note: on_drop_image_into_note,
                             on_drop_image_into_project: on_drop_image_into_project,
                             on_select_note: on_select_note,
@@ -2931,6 +2982,7 @@ struct ProjectSubtreeProps {
     on_request_delete_project: Callback<Uuid>,
     on_toggle_project: Callback<Uuid>,
     on_add_project_note: Callback<(Uuid, CreatableKind)>,
+    on_add_project_phase: Callback<Uuid>,
     on_drop_image_into_note: Callback<(Uuid, Vec<u8>, String)>,
     on_drop_image_into_project: Callback<(Uuid, Vec<u8>, String)>,
     on_select_note: Callback<Uuid>,
@@ -3032,6 +3084,7 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
             on_request_delete: props.on_request_delete_project,
             on_toggle: props.on_toggle_project,
             on_add_note: props.on_add_project_note,
+            on_add_phase: props.on_add_project_phase,
             on_drop_image_file: props.on_drop_image_into_project,
             on_cut: props.on_cut_project,
             on_copy: props.on_copy_project,
