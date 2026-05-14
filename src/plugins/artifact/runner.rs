@@ -28,6 +28,7 @@ use uuid::Uuid;
 use crate::persistence::Persistence;
 use crate::plugins::artifact::aggregation::{
     collect_ancestor_sibling_artifacts, collect_descendant_artifacts,
+    collect_master_req_subtree, BundleEntry,
 };
 use crate::plugins::artifact::frontmatter::{
     rewrite as rewrite_artifact_fm, ArtifactKind, ArtifactStatus,
@@ -365,6 +366,31 @@ pub async fn run_skill_on_source_with_revision_notes(
             Vec::new()
         };
 
+    // Phase D: master-requirement subtree bundling. When the source
+    // is a master_requirement, walk its descendant tree and pull
+    // every Markdown note, nested master_requirement artifact, and
+    // Image attachment into the prompt as supporting context. This
+    // is the "bundle the whole subtree into one input" semantic the
+    // user picked during the three-tier design — discovery is rarely
+    // a single document, it's a folder of design docs, mockups, and
+    // user-flow notes.
+    //
+    // Distinct from `aggregated` (which collects same-kind artifacts
+    // matching the skill's declared `aggregate:` field) and
+    // `inherited` (ancestor-chain context). This is specifically the
+    // master_req's own user-authored children, not generated
+    // siblings.
+    let bundle: Vec<BundleEntry> = if source_fm
+        .artifact_kind
+        .as_ref()
+        .map(|k| k.as_str() == "master_requirement")
+        .unwrap_or(false)
+    {
+        collect_master_req_subtree(note_repo, persistence, project_id, source_note_id).await
+    } else {
+        Vec::new()
+    };
+
     // 3b. Inheritance: walk the **ancestor chain** from the source
     //     upward and inline every sibling artifact whose
     //     `artifact_kind` matches the declared `inherit:` kind. Lets a
@@ -426,6 +452,7 @@ pub async fn run_skill_on_source_with_revision_notes(
         &inherited,
         combined_notes.as_deref(),
         &previous_outputs,
+        &bundle,
     );
 
     // 7. Persist the prompt as a User message (transcript visibility).
@@ -715,6 +742,7 @@ fn build_prompt(
     inherited: &[(String, String)],
     revision_notes: Option<&str>,
     previous_outputs: &[(String, String)],
+    bundle: &[BundleEntry],
 ) -> String {
     let mut buf = String::new();
     buf.push_str(
@@ -752,6 +780,49 @@ fn build_prompt(
     buf.push_str("--- source artifact body ---\n");
     buf.push_str(source_body.trim_end());
     buf.push_str("\n--- /source artifact body ---\n\n");
+
+    // Phase D: master-requirement subtree bundle. Markdown notes and
+    // nested master_requirement artifacts authored under the source
+    // are inlined here as supporting context. Image attachments are
+    // listed by path — the model can `Read` them if it needs visual
+    // detail. Order is depth-first by sibling_index so the prompt
+    // mirrors the explorer tree.
+    if !bundle.is_empty() {
+        let text_count = bundle
+            .iter()
+            .filter(|e| matches!(e, BundleEntry::Text { .. }))
+            .count();
+        let image_count = bundle
+            .iter()
+            .filter(|e| matches!(e, BundleEntry::Image { .. }))
+            .count();
+        buf.push_str(&format!(
+            "--- master-requirement subtree ({text_count} text + {image_count} image) ---\n\
+             These are notes the user authored under the source master\n\
+             requirement (nested master-requirements, design markdown,\n\
+             attached images). Treat them as part of the spec the\n\
+             requirement is describing.\n\n"
+        ));
+        for entry in bundle {
+            match entry {
+                BundleEntry::Text { title, body } => {
+                    buf.push_str(&format!("--- subtree: {title} ---\n"));
+                    buf.push_str(body.trim_end());
+                    buf.push_str(&format!("\n--- /subtree: {title} ---\n\n"));
+                }
+                BundleEntry::Image { title, path } => {
+                    buf.push_str(&format!(
+                        "--- subtree image: {title} ---\n\
+                         path: {}\n\
+                         (Use the Read tool to fetch this image if visual context is needed.)\n\
+                         --- /subtree image: {title} ---\n\n",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        buf.push_str("--- /master-requirement subtree ---\n\n");
+    }
 
     if !aggregated.is_empty() {
         let kind = contract.aggregate.as_deref().unwrap_or("artifact");
@@ -1616,6 +1687,7 @@ mod tests {
             &[],
             None,
             &[],
+            &[],
         );
         assert!(prompt.contains("REQ_BODY"));
         assert!(prompt.contains("SKILL_BODY"));
@@ -1625,6 +1697,43 @@ mod tests {
         assert!(!prompt.contains("aggregated"));
         assert!(!prompt.contains("inherited"));
         assert!(!prompt.contains("previous revisions to preserve"));
+        // Phase D: bundle section also absent when no entries.
+        assert!(!prompt.contains("master-requirement subtree"));
+    }
+
+    #[test]
+    fn build_prompt_inlines_master_req_subtree_bundle() {
+        let dir = std::path::Path::new("/tmp/x");
+        let mut contract = crate::plugins::skill::frontmatter::SkillContract::default();
+        contract.output_kind = Some("epic".into());
+        let bundle = vec![
+            BundleEntry::Text {
+                title: "user-personas".into(),
+                body: "Persona A: power user".into(),
+            },
+            BundleEntry::Image {
+                title: "ui-mockup".into(),
+                path: std::path::PathBuf::from("/vault/.operon/images/mockup.png"),
+            },
+        ];
+        let prompt = build_prompt(
+            "MASTER_REQ_BODY",
+            "SKILL_BODY",
+            dir,
+            &contract,
+            Uuid::nil(),
+            Uuid::nil(),
+            &[],
+            &[],
+            None,
+            &[],
+            &bundle,
+        );
+        assert!(prompt.contains("master-requirement subtree (1 text + 1 image)"));
+        assert!(prompt.contains("--- subtree: user-personas ---"));
+        assert!(prompt.contains("Persona A: power user"));
+        assert!(prompt.contains("--- subtree image: ui-mockup ---"));
+        assert!(prompt.contains("/vault/.operon/images/mockup.png"));
     }
 
     #[test]
@@ -1682,6 +1791,7 @@ mod tests {
             &[],
             None,
             &[],
+            &[],
         );
         assert!(prompt.contains("SEED_BODY"));
         assert!(prompt.contains("aggregated task artifacts (2 total)"));
@@ -1712,6 +1822,7 @@ mod tests {
             &inherited,
             None,
             &[],
+            &[],
         );
         assert!(prompt.contains("TASK_BODY"));
         assert!(prompt.contains(
@@ -1741,6 +1852,7 @@ mod tests {
             &[],
             Some("Emphasize observability concerns"),
             &[],
+            &[],
         );
         assert!(prompt.contains("--- refinement notes from user ---"));
         assert!(prompt.contains("Emphasize observability concerns"));
@@ -1763,6 +1875,7 @@ mod tests {
             &[],
             &[],
             Some("   \n  "),
+            &[],
             &[],
         );
         assert!(!prompt.contains("refinement notes"));
@@ -1788,6 +1901,7 @@ mod tests {
             &[],
             None,
             &previous,
+            &[],
         );
         assert!(prompt.contains("previous revisions to preserve (2 total)"));
         assert!(prompt.contains("--- previous: epic-01-onboarding ---"));
@@ -1812,6 +1926,7 @@ mod tests {
             &[],
             &[],
             None,
+            &[],
             &[],
         );
         assert!(!prompt.contains("previous revisions to preserve"));

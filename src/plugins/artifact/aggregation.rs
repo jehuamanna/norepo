@@ -188,3 +188,133 @@ pub async fn collect_ancestor_sibling_artifacts(
     }
     out
 }
+
+/// One entry in a master-requirement subtree bundle: either a piece
+/// of text the skill prompt should consume, or an image path the
+/// model can `Read` for vision context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BundleEntry {
+    /// Markdown body or nested master_requirement artifact body. Title
+    /// is the note title.
+    Text { title: String, body: String },
+    /// Image attachment. `path` is whatever was stored on the note's
+    /// `blob_path` column — typically vault-relative; callers join
+    /// against the vault root if they need an absolute path.
+    Image { title: String, path: std::path::PathBuf },
+}
+
+/// Walk the master-requirement subtree under `seed_id` depth-first
+/// and collect a flat bundle of context. Children considered:
+///
+/// - `NoteKind::Markdown` → `Text`.
+/// - `NoteKind::Artifact` whose frontmatter declares
+///   `artifact_kind: master_requirement` → `Text`. Other artifact
+///   kinds (epic / story / task / …) are skipped — those are
+///   downstream outputs, not source material.
+/// - `NoteKind::Image` → `Image` (`blob_path` as stored on the note
+///   row).
+/// - Every other kind is skipped.
+///
+/// Order is depth-first by `sibling_index`, mirroring the explorer
+/// tree the user authored. Empty when the seed has no qualifying
+/// descendants; safe to call on any note id (returns empty for
+/// missing nodes / project mismatches).
+pub async fn collect_master_req_subtree(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    persistence: &Arc<dyn Persistence>,
+    project_id: Uuid,
+    seed_id: Uuid,
+) -> Vec<BundleEntry> {
+    let all = match note_repo.list_for_project(project_id) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut by_parent: std::collections::HashMap<Uuid, Vec<&LocalNote>> =
+        std::collections::HashMap::new();
+    for n in &all {
+        if let Some(p) = n.parent_id {
+            by_parent.entry(p).or_default().push(n);
+        }
+    }
+    // DFS pre-order. Children sorted by sibling_index so the user's
+    // authored ordering shows up in the prompt. The stack stores
+    // pending nodes in reverse so popping yields sibling_index order.
+    let mut stack: Vec<&LocalNote> = Vec::new();
+    if let Some(direct) = by_parent.get(&seed_id) {
+        let mut direct_sorted = direct.clone();
+        direct_sorted.sort_by_key(|n| n.sibling_index);
+        for n in direct_sorted.into_iter().rev() {
+            stack.push(n);
+        }
+    }
+    let mut visited: HashSet<Uuid> = HashSet::new();
+    let mut visit_order: Vec<&LocalNote> = Vec::new();
+    while let Some(n) = stack.pop() {
+        if !visited.insert(n.id) {
+            continue;
+        }
+        visit_order.push(n);
+        if let Some(children) = by_parent.get(&n.id) {
+            let mut sorted = children.clone();
+            sorted.sort_by_key(|c| c.sibling_index);
+            for c in sorted.into_iter().rev() {
+                stack.push(c);
+            }
+        }
+    }
+    let mut out: Vec<BundleEntry> = Vec::with_capacity(visit_order.len());
+    for n in visit_order {
+        match n.kind {
+            NoteKind::Markdown => {
+                let bytes = match persistence.load(&n.id.to_string()).await {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let body = match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                out.push(BundleEntry::Text {
+                    title: n.title.clone(),
+                    body,
+                });
+            }
+            NoteKind::Artifact => {
+                // Only nested master_requirement artifacts qualify as
+                // bundle text; epic / story / task / etc. are output
+                // products, not source.
+                let bytes = match persistence.load(&n.id.to_string()).await {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let body = match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let fm = parse_artifact_fm(&body);
+                let is_master_req = fm
+                    .artifact_kind
+                    .as_ref()
+                    .map(|k| k.as_str() == "master_requirement")
+                    .unwrap_or(false);
+                if !is_master_req {
+                    continue;
+                }
+                out.push(BundleEntry::Text {
+                    title: n.title.clone(),
+                    body,
+                });
+            }
+            NoteKind::Image => {
+                if let Some(path) = &n.blob_path {
+                    out.push(BundleEntry::Image {
+                        title: n.title.clone(),
+                        path: std::path::PathBuf::from(path),
+                    });
+                }
+            }
+            _ => continue,
+        }
+    }
+    out
+}
