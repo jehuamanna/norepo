@@ -265,16 +265,18 @@ pub fn SessionRail() -> Element {
                         let mut renaming_for_commit = renaming_session;
                         let mut renaming_for_cancel = renaming_session;
                         let mut version_for_rename = version;
+                        // Selecting a row only changes the active
+                        // session — it does NOT touch `last_used_ms` or
+                        // bump the version. Touching on click reordered
+                        // the rail under the user's mouse, which lost
+                        // their place when they flipped between two
+                        // recent chats. Sends and cascade runs still
+                        // call `touch` themselves; selection alone is
+                        // navigation, not activity.
                         let on_select = {
                             let mut active = active_session;
-                            let session_repo = session_repo.clone();
-                            let mut version = version;
                             Callback::new(move |_| {
                                 active.set(Some(sid));
-                                if let Err(e) = session_repo.touch(sid) {
-                                    tracing::warn!(target: "operon::companion", "touch session: {e}");
-                                }
-                                version.with_mut(|v| *v += 1);
                             })
                         };
                         let on_dblclick = Callback::new(move |evt: Event<MouseData>| {
@@ -332,7 +334,7 @@ pub fn SessionRail() -> Element {
                                 } else {
                                     span {
                                         class: "operon-companion-rail-item-label truncate",
-                                        title: "Double-click to rename",
+                                        title: "{label}",
                                         "{label}"
                                     }
                                 }

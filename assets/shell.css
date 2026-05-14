@@ -1408,8 +1408,12 @@ html, body {
   transition: opacity 80ms ease-out;
 }
 
+/* ChatGPT-style: the delete button only appears on hover, even on the
+   active row. Keeping it pinned to the active row added visual noise
+   to a list the user mostly just navigates. Focus-within keeps the
+   button reachable for keyboard users. */
 .operon-companion-rail-item:hover .operon-companion-rail-item-delete,
-.operon-companion-rail-item-active .operon-companion-rail-item-delete {
+.operon-companion-rail-item:focus-within .operon-companion-rail-item-delete {
   opacity: 1;
 }
 
