@@ -145,12 +145,6 @@ impl SkillPhase {
 /// Architecture skills (`input_kind: master_requirement` →
 /// `output_kind: architecture`) fall in this set too because they
 /// run as part of the master-driven phase.
-///
-/// `architecture` is included so the Phase E review skill
-/// (`input_kind: architecture` → `output_kind: architecture_review`)
-/// survives the phase filter when the cascade visits the
-/// architecture artifact (either via the BA tree walk or the
-/// post-cascade auto-trigger).
 fn is_ba_input_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -159,7 +153,6 @@ fn is_ba_input_kind(kind: &str) -> bool {
             | "epic"
             | "feature"
             | "story"
-            | "architecture"
     )
 }
 
@@ -723,33 +716,6 @@ pub async fn run_cascade(
                 continue;
             }
 
-            // Phase E: inverse architecture-review gate. The review
-            // skill (output_kind: architecture_review) is only useful
-            // when at least one non-first-phase master_requirement
-            // exists — there has to be a "new phase" to review the
-            // architecture against. Without this gate the skill would
-            // fire on the architecture even in a single-phase project
-            // and produce an empty review note that approves nothing.
-            // The auto-trigger at the end of `run_cascade` separately
-            // ensures we only enter this branch from a non-first-phase
-            // cascade; this guard catches the manual-Play case too.
-            if skill.contract.output_kind.as_deref() == Some("architecture_review")
-                && !project_has_non_first_phase_master_req(
-                    note_repo,
-                    persistence,
-                    project_id,
-                )
-                .await
-            {
-                tracing::debug!(
-                    target: "operon::cascade",
-                    "phase gate: skipping architecture-review skill {} on {art_id} \
-                     (project has no non-first-phase master_requirements yet)",
-                    skill.id
-                );
-                continue;
-            }
-
             // Skip-already-produced gate. On a cascade re-run after
             // the user approved a checkpoint, the seed pops with all
             // its matching skills (e.g. 01 + 01b) still "matching" —
@@ -1268,128 +1234,12 @@ pub async fn run_cascade(
                 },
             );
         });
-    } else {
-        // Phase E auto-trigger: the cascade completed cleanly (no
-        // pending pause, no cancel). If the root was a
-        // master_requirement that does NOT sit in the first phase,
-        // fire the architecture-review skill against the project's
-        // architecture artifact. The review feeds back to the SA as
-        // an `architecture_review` child under the architecture and
-        // flips `needs_review: true` on the architecture so the
-        // explorer / canvas badges pick it up.
-        //
-        // Errors here are non-fatal — the cascade itself succeeded;
-        // a failed review trigger should just log and let the user
-        // run it manually from the architecture's skill picker.
-        if !crate::plugins::phase::is_in_first_phase(
-            note_repo,
-            persistence,
-            project_id,
-            root_artifact_id,
-        )
-        .await
-        {
-            if let Some((arch_id, review_skill_id)) =
-                find_architecture_and_review_skill(note_repo, persistence, project_id)
-                    .await
-            {
-                tracing::info!(
-                    target: "operon::cascade",
-                    "phase-E auto-trigger: firing architecture review on {arch_id} \
-                     after non-first-phase cascade rooted at {root_artifact_id}"
-                );
-                let outcome = crate::plugins::artifact::runner::run_skill_on_source(
-                    note_repo,
-                    project_repo,
-                    persistence,
-                    plugin,
-                    Some(chat_message_repo),
-                    cascade_session_id,
-                    arch_id,
-                    review_skill_id,
-                    None,
-                    cancel.clone(),
-                )
-                .await;
-                if let Err(e) = outcome {
-                    tracing::warn!(
-                        target: "operon::cascade",
-                        "phase-E auto-trigger: review skill run failed: {e}"
-                    );
-                }
-            }
-        }
     }
 
     Ok(CascadeOutcome::Completed {
         artifacts_produced: produced,
         errors: level_errors,
     })
-}
-
-/// Phase E auto-trigger helper: locate the project's singleton
-/// architecture artifact AND the `architecture_review` skill, in
-/// one project-list pass. Returns `Some((arch_id, skill_id))` when
-/// both exist; `None` when either is missing (no architecture yet,
-/// or the seed `11-sa-review-architecture` skill hasn't been
-/// imported into this project).
-async fn find_architecture_and_review_skill(
-    note_repo: &Arc<dyn LocalNoteRepository>,
-    persistence: &Arc<dyn Persistence>,
-    project_id: Uuid,
-) -> Option<(Uuid, Uuid)> {
-    let notes = note_repo.list_for_project(project_id).ok()?;
-    let mut arch_id: Option<Uuid> = None;
-    let mut review_skill_id: Option<Uuid> = None;
-    for n in &notes {
-        match n.kind {
-            NoteKind::Artifact => {
-                if arch_id.is_some() {
-                    continue;
-                }
-                let body = persistence
-                    .load(&n.id.to_string())
-                    .await
-                    .ok()
-                    .and_then(|bytes| String::from_utf8(bytes).ok());
-                if let Some(body) = body {
-                    let fm = parse_artifact_fm(&body);
-                    if fm
-                        .artifact_kind
-                        .as_ref()
-                        .map(|k| k.as_str() == "architecture")
-                        .unwrap_or(false)
-                    {
-                        arch_id = Some(n.id);
-                    }
-                }
-            }
-            NoteKind::Skill => {
-                if review_skill_id.is_some() {
-                    continue;
-                }
-                let body = persistence
-                    .load(&n.id.to_string())
-                    .await
-                    .ok()
-                    .and_then(|bytes| String::from_utf8(bytes).ok());
-                if let Some(body) = body {
-                    let (skill_fm_lines, _) =
-                        crate::plugins::skill::frontmatter::split(&body);
-                    let lines = skill_fm_lines.unwrap_or_default();
-                    let contract = crate::plugins::skill::frontmatter::contract(&lines);
-                    if contract.output_kind.as_deref() == Some("architecture_review") {
-                        review_skill_id = Some(n.id);
-                    }
-                }
-            }
-            _ => {}
-        }
-        if arch_id.is_some() && review_skill_id.is_some() {
-            break;
-        }
-    }
-    arch_id.zip(review_skill_id)
 }
 
 /// Snapshot every `NoteKind::Skill` note in the project, filter down
@@ -1714,60 +1564,6 @@ async fn count_descendant_artifacts_of_kind(
         }
     }
     count
-}
-
-/// Phase E gate: `true` when the project has at least one
-/// `artifact_kind: master_requirement` note whose phase ancestor is
-/// NOT the first phase. The architecture-review skill only fires
-/// when this returns true — single-phase projects have nothing for
-/// the review to compare against.
-async fn project_has_non_first_phase_master_req(
-    note_repo: &Arc<dyn LocalNoteRepository>,
-    persistence: &Arc<dyn Persistence>,
-    project_id: Uuid,
-) -> bool {
-    let notes = match note_repo.list_for_project(project_id) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    for note in &notes {
-        if !matches!(note.kind, NoteKind::Artifact) {
-            continue;
-        }
-        let bytes = match persistence.load(&note.id.to_string()).await {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let body = match String::from_utf8(bytes) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let fm = parse_artifact_fm(&body);
-        let is_master = fm
-            .artifact_kind
-            .as_ref()
-            .map(|k| k.as_str() == "master_requirement")
-            .unwrap_or(false);
-        if !is_master {
-            continue;
-        }
-        // Reuse Phase C's helper: returns true for legacy projects
-        // (no phase notes), so the inverse below correctly identifies
-        // a "non-first-phase master_req" only when the project
-        // actually has phase notes AND this master sits outside the
-        // first one.
-        if !crate::plugins::phase::is_in_first_phase(
-            note_repo,
-            persistence,
-            project_id,
-            note.id,
-        )
-        .await
-        {
-            return true;
-        }
-    }
-    false
 }
 
 /// Find children of `parent_id` whose artifact frontmatter declares

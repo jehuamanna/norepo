@@ -448,51 +448,6 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                     }
                 }
             }
-            // Phase E: pending-review banner. Renders only when this
-            // artifact is the Architecture AND it has `needs_review`
-            // set in its frontmatter. Lists the titles of child
-            // `architecture_review` notes so the user can spot them
-            // in the explorer tree below.
-            {
-                let is_architecture = fm
-                    .artifact_kind
-                    .as_ref()
-                    .map(|k| matches!(k, ArtifactKind::Architecture))
-                    .unwrap_or(false);
-                if is_architecture && fm.needs_review {
-                    let review_titles: Vec<String> = source_uuid
-                        .and_then(|sid| drop_note_repo.find_project_for_note(sid).ok().flatten().map(|p| (sid, p)))
-                        .and_then(|(sid, pid)| {
-                            drop_note_repo.list_for_project(pid).ok().map(|notes| {
-                                notes
-                                    .into_iter()
-                                    .filter(|n| n.parent_id == Some(sid))
-                                    .filter(|n| matches!(n.kind, NoteKind::Artifact))
-                                    .map(|n| n.title)
-                                    .collect()
-                            })
-                        })
-                        .unwrap_or_default();
-                    let count = review_titles.len();
-                    let suffix = if count == 1 { "" } else { "s" };
-                    rsx! {
-                        div {
-                            class: "operon-artifact-run-status operon-artifact-needs-review",
-                            "data-testid": "artifact-needs-review-banner",
-                            "\u{26A0} {count} pending architecture review{suffix} from later phase{suffix}. Open and approve or reject each one to clear the flag."
-                            if !review_titles.is_empty() {
-                                ul { class: "operon-artifact-needs-review-list",
-                                    for t in review_titles.iter() {
-                                        li { "{t}" }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    rsx! {}
-                }
-            }
             // Inline run-status row, visible regardless of whether
             // the picker is open. Empty before the first run;
             // shows the live state (Running / Done / Failed) keyed
@@ -833,94 +788,14 @@ fn save_status_change(
         handler.call(new_body.clone());
     }
     let persistence = persistence.clone();
-    let note_id_str = note_id.to_string();
-    let note_id_for_clear = note_id_str.clone();
+    let note_id = note_id.to_string();
     let body = new_body;
-    let prev_fm = parse(content);
-    let next_fm = parse(&body);
-    let note_repo_for_clear: Option<Arc<dyn LocalNoteRepository>> =
-        try_consume_context::<LocalNoteRepo>().map(|c| c.0);
     dioxus::prelude::spawn(async move {
-        if let Err(e) = persistence.save(&note_id_str, body.as_bytes()).await {
+        if let Err(e) = persistence.save(&note_id, body.as_bytes()).await {
             tracing::warn!(
                 target: "operon::artifact",
-                "save_status_change: persistence.save({note_id_str}) failed: {e}"
+                "save_status_change: persistence.save({note_id}) failed: {e}"
             );
-            return;
-        }
-        // Phase E auto-clear: if the note we just stamped was an
-        // `architecture_review` whose status moved from a Pending/
-        // Dirty state to Approved/Rejected, re-scan the parent
-        // architecture's review children. When none remain
-        // Pending/Dirty, clear the architecture's `needs_review`
-        // flag so the explorer / canvas badges drop.
-        let became_resolved = matches!(
-            prev_fm.status,
-            ArtifactStatus::Pending | ArtifactStatus::Dirty
-        ) && matches!(
-            next_fm.status,
-            ArtifactStatus::Approved | ArtifactStatus::Rejected
-        );
-        let is_review = next_fm
-            .artifact_kind
-            .as_ref()
-            .map(|k| matches!(k, ArtifactKind::ArchitectureReview))
-            .unwrap_or(false);
-        if !(became_resolved && is_review) {
-            return;
-        }
-        let Some(note_repo) = note_repo_for_clear else { return };
-        let Ok(this_id) = Uuid::parse_str(&note_id_for_clear) else { return };
-        // Find parent architecture id.
-        let Ok(Some(project_id)) = note_repo.find_project_for_note(this_id) else {
-            return;
-        };
-        let Ok(notes) = note_repo.list_for_project(project_id) else { return };
-        let parent_id = match notes.iter().find(|n| n.id == this_id) {
-            Some(n) => n.parent_id,
-            None => return,
-        };
-        let Some(parent_id) = parent_id else { return };
-        // Any remaining Pending/Dirty review siblings keep the flag.
-        let mut any_pending = false;
-        for sibling in notes.iter().filter(|n| n.parent_id == Some(parent_id)) {
-            if sibling.id == this_id {
-                continue;
-            }
-            if !matches!(sibling.kind, NoteKind::Artifact) {
-                continue;
-            }
-            let bytes = match persistence.load(&sibling.id.to_string()).await {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let body = match String::from_utf8(bytes) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let fm = parse(&body);
-            let is_review_kind = fm
-                .artifact_kind
-                .as_ref()
-                .map(|k| matches!(k, ArtifactKind::ArchitectureReview))
-                .unwrap_or(false);
-            if is_review_kind
-                && matches!(fm.status, ArtifactStatus::Pending | ArtifactStatus::Dirty)
-            {
-                any_pending = true;
-                break;
-            }
-        }
-        if !any_pending {
-            crate::plugins::artifact::runner::flip_needs_review_on(
-                &persistence,
-                parent_id,
-                false,
-            )
-            .await;
-            // Bump LocalNoteVersion so the explorer + canvas badges
-            // refresh on the next render tick.
-            *crate::shell::companion_state::LOCAL_NOTE_VERSION.write() += 1;
         }
     });
 }
@@ -2608,7 +2483,6 @@ fn artifact_kind_tag(kind: &crate::plugins::artifact::frontmatter::ArtifactKind)
         ArtifactKind::TestResults => "tres",
         ArtifactKind::Summary => "summary",
         ArtifactKind::Architecture => "arch",
-        ArtifactKind::ArchitectureReview => "review",
         ArtifactKind::Bug => "bug",
         ArtifactKind::Clarification => "clar",
         ArtifactKind::PrioritizedBacklog => "backlog",

@@ -57,7 +57,6 @@ impl CreatableKind {
             ArtifactKind::Story,
             ArtifactKind::Task,
             ArtifactKind::Architecture,
-            ArtifactKind::ArchitectureReview,
             ArtifactKind::ImplementationPlan,
             ArtifactKind::Implementation,
             ArtifactKind::TestCases,
@@ -218,20 +217,6 @@ pub fn scaffold_body(kind: &ArtifactKind) -> String {
              ## Verdict\n\n"
                 .to_string()
         }
-        ArtifactKind::ArchitectureReview => {
-            // Phase E: review note flagging concerns a new phase's
-            // requirements raise against the existing architecture.
-            // Sections mirror the LLM-output contract in
-            // `seed-skills-updated/11-sa-review-architecture.md` so
-            // manually-authored reviews look identical to generated
-            // ones.
-            "# Architecture Review: \n\n\
-             ## Phase under review\n\n\
-             ## Concerns\n\n\
-             ## Recommended amendments\n\n\
-             ## No action needed if\u{2026}\n\n"
-                .to_string()
-        }
         // The non-pipeline variants — `Plan`, `Summary`, `Bug`,
         // `Clarification`, `PrioritizedBacklog`, `Other(_)` — aren't
         // surfaced in the menu (see `pipeline_artifacts`). If a caller
@@ -337,7 +322,6 @@ mod tests {
                 "story",
                 "task",
                 "architecture",
-                "architecture_review",
                 "implementation_plan",
                 "implementation",
                 "test_cases",

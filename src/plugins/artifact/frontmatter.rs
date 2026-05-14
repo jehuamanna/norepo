@@ -65,15 +65,6 @@ pub enum ArtifactKind {
     /// from the project's `MasterRequirement`. Inherited by SDE skills
     /// to scope implementation work.
     Architecture,
-    /// Phase E: SA-authored review note flagging concerns that a new
-    /// phase's requirements may raise against the existing
-    /// Architecture. Always a direct child of an Architecture
-    /// artifact; produced by `11-sa-review-architecture` either
-    /// auto-fired after a non-first-phase cascade or manually
-    /// triggered from the architecture's skill picker. Approving the
-    /// review (or rejecting it) clears the parent architecture's
-    /// `needs_review` flag once no Pending / Dirty reviews remain.
-    ArchitectureReview,
     /// SDE-filed bug pointing at a specific Implementation. Consumed by
     /// the bug-fix skill, which produces a new Implementation revision.
     Bug,
@@ -110,7 +101,6 @@ impl ArtifactKind {
             Self::TestResults => "test_results",
             Self::Summary => "summary",
             Self::Architecture => "architecture",
-            Self::ArchitectureReview => "architecture_review",
             Self::Bug => "bug",
             Self::Clarification => "clarification",
             Self::PrioritizedBacklog => "prioritized_backlog",
@@ -133,7 +123,6 @@ impl ArtifactKind {
             "test_results" => Self::TestResults,
             "summary" => Self::Summary,
             "architecture" => Self::Architecture,
-            "architecture_review" => Self::ArchitectureReview,
             "bug" => Self::Bug,
             "clarification" => Self::Clarification,
             "prioritized_backlog" => Self::PrioritizedBacklog,
@@ -156,7 +145,6 @@ impl ArtifactKind {
             Self::TestResults => "Test Results".into(),
             Self::Summary => "Summary".into(),
             Self::Architecture => "Architecture".into(),
-            Self::ArchitectureReview => "Architecture Review".into(),
             Self::Bug => "Bug".into(),
             Self::Clarification => "Clarification".into(),
             Self::PrioritizedBacklog => "Prioritized Backlog".into(),
@@ -243,18 +231,6 @@ pub struct ArtifactFrontmatter {
     /// without breaking the YAML-ish single-line frontmatter format
     /// the rest of this parser expects.
     pub revision_notes: Option<String>,
-    /// Phase E: marker set on Architecture artifacts when a non-first
-    /// phase's cascade has produced an `architecture_review` child
-    /// that hasn't been Approved or Rejected yet. The explorer + the
-    /// workflow canvas render a ⚠ badge on flagged architectures so
-    /// the user notices without opening the note; the architecture's
-    /// own view shows a banner listing the pending review children
-    /// with click-through links. Cleared automatically when the last
-    /// Pending / Dirty review is resolved.
-    ///
-    /// Serialized only when `true` to keep diffs minimal on artifacts
-    /// without reviews.
-    pub needs_review: bool,
 }
 
 impl Default for ArtifactFrontmatter {
@@ -266,7 +242,6 @@ impl Default for ArtifactFrontmatter {
             source_skill_id: None,
             input_hash: None,
             revision_notes: None,
-            needs_review: false,
         }
     }
 }
@@ -298,9 +273,6 @@ pub fn parse(body: &str) -> ArtifactFrontmatter {
     // format landed.
     let revision_notes = revision_notes_from_lines(&lines)
         .filter(|s| !s.is_empty());
-    let needs_review = field(&lines, "needs_review")
-        .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "1"))
-        .unwrap_or(false);
     ArtifactFrontmatter {
         artifact_kind,
         status,
@@ -308,7 +280,6 @@ pub fn parse(body: &str) -> ArtifactFrontmatter {
         source_skill_id,
         input_hash,
         revision_notes,
-        needs_review,
     }
 }
 
@@ -450,11 +421,6 @@ pub fn rewrite(body: &str, next: &ArtifactFrontmatter) -> String {
             ));
         }
     }
-    // Phase E: only emit `needs_review` when true. Keeps the diff
-    // empty on the vast majority of artifacts that never get flagged.
-    if next.needs_review {
-        out.push_str("needs_review: true\n");
-    }
     // Preserve any *other* keys the skill emitted that we don't
     // model here (e.g. acceptance_criteria, dependencies). They
     // round-trip verbatim so the artifact view's "Edit body" path
@@ -467,7 +433,6 @@ pub fn rewrite(body: &str, next: &ArtifactFrontmatter) -> String {
             "source_skill_id",
             "input_hash",
             "revision_notes",
-            "needs_review",
         ];
         for line in &prev_lines {
             let trimmed = line.trim();
@@ -587,44 +552,6 @@ mod tests {
         assert_eq!(fm.artifact_kind, Some(ArtifactKind::Architecture));
         assert_eq!(ArtifactKind::Architecture.as_str(), "architecture");
         assert_eq!(ArtifactKind::Architecture.display_name(), "Architecture");
-    }
-
-    #[test]
-    fn parse_extracts_architecture_review_kind() {
-        let body =
-            "---\nartifact_kind: architecture_review\nstatus: pending\n---\nbody";
-        let fm = parse(body);
-        assert_eq!(fm.artifact_kind, Some(ArtifactKind::ArchitectureReview));
-        assert_eq!(
-            ArtifactKind::ArchitectureReview.as_str(),
-            "architecture_review"
-        );
-        assert_eq!(
-            ArtifactKind::ArchitectureReview.display_name(),
-            "Architecture Review"
-        );
-    }
-
-    #[test]
-    fn needs_review_round_trips() {
-        let body = "---\nartifact_kind: architecture\nstatus: approved\nneeds_review: true\n---\nbody";
-        let fm = parse(body);
-        assert!(fm.needs_review);
-        // Re-serialize and re-parse to confirm the field survives the
-        // round-trip via `rewrite`.
-        let rebuilt = rewrite(body, &fm);
-        assert!(rebuilt.contains("needs_review: true"));
-        let reparsed = parse(&rebuilt);
-        assert!(reparsed.needs_review);
-    }
-
-    #[test]
-    fn needs_review_omitted_when_false() {
-        let body = "---\nartifact_kind: architecture\nstatus: approved\n---\nbody";
-        let fm = parse(body);
-        assert!(!fm.needs_review);
-        let rebuilt = rewrite(body, &fm);
-        assert!(!rebuilt.contains("needs_review"));
     }
 
     #[test]
