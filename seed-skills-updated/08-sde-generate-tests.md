@@ -77,6 +77,62 @@ Required body sections (in order):
   `Revision | Date (YYYY-MM-DD) | Derived from | Summary`. Include
   Revision 1 dated `<today>` referencing the parent Implementation.
 
+## Raising clarifications
+
+If the parent Implementation + Task are ambiguous in a way you
+cannot resolve by a defensible best-guess (see the rubric below), do
+**NOT** emit a Test Cases note for this run. Instead, write one or
+more `clarification-NN-<kebab-topic>.mdx` files into the same output
+directory and stop. The cascade halts on Pending clarifications; the
+user answers via the ClarificationPanel, which flips the parent
+Implementation Dirty, and the next Play re-runs this skill with the
+answer inlined under `--- refinement notes from user ---`.
+
+**Hard rule.** Either raise clarification(s) AND emit no Test Cases
+for this run, OR emit Test Cases with zero clarifications. Don't mix.
+
+The existing "If the parent Task is too vague to test" branch (mark
+Test Cases `Rejected`) is for cases where there's genuinely nothing
+to test. The `clarification.mdx` path is for cases where the
+reviewer can supply a single decision that makes the test plan
+writable.
+
+**File format.** Use the `Write` tool **once per clarification**.
+Each file's frontmatter MUST set:
+
+```
+---
+artifact_kind: clarification
+status: pending
+---
+```
+
+Required body sections (mirror `00-coherence-check`):
+
+- **# Clarification: <one-line topic>**
+- **## Levels involved** — bullet list (Implementation slug, Task
+  slug, Story slug if relevant)
+- **## The discrepancy** — 1–2 paragraphs
+- **## Question type** — `single_choice` or `multi_choice`
+- **## Options** — `- [ ] <label> — <consequence>`, ending with
+  `- [ ] Other: ___`
+- **## Why we're asking** — one paragraph on what coverage shape
+  changes depending on the answer
+- **## Resolution target** — list the **parent Implementation's
+  slug**.
+
+**When to raise (rubric).**
+
+- (a) The parent Task / Implementation has no observable behavior
+  to test (pure refactor / config-only change / dead-code removal),
+  yet the Story's acceptance criteria imply there should be one —
+  ask the user whether to skip tests or write a regression sentinel.
+- (b) The Story's acceptance criteria are silent on the
+  "given / when / then" for the change, so any test you write would
+  be a guess at what the user considers correct.
+
+If neither applies, generate Test Cases as usual.
+
 ## Revision behavior (re-runs)
 
 If the Implementation was re-revised (e.g. after a bug fix), this

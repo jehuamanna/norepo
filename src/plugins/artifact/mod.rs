@@ -19,6 +19,12 @@ pub mod cascade;
 pub mod cascade_graph;
 pub mod frontmatter;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod migrate_v018;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod paths;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod relocate;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod runner;
 pub(crate) mod view;
 

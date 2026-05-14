@@ -244,6 +244,36 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
     // current step.
     let cascade_state_view: Option<crate::shell::companion_state::CascadePhase> = source_uuid
         .and_then(|sid| crate::shell::companion_state::CASCADE_STATE.read().get(&sid).cloned());
+    // Pick the primary Play/Stop run-mode this artifact deserves
+    // (if any) given its kind + status. Drives the new header slot
+    // that sits LEFT of the status pill — putting the run affordance
+    // immediately next to the kind title so the user finds it
+    // before the status. `None` hides the button; the right-side
+    // actions toolbar (Run skill / Generate Cascade / etc.) is
+    // unaffected. Centralising the mode-by-kind decision here keeps
+    // the header rsx readable.
+    let primary_play_mode: Option<crate::plugins::artifact::cascade::RunMode> = {
+        use crate::plugins::artifact::cascade::RunMode;
+        if !body_editable {
+            None
+        } else if is_cascade_root && is_runnable_source {
+            Some(if is_task {
+                RunMode::TaskPlanOnly
+            } else {
+                RunMode::Full
+            })
+        } else if is_implementation_plan && !is_cascade_root
+            && matches!(status, ArtifactStatus::Approved | ArtifactStatus::Dirty)
+        {
+            Some(RunMode::PlanExecuteAndTest)
+        } else if is_implementation && !is_cascade_root
+            && matches!(status, ArtifactStatus::Approved | ArtifactStatus::Dirty)
+        {
+            Some(RunMode::ImplementationRetest)
+        } else {
+            None
+        }
+    };
     // TEMP DIAGNOSTIC: surface the body-editable computation as data
     // attributes so the user can confirm via DevTools whether
     // `props.edit` and `on_change.is_some()` are both true at runtime
@@ -262,6 +292,16 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
             "data-debug-body-editable": "{dbg_body_editable}",
             div { class: "operon-artifact-header",
                 span { class: "operon-artifact-kind-badge", "{kind_label}" }
+                // Primary Play/Stop toggle, immediately next to the
+                // kind title. CascadePlayButton morphs to ⏹ Stop on
+                // its own when a cascade rooted on this artifact is
+                // in flight, so one button covers both states.
+                if let (Some(uuid), Some(mode)) = (source_uuid, primary_play_mode) {
+                    CascadePlayButton {
+                        root_artifact_id: uuid,
+                        run_mode: mode,
+                    }
+                }
                 span {
                     class: "operon-artifact-status-pill {status_class}",
                     "data-testid": "artifact-status-pill",
@@ -375,67 +415,23 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                             if let Some(uuid) = source_uuid {
                                 if is_runnable_source {
                                     GenerateCascadeButton { root_artifact_id: uuid }
-                                    // Task Play stops at the
-                                    // ImplementationPlan note; the
-                                    // master_requirement / other
-                                    // cascade roots keep the legacy
-                                    // Full sweep.
-                                    {
-                                        let mode = if is_task {
-                                            crate::plugins::artifact::cascade::RunMode::TaskPlanOnly
-                                        } else {
-                                            crate::plugins::artifact::cascade::RunMode::Full
-                                        };
-                                        rsx! {
-                                            CascadePlayButton {
-                                                root_artifact_id: uuid,
-                                                run_mode: mode,
-                                            }
-                                        }
-                                    }
                                 }
                             }
                         }
-                        // ImplementationPlan: Play kicks off the
-                        // execute tail (07b code edits + commit, 08
-                        // generate tests, 09 run tests). Pending /
-                        // Rejected plans get no Play (user is still
-                        // in initial review of the plan body).
-                        if is_implementation_plan && !is_cascade_root {
+                        // Secondary "Create test cases" button —
+                        // regen-only (no rerun) variant of the
+                        // Implementation Play. Lives in the action
+                        // strip so the primary Play/Stop next to the
+                        // title stays a single button. Dirty
+                        // Implementations only.
+                        if is_implementation
+                            && !is_cascade_root
+                            && matches!(status, ArtifactStatus::Dirty)
+                        {
                             if let Some(uuid) = source_uuid {
-                                if matches!(
-                                    status,
-                                    ArtifactStatus::Approved | ArtifactStatus::Dirty
-                                ) {
-                                    CascadePlayButton {
-                                        root_artifact_id: uuid,
-                                        run_mode: crate::plugins::artifact::cascade::RunMode::PlanExecuteAndTest,
-                                    }
-                                }
-                            }
-                        }
-                        // Implementation (post-execution record):
-                        // Play regenerates TestCases + reruns them
-                        // (ImplementationRetest). "Create test cases"
-                        // extra button on Dirty offers the regen-only
-                        // variant (no rerun). Pending / Rejected
-                        // Implementations get no SDLC toolbar.
-                        if is_implementation && !is_cascade_root {
-                            if let Some(uuid) = source_uuid {
-                                if matches!(
-                                    status,
-                                    ArtifactStatus::Approved | ArtifactStatus::Dirty
-                                ) {
-                                    CascadePlayButton {
-                                        root_artifact_id: uuid,
-                                        run_mode: crate::plugins::artifact::cascade::RunMode::ImplementationRetest,
-                                    }
-                                    if matches!(status, ArtifactStatus::Dirty) {
-                                        CascadePlayButton {
-                                            root_artifact_id: uuid,
-                                            run_mode: crate::plugins::artifact::cascade::RunMode::GenerateTestCasesOnly,
-                                        }
-                                    }
+                                CascadePlayButton {
+                                    root_artifact_id: uuid,
+                                    run_mode: crate::plugins::artifact::cascade::RunMode::GenerateTestCasesOnly,
                                 }
                             }
                         }
@@ -522,51 +518,14 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                     }
                 },
             }
-            if body_editable {
-                {
-                    let revision_notes_value =
-                        fm.revision_notes.clone().unwrap_or_default();
-                    let initially_open =
-                        matches!(status, ArtifactStatus::Dirty)
-                            || !revision_notes_value.is_empty();
-                    let content_for_revision = content_for_actions.clone();
-                    rsx! {
-                        details {
-                            class: "operon-artifact-revision-notes-section",
-                            "data-testid": "artifact-revision-notes",
-                            open: initially_open,
-                            summary { "Refinement notes (used on next re-run)" }
-                            textarea {
-                                class: "operon-artifact-revision-notes",
-                                "data-testid": "artifact-revision-notes-textarea",
-                                placeholder:
-                                    "e.g. Drop the analytics epic — out of scope. Add an Epic for observability/SLOs.",
-                                rows: "4",
-                                value: "{revision_notes_value}",
-                                oninput: move |evt| {
-                                    let next = evt.value();
-                                    patch_revision_notes(
-                                        &content_for_revision,
-                                        Some(next),
-                                        on_change,
-                                    );
-                                },
-                            }
-                            if !revision_notes_value.is_empty() {
-                                small {
-                                    class: "operon-artifact-revision-notes-hint",
-                                    "These notes will be inlined into the next regeneration prompt and cleared automatically after a successful run."
-                                }
-                            } else {
-                                small {
-                                    class: "operon-artifact-revision-notes-hint",
-                                    "Type guidance here. Mark the artifact Dirty and click Re-run — your notes get inlined into the prompt that regenerates this artifact."
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // The user-facing "Refinement notes" editor was removed.
+            // The underlying `revision_notes` frontmatter field stays —
+            // it's still set by the ClarificationPanel writeback and
+            // still inlined into the regeneration prompt under
+            // `--- refinement notes from user ---` by
+            // `run_skill_on_source_with_revision_notes`. We just don't
+            // expose a manual editor for it any more; refinement is
+            // driven via clarifications + the markdown body itself.
             if show_clarification_panel {
                 {
                     let parsed = parse_clarification(&body_only);
@@ -851,34 +810,6 @@ pub fn patch_status_text(content: &str, next: ArtifactStatus) -> String {
     let mut fm = parse(content);
     fm.status = next;
     rewrite(content, &fm)
-}
-
-/// Frontmatter-only patch for `revision_notes`. Whitespace-only input
-/// is stored as `None` so the field doesn't serialize a noisy empty
-/// line. Body is preserved untouched. The runner clears this field
-/// after a successful regeneration consumed it.
-fn patch_revision_notes(
-    content: &str,
-    next: Option<String>,
-    on_change: Option<EventHandler<String>>,
-) {
-    let mut fm = parse(content);
-    // Don't trim — the textarea is controlled, so stripping trailing
-    // whitespace mid-keystroke eats the space the user just typed and
-    // makes the field feel broken (e.g. "hello world" → "helloworld").
-    // We only collapse all-whitespace input to None so an empty edit
-    // doesn't serialize a noisy field.
-    fm.revision_notes = next.and_then(|s| {
-        if s.trim().is_empty() {
-            None
-        } else {
-            Some(s)
-        }
-    });
-    let new_body = rewrite(content, &fm);
-    if let Some(handler) = on_change {
-        handler.call(new_body);
-    }
 }
 
 fn status_css_class(s: ArtifactStatus) -> &'static str {

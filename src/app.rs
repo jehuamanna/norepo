@@ -125,6 +125,19 @@ pub fn App() -> Element {
         crate::shell::repo_permissions::RepoPermissionsOpen(repo_permissions_open)
     });
 
+    // App-scope visibility for the Project Claude Defaults panel (Tools
+    // menu + `tools.openProjectClaudeSettings` command). Same wasm
+    // carve-out — the panel touches `local_project` columns added in
+    // migration 019, which only exist in the desktop sqlite store.
+    #[cfg(not(target_arch = "wasm32"))]
+    let project_claude_settings_open: Signal<bool> = use_signal(|| false);
+    #[cfg(not(target_arch = "wasm32"))]
+    use_context_provider(|| {
+        crate::shell::project_claude_settings::ProjectClaudeSettingsOpen(
+            project_claude_settings_open,
+        )
+    });
+
     #[cfg(not(target_arch = "wasm32"))]
     let initial_mode_remembered: Option<Mode> = {
         let crate::local_mode::LocalSettingsRepo(settings) = use_context();
@@ -316,6 +329,7 @@ pub fn App() -> Element {
         // only because the panel touches the filesystem; the wasm stub
         // renders nothing.
         RepoPermissionsPanelHost {}
+        ProjectClaudeSettingsPanelHost {}
     }
 }
 
@@ -327,6 +341,22 @@ fn RepoPermissionsPanelHost() -> Element {
     #[cfg(not(target_arch = "wasm32"))]
     {
         rsx! { crate::shell::repo_permissions::RepoPermissionsPanel {} }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        rsx! {}
+    }
+}
+
+/// Same shape as `RepoPermissionsPanelHost` for the Project Claude
+/// Defaults panel — desktop-only because the underlying
+/// `local_project.{default_model, default_permission_mode}` columns are
+/// SQLite-only (migration 019).
+#[component]
+fn ProjectClaudeSettingsPanelHost() -> Element {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        rsx! { crate::shell::project_claude_settings::ProjectClaudeSettingsPanel {} }
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -351,7 +381,34 @@ fn Workspace() -> Element {
     #[cfg(not(target_arch = "wasm32"))]
     let persistence: Arc<dyn Persistence> = {
         let vault_now = vault_root.read().clone();
-        provide_persistence_with_vault(resolved_mode, vault_now.as_ref())
+        let inner = provide_persistence_with_vault(resolved_mode, vault_now.as_ref());
+        // Migration 018: route artifact saves/loads through the
+        // hierarchy-derived `.operon/artifacts/<slug>/.../index.md` path so
+        // the on-disk layout mirrors the UI tree 1:1. Non-artifact notes
+        // continue to use the opaque UUID-indexed `inner` store.
+        if resolved_mode == Mode::Local {
+            use crate::local_mode::desktop::{LocalNoteRepo, LocalProjectRepo};
+            let LocalNoteRepo(note_repo) = use_context::<LocalNoteRepo>();
+            let LocalProjectRepo(project_repo) = use_context::<LocalProjectRepo>();
+            // One-shot legacy reshape: backfill slugs and migrate any
+            // `<repo>/.operon/artifacts/<UUID>/<title>.md` staging files +
+            // opaque `<notes_dir>/<UUID>` bodies onto the new canonical
+            // path. Sentinel-gated, so this is a no-op after first run.
+            if let Some(ref vault) = vault_now {
+                crate::plugins::artifact::migrate_v018::migrate_all_projects(
+                    &project_repo,
+                    &note_repo,
+                    &vault.notes_dir(),
+                );
+            }
+            Arc::new(crate::persistence::ArtifactPersistence::new(
+                inner,
+                note_repo,
+                project_repo,
+            )) as Arc<dyn Persistence>
+        } else {
+            inner
+        }
     };
     #[cfg(target_arch = "wasm32")]
     let persistence: Arc<dyn Persistence> = provide_persistence(resolved_mode);

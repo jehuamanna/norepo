@@ -7,10 +7,12 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+pub mod claude_defaults;
 pub mod provider_card;
 pub mod providers;
 pub mod service;
 
+pub use claude_defaults::ClaudeDefaultsSection;
 pub use providers::ProvidersSection;
 pub use service::{ProviderId, SettingsService, VerifyOutcome};
 

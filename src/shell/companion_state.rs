@@ -95,6 +95,22 @@ pub static LOCAL_NOTE_VERSION: GlobalSignal<u64> = Signal::global(|| 0);
 /// not values.
 pub static SAVE_REQUEST_TICK: GlobalSignal<u64> = Signal::global(|| 0);
 
+/// Bumped by the per-project Claude settings picker every time it writes
+/// to `local_project.default_model` / `default_permission_mode`. The
+/// chat-header picker's `picker_persisted` memo subscribes so the
+/// "Inherit (X)" label refreshes when the project default changes
+/// underneath an open chat. Application-wide because the two pickers
+/// live in different scope trees (chat header vs project settings).
+pub static PROJECT_SETTINGS_VERSION: GlobalSignal<u64> = Signal::global(|| 0);
+
+/// Bumped by the app-settings Claude picker on writes to
+/// `local_app_settings`' `claude.default_model` /
+/// `claude.default_permission_mode`. Same purpose as
+/// `PROJECT_SETTINGS_VERSION` but for the bottom tier — when the global
+/// default changes, any open chat with a NULL chat row and (for Vault
+/// scope) no project row needs its "Inherit (X)" label to refresh.
+pub static GLOBAL_SETTINGS_VERSION: GlobalSignal<u64> = Signal::global(|| 0);
+
 /// User's app-wide cascade step-mode preference. Toggled via the
 /// View menu's `cascade.toggleStepMode` command. Read by
 /// `workflow::state::effective_step_mode` after the per-graph
@@ -251,6 +267,15 @@ pub static INPROGRESS_ASSISTANT: GlobalSignal<HashMap<Uuid, String>> =
 /// render and clears the signal. The user reviews + clicks Send.
 #[derive(Clone, Copy)]
 pub struct CompanionComposerInbox(pub Signal<Option<String>>);
+
+/// Sibling to [`CompanionComposerInbox`] with append-semantics instead
+/// of replace. The side-bar's "Send to chat" right-click action writes
+/// a `@[<title>](note:<uuid>)` mention token here; the companion's
+/// composer effect appends it to the current composer value (with a
+/// leading space if non-empty), then resets the signal to `None`.
+/// Keeps "send-to-chat" non-destructive over the user's draft.
+#[derive(Clone, Copy)]
+pub struct CompanionComposerAppend(pub Signal<Option<String>>);
 
 /// Snapshot of MCP servers + tools as reported by claude's `system/init`
 /// event on the most recent turn. The MCP settings panel reads this to

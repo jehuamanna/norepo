@@ -77,6 +77,65 @@ Required body sections (in order):
   `Revision | Date (YYYY-MM-DD) | Derived from | Summary`. Include
   Revision 1 dated `<today>` referencing the parent Test Cases.
 
+## Raising clarifications
+
+If the parent Test Cases artifact is too malformed to execute (see
+the rubric below), do **NOT** materialise test files, do **NOT**
+run the test command, and do **NOT** emit a Test Results note for
+this run. Instead, write one or more
+`clarification-NN-<kebab-topic>.mdx` files into the same output
+directory and stop. The cascade halts on Pending clarifications;
+the user answers via the ClarificationPanel, which flips the parent
+Test Cases Dirty, and the next Play re-runs this skill with the
+answer inlined under `--- refinement notes from user ---`.
+
+**Hard rule.** Either raise clarification(s) AND skip the test run
+entirely, OR materialise + execute + report with zero clarifications.
+Don't mix — partial test materialisation with a Pending clarification
+would leave stray test files in the repo.
+
+The existing "When to stop and ask" path below (Test Results note
+marked `Rejected`) describes the gracefully-give-up reporting path
+when there's no `## How to run` AT ALL. The `clarification.mdx`
+path is for cases where the reviewer can answer a single question
+to make the run executable (e.g. "which test runner did you mean?").
+
+**File format.** Use the `Write` tool **once per clarification**.
+Each file's frontmatter MUST set:
+
+```
+---
+artifact_kind: clarification
+status: pending
+---
+```
+
+Required body sections (mirror `00-coherence-check`):
+
+- **# Clarification: <one-line topic>**
+- **## Levels involved** — bullet list (Test Cases slug, parent
+  Implementation slug, referenced commands or file paths)
+- **## The discrepancy** — 1–2 paragraphs
+- **## Question type** — `single_choice` or `multi_choice`
+- **## Options** — `- [ ] <label> — <consequence>`, ending with
+  `- [ ] Other: ___`
+- **## Why we're asking** — one paragraph on what running the tests
+  requires
+- **## Resolution target** — list the **parent Test Cases slug**.
+
+**When to raise (rubric).**
+
+- (a) The parent Test Cases artifact has no `## How to run` section
+  AND no `## Test files` list — there's nothing concrete to execute.
+  (Prefer this over the `Rejected` path when you can give the user a
+  short list of plausible runners to pick from.)
+- (b) `## How to run` references a command / tool not present in the
+  repo (no `package.json` script, no Cargo target with that name,
+  no pytest config) — the reviewer needs to choose between several
+  candidate runners or fix the Test Cases.
+
+If neither applies, materialise files and run the tests as usual.
+
 ## Revision behavior (re-runs)
 
 If Test Cases were regenerated (e.g. after a bug fix), this skill

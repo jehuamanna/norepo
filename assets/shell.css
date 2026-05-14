@@ -1578,6 +1578,7 @@ html, body {
   line-height: 1.4;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  flex-shrink: 0;
 }
 
 .operon-companion-msg-user {
@@ -1724,6 +1725,7 @@ html, body {
 /* ------------ Tool-use card (collapsible, per-tool body) ------------ */
 .operon-tool-card {
   align-self: stretch;
+  flex-shrink: 0;
   border: 1px solid var(--vscode-panel-border);
   border-radius: 6px;
   background: var(--vscode-editorWidget-background, rgba(127, 127, 127, 0.04));
@@ -1785,6 +1787,7 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-width: 0;
 }
 .operon-tool-card-meta {
   font-size: 11px;
@@ -1800,7 +1803,6 @@ html, body {
   border-radius: 4px;
   white-space: pre-wrap;
   overflow-x: auto;
-  max-height: 320px;
   font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
   font-size: 11px;
 }
@@ -1822,10 +1824,34 @@ html, body {
 .operon-tool-card-diff-old {
   border-left: 2px solid #d36464;
   background: rgba(211, 100, 100, 0.06);
+  max-height: 320px;
+  overflow-y: auto;
+  min-width: 0;
 }
 .operon-tool-card-diff-new {
   border-left: 2px solid #6cb56c;
   background: rgba(108, 181, 108, 0.06);
+  max-height: 320px;
+  overflow-y: auto;
+  min-width: 0;
+}
+
+.operon-mention-chip {
+  display: inline-flex;
+  align-items: baseline;
+  padding: 0 6px;
+  margin: 0 1px;
+  border-radius: 10px;
+  background: rgba(64, 128, 220, 0.14);
+  color: var(--operon-accent, #4080dc);
+  font-size: 0.9em;
+  font-weight: 500;
+  line-height: 1.6;
+}
+.operon-mention-chip::before {
+  content: "@";
+  opacity: 0.7;
+  margin-right: 1px;
 }
 
 /* ------------ Cost meter footer ------------ */

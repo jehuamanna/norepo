@@ -121,6 +121,64 @@ Required body sections (in order):
   `Revision | Date (YYYY-MM-DD) | Derived from | Summary`. Include
   Revision 1 dated `<today>` referencing the parent Task.
 
+## Raising clarifications
+
+If the Task + inherited Architecture are ambiguous in a way you
+cannot resolve by a defensible best-guess (see the rubric below), do
+**NOT** emit an Implementation Plan for this run. Instead, write one
+or more `clarification-NN-<kebab-topic>.mdx` files into the same
+output directory and stop. The cascade halts on Pending
+clarifications; the user answers via the ClarificationPanel, which
+flips the parent Task Dirty, and the next Play re-runs this skill
+with the answer inlined under `--- refinement notes from user ---`.
+
+**Hard rule.** Either raise clarification(s) AND emit no Plan for
+this run, OR emit a Plan with zero clarifications. Don't mix.
+
+Soft ambiguities (the kind a reviewer can resolve without re-running
+the skill) still go under the Plan's `## Open questions` section as
+before — only raise a `clarification.mdx` when the ambiguity makes
+the **whole Plan body** unwritable.
+
+**File format.** Use the `Write` tool **once per clarification**.
+Each file's frontmatter MUST set:
+
+```
+---
+artifact_kind: clarification
+status: pending
+---
+```
+
+Required body sections (mirror `00-coherence-check`):
+
+- **# Clarification: <one-line topic>**
+- **## Levels involved** — bullet list (Task slug, Architecture
+  revision number, and any referenced files)
+- **## The discrepancy** — 1–2 paragraphs
+- **## Question type** — `single_choice` or `multi_choice`
+- **## Options** — `- [ ] <label> — <consequence>`, ending with
+  `- [ ] Other: ___`
+- **## Why we're asking** — one paragraph on what changes in the
+  Plan depending on the answer
+- **## Resolution target** — list the **parent Task's slug**.
+
+**When to raise (rubric).**
+
+- (a) The Task references a file path that doesn't exist in the repo
+  AND the Task body doesn't explicitly mark it as a new-file create.
+  (The reviewer needs to confirm: create it, or did the Task mean a
+  different existing file?)
+- (b) The latest Architecture revision contradicts the Task (e.g.
+  Architecture says "use Postgres only" while the Task says "use
+  Redis as primary store") — neither one obviously dominates.
+- (c) The Task references an API, endpoint, or contract not
+  described in the Architecture, parent Story, or any existing
+  source file — you have no shape to plan against.
+
+If none of (a)–(c) apply, write the Plan; record minor soft
+questions under the Plan's `## Open questions` section as usual.
+
 ## Revision behavior (re-runs)
 
 If the Task was edited and this skill is re-running on the same

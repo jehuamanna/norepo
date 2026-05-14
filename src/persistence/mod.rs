@@ -14,6 +14,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod artifact;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod fs;
 pub mod memory;
 #[cfg(target_arch = "wasm32")]
@@ -25,6 +27,8 @@ pub mod web;
 #[cfg(all(target_arch = "wasm32", feature = "wasm-sqlite"))]
 pub mod opfs;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use artifact::ArtifactPersistence;
 #[cfg(not(target_arch = "wasm32"))]
 pub use fs::FilesystemPersistence;
 pub use memory::MemoryPersistence;

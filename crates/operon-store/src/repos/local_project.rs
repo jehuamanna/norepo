@@ -25,10 +25,21 @@ pub struct LocalProject {
     /// the user hasn't bound a repo yet — chat is disabled until they do.
     #[serde(default)]
     pub repo_path: Option<PathBuf>,
+    /// Project-tier override for `claude --model`. `None` means
+    /// "inherit from the global default." Sits between the chat-tier
+    /// (`chat_session.model`) and the global default
+    /// (`local_app_settings` `claude.default_model`). Migration 019.
+    #[serde(default)]
+    pub default_model: Option<String>,
+    /// Project-tier override for `claude --permission-mode`. Same
+    /// inheritance semantics as `default_model`.
+    #[serde(default)]
+    pub default_permission_mode: Option<String>,
 }
 
 pub trait LocalProjectRepository: Send + Sync {
     fn list(&self) -> Result<Vec<LocalProject>, StoreError>;
+    fn get(&self, id: Uuid) -> Result<Option<LocalProject>, StoreError>;
     fn create(&self, name: &str) -> Result<LocalProject, StoreError>;
     fn rename(&self, id: Uuid, name: &str) -> Result<(), StoreError>;
     fn delete(&self, id: Uuid) -> Result<(), StoreError>;
@@ -36,6 +47,16 @@ pub trait LocalProjectRepository: Send + Sync {
     /// Bind/unbind the project's git repository. Pass `None` to clear.
     fn set_repo_path(&self, id: Uuid, repo_path: Option<&std::path::Path>)
         -> Result<(), StoreError>;
+    /// Persist the project-tier `--model` override. `None` clears it
+    /// (chats in this project then inherit the global default).
+    fn set_default_model(&self, id: Uuid, model: Option<&str>) -> Result<(), StoreError>;
+    /// Persist the project-tier `--permission-mode` override. `None`
+    /// clears it (inherit global).
+    fn set_default_permission_mode(
+        &self,
+        id: Uuid,
+        permission_mode: Option<&str>,
+    ) -> Result<(), StoreError>;
 }
 
 pub struct SqliteLocalProjectRepository {
@@ -70,6 +91,8 @@ fn row_to_local_project(row: &crate::sql::Row<'_>) -> crate::sql::Result<LocalPr
         created_at_ms: row.get(3)?,
         updated_at_ms: row.get(4)?,
         repo_path: repo_path.map(PathBuf::from),
+        default_model: row.get(6)?,
+        default_permission_mode: row.get(7)?,
     })
 }
 
@@ -77,7 +100,8 @@ impl LocalProjectRepository for SqliteLocalProjectRepository {
     fn list(&self) -> Result<Vec<LocalProject>, StoreError> {
         let conn = self.store.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, sibling_index, created_at_ms, updated_at_ms, repo_path
+            "SELECT id, name, sibling_index, created_at_ms, updated_at_ms, repo_path,
+                    default_model, default_permission_mode
              FROM local_project
              ORDER BY sibling_index ASC, created_at_ms ASC",
         )?;
@@ -87,6 +111,20 @@ impl LocalProjectRepository for SqliteLocalProjectRepository {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    fn get(&self, id: Uuid) -> Result<Option<LocalProject>, StoreError> {
+        let conn = self.store.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, sibling_index, created_at_ms, updated_at_ms, repo_path,
+                    default_model, default_permission_mode
+             FROM local_project
+             WHERE id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![id.to_string()], row_to_local_project)
+            .optional()?;
+        Ok(row)
     }
 
     fn create(&self, name: &str) -> Result<LocalProject, StoreError> {
@@ -120,6 +158,8 @@ impl LocalProjectRepository for SqliteLocalProjectRepository {
             created_at_ms: now,
             updated_at_ms: now,
             repo_path: None,
+            default_model: None,
+            default_permission_mode: None,
         })
     }
 
@@ -134,6 +174,37 @@ impl LocalProjectRepository for SqliteLocalProjectRepository {
         let n = conn.execute(
             "UPDATE local_project SET repo_path = ?2, updated_at_ms = ?3 WHERE id = ?1",
             params![id.to_string(), path_str, now],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn set_default_model(&self, id: Uuid, model: Option<&str>) -> Result<(), StoreError> {
+        let now = now_ms();
+        let conn = self.store.conn()?;
+        let n = conn.execute(
+            "UPDATE local_project SET default_model = ?2, updated_at_ms = ?3 WHERE id = ?1",
+            params![id.to_string(), model, now],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn set_default_permission_mode(
+        &self,
+        id: Uuid,
+        permission_mode: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let now = now_ms();
+        let conn = self.store.conn()?;
+        let n = conn.execute(
+            "UPDATE local_project SET default_permission_mode = ?2, updated_at_ms = ?3
+             WHERE id = ?1",
+            params![id.to_string(), permission_mode, now],
         )?;
         if n == 0 {
             return Err(StoreError::NotFound);
@@ -383,5 +454,83 @@ mod tests {
         let listed = repo.list().unwrap();
         let names: Vec<&str> = listed.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["gamma", "alpha", "beta"]);
+    }
+
+    #[test]
+    fn create_initialises_default_model_and_permission_to_null() {
+        let repo = make_repo();
+        let a = repo.create("alpha").unwrap();
+        assert!(a.default_model.is_none());
+        assert!(a.default_permission_mode.is_none());
+        let got = repo.get(a.id).unwrap().unwrap();
+        assert!(got.default_model.is_none());
+        assert!(got.default_permission_mode.is_none());
+    }
+
+    #[test]
+    fn set_default_model_round_trips() {
+        let repo = make_repo();
+        let a = repo.create("alpha").unwrap();
+        repo.set_default_model(a.id, Some("claude-opus-4-7")).unwrap();
+        assert_eq!(
+            repo.get(a.id).unwrap().unwrap().default_model.as_deref(),
+            Some("claude-opus-4-7")
+        );
+        repo.set_default_model(a.id, None).unwrap();
+        assert!(repo.get(a.id).unwrap().unwrap().default_model.is_none());
+    }
+
+    #[test]
+    fn set_default_permission_mode_round_trips() {
+        let repo = make_repo();
+        let a = repo.create("alpha").unwrap();
+        repo.set_default_permission_mode(a.id, Some("acceptEdits"))
+            .unwrap();
+        assert_eq!(
+            repo.get(a.id)
+                .unwrap()
+                .unwrap()
+                .default_permission_mode
+                .as_deref(),
+            Some("acceptEdits")
+        );
+        repo.set_default_permission_mode(a.id, None).unwrap();
+        assert!(repo
+            .get(a.id)
+            .unwrap()
+            .unwrap()
+            .default_permission_mode
+            .is_none());
+    }
+
+    #[test]
+    fn set_defaults_unknown_id_errors() {
+        let repo = make_repo();
+        let bogus = Uuid::new_v4();
+        assert!(matches!(
+            repo.set_default_model(bogus, Some("x")).unwrap_err(),
+            StoreError::NotFound
+        ));
+        assert!(matches!(
+            repo.set_default_permission_mode(bogus, Some("x"))
+                .unwrap_err(),
+            StoreError::NotFound
+        ));
+    }
+
+    #[test]
+    fn list_returns_persisted_defaults() {
+        let repo = make_repo();
+        let a = repo.create("alpha").unwrap();
+        repo.set_default_model(a.id, Some("claude-sonnet-4-6")).unwrap();
+        repo.set_default_permission_mode(a.id, Some("plan")).unwrap();
+        let row = repo
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == a.id)
+            .unwrap();
+        assert_eq!(row.default_model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(row.default_permission_mode.as_deref(), Some("plan"));
     }
 }

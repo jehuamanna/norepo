@@ -358,6 +358,7 @@ mod tests {
             SessionBinding {
                 cwd: PathBuf::from("/tmp/repo"),
                 claude_session_id: None,
+                model: None,
                 permission_mode: None,
                 bridge: None,
             },
@@ -482,6 +483,7 @@ mod tests {
             SessionBinding {
                 cwd: PathBuf::from("/tmp/other"),
                 claude_session_id: Some("preexisting-B".into()),
+                model: None,
                 permission_mode: None,
                 bridge: None,
             },

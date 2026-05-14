@@ -7,6 +7,7 @@
 pub mod error;
 pub mod ids;
 pub mod time;
+pub mod util;
 
 // Plans-Phase-2-saving: SQL-using modules are present when either the
 // desktop rusqlite back-end or the wasm-sqlite shim is active. On wasm

@@ -165,6 +165,11 @@ pub struct LocalNote {
     /// blob. `None` for markdown notes.
     #[serde(default)]
     pub blob_path: Option<String>,
+    /// Migration 018 (artifact-on-disk 1:1): filesystem-friendly identifier
+    /// used to derive `.operon/artifacts/<slug>/.../index.md`. `Some` only
+    /// for artifact notes; `None` for every other kind.
+    #[serde(default)]
+    pub slug: Option<String>,
 }
 
 pub trait LocalNoteRepository: Send + Sync {
@@ -277,6 +282,18 @@ pub trait LocalNoteRepository: Send + Sync {
     /// indices around the destination are densified the same way `move_to`
     /// does. Returns `Conflict` if any of the snapshot's ids already exist.
     fn restore_subtree(&self, snap: &SubtreeSnapshot) -> Result<(), StoreError>;
+
+    /// Migration 018: ensure an artifact note has a `slug` derived from its
+    /// title, resolving collisions against siblings in the same bucket.
+    /// Idempotent: if `slug` is already set, returns it unchanged. Returns
+    /// `Ok(None)` for non-artifact notes (no slug needed). Does not touch
+    /// `updated_at_ms` — callers running this at startup don't want every
+    /// artifact row's timestamp moved.
+    fn ensure_artifact_slug(&self, _id: Uuid) -> Result<Option<String>, StoreError> {
+        Err(StoreError::InvalidArgument(
+            "ensure_artifact_slug not implemented for this repo".into(),
+        ))
+    }
 }
 
 /// Plans-Phase-8-explorer-undo: stable, in-memory representation of a
@@ -331,6 +348,7 @@ fn row_to_local_note(row: &crate::sql::Row<'_>) -> crate::sql::Result<LocalNote>
         .map(|s| NoteKind::from_str(&s))
         .unwrap_or_default();
     let blob_path: Option<String> = row.get(9).unwrap_or(None);
+    let slug: Option<String> = row.get(10).unwrap_or(None);
     Ok(LocalNote {
         id,
         project_id,
@@ -342,11 +360,12 @@ fn row_to_local_note(row: &crate::sql::Row<'_>) -> crate::sql::Result<LocalNote>
         updated_at_ms: row.get(7)?,
         kind,
         blob_path,
+        slug,
     })
 }
 
 const SELECT_COLS: &str =
-    "id, project_id, parent_id, sibling_index, depth, title, created_at_ms, updated_at_ms, kind, blob_path";
+    "id, project_id, parent_id, sibling_index, depth, title, created_at_ms, updated_at_ms, kind, blob_path, slug";
 
 impl LocalNoteRepository for SqliteLocalNoteRepository {
     fn list_for_project(&self, project_id: Uuid) -> Result<Vec<LocalNote>, StoreError> {
@@ -466,6 +485,111 @@ impl LocalNoteRepository for SqliteLocalNoteRepository {
             updated_at_ms: now,
             kind: NoteKind::Markdown,
             blob_path: None,
+            slug: None,
+        })
+    }
+
+    fn create_with_kind(
+        &self,
+        project_id: Uuid,
+        parent_id: Option<Uuid>,
+        title: &str,
+        kind: NoteKind,
+    ) -> Result<LocalNote, StoreError> {
+        // Markdown rows skip the slug branch entirely — keep the cheap
+        // default-trait path so we don't pay for a second tx when the kind
+        // doesn't need a slug.
+        if !matches!(kind, NoteKind::Artifact) {
+            let mut row = self.create(project_id, parent_id, title)?;
+            if !matches!(kind, NoteKind::Markdown) {
+                self.set_kind(row.id, kind)?;
+                row.kind = kind;
+            }
+            return Ok(row);
+        }
+        // Artifact: do everything in one transaction so the slug uniqueness
+        // index can't race against a sibling insert.
+        let trimmed = title.trim();
+        let resolved_title = if trimmed.is_empty() {
+            DEFAULT_NOTE_TITLE
+        } else {
+            trimmed
+        };
+        let id = Uuid::new_v4();
+        let now = now_ms();
+        let mut conn = self.store.conn()?;
+        let tx = conn.transaction()?;
+
+        let depth = match parent_id {
+            Some(pid) => {
+                let parent_row: Option<(String, i64)> = tx
+                    .query_row(
+                        "SELECT project_id, depth FROM local_note WHERE id = ?1",
+                        params![pid.to_string()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()?;
+                let (parent_project, parent_depth) = parent_row.ok_or_else(|| {
+                    StoreError::InvalidArgument(format!("parent note {pid} not found"))
+                })?;
+                let parent_project_uuid = Uuid::parse_str(&parent_project)
+                    .map_err(|_| invalid_uuid(parent_project))?;
+                if parent_project_uuid != project_id {
+                    return Err(StoreError::InvalidArgument(
+                        "parent note belongs to a different project".into(),
+                    ));
+                }
+                parent_depth + 1
+            }
+            None => 0,
+        };
+
+        let next_index: i64 = match parent_id {
+            Some(pid) => tx.query_row(
+                "SELECT COALESCE(MAX(sibling_index), -1) + 1 FROM local_note
+                 WHERE project_id = ?1 AND parent_id = ?2",
+                params![project_id.to_string(), pid.to_string()],
+                |row| row.get(0),
+            )?,
+            None => tx.query_row(
+                "SELECT COALESCE(MAX(sibling_index), -1) + 1 FROM local_note
+                 WHERE project_id = ?1 AND parent_id IS NULL",
+                params![project_id.to_string()],
+                |row| row.get(0),
+            )?,
+        };
+
+        let slug = assign_artifact_slug(&tx, project_id, parent_id, resolved_title, None)?;
+
+        tx.execute(
+            "INSERT INTO local_note (id, project_id, parent_id, sibling_index, depth,
+                                     title, created_at_ms, updated_at_ms, kind, slug)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)",
+            params![
+                id.to_string(),
+                project_id.to_string(),
+                parent_id.map(|p| p.to_string()),
+                next_index,
+                depth,
+                resolved_title,
+                now,
+                kind.as_str(),
+                slug,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(LocalNote {
+            id,
+            project_id,
+            parent_id,
+            sibling_index: next_index,
+            depth,
+            title: resolved_title.to_string(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            kind,
+            blob_path: None,
+            slug: Some(slug),
         })
     }
 
@@ -477,26 +601,57 @@ impl LocalNoteRepository for SqliteLocalNoteRepository {
             ));
         }
         let now = now_ms();
-        let conn = self.store.conn()?;
-        let n = conn.execute(
-            "UPDATE local_note SET title = ?2, updated_at_ms = ?3 WHERE id = ?1",
-            params![id.to_string(), trimmed, now],
-        )?;
-        if n == 0 {
+        let mut conn = self.store.conn()?;
+        let tx = conn.transaction()?;
+        let Some((kind, project_id, parent_id, _old_title)) =
+            read_kind_and_locator_in_tx(&tx, id)?
+        else {
             return Err(StoreError::NotFound);
+        };
+        let new_slug: Option<String> = if matches!(kind, NoteKind::Artifact) {
+            Some(assign_artifact_slug(&tx, project_id, parent_id, trimmed, Some(id))?)
+        } else {
+            None
+        };
+        match new_slug.as_deref() {
+            Some(s) => {
+                tx.execute(
+                    "UPDATE local_note SET title = ?2, slug = ?3, updated_at_ms = ?4 WHERE id = ?1",
+                    params![id.to_string(), trimmed, s, now],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "UPDATE local_note SET title = ?2, updated_at_ms = ?3 WHERE id = ?1",
+                    params![id.to_string(), trimmed, now],
+                )?;
+            }
         }
+        tx.commit()?;
         Ok(())
     }
 
     fn set_kind(&self, id: Uuid, kind: NoteKind) -> Result<(), StoreError> {
-        let conn = self.store.conn()?;
-        let n = conn.execute(
-            "UPDATE local_note SET kind = ?2 WHERE id = ?1",
-            params![id.to_string(), kind.as_str()],
-        )?;
-        if n == 0 {
+        let mut conn = self.store.conn()?;
+        let tx = conn.transaction()?;
+        let Some((_old_kind, project_id, parent_id, title)) =
+            read_kind_and_locator_in_tx(&tx, id)?
+        else {
             return Err(StoreError::NotFound);
+        };
+        if matches!(kind, NoteKind::Artifact) {
+            let slug = assign_artifact_slug(&tx, project_id, parent_id, &title, Some(id))?;
+            tx.execute(
+                "UPDATE local_note SET kind = ?2, slug = ?3 WHERE id = ?1",
+                params![id.to_string(), kind.as_str(), slug],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE local_note SET kind = ?2, slug = NULL WHERE id = ?1",
+                params![id.to_string(), kind.as_str()],
+            )?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -797,6 +952,33 @@ impl LocalNoteRepository for SqliteLocalNoteRepository {
                     params![child_id, new_project_id.to_string(), delta, now],
                 )?;
             }
+
+            // Migration 018: cross-bucket move can collide with the new
+            // bucket's existing artifact slugs. Re-resolve for the moved
+            // root; descendants stay scoped to the moved node so their
+            // own slugs don't collide internally.
+            let moved_kind_title: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT kind, title FROM local_note WHERE id = ?1",
+                    params![id.to_string()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            if let Some((kind_text, title)) = moved_kind_title {
+                if matches!(NoteKind::from_str(&kind_text), NoteKind::Artifact) {
+                    let new_slug = assign_artifact_slug(
+                        &tx,
+                        new_project_id,
+                        new_parent,
+                        &title,
+                        Some(id),
+                    )?;
+                    tx.execute(
+                        "UPDATE local_note SET slug = ?2 WHERE id = ?1",
+                        params![id.to_string(), new_slug],
+                    )?;
+                }
+            }
         }
 
         tx.commit()?;
@@ -1067,6 +1249,30 @@ impl LocalNoteRepository for SqliteLocalNoteRepository {
             }
         }
 
+        // Migration 018: reparented into prev sibling's bucket — reslug if artifact.
+        let kind_title: Option<(String, String)> = tx
+            .query_row(
+                "SELECT kind, title FROM local_note WHERE id = ?1",
+                params![id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((kind_text, title)) = kind_title {
+            if matches!(NoteKind::from_str(&kind_text), NoteKind::Artifact) {
+                let new_slug = assign_artifact_slug(
+                    &tx,
+                    project_id,
+                    Some(prev_sibling_id),
+                    &title,
+                    Some(id),
+                )?;
+                tx.execute(
+                    "UPDATE local_note SET slug = ?2 WHERE id = ?1",
+                    params![id.to_string(), new_slug],
+                )?;
+            }
+        }
+
         tx.commit()?;
         Ok(())
     }
@@ -1175,6 +1381,25 @@ impl LocalNoteRepository for SqliteLocalNoteRepository {
             }
         }
 
+        // Migration 018: reparented into grandparent's bucket — reslug if artifact.
+        let kind_title: Option<(String, String)> = tx
+            .query_row(
+                "SELECT kind, title FROM local_note WHERE id = ?1",
+                params![id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((kind_text, title)) = kind_title {
+            if matches!(NoteKind::from_str(&kind_text), NoteKind::Artifact) {
+                let new_slug =
+                    assign_artifact_slug(&tx, project_id, grandparent_id, &title, Some(id))?;
+                tx.execute(
+                    "UPDATE local_note SET slug = ?2 WHERE id = ?1",
+                    params![id.to_string(), new_slug],
+                )?;
+            }
+        }
+
         tx.commit()?;
         Ok(())
     }
@@ -1221,6 +1446,49 @@ impl LocalNoteRepository for SqliteLocalNoteRepository {
         Ok(SubtreeSnapshot { root_id: id, notes })
     }
 
+    fn ensure_artifact_slug(&self, id: Uuid) -> Result<Option<String>, StoreError> {
+        let mut conn = self.store.conn()?;
+        let tx = conn.transaction()?;
+        let row: Option<(String, String, Option<String>, String, Option<String>)> = tx
+            .query_row(
+                "SELECT kind, project_id, parent_id, title, slug FROM local_note WHERE id = ?1",
+                params![id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((kind_text, project_text, parent_text, title, existing_slug)) = row else {
+            return Err(StoreError::NotFound);
+        };
+        let kind = NoteKind::from_str(&kind_text);
+        if !matches!(kind, NoteKind::Artifact) {
+            return Ok(None);
+        }
+        if let Some(s) = existing_slug {
+            return Ok(Some(s));
+        }
+        let project_id =
+            Uuid::parse_str(&project_text).map_err(|_| invalid_uuid(project_text))?;
+        let parent_id = match parent_text {
+            Some(s) => Some(Uuid::parse_str(&s).map_err(|_| invalid_uuid(s.clone()))?),
+            None => None,
+        };
+        let slug = assign_artifact_slug(&tx, project_id, parent_id, &title, Some(id))?;
+        tx.execute(
+            "UPDATE local_note SET slug = ?2 WHERE id = ?1",
+            params![id.to_string(), slug],
+        )?;
+        tx.commit()?;
+        Ok(Some(slug))
+    }
+
     fn restore_subtree(&self, snap: &SubtreeSnapshot) -> Result<(), StoreError> {
         if snap.notes.is_empty() {
             return Ok(());
@@ -1261,8 +1529,8 @@ impl LocalNoteRepository for SqliteLocalNoteRepository {
             tx.execute(
                 "INSERT INTO local_note \
                  (id, project_id, parent_id, sibling_index, depth, title, \
-                  created_at_ms, updated_at_ms, kind, blob_path) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  created_at_ms, updated_at_ms, kind, blob_path, slug) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     n.id.to_string(),
                     n.project_id.to_string(),
@@ -1274,12 +1542,101 @@ impl LocalNoteRepository for SqliteLocalNoteRepository {
                     n.updated_at_ms,
                     n.kind.as_str(),
                     n.blob_path,
+                    n.slug,
                 ],
             )?;
         }
         tx.commit()?;
         Ok(())
     }
+}
+
+/// Migration 018 (artifact-on-disk 1:1): compute a fresh slug for an
+/// artifact note in the `(project_id, parent_id)` sibling bucket. Slugifies
+/// `title` and suffixes `-2`, `-3`, … on collision against existing artifact
+/// slugs in the same bucket (excluding `exclude_id`, which lets a row be
+/// reslugified in place without colliding with its own row).
+fn assign_artifact_slug(
+    tx: &crate::sql::Transaction<'_>,
+    project_id: Uuid,
+    parent_id: Option<Uuid>,
+    title: &str,
+    exclude_id: Option<Uuid>,
+) -> Result<String, StoreError> {
+    let base = crate::util::slug::slugify(title);
+    let exclude_text = exclude_id.map(|u| u.to_string()).unwrap_or_default();
+    let mut existing: Vec<String> = Vec::new();
+    match parent_id {
+        Some(pid) => {
+            let mut stmt = tx.prepare(
+                "SELECT slug FROM local_note
+                 WHERE slug IS NOT NULL
+                   AND project_id = ?1 AND parent_id = ?2
+                   AND id <> ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![project_id.to_string(), pid.to_string(), exclude_text],
+                |row| row.get::<_, String>(0),
+            )?;
+            for r in rows {
+                existing.push(r?);
+            }
+        }
+        None => {
+            let mut stmt = tx.prepare(
+                "SELECT slug FROM local_note
+                 WHERE slug IS NOT NULL
+                   AND project_id = ?1 AND parent_id IS NULL
+                   AND id <> ?2",
+            )?;
+            let rows = stmt.query_map(
+                params![project_id.to_string(), exclude_text],
+                |row| row.get::<_, String>(0),
+            )?;
+            for r in rows {
+                existing.push(r?);
+            }
+        }
+    }
+    let refs: Vec<&str> = existing.iter().map(|s| s.as_str()).collect();
+    Ok(crate::util::slug::unique_slug(&base, &refs))
+}
+
+/// Read just the kind + (project_id, parent_id, title) for an existing
+/// row inside a transaction. Used by `rename` / `move_to` / `indent` /
+/// `outdent` to decide whether to re-slugify (only artifact rows have a
+/// slug to maintain).
+fn read_kind_and_locator_in_tx(
+    tx: &crate::sql::Transaction<'_>,
+    id: Uuid,
+) -> Result<Option<(NoteKind, Uuid, Option<Uuid>, String)>, StoreError> {
+    let row: Option<(String, String, Option<String>, String)> = tx
+        .query_row(
+            "SELECT kind, project_id, parent_id, title FROM local_note WHERE id = ?1",
+            params![id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((kind_text, project_text, parent_text, title)) = row else {
+        return Ok(None);
+    };
+    let kind = NoteKind::from_str(&kind_text);
+    let project_id =
+        Uuid::parse_str(&project_text).map_err(|_| invalid_uuid(project_text))?;
+    let parent_id = match parent_text {
+        Some(s) => {
+            Some(Uuid::parse_str(&s).map_err(|_| invalid_uuid(s.clone()))?)
+        }
+        None => None,
+    };
+    Ok(Some((kind, project_id, parent_id, title)))
 }
 
 fn swap_with_neighbour(store: &Store, id: Uuid, dir: i64) -> Result<(), StoreError> {

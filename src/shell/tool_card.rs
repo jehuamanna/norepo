@@ -165,43 +165,35 @@ fn short_value(v: &Value) -> String {
 }
 
 fn render_read(input: &Value, result: Option<&ToolResultBody>) -> Element {
-    let path = input.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
     let offset = input.get("offset").and_then(|v| v.as_u64());
     let limit = input.get("limit").and_then(|v| v.as_u64());
     rsx! {
-        div { class: "operon-tool-card-meta",
-            span { "path: " code { class: "md-inline-code", "{path}" } }
-            if let Some(o) = offset { span { " offset: " code { class: "md-inline-code", "{o}" } } }
-            if let Some(l) = limit { span { " limit: " code { class: "md-inline-code", "{l}" } } }
+        if offset.is_some() || limit.is_some() {
+            div { class: "operon-tool-card-meta",
+                if let Some(o) = offset { span { "offset: " code { class: "md-inline-code", "{o}" } } }
+                if let Some(l) = limit { span { "limit: " code { class: "md-inline-code", "{l}" } } }
+            }
         }
         ResultPre { result: result.cloned() }
     }
 }
 
 fn render_write(input: &Value, result: Option<&ToolResultBody>) -> Element {
-    let path = input.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
     let content = input
         .get("content")
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let preview: String = content.lines().take(20).collect::<Vec<_>>().join("\n");
     rsx! {
-        div { class: "operon-tool-card-meta",
-            span { "path: " code { class: "md-inline-code", "{path}" } }
-        }
         pre { class: "operon-tool-card-pre", code { class: "md-code-block", "{preview}" } }
         ResultPre { result: result.cloned() }
     }
 }
 
 fn render_edit(input: &Value, result: Option<&ToolResultBody>) -> Element {
-    let path = input.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
     let old = input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
     let new_s = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
     rsx! {
-        div { class: "operon-tool-card-meta",
-            span { "path: " code { class: "md-inline-code", "{path}" } }
-        }
         div { class: "operon-tool-card-diff",
             pre { class: "operon-tool-card-pre operon-tool-card-diff-old",
                 code { class: "md-code-block", "{old}" }
@@ -270,6 +262,9 @@ fn ResultPre(props: ResultPreProps) -> Element {
             div { class: "operon-tool-card-result-pending", "(running)" }
         },
         Some(body) => {
+            if !body.is_error && body.content.trim().is_empty() {
+                return rsx! {};
+            }
             let class = if body.is_error {
                 "operon-tool-card-pre operon-tool-card-result-error"
             } else {

@@ -118,6 +118,68 @@ Required body sections (in order):
   `Revision | Date (YYYY-MM-DD) | Derived from | Summary`. Include
   Revision 1 dated `<today>` referencing the parent Plan.
 
+## Raising clarifications
+
+If the Plan + inherited Architecture are ambiguous in a way you
+cannot resolve at execute time by a defensible best-guess (see the
+rubric below), do **NOT** edit code, do **NOT** commit, and do
+**NOT** emit an Implementation note for this run. Instead, write one
+or more `clarification-NN-<kebab-topic>.mdx` files into the same
+output directory and stop. The cascade halts on Pending
+clarifications; the user answers via the ClarificationPanel, which
+flips the parent Plan Dirty, and the next Play re-runs this skill
+with the answer inlined under `--- refinement notes from user ---`.
+
+**Hard rule.** Either raise clarification(s) AND make zero code
+edits / zero commits / zero Implementation note for this run, OR
+execute the Plan fully with zero clarifications. Don't mix —
+half-applied edits next to a Pending clarification would leave the
+repo in an inconsistent state.
+
+The existing "When to stop and ask" section below describes the
+reject-the-Plan path (Implementation note marked `Rejected`); the
+`clarification.mdx` path is for cases where the reviewer can supply
+a single decision that unblocks execution rather than requiring a
+full Plan rewrite.
+
+**File format.** Use the `Write` tool **once per clarification**.
+Each file's frontmatter MUST set:
+
+```
+---
+artifact_kind: clarification
+status: pending
+---
+```
+
+Required body sections (mirror `00-coherence-check`):
+
+- **# Clarification: <one-line topic>**
+- **## Levels involved** — bullet list (Plan slug, Architecture
+  revision, referenced file paths)
+- **## The discrepancy** — 1–2 paragraphs
+- **## Question type** — `single_choice` or `multi_choice`
+- **## Options** — `- [ ] <label> — <consequence>`, ending with
+  `- [ ] Other: ___`
+- **## Why we're asking** — one paragraph on what the answer
+  unblocks in execution
+- **## Resolution target** — list the **parent Implementation
+  Plan's slug**.
+
+**When to raise (rubric).**
+
+- (a) The Plan references a file path that doesn't exist in the
+  repo AND isn't explicitly marked as a new-file create in the
+  Plan's `## Files to change`.
+- (b) The Architecture has been revised since the Plan was approved
+  AND the revision changes a layer the Plan touches (e.g. the Plan
+  was approved against rev-2's Postgres choice; rev-3 switched to
+  SQLite — should the edits use the new choice or the old?).
+
+If neither applies, execute the Plan and report any minor execute-
+time deviations under the Implementation note's `## Follow-ups` as
+usual.
+
 ## Revision behavior (re-runs)
 
 If the Plan was edited and this skill is re-running on the same

@@ -76,6 +76,9 @@ pub struct CommandContext {
     /// Visibility of the Tools → Repo Permissions panel. Desktop-only;
     /// `None` on wasm so handlers know to skip the open path entirely.
     pub repo_permissions_open: Option<Signal<bool>>,
+    /// Visibility of the Tools → Project Claude Defaults panel.
+    /// Desktop-only mirror of `repo_permissions_open`.
+    pub project_claude_settings_open: Option<Signal<bool>>,
     /// Available only when Local Mode is active. Cloud Mode leaves this `None`,
     /// so commands gated behind it (e.g. `file.saveNote`) become no-ops there.
     pub local_save: Option<crate::local_mode::LocalSaveAction>,

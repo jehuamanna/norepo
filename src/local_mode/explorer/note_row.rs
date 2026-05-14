@@ -317,6 +317,23 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
 
     let id_for_copy = id_str.clone();
     let mut menu_items: Vec<ContextMenuItem> = mode_items;
+    // "Send to chat" appends a `@[<title>](note:<uuid>)` mention to
+    // the companion chat composer. Pulled from the optional
+    // `CompanionComposerAppend` context — skipped silently when the
+    // companion isn't mounted (e.g. tests, vault-less standalone).
+    let composer_append_handle =
+        try_consume_context::<crate::shell::companion_state::CompanionComposerAppend>()
+            .map(|c| c.0);
+    if let Some(mut append_sig) = composer_append_handle {
+        let title_for_chat = title.clone();
+        menu_items.push(ContextMenuItem::new(
+            "Send to chat",
+            Callback::new(move |_| {
+                let token = format!("@[{}](note:{})", title_for_chat, id);
+                append_sig.set(Some(token));
+            }),
+        ));
+    }
     menu_items.extend([
         ContextMenuItem::new(
             "Rename",

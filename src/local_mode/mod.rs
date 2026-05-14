@@ -70,3 +70,14 @@ pub struct ModeChosen(pub dioxus::prelude::Signal<bool>);
 /// markdown bodies (`<vault>/notes/<id>.md`) and image blobs
 /// (`<vault>/.operon/images/<sha>.<ext>`).
 pub const SETTINGS_KEY_VAULT_ROOT: &str = "vault.root.path";
+
+/// Companion-pane Claude model picker: last-chosen global default. Stored
+/// value is the model slug (e.g. `claude-opus-4-7`); empty string means
+/// "Default" (no `--model` override).
+pub const SETTINGS_KEY_CLAUDE_DEFAULT_MODEL: &str = "claude.default_model";
+
+/// Companion-pane `--permission-mode` picker: last-chosen global default.
+/// Stored value is the raw CLI mode (`acceptEdits` | `plan` |
+/// `bypassPermissions`); empty string means "(default)".
+pub const SETTINGS_KEY_CLAUDE_DEFAULT_PERMISSION_MODE: &str =
+    "claude.default_permission_mode";

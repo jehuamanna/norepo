@@ -83,6 +83,21 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "016_local_note_kind_artifact",
         include_str!("../migrations/016_local_note_kind_artifact.sql"),
     ),
+    (
+        17,
+        "017_chat_session_model_and_permission",
+        include_str!("../migrations/017_chat_session_model_and_permission.sql"),
+    ),
+    (
+        18,
+        "018_local_note_slug",
+        include_str!("../migrations/018_local_note_slug.sql"),
+    ),
+    (
+        19,
+        "019_local_project_claude_defaults",
+        include_str!("../migrations/019_local_project_claude_defaults.sql"),
+    ),
 ];
 
 fn ensure_migrations_table(conn: &Connection) -> Result<(), StoreError> {

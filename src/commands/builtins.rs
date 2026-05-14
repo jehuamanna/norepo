@@ -246,6 +246,20 @@ pub fn register_builtin_commands(reg: &mut CommandRegistry) -> Result<(), String
         }),
     })?;
 
+    // Tools → Project Claude Defaults. Same desktop-only carve-out as
+    // Repo Permissions — the panel writes to `local_project` columns
+    // that only exist in the SQLite store (migration 019).
+    reg.register(Command {
+        id: "tools.openProjectClaudeSettings".into(),
+        title: "Project Claude Defaults".into(),
+        category: "Tools".into(),
+        handler: Box::new(|ctx: &CommandContext| {
+            if let Some(mut open) = ctx.project_claude_settings_open {
+                open.set(true);
+            }
+        }),
+    })?;
+
     Ok(())
 }
 
@@ -269,6 +283,7 @@ mod tests {
                 "notes.openSample".into(),
                 "palette.show".into(),
                 "palette.showCommands".into(),
+                "tools.openProjectClaudeSettings".into(),
                 "tools.openRepoPermissions".into(),
                 "view.closeActiveTab".into(),
                 "view.toggleCompanion".into(),

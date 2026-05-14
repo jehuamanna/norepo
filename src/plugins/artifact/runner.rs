@@ -285,20 +285,24 @@ pub async fn run_skill_on_source_with_revision_notes(
             Vec::new()
         };
 
-    // 4. Where claude is going to write the new artifact files. One
-    //    subdir per source so the engine can scan a known place after
-    //    the run completes.
-    let artifacts_dir = repo_path
-        .join(".operon")
-        .join("artifacts")
-        .join(source_note_id.to_string());
-    std::fs::create_dir_all(&artifacts_dir)?;
+    // 4. Where claude is going to write the new artifact files.
+    //    Migration 018: this is a per-run tempdir under `.operon/`, not
+    //    a UUID-named directory under `.operon/artifacts/`. Canonical
+    //    artifact bodies live at
+    //    `.operon/artifacts/<resolved-slug-path>/index.md` (written by
+    //    `ArtifactPersistence` during `import_produced_artifacts`); the
+    //    tempdir is just a buffer Claude streams files into and is
+    //    auto-cleaned when `_staging_guard` drops at function end.
+    let operon_dir = repo_path.join(".operon");
+    std::fs::create_dir_all(&operon_dir)?;
+    let _staging_guard = tempfile::tempdir_in(&operon_dir)?;
+    let artifacts_dir = _staging_guard.path().to_path_buf();
     let run_started_at = SystemTime::now();
 
     // 5. Pre-snapshot the directory so we only import files claude
     //    creates *during this run*, not pre-existing leftovers from a
     //    prior run that the user already imported.
-    let existing: HashSet<PathBuf> = list_md_files(&artifacts_dir);
+    let existing: HashSet<PathBuf> = list_artifact_files(&artifacts_dir);
 
     // 6. Build the prompt that claude will see. Combine the source
     //    artifact's `revision_notes` (set by the user on the artifact
@@ -482,7 +486,7 @@ pub async fn run_skill_on_source_with_revision_notes(
     // 9. Scan the artifacts dir for files that are either new or
     //    have an mtime past `run_started_at` (claude may have
     //    overwritten an existing file on a re-run).
-    let produced = scan_produced_files(&artifacts_dir, &existing, run_started_at);
+    let produced = scan_produced_artifact_files(&artifacts_dir, &existing, run_started_at);
 
     // 10. Import each produced file as an Artifact note under the
     //     source. Delegates to the shared `import_produced_artifacts`
@@ -845,6 +849,16 @@ pub async fn import_produced_artifacts(
     // place, preserve the source's existing parent linkage, and
     // skip child-note creation. Returns the source id so the
     // revision-notes clear logic upstream still fires.
+    //
+    // Inline-clarification invariant (skills 02–09): a clarification
+    // `.mdx` file emitted mid-run carries `artifact_kind:
+    // clarification`, which never equals the producing skill's
+    // `contract.output_kind` (epic / feature / story / task /
+    // architecture / …). `is_normalizer_contract` therefore returns
+    // `false` and the clarification falls through to the child-
+    // creating branch below — exactly what we want, since the
+    // clarification is a sibling of the skill's normal output, not a
+    // rewrite of the source.
     if is_normalizer_contract(contract) {
         return import_normalizer_rewrite(
             persistence,
@@ -1069,7 +1083,7 @@ async fn import_normalizer_rewrite(
         return Vec::new();
     }
     // Best-effort: delete the scratch file so a subsequent
-    // `scan_produced_files` doesn't import it again on a later run.
+    // `scan_produced_artifact_files` doesn't import it again on a later run.
     let _ = std::fs::remove_file(first);
     vec![source_note_id]
 }
@@ -1231,10 +1245,20 @@ async fn clear_revision_notes_by_id(
     clear_revision_notes(persistence, artifact_id, &body).await;
 }
 
-/// List `.md` files (top-level only — no recursion) in `dir`.
-/// Returns absolute, canonicalized paths so the diff against post-run
-/// state works regardless of how `dir` was originally constructed.
-fn list_md_files(dir: &Path) -> HashSet<PathBuf> {
+/// `true` for file extensions the artifact importer recognises.
+/// `.md` is the historic format; `.mdx` was added so skills 02–09 can
+/// emit mid-run `clarification` artifacts whose extension makes the
+/// origin (inline-clarification flow vs. `00-coherence-check`) visible
+/// at a glance in the file tree. Both extensions parse identically.
+fn is_artifact_file_extension(ext: Option<&str>) -> bool {
+    matches!(ext, Some("md") | Some("mdx"))
+}
+
+/// List artifact-source files (top-level only — no recursion) in
+/// `dir`. Accepts `.md` and `.mdx`. Returns absolute, canonicalized
+/// paths so the diff against post-run state works regardless of how
+/// `dir` was originally constructed.
+fn list_artifact_files(dir: &Path) -> HashSet<PathBuf> {
     let mut out = HashSet::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(it) => it,
@@ -1242,7 +1266,9 @@ fn list_md_files(dir: &Path) -> HashSet<PathBuf> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
+        if path.is_file()
+            && is_artifact_file_extension(path.extension().and_then(|e| e.to_str()))
+        {
             if let Ok(canon) = path.canonicalize() {
                 out.insert(canon);
             } else {
@@ -1253,11 +1279,12 @@ fn list_md_files(dir: &Path) -> HashSet<PathBuf> {
     out
 }
 
-/// Find files in `dir` that are either NEW (not in `pre_existing`) or
-/// were modified after `run_started_at` (the latter handles re-runs
-/// that overwrite a prior file). Returned in lexicographic order so
-/// imports are deterministic across runs.
-fn scan_produced_files(
+/// Find artifact-source files (`.md` or `.mdx`) in `dir` that are
+/// either NEW (not in `pre_existing`) or were modified after
+/// `run_started_at` (the latter handles re-runs that overwrite a
+/// prior file). Returned in lexicographic order so imports are
+/// deterministic across runs.
+fn scan_produced_artifact_files(
     dir: &Path,
     pre_existing: &HashSet<PathBuf>,
     run_started_at: SystemTime,
@@ -1269,7 +1296,9 @@ fn scan_produced_files(
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !(path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md")) {
+        if !(path.is_file()
+            && is_artifact_file_extension(path.extension().and_then(|e| e.to_str())))
+        {
             continue;
         }
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
@@ -1436,29 +1465,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn list_md_files_returns_only_md() {
+    fn list_artifact_files_returns_md_and_mdx() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.md"), "x").unwrap();
+        std::fs::write(dir.path().join("clarification-01-foo.mdx"), "z").unwrap();
         std::fs::write(dir.path().join("b.txt"), "y").unwrap();
         std::fs::create_dir(dir.path().join("nested")).unwrap();
-        let set = list_md_files(dir.path());
-        assert_eq!(set.len(), 1);
+        let set = list_artifact_files(dir.path());
+        assert_eq!(set.len(), 2);
     }
 
     #[test]
-    fn scan_produced_files_diffs_against_pre_existing() {
+    fn scan_produced_artifact_files_diffs_against_pre_existing() {
         let dir = tempfile::tempdir().unwrap();
         let stale = dir.path().join("stale.md");
         std::fs::write(&stale, "x").unwrap();
-        let pre = list_md_files(dir.path());
+        let pre = list_artifact_files(dir.path());
         let started = SystemTime::now();
-        // Sleep so the new file's mtime is provably after `started`.
+        // Sleep so the new files' mtimes are provably after `started`.
         std::thread::sleep(std::time::Duration::from_millis(20));
         let fresh = dir.path().join("fresh.md");
         std::fs::write(&fresh, "y").unwrap();
-        let produced = scan_produced_files(dir.path(), &pre, started);
-        assert_eq!(produced.len(), 1);
-        assert_eq!(produced[0].file_name().unwrap(), "fresh.md");
+        let clarification = dir.path().join("clarification-01-tenancy.mdx");
+        std::fs::write(&clarification, "z").unwrap();
+        let produced = scan_produced_artifact_files(dir.path(), &pre, started);
+        assert_eq!(produced.len(), 2);
+        let names: Vec<&str> = produced
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert!(names.contains(&"fresh.md"));
+        assert!(names.contains(&"clarification-01-tenancy.mdx"));
     }
 
     #[test]

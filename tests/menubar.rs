@@ -32,7 +32,7 @@ fn help_category_label_resolves_to_palette_built_ins() {
 fn unfilled_categories_render_empty() {
     let mut reg = CommandRegistry::new();
     register_builtin_commands(&mut reg).unwrap();
-    // File now hosts the Local-Mode `file.saveNote` command — exclude it.
+    // File now hosts `file.saveNote` (Local Mode) and `file.exit`.
     for menu in [MenuId::Edit, MenuId::Selection, MenuId::Run] {
         let n = count_for_category(&reg, menu.category_label());
         assert_eq!(
@@ -41,5 +41,5 @@ fn unfilled_categories_render_empty() {
         );
     }
     let file_n = count_for_category(&reg, MenuId::File.category_label());
-    assert_eq!(file_n, 1, "File should host exactly file.saveNote");
+    assert_eq!(file_n, 2, "File should host file.saveNote + file.exit");
 }

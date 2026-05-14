@@ -149,6 +149,14 @@ pub fn CommandPalette() -> Element {
     };
     #[cfg(target_arch = "wasm32")]
     let repo_permissions_open: Option<Signal<bool>> = None;
+    #[cfg(not(target_arch = "wasm32"))]
+    let project_claude_settings_open: Option<Signal<bool>> = {
+        let crate::shell::project_claude_settings::ProjectClaudeSettingsOpen(s) =
+            use_context();
+        Some(s)
+    };
+    #[cfg(target_arch = "wasm32")]
+    let project_claude_settings_open: Option<Signal<bool>> = None;
 
     let snapshot = palette.read();
     let open = snapshot.open;
@@ -311,6 +319,7 @@ pub fn CommandPalette() -> Element {
                                                 theme_registry: theme_reg_for_keydown.clone(),
                                                 about_open,
                                                 repo_permissions_open,
+                                                project_claude_settings_open,
                                                 local_save: try_consume_context(),
                                             };
                                             let _ = cmd_reg_for_keydown.execute(&c.id, &context);

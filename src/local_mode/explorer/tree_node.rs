@@ -84,6 +84,7 @@ mod tests {
             updated_at_ms: 0,
             kind: operon_store::repos::NoteKind::Markdown,
             blob_path: None,
+            slug: None,
         }
     }
 

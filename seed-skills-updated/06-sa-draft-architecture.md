@@ -77,6 +77,62 @@ Required body sections (in order):
   Always include Revision 1 dated `<today>` with author "SA (seed
   draft)". On re-runs, append a new row for each iteration.
 
+## Raising clarifications
+
+If the master_requirement + Requirements are ambiguous in a way you
+cannot resolve by a defensible best-guess (see the rubric below), do
+**NOT** emit an Architecture for this run. Instead, write one or more
+`clarification-NN-<kebab-topic>.mdx` files into the same output
+directory and stop. The cascade halts on Pending clarifications; the
+user answers via the ClarificationPanel, which flips the
+master_requirement Dirty, and the next Play re-runs this skill with
+the answer inlined under `--- refinement notes from user ---`.
+
+**Hard rule.** Either raise clarification(s) AND skip the Architecture
+for this run, OR emit the Architecture with zero clarifications.
+Don't mix. (The Architecture is a single artifact revised in place —
+emitting it next to a Pending clarification would lock a stale draft
+in revision 1.)
+
+**File format.** Use the `Write` tool **once per clarification**.
+Each file's frontmatter MUST set:
+
+```
+---
+artifact_kind: clarification
+status: pending
+---
+```
+
+Required body sections (mirror `00-coherence-check`):
+
+- **# Clarification: <one-line topic>**
+- **## Levels involved** — bullet list of Requirement / master slugs
+- **## The discrepancy** — 1–2 paragraphs explaining the conflict
+- **## Question type** — `single_choice` or `multi_choice`
+- **## Options** — `- [ ] <label> — <consequence>`, ending with
+  `- [ ] Other: ___`
+- **## Why we're asking** — one paragraph on what changes in the
+  Architecture depending on the answer
+- **## Resolution target** — list the **master_requirement's slug**.
+
+**When to raise (rubric).**
+
+- (a) Requirements assert contradictory NFRs (e.g. "p99 < 100ms" on
+  the same path as "synchronous third-party call"; "fully offline"
+  with "real-time multi-user collaboration") that no architecture
+  can simultaneously satisfy.
+- (b) No Requirement specifies persistence (DB family / cloud /
+  on-prem) AND the master_requirement is also silent — the
+  `## Data model` and `## Tech stack choices` sections can't be
+  written confidently.
+- (c) Two Requirements imply different deployment models (SPA vs
+  SSR; serverless vs long-running service; mobile-native vs PWA)
+  and the master is silent on which to pick.
+
+If none of (a)–(c) apply, draft the Architecture; tag any soft
+ambiguities under `## Open questions` as `NON-BLOCKING` as usual.
+
 ## Revision behavior (iterative refinement)
 
 This skill is designed for **many revisions** over the project's

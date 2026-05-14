@@ -194,6 +194,7 @@ mod tests {
             updated_at_ms: 0,
             kind: NoteKind::Markdown,
             blob_path: None,
+            slug: None,
         }
     }
 

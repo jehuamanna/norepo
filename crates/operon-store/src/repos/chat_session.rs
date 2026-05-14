@@ -35,6 +35,18 @@ pub struct ChatSession {
     pub claude_session_id: Option<String>,
     pub last_used_ms: i64,
     pub created_ms: i64,
+    /// Per-chat `--model` override. `None` means "use the global
+    /// default" — i.e. the spawn omits the `--model` flag and lets
+    /// claude pick. Set by the companion toolbar's model picker;
+    /// preserved across restarts via migration 017.
+    pub model: Option<String>,
+    /// Per-chat `--permission-mode` override. One of
+    /// `default` / `acceptEdits` / `plan` / `bypassPermissions`, or
+    /// `None` to omit the flag (claude picks its default — usually
+    /// auto-approve in `--print` mode). Set by the companion
+    /// toolbar's permission picker; preserved across restarts via
+    /// migration 017.
+    pub permission_mode: Option<String>,
 }
 
 pub trait ChatSessionRepository: Send + Sync {
@@ -64,6 +76,17 @@ pub trait ChatSessionRepository: Send + Sync {
         &self,
         id: Uuid,
         claude_session_id: Option<&str>,
+    ) -> Result<(), StoreError>;
+    /// Persist the per-chat Claude model override. `None` clears it
+    /// (the next spawn omits `--model` and falls back to the plugin
+    /// default).
+    fn set_model(&self, id: Uuid, model: Option<&str>) -> Result<(), StoreError>;
+    /// Persist the per-chat Claude `--permission-mode` override.
+    /// `None` clears it (the spawn omits the flag).
+    fn set_permission_mode(
+        &self,
+        id: Uuid,
+        permission_mode: Option<&str>,
     ) -> Result<(), StoreError>;
 }
 
@@ -118,6 +141,8 @@ fn row_to_chat_session(row: &crate::sql::Row<'_>) -> crate::sql::Result<ChatSess
         claude_session_id: row.get(4)?,
         last_used_ms: row.get(5)?,
         created_ms: row.get(6)?,
+        model: row.get(7)?,
+        permission_mode: row.get(8)?,
     })
 }
 
@@ -136,7 +161,7 @@ impl ChatSessionRepository for SqliteChatSessionRepository {
         // same query covers both vault (scope_id=NULL) and project rows.
         let mut stmt = conn.prepare(
             "SELECT id, scope_kind, scope_id, label, claude_session_id,
-                    last_used_ms, created_ms
+                    last_used_ms, created_ms, model, permission_mode
              FROM chat_session
              WHERE scope_kind = ?1 AND scope_id IS ?2
              ORDER BY last_used_ms DESC, created_ms DESC",
@@ -153,7 +178,7 @@ impl ChatSessionRepository for SqliteChatSessionRepository {
         let conn = self.store.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, scope_kind, scope_id, label, claude_session_id,
-                    last_used_ms, created_ms
+                    last_used_ms, created_ms, model, permission_mode
              FROM chat_session
              WHERE id = ?1",
         )?;
@@ -181,8 +206,8 @@ impl ChatSessionRepository for SqliteChatSessionRepository {
         conn.execute(
             "INSERT INTO chat_session
                 (id, scope_kind, scope_id, label, claude_session_id,
-                 last_used_ms, created_ms)
-             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?5)",
+                 last_used_ms, created_ms, model, permission_mode)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?5, NULL, NULL)",
             params![id.to_string(), kind, scope_id, resolved_label, now],
         )?;
         Ok(ChatSession {
@@ -192,6 +217,8 @@ impl ChatSessionRepository for SqliteChatSessionRepository {
             claude_session_id: None,
             last_used_ms: now,
             created_ms: now,
+            model: None,
+            permission_mode: None,
         })
     }
 
@@ -244,6 +271,34 @@ impl ChatSessionRepository for SqliteChatSessionRepository {
         let n = conn.execute(
             "UPDATE chat_session SET claude_session_id = ?2 WHERE id = ?1",
             params![id.to_string(), claude_session_id],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn set_model(&self, id: Uuid, model: Option<&str>) -> Result<(), StoreError> {
+        let conn = self.store.conn()?;
+        let n = conn.execute(
+            "UPDATE chat_session SET model = ?2 WHERE id = ?1",
+            params![id.to_string(), model],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn set_permission_mode(
+        &self,
+        id: Uuid,
+        permission_mode: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let conn = self.store.conn()?;
+        let n = conn.execute(
+            "UPDATE chat_session SET permission_mode = ?2 WHERE id = ?1",
+            params![id.to_string(), permission_mode],
         )?;
         if n == 0 {
             return Err(StoreError::NotFound);
@@ -370,6 +425,72 @@ mod tests {
     fn get_unknown_id_returns_none() {
         let repo = make_repo();
         assert!(repo.get(Uuid::new_v4()).unwrap().is_none());
+    }
+
+    #[test]
+    fn create_initialises_model_and_permission_to_null() {
+        let repo = make_repo();
+        let s = repo.create(ChatScope::Vault, "x").unwrap();
+        assert!(s.model.is_none());
+        assert!(s.permission_mode.is_none());
+        let fetched = repo.get(s.id).unwrap().unwrap();
+        assert!(fetched.model.is_none());
+        assert!(fetched.permission_mode.is_none());
+    }
+
+    #[test]
+    fn set_model_round_trip() {
+        let repo = make_repo();
+        let s = repo.create(ChatScope::Vault, "x").unwrap();
+        repo.set_model(s.id, Some("claude-opus-4-7")).unwrap();
+        assert_eq!(
+            repo.get(s.id).unwrap().unwrap().model.as_deref(),
+            Some("claude-opus-4-7")
+        );
+        repo.set_model(s.id, None).unwrap();
+        assert!(repo.get(s.id).unwrap().unwrap().model.is_none());
+    }
+
+    #[test]
+    fn set_permission_mode_round_trip() {
+        let repo = make_repo();
+        let s = repo.create(ChatScope::Vault, "x").unwrap();
+        repo.set_permission_mode(s.id, Some("acceptEdits")).unwrap();
+        assert_eq!(
+            repo.get(s.id).unwrap().unwrap().permission_mode.as_deref(),
+            Some("acceptEdits")
+        );
+        repo.set_permission_mode(s.id, None).unwrap();
+        assert!(repo.get(s.id).unwrap().unwrap().permission_mode.is_none());
+    }
+
+    #[test]
+    fn set_model_and_permission_mode_unknown_id_errors() {
+        let repo = make_repo();
+        let bogus = Uuid::new_v4();
+        assert!(matches!(
+            repo.set_model(bogus, Some("x")).unwrap_err(),
+            StoreError::NotFound
+        ));
+        assert!(matches!(
+            repo.set_permission_mode(bogus, Some("x")).unwrap_err(),
+            StoreError::NotFound
+        ));
+    }
+
+    #[test]
+    fn list_in_scope_returns_persisted_model_and_permission_mode() {
+        let repo = make_repo();
+        let proj = Uuid::new_v4();
+        let a = repo
+            .create(ChatScope::Project(proj), "alpha")
+            .unwrap();
+        repo.set_model(a.id, Some("claude-sonnet-4-6")).unwrap();
+        repo.set_permission_mode(a.id, Some("plan")).unwrap();
+        let listed = repo.list_in_scope(ChatScope::Project(proj)).unwrap();
+        let row = listed.iter().find(|r| r.id == a.id).unwrap();
+        assert_eq!(row.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(row.permission_mode.as_deref(), Some("plan"));
     }
 
     #[test]

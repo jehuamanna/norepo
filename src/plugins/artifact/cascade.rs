@@ -928,6 +928,15 @@ pub async fn run_cascade(
                     // batched split.)
                     let checkpoint_hit = (skill.contract.cascade_stop || step_mode_on)
                         && !o.created_artifact_ids.is_empty();
+                    // (title, body) for every new child this skill
+                    // produced. Used both by the graph writer below
+                    // and by the mid-run clarification scan after
+                    // the loop. Loading the body once per child
+                    // (instead of only when graph_writer is Some)
+                    // costs one extra `persistence.load` per child
+                    // when the canvas is closed, which is cheap and
+                    // unconditional makes the halt logic simple.
+                    let mut produced_pairs: Vec<(String, String)> = Vec::new();
                     for child_id in &o.created_artifact_ids {
                         if !skill.contract.cascade_stop && !step_mode_on {
                             if let Err(e) = approve_artifact(persistence, *child_id).await {
@@ -946,13 +955,15 @@ pub async fn run_cascade(
                             .unwrap_or_default();
                         titles.insert(*child_id, child_title.clone());
 
+                        let body = persistence
+                            .load(&child_id.to_string())
+                            .await
+                            .ok()
+                            .and_then(|b| String::from_utf8(b).ok())
+                            .unwrap_or_default();
+                        produced_pairs.push((child_title.clone(), body.clone()));
+
                         if let Some(writer) = graph_writer.as_deref_mut() {
-                            let body = persistence
-                                .load(&child_id.to_string())
-                                .await
-                                .ok()
-                                .and_then(|b| String::from_utf8(b).ok())
-                                .unwrap_or_default();
                             writer.on_artifact_produced(art_id, *child_id, &child_title, body);
                         }
                     }
@@ -970,6 +981,28 @@ pub async fn run_cascade(
                                 "graph flush failed: {e}"
                             );
                         }
+                    }
+                    // Per-step clarification halt. Skills 02–09 can
+                    // pause the cascade mid-walk by emitting an
+                    // `artifact_kind: clarification` `.mdx` file when
+                    // their inputs are too ambiguous to best-guess.
+                    // If this skill raised any Pending clarification,
+                    // hard-halt the cascade right now — don't proceed
+                    // to checkpoint-pause or enqueue children — so
+                    // downstream skills can't fire on output that's
+                    // waiting on a human decision. Same error variant
+                    // as the step-0 gate (`unresolved_clarification_titles`),
+                    // so the UI handles both uniformly. Includes the
+                    // producing skill's title for diagnostics.
+                    let raised =
+                        produced_pending_clarification_titles(&produced_pairs);
+                    if !raised.is_empty() {
+                        return Err(CascadeError::SkillRun(format!(
+                            "{} unresolved clarification(s) raised by {} — answer them first: {}",
+                            raised.len(),
+                            skill.title,
+                            raised.join(", ")
+                        )));
                     }
                     if checkpoint_hit {
                         let pause_target_id = o
@@ -1285,6 +1318,33 @@ pub async fn unresolved_clarification_titles(
         }
     }
     out
+}
+
+/// From a list of `(title, body)` pairs produced in one skill run,
+/// return the titles of those whose frontmatter declares
+/// `artifact_kind: clarification` AND `status: pending`. Pure
+/// helper — no async, no I/O — so it's trivially unit-testable.
+///
+/// Used by `run_cascade`'s per-step halt: when a skill (02 … 09) is
+/// allowed to emit a mid-run clarification (its prompt says "raise
+/// instead of best-guess when ambiguous"), the runner imports the
+/// produced `.mdx` file with `artifact_kind: clarification` and
+/// `status: pending` (clarification's gate is approval). The cascade
+/// detects it via this helper and bails with `CascadeError::SkillRun`
+/// so downstream skills don't fire on potentially-wrong upstream
+/// output.
+pub fn produced_pending_clarification_titles(
+    produced: &[(String, String)],
+) -> Vec<String> {
+    produced
+        .iter()
+        .filter_map(|(title, body)| {
+            let fm = parse_artifact_fm(body);
+            let is_clar = matches!(fm.artifact_kind, Some(ArtifactKind::Clarification));
+            let is_pending = matches!(fm.status, ArtifactStatus::Pending);
+            (is_clar && is_pending).then(|| title.clone())
+        })
+        .collect()
 }
 
 /// Compute the set of artifact ids `art_id` depends on. Sources:
@@ -1819,6 +1879,50 @@ mod tests {
     }
 
     #[test]
+    fn produced_pending_clarification_titles_filters_correctly() {
+        let pending_clar = (
+            "clarification-01-tenancy".to_string(),
+            "---\nartifact_kind: clarification\nstatus: pending\n---\n\n# Clarification: tenancy\n"
+                .to_string(),
+        );
+        let approved_clar = (
+            "clarification-02-old".to_string(),
+            "---\nartifact_kind: clarification\nstatus: approved\n---\n\n# Clarification: resolved\n"
+                .to_string(),
+        );
+        let pending_epic = (
+            "epic-01-onboarding".to_string(),
+            "---\nartifact_kind: epic\nstatus: pending\n---\n\n# Epic: onboarding\n".to_string(),
+        );
+        let missing_fm = (
+            "stray".to_string(),
+            "# No frontmatter at all\n".to_string(),
+        );
+        let titles = produced_pending_clarification_titles(&[
+            pending_clar,
+            approved_clar,
+            pending_epic,
+            missing_fm,
+        ]);
+        assert_eq!(titles, vec!["clarification-01-tenancy".to_string()]);
+    }
+
+    #[test]
+    fn produced_pending_clarification_titles_empty_when_no_clarifications() {
+        let pairs: Vec<(String, String)> = vec![
+            (
+                "epic-01".into(),
+                "---\nartifact_kind: epic\nstatus: pending\n---\n".into(),
+            ),
+            (
+                "epic-02".into(),
+                "---\nartifact_kind: epic\nstatus: pending\n---\n".into(),
+            ),
+        ];
+        assert!(produced_pending_clarification_titles(&pairs).is_empty());
+    }
+
+    #[test]
     fn group_by_input_kind_indexes_each_skill() {
         let skills = vec![
             skill_ref(1, "ba-decompose-features", "epic", "feature"),
@@ -1971,6 +2075,7 @@ mod tests {
             updated_at_ms: 0,
             kind: NoteKind::Artifact,
             blob_path: None,
+            slug: None,
         }
     }
 

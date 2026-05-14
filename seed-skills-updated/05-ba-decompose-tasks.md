@@ -121,6 +121,53 @@ Required body sections (in order):
 If you can't articulate the dep in one of those terms, leave
 `None (parallel-safe)`.
 
+## Raising clarifications
+
+If the parent Story you just read is ambiguous in a way you cannot
+resolve by a defensible best-guess (see the rubric below), do **NOT**
+emit any Task for this run. Instead, write one or more
+`clarification-NN-<kebab-topic>.mdx` files into the same output
+directory and stop. The cascade halts on Pending clarifications; the
+user answers via the ClarificationPanel, which flips the parent
+Story Dirty, and the next Play re-runs this skill with the answer
+inlined under `--- refinement notes from user ---`.
+
+**Hard rule.** Either raise clarification(s) AND emit zero Tasks for
+this run, OR emit Tasks with zero clarifications. Don't mix.
+
+**File format.** Use the `Write` tool **once per clarification**.
+Each file's frontmatter MUST set:
+
+```
+---
+artifact_kind: clarification
+status: pending
+---
+```
+
+Required body sections (mirror `00-coherence-check`):
+
+- **# Clarification: <one-line topic>**
+- **## Levels involved** — bullet list with `[A3]` / `[A4]` tags
+- **## The discrepancy** — 1–2 paragraphs explaining the ambiguity
+- **## Question type** — `single_choice` or `multi_choice`
+- **## Options** — `- [ ] <label> — <consequence>`, ending with
+  `- [ ] Other: ___`
+- **## Why we're asking** — one paragraph on what changes in the
+  Task decomposition depending on the answer
+- **## Resolution target** — list the **parent Story's slug**.
+
+**When to raise (rubric).**
+
+- (a) The Story's acceptance criteria don't say which side of the
+  stack owns the change (frontend vs backend vs both), and Task
+  count / scope hinges on that split.
+- (b) The Story implies a data-model change but doesn't name the
+  entity, column, or migration — you can't write the
+  schema-vs-usage Tasks without knowing it.
+
+If neither applies, proceed with normal Task decomposition.
+
 ## Revision behavior (re-runs)
 
 If the parent Story was edited and this skill is re-running, the

@@ -118,6 +118,54 @@ Stories under other Features.
 If you can't articulate the dep in one of those terms, leave
 `None (parallel-safe)`.
 
+## Raising clarifications
+
+If the parent Feature you just read is ambiguous in a way you cannot
+resolve by a defensible best-guess (see the rubric below), do **NOT**
+emit any Story for this run. Instead, write one or more
+`clarification-NN-<kebab-topic>.mdx` files into the same output
+directory and stop. The cascade halts on Pending clarifications; the
+user answers via the ClarificationPanel, which flips the parent
+Feature Dirty, and the next Play re-runs this skill with the answer
+inlined under `--- refinement notes from user ---`.
+
+**Hard rule.** Either raise clarification(s) AND emit zero Stories
+for this run, OR emit Stories with zero clarifications. Don't mix.
+
+**File format.** Use the `Write` tool **once per clarification**.
+Each file's frontmatter MUST set:
+
+```
+---
+artifact_kind: clarification
+status: pending
+---
+```
+
+Required body sections (mirror `00-coherence-check`):
+
+- **# Clarification: <one-line topic>**
+- **## Levels involved** — bullet list with `[A2]` / `[A3]` tags
+- **## The discrepancy** — 1–2 paragraphs explaining the ambiguity
+- **## Question type** — `single_choice` or `multi_choice`
+- **## Options** — `- [ ] <label> — <consequence>`, ending with
+  `- [ ] Other: ___`
+- **## Why we're asking** — one paragraph on what changes in the
+  Story decomposition depending on the answer
+- **## Resolution target** — list the **parent Feature's slug**.
+
+**When to raise (rubric).**
+
+- (a) The Feature lacks user-flow detail and could decompose along
+  either UI-driven OR API-driven seams (Story count and shape change
+  materially between the two).
+- (b) The Feature's acceptance criteria are silent on a non-functional
+  dimension (auth, audit, accessibility, offline-tolerance) that
+  materially changes the Story count.
+
+If neither (a) nor (b) applies, proceed with normal Story
+decomposition.
+
 ## Revision behavior (re-runs)
 
 If the parent Feature was edited and this skill is re-running, the

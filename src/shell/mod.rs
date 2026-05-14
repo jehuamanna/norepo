@@ -27,6 +27,7 @@ pub mod codemirror_host;
 mod companion_area;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod companion_chat;
+pub mod companion_settings;
 pub mod companion_state;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod agent_backend_picker;
@@ -34,6 +35,8 @@ pub mod agent_backend_picker;
 pub mod permission_persist;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod permission_prompt;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod project_claude_settings;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod repo_permissions;
 #[cfg(not(target_arch = "wasm32"))]

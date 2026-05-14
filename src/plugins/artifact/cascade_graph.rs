@@ -59,7 +59,7 @@ impl CascadeGraphWriter {
         graph_note_id: Uuid,
         persistence: &Arc<dyn Persistence>,
     ) -> Self {
-        let graph = match persistence.load(&graph_note_id.to_string()).await {
+        let mut graph = match persistence.load(&graph_note_id.to_string()).await {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(text) => serde_json::from_str::<WorkflowGraph>(&text)
                     .unwrap_or_else(|_| WorkflowGraph::new()),
@@ -67,6 +67,21 @@ impl CascadeGraphWriter {
             },
             Err(_) => WorkflowGraph::new(),
         };
+        // Pre-split (commit 78938fe) the monolithic `07-sde-implement-task`
+        // skill emitted `task → implementation` directly, so old cascade
+        // workflow notes have a `Task → Implementation` parent_child edge.
+        // Re-running 07a on the same Task now adds `Task → Implementation
+        // Plan` alongside it, leaving Plan and Implementation as siblings
+        // under Task (same y-row on the canvas) instead of Plan → Impl.
+        // Walk the loaded graph once and re-parent legacy Implementation
+        // edges under their sibling Implementation Plan.
+        let rewired = repair_legacy_plan_implementation_edges(&mut graph);
+        if rewired > 0 {
+            tracing::info!(
+                target: "operon::cascade::graph",
+                "repaired {rewired} legacy Task\u{2192}Implementation edge(s) in {graph_note_id}"
+            );
+        }
         // Index existing artifact-snapshot nodes so re-runs reuse
         // them instead of duplicating.
         let mut by_artifact = HashMap::new();
@@ -112,6 +127,28 @@ impl CascadeGraphWriter {
 
         // Allocate / reuse a node id for the child.
         let child_node_id = self.ensure_snapshot_for(child_artifact_id, Some(kind_label.clone()));
+
+        // Scenario-B guard: when adding an Implementation child, the
+        // parent should always be an Implementation Plan (per the 07a/
+        // 07b chain). If the cascade orchestrator ever calls this with
+        // a non-Plan parent for an Implementation child (or vice-versa
+        // for a Plan child arriving under a parent that already has an
+        // Implementation sibling), log a warning so we catch live
+        // mis-parenting that the post-load repair pass wouldn't see.
+        if kind_label == KIND_LABEL_IMPL {
+            let parent_kind = self
+                .graph
+                .nodes
+                .get(&parent_node_id)
+                .and_then(|n| n.artifact_kind_label.clone())
+                .unwrap_or_default();
+            if !parent_kind.is_empty() && parent_kind != KIND_LABEL_PLAN {
+                tracing::warn!(
+                    target: "operon::cascade::graph",
+                    "on_artifact_produced: Implementation child {child_artifact_id} parented under {parent_kind:?} (expected {KIND_LABEL_PLAN:?}); canvas layout will show Implementation at wrong level"
+                );
+            }
+        }
 
         // Cache title + kind label on the child node so the canvas
         // tile renders without a per-paint LocalNoteRepository lookup.
@@ -422,6 +459,206 @@ impl CascadeGraphWriter {
 /// a hard constraint — the user can drag nodes after the fact.
 const NODE_X_SPACING: f64 = 180.0;
 const NODE_Y_SPACING: f64 = 140.0;
+
+/// Display names of the two artifact kinds that participate in the
+/// post-split `07a → 07b` chain. Pulled into module-level constants so
+/// the repair pass and the misparent-warning log share the same source
+/// of truth. These must stay in lock-step with
+/// `ArtifactKind::ImplementationPlan.display_name()` and
+/// `ArtifactKind::Implementation.display_name()`.
+const KIND_LABEL_PLAN: &str = "Implementation Plan";
+const KIND_LABEL_IMPL: &str = "Implementation";
+
+/// Repair pass for cascade workflow notes created **before** commit
+/// `78938fe` (the 07a/07b split). The pre-split monolithic
+/// `07-sde-implement-task` skill consumed a Task and produced an
+/// Implementation directly, so `on_artifact_produced` wrote a
+/// `Task → Implementation` parent_child edge. After the split, replaying
+/// the same Task fires only 07a (now the sole `input_kind=task` skill),
+/// which adds `Task → Implementation Plan` next to the stale edge.
+/// The canvas then renders Plan and Implementation as siblings under
+/// Task at the same y-row — the user-reported bug.
+///
+/// For each parent node `T` that has parent_child edges to **both** an
+/// `Implementation Plan` child and an `Implementation` child, re-parent
+/// the Implementation edge to point from the Plan instead. Re-position
+/// the moved Implementation node (and shift its descendants down by one
+/// row) so the canvas reflects the new chain.
+///
+/// Returns the number of Implementation edges rewired. Idempotent: a
+/// second invocation on the same graph rewires zero edges.
+pub(crate) fn repair_legacy_plan_implementation_edges(graph: &mut WorkflowGraph) -> usize {
+    // Step 1: index `(parent_node_id → Vec<child_node_id>)` over
+    // parent_child edges. We mutate `graph.edges` below, so collect the
+    // structural view first.
+    let mut children_by_parent: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for e in &graph.edges {
+        if e.edge_kind.as_deref() == Some("parent_child") {
+            children_by_parent.entry(e.from).or_default().push(e.to);
+        }
+    }
+
+    // Step 2: find Task-like parents that have both a Plan child and
+    // an Implementation child. The parent itself can be any kind
+    // (Task is the SDLC case; defending against any future mis-parent
+    // by matching purely on the child-pair pattern).
+    let mut rewires: Vec<(Uuid, Uuid, Uuid)> = Vec::new(); // (legacy_parent, plan_node, impl_node)
+    for (parent, children) in &children_by_parent {
+        let plan = children.iter().find(|cid| {
+            graph
+                .nodes
+                .get(cid)
+                .and_then(|n| n.artifact_kind_label.as_deref())
+                == Some(KIND_LABEL_PLAN)
+        });
+        let implementation = children.iter().find(|cid| {
+            graph
+                .nodes
+                .get(cid)
+                .and_then(|n| n.artifact_kind_label.as_deref())
+                == Some(KIND_LABEL_IMPL)
+        });
+        if let (Some(plan), Some(impl_)) = (plan, implementation) {
+            rewires.push((*parent, *plan, *impl_));
+        }
+    }
+
+    if rewires.is_empty() {
+        return 0;
+    }
+
+    // Step 3: apply each rewire — flip the edge `from` and reposition.
+    let mut rewired = 0_usize;
+    for (legacy_parent, plan_node, impl_node) in rewires {
+        // Flip the parent_child edge `legacy_parent → impl_node` to
+        // `plan_node → impl_node`. If the rewired edge already exists
+        // (e.g., a partial earlier repair), just drop the legacy one.
+        let already_correct = graph.edges.iter().any(|e| {
+            e.edge_kind.as_deref() == Some("parent_child")
+                && e.from == plan_node
+                && e.to == impl_node
+        });
+        let mut flipped = false;
+        for e in graph.edges.iter_mut() {
+            if e.edge_kind.as_deref() == Some("parent_child")
+                && e.from == legacy_parent
+                && e.to == impl_node
+            {
+                if already_correct {
+                    // Will be removed in the post-pass below.
+                    e.from = legacy_parent; // no-op marker; remove sweep handles it
+                } else {
+                    e.from = plan_node;
+                    flipped = true;
+                }
+                break;
+            }
+        }
+        if already_correct {
+            // Remove the duplicate legacy edge outright.
+            graph.edges.retain(|e| {
+                !(e.edge_kind.as_deref() == Some("parent_child")
+                    && e.from == legacy_parent
+                    && e.to == impl_node)
+            });
+        }
+        if !flipped && !already_correct {
+            continue;
+        }
+
+        // Reposition the impl_node and shift its descendants down by
+        // one row. The new x is `count_children(plan_node) - 1` *
+        // NODE_X_SPACING (subtract 1 because the just-flipped edge is
+        // already counted in graph.edges).
+        let plan_level = level_of_in_graph(graph, plan_node);
+        let new_impl_level = plan_level + 1;
+        let plan_child_count = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                e.from == plan_node && e.edge_kind.as_deref() == Some("parent_child")
+            })
+            .count();
+        let sibling_index_under_plan = plan_child_count.saturating_sub(1);
+        let new_pos_y = f64::from(new_impl_level as i32) * NODE_Y_SPACING;
+        let new_pos_x = f64::from(sibling_index_under_plan as i32) * NODE_X_SPACING;
+
+        let old_impl_y = graph
+            .nodes
+            .get(&impl_node)
+            .map(|n| n.position.1)
+            .unwrap_or(0.0);
+        if let Some(n) = graph.nodes.get_mut(&impl_node) {
+            n.position = (new_pos_x, new_pos_y);
+        }
+        let y_delta = new_pos_y - old_impl_y;
+        if y_delta.abs() > f64::EPSILON {
+            // Walk impl_node's transitive parent_child descendants and
+            // apply the same y delta so the subtree stays connected.
+            let descendants = descendants_of(graph, impl_node);
+            for d in descendants {
+                if let Some(n) = graph.nodes.get_mut(&d) {
+                    n.position.1 += y_delta;
+                }
+            }
+        }
+
+        rewired += 1;
+    }
+
+    if rewired > 0 {
+        graph.version = graph.version.saturating_add(1);
+    }
+    rewired
+}
+
+/// Free-function variant of `CascadeGraphWriter::level_of` that walks a
+/// borrowed `WorkflowGraph`. Used by the repair pass before a writer
+/// exists.
+fn level_of_in_graph(graph: &WorkflowGraph, node_id: Uuid) -> u32 {
+    let mut level: u32 = 0;
+    let mut current = node_id;
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        if !visited.insert(current) {
+            break;
+        }
+        let parent = graph
+            .edges
+            .iter()
+            .find(|e| {
+                e.to == current && e.edge_kind.as_deref() == Some("parent_child")
+            })
+            .map(|e| e.from);
+        match parent {
+            Some(p) => {
+                current = p;
+                level += 1;
+            }
+            None => break,
+        }
+    }
+    level
+}
+
+/// Collect all transitive parent_child descendants of `root` (excluding
+/// `root` itself). BFS; cycle-safe via a visited set.
+fn descendants_of(graph: &WorkflowGraph, root: Uuid) -> Vec<Uuid> {
+    let mut out = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(root);
+    visited.insert(root);
+    while let Some(cur) = queue.pop_front() {
+        for e in &graph.edges {
+            if e.edge_kind.as_deref() == Some("parent_child") && e.from == cur && visited.insert(e.to) {
+                out.push(e.to);
+                queue.push_back(e.to);
+            }
+        }
+    }
+    out
+}
 
 /// Find or create the `Cascade: <root>` workflow note for a cascade
 /// run. The note is parented under the project root (no
@@ -856,5 +1093,218 @@ mod tests {
     fn parse_cross_tree_deps_returns_empty_when_section_absent() {
         let body = "# backlog\n\n## Risks\n- nothing here\n";
         assert!(parse_cross_tree_deps(body).is_empty());
+    }
+
+    /// Build a snapshot node with a given kind label, at the given
+    /// (x, y) position. Test-only helper for the repair-pass tests.
+    fn mk_snapshot(id: Uuid, label: &str, pos: (f64, f64)) -> Node {
+        Node {
+            id,
+            skill_note_id: Uuid::nil(),
+            typed_fields: serde_json::Value::Null,
+            extra_instructions: String::new(),
+            position: pos,
+            cached_output_path: None,
+            cached_input_hash: None,
+            status: NodeStatus::Fresh,
+            cached_output_note_id: None,
+            is_artifact_snapshot: true,
+            artifact_ref: Some(Uuid::new_v4()),
+            artifact_kind_label: Some(label.to_string()),
+            artifact_title: None,
+            source_artifact_id: None,
+            cached_produced_artifact_ids: Vec::new(),
+        }
+    }
+
+    fn mk_parent_child_edge(from: Uuid, to: Uuid) -> Edge {
+        Edge {
+            id: Uuid::new_v4(),
+            from,
+            from_socket: "default".into(),
+            to,
+            to_socket: "default".into(),
+            edge_kind: Some("parent_child".into()),
+        }
+    }
+
+    #[test]
+    fn repair_rewires_implementation_under_plan_when_both_share_task_parent() {
+        // Pre-split legacy graph shape:
+        //
+        //   Task ─┬─> Plan
+        //         └─> Implementation   (legacy edge, kept after 07a re-run)
+        //
+        // The repair pass should rewire `Task → Implementation` to
+        // `Plan → Implementation`.
+        let mut graph = WorkflowGraph::new();
+        let task = Uuid::new_v4();
+        let plan = Uuid::new_v4();
+        let implementation = Uuid::new_v4();
+        graph
+            .nodes
+            .insert(task, mk_snapshot(task, "Task", (0.0, 0.0)));
+        graph.nodes.insert(
+            plan,
+            mk_snapshot(plan, KIND_LABEL_PLAN, (0.0, NODE_Y_SPACING)),
+        );
+        graph.nodes.insert(
+            implementation,
+            mk_snapshot(
+                implementation,
+                KIND_LABEL_IMPL,
+                (NODE_X_SPACING, NODE_Y_SPACING),
+            ),
+        );
+        graph.edges.push(mk_parent_child_edge(task, plan));
+        graph.edges.push(mk_parent_child_edge(task, implementation));
+
+        let rewired = repair_legacy_plan_implementation_edges(&mut graph);
+        assert_eq!(rewired, 1);
+
+        // The Task → Implementation edge must be gone; Plan → Implementation must exist.
+        let edges_from_task_to_impl: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                e.edge_kind.as_deref() == Some("parent_child")
+                    && e.from == task
+                    && e.to == implementation
+            })
+            .collect();
+        assert!(
+            edges_from_task_to_impl.is_empty(),
+            "legacy Task\u{2192}Implementation edge should be removed"
+        );
+        let edges_from_plan_to_impl: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                e.edge_kind.as_deref() == Some("parent_child")
+                    && e.from == plan
+                    && e.to == implementation
+            })
+            .collect();
+        assert_eq!(
+            edges_from_plan_to_impl.len(),
+            1,
+            "Plan\u{2192}Implementation edge should now exist"
+        );
+
+        // Implementation's y must move from level-1 to level-2.
+        let impl_pos = graph.nodes.get(&implementation).unwrap().position;
+        assert!(
+            (impl_pos.1 - 2.0 * NODE_Y_SPACING).abs() < f64::EPSILON,
+            "Implementation y was {}, expected {}",
+            impl_pos.1,
+            2.0 * NODE_Y_SPACING
+        );
+    }
+
+    #[test]
+    fn repair_is_idempotent_when_graph_already_correct() {
+        // Correct post-split shape:  Task → Plan → Implementation
+        let mut graph = WorkflowGraph::new();
+        let task = Uuid::new_v4();
+        let plan = Uuid::new_v4();
+        let implementation = Uuid::new_v4();
+        graph
+            .nodes
+            .insert(task, mk_snapshot(task, "Task", (0.0, 0.0)));
+        graph.nodes.insert(
+            plan,
+            mk_snapshot(plan, KIND_LABEL_PLAN, (0.0, NODE_Y_SPACING)),
+        );
+        graph.nodes.insert(
+            implementation,
+            mk_snapshot(
+                implementation,
+                KIND_LABEL_IMPL,
+                (0.0, 2.0 * NODE_Y_SPACING),
+            ),
+        );
+        graph.edges.push(mk_parent_child_edge(task, plan));
+        graph.edges.push(mk_parent_child_edge(plan, implementation));
+
+        // First call: nothing to repair (Task has Plan child but no
+        // Implementation child).
+        let rewired_first = repair_legacy_plan_implementation_edges(&mut graph);
+        assert_eq!(rewired_first, 0);
+
+        // Sanity: Plan → Implementation edge still exactly one copy.
+        let count = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                e.edge_kind.as_deref() == Some("parent_child")
+                    && e.from == plan
+                    && e.to == implementation
+            })
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn repair_shifts_descendants_down_with_implementation() {
+        // Pre-split graph with descendants below Implementation:
+        //
+        //   Task ─┬─> Plan
+        //         └─> Implementation ──> TestCases ──> TestResults
+        //
+        // After repair: Task → Plan → Implementation → TestCases → TestResults.
+        // TestCases and TestResults must move down by one row each.
+        let mut graph = WorkflowGraph::new();
+        let task = Uuid::new_v4();
+        let plan = Uuid::new_v4();
+        let implementation = Uuid::new_v4();
+        let test_cases = Uuid::new_v4();
+        let test_results = Uuid::new_v4();
+        graph
+            .nodes
+            .insert(task, mk_snapshot(task, "Task", (0.0, 0.0)));
+        graph.nodes.insert(
+            plan,
+            mk_snapshot(plan, KIND_LABEL_PLAN, (0.0, NODE_Y_SPACING)),
+        );
+        graph.nodes.insert(
+            implementation,
+            mk_snapshot(
+                implementation,
+                KIND_LABEL_IMPL,
+                (NODE_X_SPACING, NODE_Y_SPACING),
+            ),
+        );
+        graph.nodes.insert(
+            test_cases,
+            mk_snapshot(test_cases, "Test Cases", (NODE_X_SPACING, 2.0 * NODE_Y_SPACING)),
+        );
+        graph.nodes.insert(
+            test_results,
+            mk_snapshot(
+                test_results,
+                "Test Results",
+                (NODE_X_SPACING, 3.0 * NODE_Y_SPACING),
+            ),
+        );
+        graph.edges.push(mk_parent_child_edge(task, plan));
+        graph.edges.push(mk_parent_child_edge(task, implementation));
+        graph.edges.push(mk_parent_child_edge(implementation, test_cases));
+        graph.edges.push(mk_parent_child_edge(test_cases, test_results));
+
+        let rewired = repair_legacy_plan_implementation_edges(&mut graph);
+        assert_eq!(rewired, 1);
+
+        let tc_y = graph.nodes.get(&test_cases).unwrap().position.1;
+        let tr_y = graph.nodes.get(&test_results).unwrap().position.1;
+        assert!(
+            (tc_y - 3.0 * NODE_Y_SPACING).abs() < f64::EPSILON,
+            "TestCases y was {tc_y}, expected {}",
+            3.0 * NODE_Y_SPACING
+        );
+        assert!(
+            (tr_y - 4.0 * NODE_Y_SPACING).abs() < f64::EPSILON,
+            "TestResults y was {tr_y}, expected {}",
+            4.0 * NODE_Y_SPACING
+        );
     }
 }

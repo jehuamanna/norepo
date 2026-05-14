@@ -118,6 +118,59 @@ Features under a different Epic.
 If you can't articulate the dep in one of those terms, leave
 `None (parallel-safe)`.
 
+## Raising clarifications
+
+If the parent Epic you just read is ambiguous in a way you cannot
+resolve by a defensible best-guess (see the rubric below), do **NOT**
+emit any Feature for this run. Instead, write one or more
+`clarification-NN-<kebab-topic>.mdx` files into the same output
+directory and stop. The cascade halts on Pending clarifications; the
+user answers via the ClarificationPanel, which flips the parent Epic
+Dirty, and the next Play re-runs this skill with the answer inlined
+under `--- refinement notes from user ---`.
+
+**Hard rule.** Either raise clarification(s) AND emit zero Features
+for this run, OR emit Features with zero clarifications. Don't mix.
+
+**File format.** Use the `Write` tool **once per clarification**.
+Each file's frontmatter MUST set:
+
+```
+---
+artifact_kind: clarification
+status: pending
+---
+```
+
+Required body sections (mirror `00-coherence-check`):
+
+- **# Clarification: <one-line topic>**
+- **## Levels involved** — bullet list of the artifacts whose
+  ambiguity you're flagging (slug + `[A1]` / `[A2]` tag)
+- **## The discrepancy** — 1–2 paragraphs explaining the ambiguity
+- **## Question type** — `single_choice` or `multi_choice`
+- **## Options** — `- [ ] <label> — <consequence>`, ending with
+  `- [ ] Other: ___`
+- **## Why we're asking** — one paragraph on what changes in the
+  Feature decomposition depending on the answer
+- **## Resolution target** — list the **parent Epic's slug**. When
+  the user answers, the Epic is marked Dirty and the next Play
+  re-runs `03` with the answer inlined.
+
+**When to raise (rubric).**
+
+- (a) The Epic's outcome admits two materially different Feature
+  sets (e.g. self-serve flow vs admin-managed flow), and the Epic
+  body doesn't say which the team picked.
+- (b) The Epic lacks acceptance criteria AND the parent Requirement
+  doesn't supply one either — you have no testable spine to slice
+  Features against.
+- (c) The Epic uses a domain term ("the dashboard", "admin user",
+  "the report") with no upstream definition, and the term materially
+  changes how Features are scoped.
+
+If none of (a)–(c) apply, proceed with normal Feature decomposition.
+
 ## Revision behavior (re-runs)
 
 If the parent Epic was edited and this skill is re-running, the

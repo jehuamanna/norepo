@@ -132,6 +132,63 @@ this seed. Use `None (parallel-safe)` when no prerequisite.
 If you can't articulate the dep in one of those terms, leave
 `None (parallel-safe)`.
 
+## Raising clarifications
+
+If the Requirements you just read are ambiguous in a way you cannot
+resolve by a defensible best-guess (see the rubric below), do **NOT**
+emit any Epic for this run. Instead, write one or more
+`clarification-NN-<kebab-topic>.mdx` files into the same output
+directory and stop. The cascade halts on Pending clarifications; the
+user answers via the ClarificationPanel, which flips the
+master_requirement Dirty, and the next Play re-runs this skill with
+the answer inlined under `--- refinement notes from user ---`.
+
+**Hard rule.** Either raise clarification(s) AND emit zero Epics for
+this run, OR emit Epics with zero clarifications. Don't mix — a
+half-baked Epic sitting next to a Pending clarification confuses the
+next Play.
+
+**File format.** Use the `Write` tool **once per clarification**.
+Each file's frontmatter MUST set:
+
+```
+---
+artifact_kind: clarification
+status: pending
+---
+```
+
+Required body sections (mirror `00-coherence-check`):
+
+- **# Clarification: <one-line topic>**
+- **## Levels involved** — bullet list of the artifacts whose
+  ambiguity you're flagging (slug + `[A0]` / `[master]` tag)
+- **## The discrepancy** — 1–2 paragraphs: what each Requirement
+  says, why a best-guess would be wrong
+- **## Question type** — `single_choice` or `multi_choice`
+- **## Options** — one bullet per option,
+  `- [ ] <label> — <consequence if chosen>`. Always end with
+  `- [ ] Other: ___`
+- **## Why we're asking** — one paragraph on what changes in the
+  Epic decomposition depending on the answer
+- **## Resolution target** — list the **master_requirement's slug**.
+  When the user answers, the master is marked Dirty and the next
+  Play re-runs `02` with the answer inlined.
+
+**When to raise (rubric).**
+
+- (a) Two detailed Requirements describe overlapping scope without
+  indicating which is canonical (e.g. both claim ownership of the
+  same domain or capability).
+- (b) Requirements name a persona, role, or domain term that no
+  other Requirement defines — and the term materially changes Epic
+  boundaries.
+- (c) Requirements list mutually contradictory constraints (e.g.
+  "single-tenant" vs "multi-tenant"; "synchronous integration" vs
+  "event-driven only") that affect what Epics are needed.
+
+If none of (a)–(c) apply, proceed with normal Epic decomposition.
+
 ## Revision behavior (re-runs)
 
 If the master_requirement or any child Requirement was edited and this

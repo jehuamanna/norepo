@@ -24,6 +24,18 @@ Compared to `seed-skills-employee/`:
   Play and emits `clarification` artifacts for cross-level
   contradictions. The user answers in-place (single/multi choice
   with custom-input slots), and the cascade resumes.
+- **Inline clarifications** — any BA/SA/SDE skill from `02` through
+  `09` may also pause itself mid-run when its inputs are too
+  ambiguous to best-guess, by emitting a
+  `clarification-NN-<topic>.mdx` file (note the `.mdx` extension —
+  the visual signal "raised mid-skill") under its source artifact.
+  The cascade hard-halts on Pending clarifications; the user answers
+  via the same `ClarificationPanel`; the next Play re-runs the
+  producing skill with the answer inlined under
+  `--- refinement notes from user ---`. Same `artifact_kind:
+  clarification`, same answer flow as `00`'s output — just raised by
+  the decomposition / planning / test skill itself when it can't
+  proceed responsibly.
 - **Revision history is preserved** in every artifact body: each
   re-run appends a new `## Revision N (YYYY-MM-DD)` row and tucks the
   prior body under a collapsed `<details>` block.
@@ -58,20 +70,28 @@ master_requirement   [PROJECT ROOT — the only Play button]
 | Order | Skill | Phase | input_kind | output_kind | Count | Gate | Persona |
 |---|---|---|---|---|---|---|---|
 | 00 | `00-coherence-check` | BA | master_requirement (aggregator over `task`) | clarification | many (0–N) | approval | BA |
-| 02 | `02-ba-discover-epics` | BA | master_requirement (aggregator over `requirements`) | epic | many (1–3) | approval | BA |
+| 02 | `02-ba-discover-epics` | BA | master_requirement (aggregator over `requirements`) | epic *or* clarification¹ | many (1–3) | approval | BA |
 | 02n | `02n-ba-normalize-epics` | BA | epic | epic | one | auto | BA |
-| 03 | `03-ba-decompose-features` | BA | epic | feature | many (1–2) | approval | BA |
+| 03 | `03-ba-decompose-features` | BA | epic | feature *or* clarification¹ | many (1–2) | approval | BA |
 | 03n | `03n-ba-normalize-features` | BA | feature | feature | one | auto | BA |
-| 04 | `04-ba-decompose-stories` | BA | feature | story | many (1–3) | approval | BA |
+| 04 | `04-ba-decompose-stories` | BA | feature | story *or* clarification¹ | many (1–3) | approval | BA |
 | 04n | `04n-ba-normalize-stories` | BA | story | story | one | auto | BA |
-| 05 | `05-ba-decompose-tasks` | BA | story | task | many (1–3) | approval | BA |
-| 06 | `06-sa-draft-architecture` | BA | master_requirement (aggregator over `requirements`) | architecture | one | approval | SA |
+| 05 | `05-ba-decompose-tasks` | BA | story | task *or* clarification¹ | many (1–3) | approval | BA |
+| 06 | `06-sa-draft-architecture` | BA | master_requirement (aggregator over `requirements`) | architecture *or* clarification¹ | one | approval | SA |
 | 05n | `05n-sde-normalize-tasks` | SDE | task | task | one | auto | SDE |
-| 07a | `07a-sde-plan-task` | SDE | task (inherits `architecture`) | implementation_plan | one | approval | SDE |
-| 07b | `07b-sde-execute-implementation` | SDE | implementation_plan (inherits `architecture`) | implementation | one | approval | SDE |
-| 08 | `08-sde-generate-tests` | SDE | implementation | test_cases | one | approval | SDE |
-| 09 | `09-sde-execute-tests` | SDE | test_cases | test_results | one | approval | SDE |
+| 07a | `07a-sde-plan-task` | SDE | task (inherits `architecture`) | implementation_plan *or* clarification¹ | one | approval | SDE |
+| 07b | `07b-sde-execute-implementation` | SDE | implementation_plan (inherits `architecture`) | implementation *or* clarification¹ | one | approval | SDE |
+| 08 | `08-sde-generate-tests` | SDE | implementation | test_cases *or* clarification¹ | one | approval | SDE |
+| 09 | `09-sde-execute-tests` | SDE | test_cases | test_results *or* clarification¹ | one | approval | SDE |
 | 10 | `10-sde-fix-bug` | SDE | bug (inherits `architecture`) | implementation | one | approval | SDE |
+
+¹ When inputs are ambiguous (per each skill's `## Raising
+clarifications` rubric), the skill emits `clarification-NN-*.mdx`
+files instead of its primary output, hard-halting the cascade. The
+user answers via the `ClarificationPanel`; the next Play re-runs the
+skill with the answer inlined under
+`--- refinement notes from user ---`. See the per-skill bodies for
+specific triggers.
 
 ## Two-phase workflow
 

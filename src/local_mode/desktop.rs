@@ -39,8 +39,16 @@ pub fn LocalStateProvider(children: Element) -> Element {
         Arc::new(SqliteLocalSettingsRepository::new(store.clone()));
     let project_repo: Arc<dyn LocalProjectRepository> =
         Arc::new(SqliteLocalProjectRepository::new(store.clone()));
-    let note_repo: Arc<dyn LocalNoteRepository> =
+    let raw_note_repo: Arc<dyn LocalNoteRepository> =
         Arc::new(SqliteLocalNoteRepository::new(store.clone()));
+    // Migration 018: wrap the note repo so artifact renames / moves /
+    // deletes also relocate the on-disk `.operon/artifacts/<slug>/.../`
+    // directory to match the UI tree.
+    let note_repo: Arc<dyn LocalNoteRepository> =
+        Arc::new(crate::plugins::artifact::relocate::RelocatingNoteRepo::new(
+            raw_note_repo,
+            project_repo.clone(),
+        ));
     let tree_repo: Arc<dyn LocalTreeStateRepository> =
         Arc::new(SqliteLocalTreeStateRepository::new(store.clone()));
     let link_repo: Arc<dyn LocalNoteLinkRepository> =
@@ -126,8 +134,15 @@ pub fn provide_local_state() {
         Arc::new(SqliteLocalSettingsRepository::new(store.clone()));
     let project_repo: Arc<dyn LocalProjectRepository> =
         Arc::new(SqliteLocalProjectRepository::new(store.clone()));
-    let note_repo: Arc<dyn LocalNoteRepository> =
+    let raw_note_repo: Arc<dyn LocalNoteRepository> =
         Arc::new(SqliteLocalNoteRepository::new(store.clone()));
+    // Migration 018: same FS-relocating wrapper as `LocalStateProvider`
+    // installs above. Renames in the UI move on-disk artifact folders.
+    let note_repo: Arc<dyn LocalNoteRepository> =
+        Arc::new(crate::plugins::artifact::relocate::RelocatingNoteRepo::new(
+            raw_note_repo,
+            project_repo.clone(),
+        ));
     let tree_repo: Arc<dyn LocalTreeStateRepository> =
         Arc::new(SqliteLocalTreeStateRepository::new(store.clone()));
     let link_repo: Arc<dyn LocalNoteLinkRepository> =
@@ -266,6 +281,9 @@ pub fn SettingsPanel(open: Signal<bool>, username: Signal<String>) -> Element {
                 // `SettingsServiceCtx` from context so we don't have to
                 // pass a non-PartialEq prop through Dioxus.
                 crate::shell::settings::ProvidersSection {}
+                // Global Claude defaults — bottom tier of the
+                // three-tier hierarchy (chat → project → global).
+                crate::shell::settings::ClaudeDefaultsSection {}
                 div {
                     class: "operon-modal-actions",
                     button {
@@ -525,6 +543,14 @@ pub fn provide_local_app_signals() {
     use_context_provider(|| {
         crate::shell::companion_state::CompanionComposerInbox(companion_composer_inbox)
     });
+    // Append-semantics sibling of the inbox above. The side-bar's
+    // "Send to chat" right-click writes a `@[<title>](note:<uuid>)`
+    // mention token here; the companion appends it to the composer
+    // without clobbering the user's draft.
+    let companion_composer_append: Signal<Option<String>> = use_signal(|| None);
+    use_context_provider(|| {
+        crate::shell::companion_state::CompanionComposerAppend(companion_composer_append)
+    });
     // M3c: shared Claude Code plugin instance. Companion + workflow
     // executor both consume this so a workflow cascade reuses claude
     // session caching without spawning duplicate subprocesses.
@@ -539,6 +565,29 @@ pub fn provide_local_app_signals() {
             ),
         )
     });
+    // Hydrate the plugin's global defaults from local_app_settings so the
+    // model + permission-mode dropdowns survive app restarts, project
+    // switches, and new chat sessions.
+    {
+        let LocalSettingsRepo(settings_repo) = use_context();
+        let claude_plugin = claude_plugin.clone();
+        use_hook(move || {
+            if let Ok(Some(m)) =
+                settings_repo.get(crate::local_mode::SETTINGS_KEY_CLAUDE_DEFAULT_MODEL)
+            {
+                if !m.is_empty() {
+                    claude_plugin.set_default_model(Some(m));
+                }
+            }
+            if let Ok(Some(pm)) = settings_repo
+                .get(crate::local_mode::SETTINGS_KEY_CLAUDE_DEFAULT_PERMISSION_MODE)
+            {
+                if !pm.is_empty() {
+                    claude_plugin.set_permission_mode(Some(pm));
+                }
+            }
+        });
+    }
     use_context_provider(|| {
         crate::shell::companion_state::ClaudeCodePluginCtx(claude_plugin.clone())
     });
