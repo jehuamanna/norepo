@@ -82,12 +82,6 @@ pub(crate) struct PluginState {
 pub(crate) struct SessionBinding {
     pub cwd: PathBuf,
     pub claude_session_id: Option<String>,
-    /// Optional override of the global `--model` for THIS session.
-    /// Set by the companion's per-chat model picker (which now
-    /// persists the choice via the `chat_session.model` column).
-    /// `None` = fall back to `PluginState.default_model`, then
-    /// `ClaudeCodeConfig.model`, then claude's own default.
-    pub model: Option<String>,
     /// Optional override of the global `permission_mode` for THIS
     /// session only. Set by callers that need a stricter or looser
     /// policy than the user's companion-toolbar default — e.g. the
@@ -131,24 +125,21 @@ impl ClaudeCodeChatPlugin {
     pub fn bind_session(&self, operon_session: Uuid, cwd: PathBuf) {
         let mut s = self.state.lock().expect("plugin state mutex poisoned");
         let existing = s.bindings.get(&operon_session).cloned();
-        let (claude_session_id, model, permission_mode, bridge) = match existing {
-            Some(b) if b.cwd == cwd => {
-                (b.claude_session_id, b.model, b.permission_mode, b.bridge)
-            }
+        let (claude_session_id, permission_mode, bridge) = match existing {
+            Some(b) if b.cwd == cwd => (b.claude_session_id, b.permission_mode, b.bridge),
             // cwd changed: invalidate the cached claude session id (it
             // was tied to the previous directory) but keep the
-            // model + permission-mode overrides + bridge — those are
-            // deliberate caller decisions that don't depend on the
-            // working directory.
-            Some(b) => (None, b.model, b.permission_mode, b.bridge),
-            None => (None, None, None, None),
+            // permission-mode override + bridge — those are deliberate
+            // caller decisions that don't depend on the working
+            // directory.
+            Some(b) => (None, b.permission_mode, b.bridge),
+            None => (None, None, None),
         };
         s.bindings.insert(
             operon_session,
             SessionBinding {
                 cwd,
                 claude_session_id,
-                model,
                 permission_mode,
                 bridge,
             },
@@ -208,39 +199,6 @@ impl ClaudeCodeChatPlugin {
         if let Some(b) = s.bindings.get_mut(&operon_session) {
             b.permission_mode = mode;
         }
-    }
-
-    /// Set a per-session `--model` override. Preferred over the
-    /// global `set_default_model` value and the static
-    /// `ClaudeCodeConfig.model` fallback when spawning subsequent
-    /// turns for `operon_session`. Pass `None` to clear the override
-    /// and fall back to the global → static chain. No-op if
-    /// `bind_session` hasn't been called for the session id yet.
-    pub fn set_session_model(&self, operon_session: Uuid, model: Option<String>) {
-        let mut s = self.state.lock().expect("plugin state mutex poisoned");
-        if let Some(b) = s.bindings.get_mut(&operon_session) {
-            b.model = model;
-        }
-    }
-
-    /// Currently-cached per-session model override, if any. Useful for
-    /// the UI to display the picker's "selected" state from the same
-    /// authoritative source the spawn path reads.
-    pub fn current_session_model(&self, operon_session: Uuid) -> Option<String> {
-        self.state
-            .lock()
-            .ok()
-            .and_then(|s| s.bindings.get(&operon_session).and_then(|b| b.model.clone()))
-    }
-
-    /// Currently-cached per-session permission-mode override, if any.
-    /// Mirror of `current_session_model`.
-    pub fn current_session_permission_mode(&self, operon_session: Uuid) -> Option<String> {
-        self.state.lock().ok().and_then(|s| {
-            s.bindings
-                .get(&operon_session)
-                .and_then(|b| b.permission_mode.clone())
-        })
     }
 
     /// Attach (or detach) a `PermissionBridge` to a session. While set,
@@ -372,21 +330,10 @@ impl ClaudeCodeChatPlugin {
                 .permission_mode
                 .clone()
                 .or_else(|| s.permission_mode.clone());
-            // Per-session model override (`SessionBinding.model`,
-            // restored from `chat_session.model` at bind time) wins
-            // over the global `PluginState.default_model`, which
-            // itself wins over the static `ClaudeCodeConfig.model`
-            // (handled further down). Without this, switching chats
-            // wouldn't change the model — the global state would
-            // override every per-chat choice.
-            let effective_model_override = binding
-                .model
-                .clone()
-                .or_else(|| s.default_model.clone());
             (
                 binding.cwd.clone(),
                 binding.claude_session_id.clone(),
-                effective_model_override,
+                s.default_model.clone(),
                 effective_mode,
                 binding.bridge.clone(),
             )
