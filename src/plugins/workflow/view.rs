@@ -74,6 +74,16 @@ pub fn WorkflowEditor(props: WorkflowEditorProps) -> Element {
     // a button that flips this.
     let json_visible: Signal<bool> = use_signal(|| false);
 
+    // Phase C: per-phase canvas filter. When `true` (the default), the
+    // canvas drops every edge whose endpoints belong to different
+    // `NoteKind::Phase` ancestors. Cross-phase dependencies are allowed
+    // in the data model (e.g. a Phase 1 epic depending on Phase 0
+    // infrastructure) but they clutter the visualisation for the
+    // common case of one-phase-at-a-time review. Toolbar exposes a
+    // button to flip this so the user can see the full DAG when
+    // debugging cross-phase wiring.
+    let hide_cross_phase_edges: Signal<bool> = use_signal(|| true);
+
     // Undo / redo / clipboard — editor-scope so they survive canvas
     // re-renders. History caps at HISTORY_CAP entries (oldest dropped
     // when full) to avoid unbounded memory growth on long sessions.
@@ -272,6 +282,7 @@ pub fn WorkflowEditor(props: WorkflowEditorProps) -> Element {
                 apply_graph: apply_graph,
                 apply_with_undo: apply_with_undo,
                 json_visible: json_visible,
+                hide_cross_phase_edges: hide_cross_phase_edges,
                 expanded: expanded,
                 persist_expanded: persist_expanded,
             }
@@ -287,6 +298,7 @@ pub fn WorkflowEditor(props: WorkflowEditorProps) -> Element {
                     expanded: expanded,
                     persist_expanded: persist_expanded,
                     persist_view: persist_view,
+                    hide_cross_phase_edges: hide_cross_phase_edges,
                 }
                 if *json_visible.read() {
                     div { class: "operon-workflow-json",
@@ -343,6 +355,7 @@ pub fn WorkflowView(props: WorkflowViewProps) -> Element {
     let persist_noop: Callback<std::collections::BTreeSet<NodeId>> =
         Callback::new(|_| {});
     let persist_view_noop: Callback<(f64, f64, f64)> = Callback::new(|_| {});
+    let hide_cross_phase_edges: Signal<bool> = use_signal(|| true);
     rsx! {
         div { class: "operon-workflow-surface",
             "data-testid": "workflow-view",
@@ -357,6 +370,7 @@ pub fn WorkflowView(props: WorkflowViewProps) -> Element {
                 expanded: expanded,
                 persist_expanded: persist_noop,
                 persist_view: persist_view_noop,
+                hide_cross_phase_edges: hide_cross_phase_edges,
             }
         }
     }
@@ -389,6 +403,10 @@ struct WorkflowCanvasProps {
     /// mouseup, zoom-button click, and ctrl+wheel zoom so the
     /// workflow note remembers the last viewport across close/reopen.
     persist_view: Callback<(f64, f64, f64)>,
+    /// Phase C: when `true`, edges whose endpoints belong to different
+    /// `NoteKind::Phase` ancestors are dropped from the rendered set.
+    /// Toggled from the toolbar.
+    hide_cross_phase_edges: Signal<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -531,6 +549,45 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                 if let Ok(rows) = repo.list_for_project(project_id) {
                     for row in rows {
                         out.insert(row.id, row.kind);
+                    }
+                }
+            }
+        }
+        out
+    };
+    // Phase C: each note's phase ancestor id (or None if no phase
+    // ancestor exists). Used by the edge filter to drop cross-phase
+    // edges when the toolbar toggle is on. Built by walking parents
+    // for every project note up to depth 32 — small enough to be a
+    // single-pass map at render time.
+    let note_to_phase: HashMap<Uuid, Option<Uuid>> = {
+        let mut out: HashMap<Uuid, Option<Uuid>> = HashMap::new();
+        if let (Ok(workflow_id), Some(LocalNoteRepo(repo))) = (
+            Uuid::parse_str(&props.note_id),
+            try_consume_context::<LocalNoteRepo>(),
+        ) {
+            if let Ok(Some(project_id)) = repo.find_project_for_note(workflow_id) {
+                if let Ok(rows) = repo.list_for_project(project_id) {
+                    let parent_by_id: HashMap<Uuid, Option<Uuid>> =
+                        rows.iter().map(|n| (n.id, n.parent_id)).collect();
+                    let kind_by_id: HashMap<Uuid, NoteKind> =
+                        rows.iter().map(|n| (n.id, n.kind)).collect();
+                    for row in &rows {
+                        let mut cursor = row.parent_id;
+                        let mut steps = 0;
+                        let mut found: Option<Uuid> = None;
+                        while let Some(id) = cursor {
+                            if steps > 32 {
+                                break;
+                            }
+                            steps += 1;
+                            if matches!(kind_by_id.get(&id), Some(NoteKind::Phase)) {
+                                found = Some(id);
+                                break;
+                            }
+                            cursor = parent_by_id.get(&id).copied().flatten();
+                        }
+                        out.insert(row.id, found);
                     }
                 }
             }
@@ -807,12 +864,38 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
             is_expanded: expanded_snap.contains(id),
         })
         .collect();
+    let hide_cross_phase = *props.hide_cross_phase_edges.read();
     let edges: Vec<EdgeRender> = g
         .edges
         .iter()
         .filter_map(|e| {
             let from = nodes.iter().find(|n| n.id == e.from)?;
             let to = nodes.iter().find(|n| n.id == e.to)?;
+            // Phase C cross-phase filter. Look up each endpoint's
+            // phase ancestor via `note_to_phase` (keyed by the node's
+            // `artifact_ref`). If both ends sit in different phases,
+            // drop the edge when the toolbar toggle is on. Nodes
+            // without an `artifact_ref` (skill nodes, plain Markdown
+            // tiles) have no phase concept and are treated as
+            // matching everything — same as legacy projects with no
+            // phase notes at all.
+            if hide_cross_phase {
+                let from_phase = g
+                    .nodes
+                    .get(&e.from)
+                    .and_then(|n| n.artifact_ref)
+                    .and_then(|aref| note_to_phase.get(&aref).copied().flatten());
+                let to_phase = g
+                    .nodes
+                    .get(&e.to)
+                    .and_then(|n| n.artifact_ref)
+                    .and_then(|aref| note_to_phase.get(&aref).copied().flatten());
+                if let (Some(f), Some(t)) = (from_phase, to_phase) {
+                    if f != t {
+                        return None;
+                    }
+                }
+            }
             let s_idx = outgoing_index.get(&e.id).copied().unwrap_or(0);
             let s_total = outgoing_count.get(&e.from).copied().unwrap_or(1);
             let t_idx = incoming_index.get(&e.id).copied().unwrap_or(0);
@@ -2834,6 +2917,10 @@ struct WorkflowToolbarProps {
     /// Visibility of the JSON-tree pane (the textarea to the right of the
     /// canvas). Toolbar renders a "{}" button that flips this signal.
     json_visible: Signal<bool>,
+    /// Phase C: per-phase edge filter toggle. Toolbar renders a button
+    /// that flips this signal; the canvas reads it when building the
+    /// edge render list.
+    hide_cross_phase_edges: Signal<bool>,
     /// Canvas-scope expand/collapse set. Toolbar buttons clear it
     /// ("Collapse all") or fill it with every node id ("Expand all").
     expanded: Signal<std::collections::BTreeSet<NodeId>>,
@@ -2854,12 +2941,17 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
     // detached handles whose writes are silently dropped.
     let ActiveChatSession(active_session_signal) = use_context();
     let ActiveChatScope(active_scope_signal) = use_context();
-    let note_repo_for_picker = note_repo.clone();
-    let project_repo_for_seed = project_repo.clone();
+    // Additional contexts needed to launch `spawn_cascade` from the
+    // toolbar's Run button (mirrors `CascadePlayButton`'s use_context
+    // pattern in `plugins/artifact/view.rs`).
+    let persistence: Arc<dyn Persistence> = use_context();
+    let ClaudeCodePluginCtx(plugin) = use_context();
+    let ChatSessionRepo(chat_session_repo) = use_context();
+    let ChatMessageRepo(chat_message_repo) = use_context();
+    let LocalNoteVersion(note_version) = use_context();
+    let ChatSessionVersion(chat_session_version) = use_context();
     let on_apply = props.on_apply;
     let graph_text = props.graph_text.clone();
-    let note_id_str = props.note_id.clone();
-    let apply_graph = props.apply_graph;
     let apply_with_undo = props.apply_with_undo;
     let mut json_visible = props.json_visible;
     let mut expanded = props.expanded;
@@ -2906,45 +2998,6 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
         persist_expanded.call(empty);
     };
 
-    let mut picker_open = use_signal(|| false);
-    let mut picker_options: Signal<Vec<LocalNote>> = use_signal(Vec::new);
-    // Parallel picker for inserting artifact-snapshot tiles by hand.
-    // Lets users build a workflow that drives Requirements → Code
-    // without having to bootstrap the Requirements tile via ▶ Play
-    // first. Mirrors the skill picker's signal pattern.
-    let mut artifact_picker_open = use_signal(|| false);
-    let mut artifact_picker_options: Signal<Vec<LocalNote>> = use_signal(Vec::new);
-    let note_repo_for_artifact_picker = note_repo.clone();
-
-    // Run-all-dirty: parse current graph, topo-sort dirty nodes, run
-    // each sequentially via the executor, applying the mutated graph
-    // after every node so the canvas reflects progress in real time.
-    let note_id_for_run = note_id_str.clone();
-    let graph_text_for_run = graph_text.clone();
-    let on_run_all = move |_| {
-        eprintln!(
-            "operon: ▶ Run all dirty CLICKED note_id={} graph_text_len={}",
-            note_id_for_run,
-            graph_text_for_run.len()
-        );
-        let initial = match serde_json::from_str::<WorkflowGraph>(&graph_text_for_run) {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!(
-                    "operon: ▶ Run all dirty BAIL — graph_text JSON parse: {e}"
-                );
-                return;
-            }
-        };
-        spawn_run_cascade(
-            note_id_for_run.clone(),
-            initial,
-            apply_graph,
-            active_session_signal,
-            active_scope_signal,
-        );
-    };
-
     // Compute the current effective step-mode for label rendering.
     // Re-parses on every toolbar render — cheap (graph_text is a few
     // KB) and matches the rest of the toolbar's "trust the JSON,
@@ -2975,118 +3028,22 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
         on_apply.call(serialize(&graph));
     };
 
-    let note_id_str_for_picker = note_id_str.clone();
-    let open_picker = move |_| {
-        let note_uuid = match Uuid::parse_str(&note_id_str_for_picker) {
-            Ok(u) => u,
-            Err(_) => return,
-        };
-        let project_id = match note_repo_for_picker.find_project_for_note(note_uuid) {
-            Ok(Some(p)) => p,
-            _ => return,
-        };
-        let mut skills: Vec<LocalNote> = note_repo_for_picker
-            .list_for_project(project_id)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|n| matches!(n.kind, NoteKind::Skill))
-            .collect();
-        skills.sort_by(|a, b| a.title.cmp(&b.title));
-        picker_options.set(skills);
-        picker_open.set(true);
-    };
-
-    let note_id_str_for_artifact_picker = note_id_str.clone();
-    let open_artifact_picker = move |_| {
-        let note_uuid = match Uuid::parse_str(&note_id_str_for_artifact_picker) {
-            Ok(u) => u,
-            Err(_) => return,
-        };
-        let project_id = match note_repo_for_artifact_picker
-            .find_project_for_note(note_uuid)
-        {
-            Ok(Some(p)) => p,
-            _ => return,
-        };
-        let mut artifacts: Vec<LocalNote> = note_repo_for_artifact_picker
-            .list_for_project(project_id)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|n| matches!(n.kind, NoteKind::Artifact))
-            .collect();
-        artifacts.sort_by(|a, b| a.title.cmp(&b.title));
-        artifact_picker_options.set(artifacts);
-        artifact_picker_open.set(true);
-    };
-
-    // Seed-pipeline: bulk-add every numbered skill in the project as a
-    // chained Dirty node, sequentially connected by edges, in numeric
-    // order. Reuses the same builder the cascade-workflow auto-seeder
-    // uses (`cascade_graph::append_numbered_skill_chain`) so manual
-    // and automatic seeding stay in sync.
-    //
-    // The seed is filtered by the project's cascade-stages selection
-    // (`<repo>/.operon/cascade-stages.json`) — the same checkboxes
-    // surfaced from a Requirements artifact's "Pipeline stages" panel.
-    // So if the user has unchecked stages 5–10 there, "Seed pipeline"
-    // here only adds 01–04. Absent sidecar = "all stages enabled" via
-    // `stages_sidecar::resolve_or_all`'s fallback.
-    let note_repo_for_seed = note_repo.clone();
-    let note_id_for_seed = props.note_id.clone();
-    let graph_text_for_seed = graph_text.clone();
-    let on_seed_pipeline = move |_| {
-        let note_uuid = match Uuid::parse_str(&note_id_for_seed) {
-            Ok(u) => u,
-            Err(_) => return,
-        };
-        let project_id = match note_repo_for_seed.find_project_for_note(note_uuid) {
-            Ok(Some(p)) => p,
-            _ => return,
-        };
-        let mut project_skills: Vec<LocalNote> = note_repo_for_seed
-            .list_for_project(project_id)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|n| matches!(n.kind, NoteKind::Skill))
-            .collect();
-        // Apply the cascade-stages.json filter — only seed checked
-        // stages. We need the project's repo_path to find the sidecar;
-        // when the project isn't repo-bound we fall through and seed
-        // every numbered skill (matches the Play button's behavior in
-        // the same situation).
-        let repo_path: Option<std::path::PathBuf> = project_repo_for_seed
-            .list()
-            .ok()
-            .and_then(|all| all.into_iter().find(|p| p.id == project_id))
-            .and_then(|p| p.repo_path);
-        if let Some(path) = repo_path.as_ref() {
-            let all_ids: std::collections::HashSet<Uuid> =
-                project_skills.iter().map(|n| n.id).collect();
-            let enabled = crate::plugins::artifact::cascade::stages_sidecar::resolve_or_all(
-                path, &all_ids,
-            );
-            project_skills.retain(|n| enabled.contains(&n.id));
-        }
-        let current = match serde_json::from_str::<WorkflowGraph>(&graph_text_for_seed) {
-            Ok(g) => g,
-            Err(_) if graph_text_for_seed.trim().is_empty() => WorkflowGraph::new(),
-            Err(_) => return,
-        };
-        let next = crate::plugins::artifact::cascade_graph::append_numbered_skill_chain(
-            current,
-            &project_skills,
-        );
-        // Auto-expand every node in the post-seed graph so the chain
-        // is visible immediately. Without this, `compute_visible`
-        // walks from the indegree-0 root (skill 01) and stops there
-        // because no node is in `expanded` — the user sees only 01
-        // and has to click chevrons to reveal the rest.
-        let all_ids: std::collections::BTreeSet<NodeId> =
-            next.nodes.keys().copied().collect();
-        expanded.set(all_ids.clone());
-        persist_expanded.call(all_ids);
-        on_apply.call(serialize(&next));
-    };
+    // Resolve the cascade's seed artifact tile from the current graph
+    // text so the ▶ Run button can invoke `spawn_cascade` against the
+    // originating master-requirement / Requirements artifact — the
+    // same UUID `CascadePlayButton` on that artifact's tile would pass.
+    // Cascades are always seeded with one such tile by
+    // `cascade_graph::seed_cascade_workflow_root_only`; hand-built
+    // workflows without one render Run disabled. Re-derived on every
+    // render, mirroring `current_step_mode` above.
+    let seed_artifact_id: Option<Uuid> = serde_json::from_str::<WorkflowGraph>(&graph_text)
+        .ok()
+        .and_then(|g| {
+            g.nodes
+                .values()
+                .find(|n| n.is_artifact_snapshot && n.artifact_ref.is_some())
+                .and_then(|n| n.artifact_ref)
+        });
 
     rsx! {
         div { class: "operon-workflow-toolbar",
@@ -3094,33 +3051,44 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
             button {
                 r#type: "button",
                 class: "operon-workflow-toolbar-button",
-                "data-testid": "workflow-toolbar-add",
-                onclick: open_picker,
-                "+ Add skill node"
-            }
-            button {
-                r#type: "button",
-                class: "operon-workflow-toolbar-button",
-                "data-testid": "workflow-toolbar-add-artifact",
-                title: "Drop a read-only Artifact tile onto the canvas (Requirements / Epic / etc.) — wire it to a skill node to bind that skill's source artifact",
-                onclick: open_artifact_picker,
-                "+ Add artifact tile"
-            }
-            button {
-                r#type: "button",
-                class: "operon-workflow-toolbar-button",
-                "data-testid": "workflow-toolbar-seed",
-                title: "Add every numbered skill in the project as a chained Dirty node, in numeric order",
-                onclick: on_seed_pipeline,
-                "+ Seed pipeline"
-            }
-            button {
-                r#type: "button",
-                class: "operon-workflow-toolbar-button",
                 "data-testid": "workflow-toolbar-run",
-                title: "Run every Dirty node in topological order",
-                onclick: on_run_all,
-                "\u{25B6} Run all dirty"
+                disabled: seed_artifact_id.is_none(),
+                title: if seed_artifact_id.is_some() {
+                    "Run the SDLC pipeline from this cascade's seed artifact.".to_string()
+                } else {
+                    "This canvas has no seed artifact tile \u{2014} Run is disabled.".to_string()
+                },
+                onclick: {
+                    let note_repo = note_repo.clone();
+                    let project_repo = project_repo.clone();
+                    let persistence = persistence.clone();
+                    let plugin = plugin.clone();
+                    let chat_session_repo = chat_session_repo.clone();
+                    let chat_message_repo = chat_message_repo.clone();
+                    let mut note_version_setter = note_version;
+                    let mut chat_session_version_setter = chat_session_version;
+                    let mut active_session_setter = active_session_signal;
+                    let mut active_scope_setter = active_scope_signal;
+                    move |_| {
+                        let Some(root_id) = seed_artifact_id else { return; };
+                        crate::plugins::artifact::view::spawn_cascade(
+                            root_id,
+                            note_repo.clone(),
+                            project_repo.clone(),
+                            persistence.clone(),
+                            plugin.clone(),
+                            chat_session_repo.clone(),
+                            chat_message_repo.clone(),
+                            &mut note_version_setter,
+                            &mut chat_session_version_setter,
+                            &mut active_session_setter,
+                            &mut active_scope_setter,
+                            None,
+                            crate::plugins::artifact::cascade::RunMode::Full,
+                        );
+                    }
+                },
+                "\u{25B6} Run"
             }
             button {
                 r#type: "button",
@@ -3163,6 +3131,32 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
                 onclick: on_collapse_all,
                 "\u{25B8} Collapse all"
             }
+            {
+                let mut hide_cross = props.hide_cross_phase_edges;
+                let is_hiding = *hide_cross.read();
+                rsx! {
+                    button {
+                        r#type: "button",
+                        class: if is_hiding {
+                            "operon-workflow-toolbar-button operon-workflow-toolbar-button-active"
+                        } else {
+                            "operon-workflow-toolbar-button"
+                        },
+                        "data-testid": "workflow-toolbar-toggle-cross-phase",
+                        "aria-pressed": if is_hiding { "true" } else { "false" },
+                        title: if is_hiding {
+                            "Hiding edges that cross phase boundaries. Click to show every cross-phase dependency."
+                        } else {
+                            "Showing every edge, including cross-phase dependencies. Click to hide cross-phase edges and focus on one phase at a time."
+                        },
+                        onclick: move |_| {
+                            let v = *hide_cross.peek();
+                            hide_cross.set(!v);
+                        },
+                        if is_hiding { "\u{29C9} 1 phase" } else { "\u{29C9} All phases" }
+                    }
+                }
+            }
             button {
                 r#type: "button",
                 class: if *json_visible.read() {
@@ -3178,123 +3172,6 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
                     json_visible.set(!v);
                 },
                 if *json_visible.read() { "{{}} Hide JSON" } else { "{{}} Show JSON" }
-            }
-            if *picker_open.read() {
-                // Click-outside dismissal: a transparent fixed-position
-                // backdrop catches clicks anywhere outside the picker
-                // panel. The panel itself stops propagation so clicks
-                // on its options don't bubble up here and close it
-                // before the option's onclick handler runs.
-                div {
-                    class: "operon-workflow-skill-picker-backdrop",
-                    "data-testid": "workflow-skill-picker-backdrop",
-                    onclick: move |_| picker_open.set(false),
-                }
-                div {
-                    class: "operon-workflow-skill-picker",
-                    "data-testid": "workflow-skill-picker",
-                    onclick: move |evt: dioxus::events::MouseEvent| {
-                        evt.stop_propagation();
-                    },
-                    div { class: "operon-workflow-skill-picker-header",
-                        span { "Pick a skill to add" }
-                        button {
-                            r#type: "button",
-                            class: "operon-workflow-skill-picker-close",
-                            onclick: move |_| picker_open.set(false),
-                            "\u{2715}"
-                        }
-                    }
-                    if picker_options.read().is_empty() {
-                        div { class: "operon-workflow-skill-picker-empty",
-                            "No skill notes in this project yet \u{2014} create one with + \u{2192} Skill in the explorer."
-                        }
-                    } else {
-                        ul { class: "operon-workflow-skill-picker-list",
-                            for skill in picker_options.read().iter() {
-                                {
-                                    let skill_id = skill.id;
-                                    let label = skill.title.clone();
-                                    let graph_text = graph_text.clone();
-                                    let on_apply = on_apply;
-                                    rsx! {
-                                        li {
-                                            key: "{skill_id}",
-                                            button {
-                                                r#type: "button",
-                                                class: "operon-workflow-skill-picker-item",
-                                                onclick: move |_| {
-                                                    let next = append_node_to_graph(&graph_text, skill_id);
-                                                    on_apply.call(next);
-                                                    picker_open.set(false);
-                                                },
-                                                "{label}"
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if *artifact_picker_open.read() {
-                div {
-                    class: "operon-workflow-skill-picker-backdrop",
-                    "data-testid": "workflow-artifact-picker-backdrop",
-                    onclick: move |_| artifact_picker_open.set(false),
-                }
-                div {
-                    class: "operon-workflow-skill-picker",
-                    "data-testid": "workflow-artifact-picker",
-                    onclick: move |evt: dioxus::events::MouseEvent| {
-                        evt.stop_propagation();
-                    },
-                    div { class: "operon-workflow-skill-picker-header",
-                        span { "Pick an artifact to drop on the canvas" }
-                        button {
-                            r#type: "button",
-                            class: "operon-workflow-skill-picker-close",
-                            onclick: move |_| artifact_picker_open.set(false),
-                            "\u{2715}"
-                        }
-                    }
-                    if artifact_picker_options.read().is_empty() {
-                        div { class: "operon-workflow-skill-picker-empty",
-                            "No artifact notes in this project yet \u{2014} create a Requirements artifact in the explorer first."
-                        }
-                    } else {
-                        ul { class: "operon-workflow-skill-picker-list",
-                            for art in artifact_picker_options.read().iter() {
-                                {
-                                    let art_id = art.id;
-                                    let label = art.title.clone();
-                                    let graph_text = graph_text.clone();
-                                    let on_apply = on_apply;
-                                    rsx! {
-                                        li {
-                                            key: "{art_id}",
-                                            button {
-                                                r#type: "button",
-                                                class: "operon-workflow-skill-picker-item",
-                                                onclick: move |_| {
-                                                    let next = append_artifact_tile_to_graph(
-                                                        &graph_text,
-                                                        art_id,
-                                                        &label,
-                                                    );
-                                                    on_apply.call(next);
-                                                    artifact_picker_open.set(false);
-                                                },
-                                                "{label}"
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
             }
         }
     }
@@ -4169,6 +4046,14 @@ fn append_artifact_tile_to_graph(
 /// nodes in topological order, applying the mutated `WorkflowGraph`
 /// back to the editor signal after every step so the canvas reflects
 /// each node's lifecycle (Dirty → Running → Fresh / Error).
+///
+/// Currently unused: the toolbar's old "▶ Run all dirty" button was
+/// replaced by the master-requirement Run button, and there is no
+/// other caller. Kept around because the topo-by-dirty executor wiring
+/// here is non-trivial and may be useful if hand-authored workflows
+/// regain a runner in the future. Remove if it's still dead at the
+/// next major cleanup.
+#[allow(dead_code)]
 fn spawn_run_cascade(
     note_id_str: String,
     mut graph: WorkflowGraph,
