@@ -663,6 +663,33 @@ pub async fn run_cascade(
                 break;
             }
 
+            // Phase C: architecture-skill phase gate. The architecture
+            // skill is meant to fire ONCE per project, anchored on the
+            // first phase's master_requirement. Without this gate, every
+            // subsequent phase that has its own master_requirement
+            // re-spawns a duplicate architecture artifact under itself,
+            // breaking the "one architecture per project" semantic
+            // locked in during the three-tier design. Legacy projects
+            // with no phase notes are unaffected — `is_in_first_phase`
+            // returns true when no phase ancestor exists.
+            if skill.contract.output_kind.as_deref() == Some("architecture")
+                && !crate::plugins::phase::is_in_first_phase(
+                    note_repo,
+                    persistence,
+                    project_id,
+                    art_id,
+                )
+                .await
+            {
+                tracing::debug!(
+                    target: "operon::cascade",
+                    "phase gate: skipping architecture skill {} on {art_id} \
+                     (artifact not in first phase)",
+                    skill.id
+                );
+                continue;
+            }
+
             // Skip-already-produced gate. On a cascade re-run after
             // the user approved a checkpoint, the seed pops with all
             // its matching skills (e.g. 01 + 01b) still "matching" —

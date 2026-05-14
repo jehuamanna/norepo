@@ -16,6 +16,8 @@
 //! listing; `phase_label` is the free-form human name and falls back
 //! to the note's `title` column when absent.
 
+pub mod discovery;
 pub mod frontmatter;
 
+pub use discovery::{ancestor_phase_id, first_phase_id, is_in_first_phase};
 pub use frontmatter::{parse, serialize, PhaseFrontmatter};
