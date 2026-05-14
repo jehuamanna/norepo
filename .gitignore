@@ -21,3 +21,6 @@ pkg/
 
 # Misc
 .pnpm-store/
+
+# MCP config — contains per-developer tokens (FIGMA_API_KEY etc.)
+.mcp.json
