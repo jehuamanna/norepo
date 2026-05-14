@@ -19,5 +19,8 @@
 pub mod discovery;
 pub mod frontmatter;
 
-pub use discovery::{ancestor_phase_id, first_phase_id, is_in_first_phase};
+pub use discovery::{
+    ancestor_phase_id, architecture_under_phase, find_ce_root, first_phase_id,
+    is_in_first_phase, previous_phase_id,
+};
 pub use frontmatter::{parse, serialize, PhaseFrontmatter};

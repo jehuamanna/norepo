@@ -402,6 +402,81 @@ pub async fn run_skill_on_source_with_revision_notes(
         Vec::new()
     };
 
+    // 3c. Phase-F: prior-architecture inheritance chain. When the
+    //   skill produces `architecture`, the new architecture is
+    //   conceptually a REFINEMENT of the previous phase's
+    //   architecture, not a fresh draft. Walk:
+    //     - find the source's owning phase
+    //     - find the previous phase
+    //     - find that previous phase's architecture artifact
+    //   …and inline its body into the prompt as `--- prior
+    //   architecture (Phase N-1) ---`. If there's no previous phase
+    //   (Phase 0 / Discovery), fall back to CE's subtree as the
+    //   seed instead. Empty for non-architecture skills.
+    let (prior_architecture_title, prior_architecture_body, ce_seed_bundle): (
+        Option<String>,
+        Option<String>,
+        Vec<BundleEntry>,
+    ) = if contract.output_kind.as_deref() == Some("architecture") {
+        let here_phase = crate::plugins::phase::ancestor_phase_id(
+            note_repo,
+            project_id,
+            source_note_id,
+        );
+        let prev_phase = match here_phase {
+            Some(pid) => crate::plugins::phase::previous_phase_id(
+                note_repo,
+                persistence,
+                project_id,
+                pid,
+            )
+            .await,
+            None => None,
+        };
+        if let Some(prev_phase_id) = prev_phase {
+            // Look up the previous phase's architecture artifact + body.
+            let prior_id = crate::plugins::phase::architecture_under_phase(
+                note_repo,
+                persistence,
+                project_id,
+                prev_phase_id,
+            )
+            .await;
+            if let Some(pid) = prior_id {
+                let body = persistence
+                    .load(&pid.to_string())
+                    .await
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok());
+                let title = note_repo
+                    .list_for_project(project_id)
+                    .ok()
+                    .and_then(|ns| ns.into_iter().find(|n| n.id == pid))
+                    .map(|n| n.title);
+                (title, body, Vec::new())
+            } else {
+                (None, None, Vec::new())
+            }
+        } else {
+            // Phase 0 / no phases yet → seed from CE if it exists.
+            let ce_id = crate::plugins::phase::find_ce_root(
+                note_repo,
+                persistence,
+                project_id,
+            )
+            .await;
+            let ce_bundle = if let Some(ce) = ce_id {
+                collect_master_req_subtree(note_repo, persistence, project_id, ce)
+                    .await
+            } else {
+                Vec::new()
+            };
+            (None, None, ce_bundle)
+        }
+    } else {
+        (None, None, Vec::new())
+    };
+
     // 3b. Inheritance: walk the **ancestor chain** from the source
     //     upward and inline every sibling artifact whose
     //     `artifact_kind` matches the declared `inherit:` kind. Lets a
@@ -464,6 +539,9 @@ pub async fn run_skill_on_source_with_revision_notes(
         combined_notes.as_deref(),
         &previous_outputs,
         &bundle,
+        prior_architecture_title.as_deref(),
+        prior_architecture_body.as_deref(),
+        &ce_seed_bundle,
     );
 
     // 7. Persist the prompt as a User message (transcript visibility).
@@ -851,6 +929,9 @@ fn build_prompt(
     revision_notes: Option<&str>,
     previous_outputs: &[(String, String)],
     bundle: &[BundleEntry],
+    prior_architecture_title: Option<&str>,
+    prior_architecture_body: Option<&str>,
+    ce_seed_bundle: &[BundleEntry],
 ) -> String {
     let mut buf = String::new();
     buf.push_str(
@@ -930,6 +1011,64 @@ fn build_prompt(
             }
         }
         buf.push_str("--- /master-requirement subtree ---\n\n");
+    }
+
+    // Phase-F prior-architecture inheritance. Architecture-producing
+    // skills inline the previous phase's architecture body so the new
+    // architecture is a refinement, not a fresh draft. For Phase 0
+    // (no previous phase) the runner falls back to CE's subtree
+    // (`ce_seed_bundle`) as the originating seed; both are mutually
+    // exclusive — only one block ever renders per run.
+    if let Some(body) = prior_architecture_body {
+        let title = prior_architecture_title.unwrap_or("prior phase");
+        buf.push_str(&format!(
+            "--- prior architecture ({title}) ---\n\
+             This is the architecture artifact produced in the previous\n\
+             phase. Your task is to REFINE this — preserve every section\n\
+             header structure, keep decisions that still apply, amend\n\
+             sections where the new master requirement introduces\n\
+             changes, and add new sections only when genuinely new\n\
+             subsystems are needed. Cite the source section header in\n\
+             your `## Revision history` row when you change something.\n\n"
+        ));
+        buf.push_str(body.trim_end());
+        buf.push_str("\n--- /prior architecture ---\n\n");
+    } else if !ce_seed_bundle.is_empty() {
+        let text_count = ce_seed_bundle
+            .iter()
+            .filter(|e| matches!(e, BundleEntry::Text { .. }))
+            .count();
+        let image_count = ce_seed_bundle
+            .iter()
+            .filter(|e| matches!(e, BundleEntry::Image { .. }))
+            .count();
+        buf.push_str(&format!(
+            "--- CE seed ({text_count} text + {image_count} image) ---\n\
+             This project has no prior architecture yet — you are\n\
+             producing the FIRST one. The CE (customer-engagement)\n\
+             input bucket at the project root contains the raw client\n\
+             materials below. Read them as the originating brief and\n\
+             draft an architecture that honors them.\n\n"
+        ));
+        for entry in ce_seed_bundle {
+            match entry {
+                BundleEntry::Text { title, body } => {
+                    buf.push_str(&format!("--- ce: {title} ---\n"));
+                    buf.push_str(body.trim_end());
+                    buf.push_str(&format!("\n--- /ce: {title} ---\n\n"));
+                }
+                BundleEntry::Image { title, path } => {
+                    buf.push_str(&format!(
+                        "--- ce image: {title} ---\n\
+                         path: {}\n\
+                         (Use the Read tool to fetch this image if visual context is needed.)\n\
+                         --- /ce image: {title} ---\n\n",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        buf.push_str("--- /CE seed ---\n\n");
     }
 
     if !aggregated.is_empty() {
@@ -1796,6 +1935,9 @@ mod tests {
             None,
             &[],
             &[],
+            None,
+            None,
+            &[],
         );
         assert!(prompt.contains("REQ_BODY"));
         assert!(prompt.contains("SKILL_BODY"));
@@ -1836,12 +1978,84 @@ mod tests {
             None,
             &[],
             &bundle,
+            None,
+            None,
+            &[],
         );
         assert!(prompt.contains("master-requirement subtree (1 text + 1 image)"));
         assert!(prompt.contains("--- subtree: user-personas ---"));
         assert!(prompt.contains("Persona A: power user"));
         assert!(prompt.contains("--- subtree image: ui-mockup ---"));
         assert!(prompt.contains("/vault/.operon/images/mockup.png"));
+    }
+
+    #[test]
+    fn build_prompt_inlines_prior_architecture_when_present() {
+        let dir = std::path::Path::new("/tmp/x");
+        let mut contract = crate::plugins::skill::frontmatter::SkillContract::default();
+        contract.output_kind = Some("architecture".into());
+        let prompt = build_prompt(
+            "MASTER_REQ_BODY",
+            "SKILL_BODY",
+            dir,
+            &contract,
+            Uuid::nil(),
+            Uuid::nil(),
+            &[],
+            &[],
+            None,
+            &[],
+            &[],
+            Some("architecture-phase-0-discovery"),
+            Some("# Architecture\nDiscovery decisions go here.\n"),
+            &[],
+        );
+        assert!(prompt.contains("--- prior architecture (architecture-phase-0-discovery) ---"));
+        assert!(prompt.contains("Discovery decisions go here."));
+        assert!(prompt.contains("REFINE this"));
+        // CE-seed block must NOT render when prior arch is present.
+        assert!(!prompt.contains("CE seed"));
+    }
+
+    #[test]
+    fn build_prompt_inlines_ce_seed_when_no_prior_arch() {
+        let dir = std::path::Path::new("/tmp/x");
+        let mut contract = crate::plugins::skill::frontmatter::SkillContract::default();
+        contract.output_kind = Some("architecture".into());
+        let ce = vec![
+            BundleEntry::Text {
+                title: "ce-overview".into(),
+                body: "Client wants single-page memory match.".into(),
+            },
+            BundleEntry::Image {
+                title: "client-mockup".into(),
+                path: std::path::PathBuf::from("/vault/.operon/images/m.png"),
+            },
+        ];
+        let prompt = build_prompt(
+            "MASTER_REQ_BODY",
+            "SKILL_BODY",
+            dir,
+            &contract,
+            Uuid::nil(),
+            Uuid::nil(),
+            &[],
+            &[],
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &ce,
+        );
+        assert!(prompt.contains("--- CE seed (1 text + 1 image) ---"));
+        assert!(prompt.contains("--- ce: ce-overview ---"));
+        assert!(prompt.contains("Client wants single-page memory match."));
+        assert!(prompt.contains("--- ce image: client-mockup ---"));
+        // Prior-arch block header must NOT render (the CE-seed block
+        // does mention "prior architecture yet" in its prose, so
+        // assert on the fence line specifically).
+        assert!(!prompt.contains("--- prior architecture ("));
     }
 
     #[test]
@@ -1900,6 +2114,9 @@ mod tests {
             None,
             &[],
             &[],
+            None,
+            None,
+            &[],
         );
         assert!(prompt.contains("SEED_BODY"));
         assert!(prompt.contains("aggregated task artifacts (2 total)"));
@@ -1931,6 +2148,9 @@ mod tests {
             None,
             &[],
             &[],
+            None,
+            None,
+            &[],
         );
         assert!(prompt.contains("TASK_BODY"));
         assert!(prompt.contains(
@@ -1961,6 +2181,9 @@ mod tests {
             Some("Emphasize observability concerns"),
             &[],
             &[],
+            None,
+            None,
+            &[],
         );
         assert!(prompt.contains("--- refinement notes from user ---"));
         assert!(prompt.contains("Emphasize observability concerns"));
@@ -1984,6 +2207,9 @@ mod tests {
             &[],
             Some("   \n  "),
             &[],
+            &[],
+            None,
+            None,
             &[],
         );
         assert!(!prompt.contains("refinement notes"));
@@ -2010,6 +2236,9 @@ mod tests {
             None,
             &previous,
             &[],
+            None,
+            None,
+            &[],
         );
         assert!(prompt.contains("previous revisions to preserve (2 total)"));
         assert!(prompt.contains("--- previous: epic-01-onboarding ---"));
@@ -2035,6 +2264,9 @@ mod tests {
             &[],
             None,
             &[],
+            &[],
+            None,
+            None,
             &[],
         );
         assert!(!prompt.contains("previous revisions to preserve"));

@@ -110,3 +110,166 @@ pub async fn is_in_first_phase(
         (Some(p), Some(f)) => p == f,
     }
 }
+
+/// Return the phase id immediately preceding `start_phase_id` in the
+/// project's ordering. "Preceding" = highest `(phase_order,
+/// created_at_ms)` that is strictly less than the start phase's key.
+///
+/// Returns `None` when:
+/// - `start_phase_id` is the first phase (no previous), OR
+/// - `start_phase_id` is not a known phase note, OR
+/// - the project has no phase notes at all.
+///
+/// Used by the runner's architecture-skill inheritance: when running
+/// `06-sa-draft-architecture` for Phase N, the prompt inlines the
+/// architecture artifact from Phase N-1 as prior-art context. For
+/// Phase 0 (`previous_phase_id` returns None), the runner falls back
+/// to CE's subtree.
+pub async fn previous_phase_id(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    persistence: &Arc<dyn Persistence>,
+    project_id: Uuid,
+    start_phase_id: Uuid,
+) -> Option<Uuid> {
+    let notes = note_repo.list_for_project(project_id).ok()?;
+    let phase_notes: Vec<&LocalNote> = notes
+        .iter()
+        .filter(|n| matches!(n.kind, NoteKind::Phase))
+        .collect();
+    if phase_notes.is_empty() {
+        return None;
+    }
+    // Build the sort keys for every phase so we can locate the start
+    // phase's key and find the largest strictly-less neighbour in one
+    // pass.
+    let mut keyed: Vec<(Uuid, i32, i64)> = Vec::with_capacity(phase_notes.len());
+    for n in phase_notes {
+        let order = match persistence.load(&n.id.to_string()).await {
+            Ok(bytes) => String::from_utf8(bytes)
+                .ok()
+                .and_then(|body| frontmatter::parse(&body).order)
+                .unwrap_or(i32::MAX),
+            Err(_) => i32::MAX,
+        };
+        keyed.push((n.id, order, n.created_at_ms));
+    }
+    let start_key = keyed
+        .iter()
+        .find(|(id, _, _)| *id == start_phase_id)
+        .map(|(_, order, ts)| (*order, *ts))?;
+    keyed
+        .into_iter()
+        .filter(|(id, order, ts)| {
+            *id != start_phase_id && (*order, *ts) < start_key
+        })
+        .max_by_key(|(_, order, ts)| (*order, *ts))
+        .map(|(id, _, _)| id)
+}
+
+/// Find the project-root note whose body declares
+/// `artifact_kind: requirement` AND that has no master_requirement
+/// ancestor. The "CE" customer-engagement bucket — a project-level
+/// singleton sitting alongside the phases. Used by the runner as the
+/// fallback inheritance source for Phase 0's architecture (when
+/// `previous_phase_id` returns `None`).
+///
+/// Returns `None` if no such note exists. Convention: the user
+/// authors one `Artifact` note at the project root with kind
+/// `requirement`; everything under it (markdown, images, nested
+/// requirements) is part of CE.
+pub async fn find_ce_root(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    persistence: &Arc<dyn Persistence>,
+    project_id: Uuid,
+) -> Option<Uuid> {
+    let notes = note_repo.list_for_project(project_id).ok()?;
+    for n in &notes {
+        // CE is at project root (no parent).
+        if n.parent_id.is_some() {
+            continue;
+        }
+        if !matches!(n.kind, NoteKind::Artifact) {
+            continue;
+        }
+        let bytes = persistence.load(&n.id.to_string()).await.ok()?;
+        let body = String::from_utf8(bytes).ok()?;
+        let fm = crate::plugins::artifact::frontmatter::parse(&body);
+        if fm
+            .artifact_kind
+            .as_ref()
+            .map(|k| k.as_str() == "requirement" || k.as_str() == "requirements")
+            .unwrap_or(false)
+        {
+            return Some(n.id);
+        }
+    }
+    None
+}
+
+/// Find the architecture artifact (`artifact_kind: architecture`)
+/// living directly under `phase_id`'s master_requirement. Walks
+/// children of `phase_id` looking for a master_requirement, then
+/// walks that master's children for an Architecture. Returns `None`
+/// when either is missing.
+pub async fn architecture_under_phase(
+    note_repo: &Arc<dyn LocalNoteRepository>,
+    persistence: &Arc<dyn Persistence>,
+    project_id: Uuid,
+    phase_id: Uuid,
+) -> Option<Uuid> {
+    let notes = note_repo.list_for_project(project_id).ok()?;
+    // Step 1: find master_requirement child of phase_id.
+    let master_id = {
+        let mut found: Option<Uuid> = None;
+        for n in &notes {
+            if n.parent_id != Some(phase_id) {
+                continue;
+            }
+            if !matches!(n.kind, NoteKind::Artifact) {
+                continue;
+            }
+            let Ok(bytes) = persistence.load(&n.id.to_string()).await else {
+                continue;
+            };
+            let Ok(body) = String::from_utf8(bytes) else {
+                continue;
+            };
+            let fm = crate::plugins::artifact::frontmatter::parse(&body);
+            if fm
+                .artifact_kind
+                .as_ref()
+                .map(|k| k.as_str() == "master_requirement")
+                .unwrap_or(false)
+            {
+                found = Some(n.id);
+                break;
+            }
+        }
+        found?
+    };
+    // Step 2: find architecture child of master_id.
+    for n in &notes {
+        if n.parent_id != Some(master_id) {
+            continue;
+        }
+        if !matches!(n.kind, NoteKind::Artifact) {
+            continue;
+        }
+        let Ok(bytes) = persistence.load(&n.id.to_string()).await else {
+            continue;
+        };
+        let Ok(body) = String::from_utf8(bytes) else {
+            continue;
+        };
+        let fm = crate::plugins::artifact::frontmatter::parse(&body);
+        if fm
+            .artifact_kind
+            .as_ref()
+            .map(|k| k.as_str() == "architecture")
+            .unwrap_or(false)
+        {
+            return Some(n.id);
+        }
+    }
+    None
+}

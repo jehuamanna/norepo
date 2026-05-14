@@ -1,21 +1,22 @@
 # SDLC Pipeline — User Guide
 
-Operon turns a free-form charter into shippable code by running a chain
-of Claude-driven skills, each producing typed Artifact notes. This
-document explains the artifact tree, the placement rules, the run
-lifecycle, and the conventions you need to know to use the app
-effectively.
+Operon turns a free-form customer brief into shippable code by running
+a chain of Claude-driven skills, each producing typed Artifact notes.
+This document explains the artifact tree, the placement rules, the
+inheritance chain across phases, and the conventions you need to know
+to use the app effectively.
 
 If you're looking for an end-to-end walkthrough on a fresh app, the
-checklist at the bottom of this file is the quickest path.
+checklist at the bottom is the quickest path.
 
 ---
 
 ## Cascade artifact tree (post-cascade structure)
 
 ```
-demo (project)
-├── Skill notes ────────────────────── one per imported seed; NoteKind::Skill
+demo (Project)
+│
+├── Skills/                          ← one note per imported seed; NoteKind::Skill
 │   ├── 00-coherence-check
 │   ├── 02-ba-discover-epics
 │   ├── 02n-ba-normalize-epics
@@ -30,17 +31,29 @@ demo (project)
 │   ├── 07b-sde-execute-implementation
 │   ├── 08-sde-generate-tests
 │   ├── 09-sde-execute-tests
-│   ├── 10-sde-fix-bug
-│   └── 11-sa-review-architecture
+│   └── 10-sde-fix-bug
+│
+├── CE (Artifact, kind: requirement)         ← PROJECT-LEVEL singleton
+│   │   ↑ Customer-engagement input bucket. Human-authored, never
+│   │     consumed by a skill directly. Seeds Phase 0's architecture
+│   │     when no prior phase exists.
+│   │
+│   ├── CE - architecture (optional, kind: architecture)
+│   │       ↑ Customer's as-is / sketched system, if they provided one.
+│   ├── CE - more requirements (kind: requirement)
+│   ├── attached-brief.pdf
+│   └── ui-mockup.png
 │
 ├── Discovery (NoteKind::Phase, phase_order: 0)
 │   └── master-req-memory-match (Artifact: master_requirement)
-│       │     ↑ may have user-authored Markdown / nested master-reqs /
-│       │       images as direct children — those are BUNDLED into the
-│       │       prompt at run time, they're NOT separate cascade outputs.
+│       │     ↑ Human-authored by BA after reading CE. Can carry
+│       │       free-form Markdown / nested master-reqs / images as
+│       │       children — those are bundled into the prompt at run
+│       │       time, NOT cascade outputs.
 │       │
-│       ├── architecture-memory-match (Artifact: architecture)
-│       │   └── review-phase-1-multiplayer (Artifact: architecture_review)
+│       ├── architecture-discovery (Artifact: architecture)
+│       │       ↑ Drafted by `06-sa-draft-architecture` using CE's
+│       │         subtree as the seed (no prior phase exists yet).
 │       │
 │       └── epic-01-playable-memory-match (Artifact: epic)
 │           │  (body rewritten in place by 02n-ba normalizer)
@@ -67,17 +80,60 @@ demo (project)
 │           ├── feature-02 …
 │           └── feature-03 …
 │
-└── Phase 1 — Multiplayer (NoteKind::Phase, phase_order: 1)
-    └── master-req-multiplayer (Artifact: master_requirement)
-        │  ← Phase gate: `06-sa-draft-architecture` SKIPS here
-        │    (architecture is frozen after the first phase).
-        │  ← When this cascade completes, `11-sa-review-architecture`
-        │    auto-fires against the existing architecture and a new
-        │    review note appears under it.
-        │
-        └── epic-… (Artifact: epic)
-            └── feature-… → story-… → task-… → plan → impl → tests → results
+├── Phase 1 — Multiplayer (NoteKind::Phase, phase_order: 1)
+│   └── master-req-multiplayer (Artifact: master_requirement)
+│       ├── architecture-phase-1-multiplayer (Artifact: architecture)
+│       │       ↑ Drafted by `06-sa-draft-architecture`, REFINING the
+│       │         architecture from Discovery (the previous phase).
+│       └── epic-… → feature → story → task → plan → impl → tests
+│
+└── Phase 2 — Polish (NoteKind::Phase, phase_order: 2)
+    └── master-req-polish (Artifact: master_requirement)
+        ├── architecture-phase-2-polish (Artifact: architecture)
+        │       ↑ Refines architecture-phase-1-multiplayer.
+        └── epic-… → …
 ```
+
+---
+
+## The architecture inheritance chain
+
+Each phase has its **own** architecture, and each one builds on the
+previous. The chain is the spine of the project:
+
+```
+CE subtree (Markdown, images, optional CE-architecture)
+       │ (seeds when there's no prior phase)
+       ▼
+Phase 0 (Discovery) architecture
+       │ (refines)
+       ▼
+Phase 1 architecture
+       │ (refines)
+       ▼
+Phase 2 architecture
+       │
+       ▼  …
+```
+
+When `06-sa-draft-architecture` runs on a phase's master_requirement,
+the runner inlines exactly one of:
+
+- `--- prior architecture (architecture-phase-N-1.md) ---` — the
+  previous phase's architecture body. The skill is instructed to
+  preserve section structure, keep decisions that still apply, and
+  amend / add sections only where the new master_requirement
+  introduces changes. The output's `## Revision history` row names
+  the prior file and the sections that moved.
+
+- `--- CE seed (N text + M image) ---` — only fires when there's no
+  previous phase (Phase 0 / Discovery). The runner walks the CE
+  subtree, inlining every Markdown body and listing every image path.
+  The skill drafts a fresh architecture using the CE materials as the
+  brief.
+
+Exactly one block renders per run. CE is the originating seed for the
+chain; from Phase 1 onward, each architecture refines its predecessor.
 
 ---
 
@@ -93,13 +149,12 @@ demo (project)
 | `04n-ba-normalize-stories` | story | story | one | rewrites source | |
 | `05-ba-decompose-tasks` | story | task | many | child of source | |
 | `05n-sde-normalize-tasks` | task | task | one | rewrites source | |
-| `06-sa-draft-architecture` | master_requirement | architecture | one | sibling-of-epics under MR | gated to first phase only |
+| `06-sa-draft-architecture` | master_requirement | architecture | one | sibling-of-epics under MR | fires **every phase**; inherits the previous phase's architecture (or CE for Phase 0) |
 | `07a-sde-plan-task` | task | implementation_plan | one | child of task | inherits architecture |
 | `07b-sde-execute-implementation` | implementation_plan | implementation | one | child of plan | inherits architecture; writes code via Claude tools |
 | `08-sde-generate-tests` | implementation | test_cases | one | child of impl | |
 | `09-sde-execute-tests` | test_cases | test_results | one | child of test_cases | runs the tests, captures output |
 | `10-sde-fix-bug` | bug | implementation | one | child of bug | revision of an earlier impl |
-| `11-sa-review-architecture` | architecture | architecture_review | one | child of architecture | auto-fires for non-first-phase cascades |
 | `00-coherence-check` | any | clarification | many | child of disagreeing artifact | halts cascade until each Pending is resolved |
 
 `aggregate: <kind>` in a skill's frontmatter walks descendants of the
@@ -119,9 +174,9 @@ placement — they only enrich the prompt the model sees.
    the right thing.
 
 2. **Normalizer (`input_kind == output_kind`, `output_count: one`):**
-   no new note is created. The source body is **rewritten in place**,
-   preserving its parent and existing children. That's why Epic /
-   Feature / Story / Task bodies "improve" without the tree growing.
+   no new note. The source body is **rewritten in place**, preserving
+   its parent and existing children. Epic / Feature / Story / Task
+   bodies "improve" without the tree growing.
 
 3. **Aggregator (`aggregate: <kind>`):** the runner inlines every
    descendant of the source matching `<kind>` into the prompt.
@@ -135,10 +190,13 @@ placement — they only enrich the prompt the model sees.
   project's right-click → "Import skills…" menu.
 - **Phase notes** (`NoteKind::Phase`) live at the project root, created
   via right-click → "New phase".
+- **CE** is a project-level singleton `Artifact` (kind: `requirement`)
+  at the project root. Created manually via Add note → Artifact ▶ →
+  Requirement, then renamed to `CE` or similar. One per project.
 - **User-authored markdown, nested master-reqs, images** under a
-  `master_requirement` are **prompt inputs** (bundled into the skill
-  run's context), not cascade outputs.
-- **Workflow notes** (the cascade canvas) are siblings of artifacts,
+  `master_requirement` (or under `CE`) are **prompt inputs**, bundled
+  into the skill run's context, not cascade outputs.
+- **Workflow notes** (cascade canvas) are siblings of artifacts,
   auto-created the first time you Play. Treat them as a visualization,
   not part of the lineage.
 
@@ -151,10 +209,10 @@ Two structures kept in sync:
 - **Explorer tree** = the `parent_id` chain stored in SQLite. Drives
   the visible hierarchy in the side panel and what the cascade walks.
 - **On-disk artifact body** = `<repo>/.operon/artifacts/<slug>/<slug>/.../index.md`.
-  Each artifact note carries a stable `slug` (migration 018) so
-  renames don't break paths. The runner writes new artifacts to a
-  per-run tempdir under `.operon/`, then `import_produced_artifacts`
-  moves them to their canonical slug path.
+  Each artifact carries a stable `slug` (migration 018), so renames
+  don't break paths. The runner writes new artifacts to a per-run
+  tempdir under `.operon/`, then `import_produced_artifacts` moves
+  them to their canonical slug path.
 - **Clarification artifacts** (from `00-coherence-check`) are the one
   exception: they land as `.mdx` files in the per-run tempdir mid-
   cascade and get imported as `NoteKind::Artifact` children of the
@@ -197,12 +255,38 @@ Frontmatter fields:
 Ordering: explicit `phase_order` ascending, then `created_at_ms`
 ascending. Unnumbered phases sort to the end.
 
-**Architecture is frozen after the first phase.** When a master-req
-in Phase 1+ is run through the cascade, the architecture skill is
-gated off and the post-cascade auto-trigger fires the architecture-
-review skill instead. The review surfaces as a child note under
-architecture, plus a `needs_review: true` flag that drives a ⚠ badge
-in the explorer.
+Each phase contains one `master_requirement`, that master's
+`architecture`, the epic chain, and any per-phase free-form material.
+Architectures across phases form a refinement chain (see above);
+master_requirements do **not** — each phase's master is hand-authored
+by the BA.
+
+---
+
+## CE — the customer-engagement bucket
+
+CE is the entry point for everything the customer hands you:
+markdown design docs, attached PDFs, sketched architecture diagrams,
+mockup images. It sits at the project root as an `Artifact` (kind:
+`requirement`) and serves two roles:
+
+- **Reference for the BA.** Everything is in one place, with the
+  customer's structure preserved.
+- **Seed for Phase 0's architecture.** When `06-sa-draft-architecture`
+  runs on Discovery's master_requirement (which has no prior phase),
+  the runner walks the CE subtree and inlines every text body + image
+  path under `--- CE seed ---`. The architecture skill drafts from
+  scratch using this as the brief.
+
+One CE per project. Convention: name it `CE` and place it at the top
+of the explorer tree. Create via right-click → Add note → Artifact ▶
+→ Requirement, then rename. CE's children can be any mix of nested
+requirements, markdown, images, or even a CE-side architecture sketch
+the customer provided — all of it goes into the seed bundle.
+
+CE is **not** consumed by any skill directly. The BA reads it, writes
+Discovery's master_requirement manually as the team-internalized
+charter, then runs the cascade from Discovery.
 
 ---
 
@@ -258,36 +342,7 @@ dependency when debugging cross-batch wiring.
 
 ---
 
-## Architecture review (Phase E)
-
-When a Phase 1+ cascade completes, `11-sa-review-architecture` fires
-automatically against the project's existing architecture artifact.
-The output is a Pending `architecture_review` Artifact note as a
-child of architecture, plus a `needs_review: true` flag set on
-architecture itself.
-
-Surface signals:
-- Explorer row for architecture renders a ⚠ glyph next to the status
-  dot.
-- Opening architecture in the editor shows a yellow banner listing
-  pending review titles.
-- Opening a review shows `## Concerns`, `## Recommended amendments`,
-  `## No action needed if…`.
-
-When you Approve or Reject the last Pending/Dirty review, the
-architecture's `needs_review` flag clears automatically and the
-banner / badge disappear.
-
-Manual re-trigger: open architecture → ▶ Play → skill picker →
-`11-sa-review-architecture` (kind matches `architecture`).
-
-The review never auto-edits architecture. Applying the recommended
-amendments is the user's call — typically by editing the architecture
-body, clicking Mark dirty, and re-running downstream work.
-
----
-
-## Master-requirement subtree bundling (Phase D)
+## Master-requirement subtree bundling
 
 A master_requirement note is rarely a single document. You can author
 nested master-reqs, supporting Markdown notes, and images under it,
@@ -312,6 +367,9 @@ Walking order is depth-first by `sibling_index` so the prompt mirrors
 the tree you authored. Only `Markdown` notes, nested `master_requirement`
 artifacts, and `Image` notes go into the bundle — Epic / Feature /
 Story / etc. children are downstream outputs and are skipped.
+
+The same depth-first walker is used to build the CE seed bundle for
+Phase 0's architecture run — same content shape, different label.
 
 ---
 
@@ -352,6 +410,12 @@ each turn, with three useful affordances:
 For a wholly fresh re-run that discards the existing subtree: delete
 the children manually, then Play on the parent.
 
+For architectures specifically: marking a Phase N architecture Dirty
+and re-running iterates within that phase. To start a new
+architecture for Phase N+1, you create the next phase's
+master_requirement and Play on it — `06-sa-draft-architecture` then
+inherits Phase N's architecture as the prior.
+
 ---
 
 ## Bug fixing
@@ -371,19 +435,22 @@ test cycle (`08` → `09`) then re-runs to confirm.
 3. Right-click the workspace → New project. Bind a repository.
 4. Right-click project → Import skills… → pick the `seed-skills-updated/`
    folder.
-5. Right-click project → New phase → name it `Discovery`. Set
+5. Right-click project → Add note → Artifact ▶ → Requirement → name
+   it `CE`. Author / paste the customer brief into its body.
+6. Optionally add Markdown / image / nested requirement children
+   under `CE` (mockups, attached PDFs, customer-side architecture).
+7. Right-click project → New phase → name it `Discovery`. Set
    `phase_order: 0` in its body.
-6. Under Discovery, create a `master_requirement` artifact. Write the
-   charter, Approve.
-7. (Optional) author Markdown / image children under the master-req
-   for richer context (Phase D bundle).
-8. Click ▶ Play on the master-req. Watch the cascade walk
-   architecture + epics, normalize them, then go feature → story →
-   task → plan → impl → tests → results.
-9. (Optional) New phase → `Phase 1`. Create another master_requirement.
-   Play. This time architecture is NOT re-spawned; a review note
-   appears under the existing architecture.
-10. Open the review, read the concerns, Approve. The ⚠ flag clears.
+8. Under Discovery, create a `master_requirement` artifact. Write the
+   team-internalized charter (derived from CE, but in your own
+   words). Approve.
+9. Click ▶ Play on the master_requirement. Watch the cascade walk
+   architecture (seeded by CE) + epics, normalize them, then go
+   feature → story → task → plan → impl → tests → results.
+10. (Optional) New phase → `Phase 1`. Create another master_requirement.
+    Play. The architecture skill fires again, this time inheriting
+    Phase 0's architecture as the prior — refinement, not redraft.
+11. Repeat for Phase 2, 3, … as new requirement batches arrive.
 
 ---
 
@@ -391,11 +458,11 @@ test cycle (`08` → `09`) then re-runs to confirm.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `architecture` appears as a child of an Epic | Play clicked on Epic before Phase A.1; legacy data | Drag architecture under master_req in explorer |
+| `architecture` appears as a child of an Epic | Play clicked on Epic before the runner's auto-ascend landed | Drag architecture under master_req in explorer |
 | Cascade halts immediately with "unresolved clarifications" | A `00-coherence-check` clarification is Pending | Open each Pending clarification, pick an answer, retry Play |
 | Skill picker shows skills greyed out as mismatched | The source's `artifact_kind` doesn't match the skill's `input_kind` | Either Play on a kind-matching parent, or trust the runner to ascend to one |
-| Phase 1 cascade spawns a second architecture | Phase note has wrong `phase_order` (≤ 0) | Check the phase's body frontmatter and the parent chain — the master-req must be inside a `NoteKind::Phase` with `phase_order > min` |
-| ⚠ flag stuck on architecture after approving all reviews | `LocalNoteVersion` didn't refresh in this view | Switch tabs and back; or check the architecture body for stray `needs_review: true` |
-| Model picker shows "Inherit (Claude default)" even after setting global | The global value was saved but the view's memo hasn't refreshed | Restart the app, or change + change-back the global to bump `GLOBAL_SETTINGS_VERSION` |
-| Mention chip click does nothing | Running in wasm preview / sandbox without `NoteLinkResolver` provided | Use the desktop build; or wait for the panel to fully mount before clicking |
+| Phase 1 architecture is a redraft, not a refinement | Phase 1's master_req has no `phase_order` and sorts before Discovery's | Add `phase_order: 1` to Phase 1's frontmatter |
+| Phase 0 architecture references nothing from CE | CE doesn't exist or isn't at project root | Create a Requirement Artifact at project root with the customer brief, name it `CE`, replay |
+| Mention chip click does nothing | Running in wasm preview / sandbox without `NoteLinkResolver` provided | Use the desktop build |
 | Permission shim missing notice in chat header | `operon-mcp-permission` binary not built or not on PATH | `cargo build` rebuilds it as a sibling of the main binary; or set `OPERON_MCP_PERMISSION_BIN` |
+| Model picker shows "Inherit (Claude default)" even after setting global | Memo hasn't refreshed | Restart the app, or change + change-back the global to bump `GLOBAL_SETTINGS_VERSION` |
