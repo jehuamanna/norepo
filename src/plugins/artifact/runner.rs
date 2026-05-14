@@ -1111,7 +1111,71 @@ pub async fn import_produced_artifacts(
         }
         created_ids.push(row_id);
     }
+
+    // Phase E: when the skill produced architecture_review notes,
+    // flip `needs_review: true` on the parent architecture so the
+    // explorer + canvas badges pick it up. The source for an
+    // architecture-review run is the architecture artifact itself
+    // (input_kind: architecture), so `source_note_id` IS the
+    // parent we need to mark. Only flip when we actually imported at
+    // least one review — empty runs (no produced files) shouldn't
+    // raise the flag.
+    if !created_ids.is_empty()
+        && contract.output_kind.as_deref() == Some("architecture_review")
+    {
+        flip_needs_review_on(persistence, source_note_id, true).await;
+    }
+
     created_ids
+}
+
+/// Phase E: rewrite the artifact at `note_id` to set
+/// `needs_review = value`, preserving the rest of the body and
+/// frontmatter. Used by `import_produced_artifacts` to raise the
+/// flag on an architecture when a fresh review lands, and by the
+/// view's approve/reject handlers to clear it when no Pending /
+/// Dirty reviews remain. Errors are logged and swallowed — flipping
+/// the flag is best-effort UI signaling, not load-bearing semantics.
+pub async fn flip_needs_review_on(
+    persistence: &Arc<dyn Persistence>,
+    note_id: Uuid,
+    value: bool,
+) {
+    let bytes = match persistence.load(&note_id.to_string()).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                target: "operon::artifact",
+                "flip_needs_review: load {note_id} failed: {e}"
+            );
+            return;
+        }
+    };
+    let body = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                target: "operon::artifact",
+                "flip_needs_review: utf8 {note_id}: {e}"
+            );
+            return;
+        }
+    };
+    let mut fm = crate::plugins::artifact::frontmatter::parse(&body);
+    if fm.needs_review == value {
+        return; // no-op, avoid touching mtime
+    }
+    fm.needs_review = value;
+    let rewritten = rewrite_artifact_fm(&body, &fm);
+    if let Err(e) = persistence
+        .save(&note_id.to_string(), rewritten.as_bytes())
+        .await
+    {
+        tracing::warn!(
+            target: "operon::artifact",
+            "flip_needs_review: save {note_id} failed: {e}"
+        );
+    }
 }
 
 /// `true` when a skill contract describes an in-place rewrite: the

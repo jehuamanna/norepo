@@ -565,6 +565,32 @@ html, body {
   background: var(--vscode-charts-red, #f85149);
 }
 
+/* Phase E: pending-review glyph on Architecture rows when a later
+   phase has spawned an architecture_review child that hasn't been
+   resolved. Sits next to the status dot so the user sees both the
+   approval state and the review flag at a glance. */
+.operon-note-needs-review {
+  margin-left: 4px;
+  color: var(--vscode-editorWarning-foreground, #d6a23d);
+  font-size: 11px;
+  line-height: 1;
+}
+
+.operon-artifact-needs-review {
+  border-left: 3px solid var(--vscode-editorWarning-foreground, #d6a23d);
+  background: rgba(214, 162, 61, 0.08);
+}
+.operon-artifact-needs-review-list {
+  margin: 4px 0 0 16px;
+  padding: 0;
+  font-size: 0.85em;
+  opacity: 0.85;
+}
+.operon-workflow-node-needs-review {
+  outline: 2px solid var(--vscode-editorWarning-foreground, #d6a23d);
+  outline-offset: -2px;
+}
+
 .notes-explorer-toolbar {
   display: flex;
   align-items: center;

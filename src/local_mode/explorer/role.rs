@@ -17,6 +17,12 @@ use crate::plugins::artifact::frontmatter::{ArtifactKind, ArtifactStatus};
 pub struct ArtifactMeta {
     pub kind: Option<ArtifactKind>,
     pub status: ArtifactStatus,
+    /// Phase E: `true` when this artifact has the `needs_review` flag
+    /// set in its frontmatter. The explorer row uses this to render a
+    /// ⚠ next to the status dot. Only meaningful for Architecture
+    /// artifacts today; cheap enough to thread through for all kinds
+    /// in case future skills set the flag elsewhere.
+    pub needs_review: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -53,7 +59,9 @@ pub fn role_for_artifact_kind(kind: &ArtifactKind) -> Option<Role> {
         | ArtifactKind::Summary
         | ArtifactKind::Clarification
         | ArtifactKind::PrioritizedBacklog => Some(Role::Ba),
-        ArtifactKind::Architecture | ArtifactKind::Plan => Some(Role::Sa),
+        ArtifactKind::Architecture
+        | ArtifactKind::ArchitectureReview
+        | ArtifactKind::Plan => Some(Role::Sa),
         ArtifactKind::Task
         | ArtifactKind::Implementation
         | ArtifactKind::ImplementationPlan

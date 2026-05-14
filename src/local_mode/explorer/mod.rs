@@ -2429,6 +2429,7 @@ pub fn ExplorerPanel() -> Element {
                             role::ArtifactMeta {
                                 kind: fm.artifact_kind,
                                 status: fm.status,
+                                needs_review: fm.needs_review,
                             },
                         );
                     }
@@ -3138,6 +3139,11 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
                             .artifact_meta
                             .get(&note.id)
                             .map(|m| m.status),
+                        needs_review: props
+                            .artifact_meta
+                            .get(&note.id)
+                            .map(|m| m.needs_review)
+                            .unwrap_or(false),
                         in_rename: props.renaming_note == Some(note.id),
                         is_first_sibling: is_first,
                         is_last_sibling: is_last,

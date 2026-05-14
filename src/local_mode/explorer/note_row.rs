@@ -48,6 +48,13 @@ pub struct NoteRowProps {
     /// dot at the row's right edge so users can see workflow progress
     /// at a glance. `None` for non-Artifact notes — no dot.
     pub artifact_status: Option<crate::plugins::artifact::frontmatter::ArtifactStatus>,
+    /// Phase E: when `true`, the row renders a ⚠ glyph next to the
+    /// status dot to flag that this Architecture artifact has a
+    /// pending `architecture_review` child. Only set by the parent
+    /// row-builder when the underlying note is an Architecture with
+    /// `needs_review: true` in its frontmatter.
+    #[props(default = false)]
+    pub needs_review: bool,
     pub in_rename: bool,
     pub is_first_sibling: bool,
     pub is_last_sibling: bool,
@@ -1094,6 +1101,15 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                                 "aria-label": "Status: {status_str}",
                             }
                         }
+                    }
+                }
+                if props.needs_review {
+                    span {
+                        class: "operon-note-needs-review",
+                        "data-testid": "note-row-needs-review",
+                        title: "Pending architecture review",
+                        "aria-label": "Pending architecture review",
+                        "\u{26A0}"
                     }
                 }
                 button {
