@@ -25,7 +25,10 @@ use uuid::Uuid;
 
 use crate::plugins::workflow::engine::{compute_input_hash, hash_body, SkillBag, SkillSnapshot};
 use crate::plugins::workflow::state::{Node, NodeId, WorkflowGraph};
-use crate::shell::companion_state::{ArtifactRunState, ARTIFACT_RUN_STATE};
+use crate::shell::companion_state::{
+    publish_node_live, summarize_tool_input, ArtifactRunState, NodeLiveGuard, NodeLiveTool,
+    ARTIFACT_RUN_STATE, NODE_LIVE_STATE,
+};
 
 /// Phase-4 cascade transcript persistence: when the cascade routes
 /// through a real `chat_session`, the executor records each Claude
@@ -218,6 +221,16 @@ pub async fn run_node(
     });
     let mut run_state_guard = RunStateGuard::armed(operon_session);
 
+    // Per-node live state: cleared at run start so a prior run's
+    // last_error / last_write_file doesn't linger on the tile.
+    // Lifecycle mirrors `RunStateGuard` — `NodeLiveGuard` clears
+    // the entry on drop so a cancelled task doesn't leave the tile
+    // showing a half-finished tool call.
+    NODE_LIVE_STATE.with_mut(|m| {
+        m.remove(&node_id);
+    });
+    let mut node_live_guard = NodeLiveGuard::armed(node_id);
+
     // Run claude.
     eprintln!(
         "operon: executor::run_node [{node_id}] calling plugin.send_rich \
@@ -231,6 +244,10 @@ pub async fn run_node(
         Err(e) => {
             let reason = format!("send_rich: {e}");
             run_state_guard.disarm_with(ArtifactRunState::Failed { reason: reason.clone() });
+            publish_node_live(node_id, |s| {
+                s.last_error = Some(reason.clone());
+            });
+            node_live_guard.disarm();
             return Err(ExecError::Plugin(reason));
         }
     };
@@ -297,6 +314,10 @@ pub async fn run_node(
                 }
             }
             AgentEvent::Thinking(t) => {
+                publish_node_live(node_id, |s| {
+                    s.thinking = true;
+                    s.active_tool = None;
+                });
                 flush_assistant(&mut assistant_buf);
                 if let Some(sink) = transcript_sink.as_ref() {
                     let _ = sink.chat_repo.append(
@@ -309,6 +330,27 @@ pub async fn run_node(
                 }
             }
             AgentEvent::ToolUse { id, name, input } => {
+                publish_node_live(node_id, |s| {
+                    s.thinking = false;
+                    s.active_tool = Some(NodeLiveTool {
+                        id: id.clone(),
+                        name: name.clone(),
+                        summary: summarize_tool_input(&name, &input),
+                    });
+                    if name == "Write" {
+                        if let Some(path) =
+                            input.get("file_path").and_then(|v| v.as_str())
+                        {
+                            s.last_write_file = Some(
+                                std::path::Path::new(path)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or(path)
+                                    .to_string(),
+                            );
+                        }
+                    }
+                });
                 flush_assistant(&mut assistant_buf);
                 if let Some(sink) = transcript_sink.as_ref() {
                     let _ = sink.chat_repo.append(
@@ -352,6 +394,15 @@ pub async fn run_node(
                 }
             }
             AgentEvent::ToolResult { tool_use_id, content, is_error } => {
+                publish_node_live(node_id, |s| {
+                    if s.active_tool
+                        .as_ref()
+                        .map(|t| t.id == tool_use_id)
+                        .unwrap_or(false)
+                    {
+                        s.active_tool = None;
+                    }
+                });
                 if let Some(sink) = transcript_sink.as_ref() {
                     // Patch the prior ToolCall row so the rail reads as
                     // a complete round-trip card. Same shape regular
@@ -371,6 +422,10 @@ pub async fn run_node(
                 }
             }
             AgentEvent::Done { .. } => {
+                NODE_LIVE_STATE.with_mut(|m| {
+                    m.remove(&node_id);
+                });
+                node_live_guard.disarm();
                 flush_assistant(&mut assistant_buf);
                 break;
             }
@@ -403,6 +458,12 @@ pub async fn run_node(
                 }
             }
             AgentEvent::Error(msg) => {
+                publish_node_live(node_id, |s| {
+                    s.thinking = false;
+                    s.active_tool = None;
+                    s.last_error = Some(msg.clone());
+                });
+                node_live_guard.disarm();
                 flush_assistant(&mut assistant_buf);
                 if let Some(sink) = transcript_sink.as_ref() {
                     let _ = sink.chat_repo.append(
@@ -440,12 +501,17 @@ pub async fn run_node(
         std::thread::sleep(std::time::Duration::from_millis(80));
     }
     if produced.is_empty() {
+        let reason = format!(
+            "claude finished but no .md files appeared in {}",
+            out_dir.display()
+        );
         run_state_guard.disarm_with(ArtifactRunState::Failed {
-            reason: format!(
-                "claude finished but no .md files appeared in {}",
-                out_dir.display()
-            ),
+            reason: reason.clone(),
         });
+        publish_node_live(node_id, |s| {
+            s.last_error = Some(reason);
+        });
+        node_live_guard.disarm();
         return Err(ExecError::OutputMissing(out_dir.clone()));
     }
     // Lead-output backward compat for callers that still read

@@ -30,7 +30,7 @@ use crate::plugins::workflow::executor::{
 use crate::plugins::workflow::state::{Edge, EdgeId, Node, NodeId, NodeStatus, WorkflowGraph};
 use crate::shell::companion_state::{
     ActiveChatScope, ActiveChatSession, ChatMessageRepo, ChatSessionRepo, ChatSessionVersion,
-    ClaudeCodePluginCtx,
+    ClaudeCodePluginCtx, NodeLiveState, NODE_LIVE_STATE,
 };
 use operon_store::repos::ChatScope;
 
@@ -47,6 +47,7 @@ const NODE_H: f64 = 210.0;
 const NODE_ROW1_Y: f64 = 22.0; // header strip (chevron + kind + ≡ ▶ ✏)
 const NODE_ROW2_Y: f64 = 64.0; // name / title text baseline
 const NODE_ROW_ACTIONS_Y: f64 = 92.0; // artifact action strip (Approve / Reject / …)
+const NODE_ROW_LIVE_Y: f64 = 112.0; // M3 live-activity readout (skill nodes only)
 const NODE_ROW_STATUS_Y: f64 = 132.0; // NodeStatus pills (Dirty / Running / …)
 const NODE_ROW_FOOTER_Y: f64 = 172.0; // 👁 view + 🗑 delete icons
 /// Top of each in-tile control band — used as the rect `y` for
@@ -952,6 +953,15 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
         None
     };
     let selected_node_view = single_selected.and_then(|sid| g.nodes.get(&sid).cloned());
+
+    // Per-node live state snapshot. Subscribing here (rather than
+    // per-tile) re-renders the whole canvas when ANY node's live
+    // state changes — fine because publishes are bounded by
+    // tool-call / thinking-block frequency, not streaming-text
+    // frequency (executor.rs intentionally omits Text from the
+    // publish path).
+    let node_live_snap: HashMap<Uuid, NodeLiveState> =
+        NODE_LIVE_STATE.read().clone();
 
     let persist_view = props.persist_view;
     let reset_view = {
@@ -2039,6 +2049,34 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                         x: "16",
                                         y: "{NODE_ROW2_Y}",
                                         "{n.label}"
+                                    }
+                                    // Row 3 (skill nodes only) — live activity
+                                    // readout fed by the executor's AgentEvent
+                                    // stream via NODE_LIVE_STATE. Shows current
+                                    // tool, thinking pulse, last write, or
+                                    // last error. Cleared on Done; sticky on
+                                    // Error so the failure reason survives the
+                                    // run's terminal event.
+                                    {
+                                        let live_render: Option<(&'static str, String, &'static str)> = if n.is_artifact_snapshot {
+                                            None
+                                        } else {
+                                            node_live_snap.get(&n.id).map(describe_live_state)
+                                        };
+                                        if let Some((icon, label, css)) = live_render {
+                                            rsx! {
+                                                text {
+                                                    class: "operon-workflow-node-live operon-workflow-node-live-{css}",
+                                                    "data-testid": "workflow-node-live",
+                                                    "data-live-kind": "{css}",
+                                                    x: "16",
+                                                    y: "{NODE_ROW_LIVE_Y}",
+                                                    "{icon} {label}"
+                                                }
+                                            }
+                                        } else {
+                                            rsx! {}
+                                        }
                                     }
                                     // (Status moved to the row-4 pill
                                     // strip — the pill that matches
@@ -3350,6 +3388,27 @@ fn truncate_for_card(s: &str) -> String {
     out
 }
 
+/// Derive icon + body + CSS modifier from a node's live-state snapshot.
+/// Priority: error > active_tool > thinking > last_write. The returned
+/// css modifier ("error" / "tool" / "thinking" / "write" / "idle") is
+/// appended to the base `operon-workflow-node-live` class so styles can
+/// differentiate (e.g. red for error, dim for idle).
+fn describe_live_state(s: &NodeLiveState) -> (&'static str, String, &'static str) {
+    if let Some(err) = s.last_error.as_ref() {
+        return ("\u{2716}", truncate_for_card(err.as_str()), "error");
+    }
+    if let Some(tool) = s.active_tool.as_ref() {
+        return ("\u{25B8}", truncate_for_card(tool.summary.as_str()), "tool");
+    }
+    if s.thinking {
+        return ("\u{2728}", "thinking\u{2026}".to_string(), "thinking");
+    }
+    if let Some(f) = s.last_write_file.as_ref() {
+        return ("\u{1F4DD}", truncate_for_card(f.as_str()), "write");
+    }
+    ("\u{00B7}", String::new(), "idle")
+}
+
 fn node_label(n: &Node, skill_titles: &HashMap<Uuid, String>) -> String {
     let raw = if n.is_artifact_snapshot {
         // Cascade snapshot: prefer the artifact's cached title (e.g.
@@ -4180,6 +4239,38 @@ fn spawn_run_cascade(
             project_id_opt,
             transcript_sink.is_some(),
         );
+
+        // M2 — refresh <repo>/.claude/CLAUDE.md with the project's
+        // current SDLC inventory before binding the session, so the
+        // first turn of this cascade sees up-to-date context. Failure
+        // is non-fatal: the cascade still runs without the doc.
+        if let Some(project_id) = project_id_opt {
+            let project_name = project_repo
+                .get(project_id)
+                .ok()
+                .flatten()
+                .map(|p| p.name)
+                .unwrap_or_else(|| "Unknown project".to_string());
+            if let Err(e) = crate::plugins::artifact::claude_context::write_project_claude_md(
+                &note_repo,
+                &persistence,
+                project_id,
+                &project_name,
+                &repo_path,
+            )
+            .await
+            {
+                eprintln!(
+                    "operon: cascade CLAUDE.md refresh failed (non-fatal): {e}"
+                );
+            } else {
+                eprintln!(
+                    "operon: cascade CLAUDE.md refreshed at {}/.claude/CLAUDE.md",
+                    repo_path.display()
+                );
+            }
+        }
+
         plugin.bind_session(operon_session, repo_path.clone());
 
         // Switch the companion's rail to the cascade's session so the
@@ -4478,6 +4569,32 @@ fn spawn_run_node(
             });
         }
         let operon_session = cascade_session_id;
+
+        // M2 — refresh <repo>/.claude/CLAUDE.md before binding so the
+        // per-node ▶ run sees the up-to-date SDLC inventory on its
+        // first turn. Non-fatal on failure.
+        if let Some(project_id) = project_id_opt {
+            let project_name = project_repo
+                .get(project_id)
+                .ok()
+                .flatten()
+                .map(|p| p.name)
+                .unwrap_or_else(|| "Unknown project".to_string());
+            if let Err(e) = crate::plugins::artifact::claude_context::write_project_claude_md(
+                &note_repo,
+                &persistence,
+                project_id,
+                &project_name,
+                &repo_path,
+            )
+            .await
+            {
+                eprintln!(
+                    "operon: per-node run CLAUDE.md refresh failed (non-fatal): {e}"
+                );
+            }
+        }
+
         plugin.bind_session(operon_session, repo_path.clone());
 
         // Switch the rail to the cascade session so the user sees the
@@ -4826,6 +4943,7 @@ async fn run_one_node_sdlc(
         operon_session,
         source_id,
         node_snapshot.skill_note_id,
+        Some(node_id),
         cancel,
     )
     .await

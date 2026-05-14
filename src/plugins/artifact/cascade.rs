@@ -344,6 +344,32 @@ pub async fn run_cascade(
         )));
     }
 
+    // 0b. M2 — refresh <repo>/.claude/CLAUDE.md with the project's
+    //     current SDLC inventory before any skill runs. Claude reads
+    //     CLAUDE.md once at session start (this cascade uses --resume
+    //     across nodes), so the first runner invocation will pick up
+    //     the freshest context. Non-fatal: a failure here means
+    //     Claude falls back to whatever CLAUDE.md was already on disk
+    //     (possibly nothing), which doesn't break the cascade.
+    if let Ok(Some(project)) = project_repo.get(project_id) {
+        if let Some(repo_path) = project.repo_path.as_ref() {
+            if let Err(e) = super::claude_context::write_project_claude_md(
+                note_repo,
+                persistence,
+                project_id,
+                &project.name,
+                repo_path,
+            )
+            .await
+            {
+                tracing::warn!(
+                    target: "operon::cascade",
+                    "CLAUDE.md refresh failed for project {project_id}: {e}"
+                );
+            }
+        }
+    }
+
     // 1. Snapshot every project skill, drop the ones not in the
     //    enabled set, parse contracts. One-shot — skill bodies don't
     //    change mid-cascade.
@@ -935,6 +961,7 @@ pub async fn run_cascade(
                     skill.id,
                     dirty_notes.clone(),
                     previous_outputs.clone(),
+                    None,
                     cancel.clone(),
                 )
                 .await
@@ -948,6 +975,7 @@ pub async fn run_cascade(
                     cascade_session_id,
                     art_id,
                     skill.id,
+                    None,
                     cancel.clone(),
                 )
                 .await
@@ -1279,6 +1307,7 @@ pub async fn run_cascade(
                     cascade_session_id,
                     arch_id,
                     review_skill_id,
+                    None,
                     cancel.clone(),
                 )
                 .await;

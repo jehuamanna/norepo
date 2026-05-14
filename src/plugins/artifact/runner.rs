@@ -26,6 +26,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::persistence::Persistence;
+use crate::shell::companion_state::{
+    publish_node_live, summarize_tool_input, NodeLiveGuard, NodeLiveTool,
+};
 use crate::plugins::artifact::aggregation::{
     collect_ancestor_sibling_artifacts, collect_descendant_artifacts,
     collect_master_req_subtree, BundleEntry,
@@ -154,6 +157,7 @@ pub async fn run_skill_on_source(
     chat_session_id: Uuid,
     source_note_id: Uuid,
     skill_note_id: Uuid,
+    workflow_node_id: Option<Uuid>,
     cancel: CancellationToken,
 ) -> Result<RunOutcome, RunnerError> {
     run_skill_on_source_with_revision_notes(
@@ -167,6 +171,7 @@ pub async fn run_skill_on_source(
         skill_note_id,
         None,
         Vec::new(),
+        workflow_node_id,
         cancel,
     )
     .await
@@ -207,6 +212,12 @@ pub async fn run_skill_on_source_with_revision_notes(
     skill_note_id: Uuid,
     extra_revision_notes: Option<(Uuid, String)>,
     previous_outputs: Vec<(String, String)>,
+    // M3 live-visibility hook: when the runner is invoked by the
+    // workflow cascade for a specific node, this carries the workflow
+    // `NodeId` so each AgentEvent can be surfaced on the canvas tile.
+    // `None` for per-artifact ▶ runs and the autonomous cascade —
+    // those have no workflow-canvas node to update.
+    workflow_node_id: Option<Uuid>,
     cancel: CancellationToken,
 ) -> Result<RunOutcome, RunnerError> {
     // 1. Resolve project + repo_path.
@@ -518,10 +529,31 @@ pub async fn run_skill_on_source_with_revision_notes(
     // `CancellationToken` clones share state — when the cascade's
     // outer token cancels, this clone fires too.
     let ct = cancel.clone();
+
+    // M3 live visibility — published only when the runner is invoked
+    // for a workflow canvas node. Clear any prior run's state and arm
+    // a drop-guard so a cancelled task doesn't leave the tile stuck
+    // showing the last tool call.
+    if let Some(nid) = workflow_node_id {
+        crate::shell::companion_state::NODE_LIVE_STATE.with_mut(|m| {
+            m.remove(&nid);
+        });
+    }
+    let mut node_live_guard = workflow_node_id.map(NodeLiveGuard::armed);
+
     let mut rx = plugin
         .send_rich(prompt, chat_session_id, ct)
         .await
-        .map_err(|e| RunnerError::Plugin(format!("send_rich: {e}")))?;
+        .map_err(|e| {
+            if let Some(nid) = workflow_node_id {
+                let reason = format!("send_rich: {e}");
+                publish_node_live(nid, |s| s.last_error = Some(reason));
+                if let Some(g) = node_live_guard.as_mut() {
+                    g.disarm();
+                }
+            }
+            RunnerError::Plugin(format!("send_rich: {e}"))
+        })?;
     let mut assistant_buf = String::new();
     while let Some(ev) = rx.next().await {
         // Persist event to the rail's chat_message (mirroring the
@@ -541,6 +573,61 @@ pub async fn run_skill_on_source_with_revision_notes(
         // import remains a safety net (idempotent dedup at
         // `import_produced_artifacts` keeps it a no-op for files
         // already imported).
+        // M3 live publish: surface tool/thinking activity on the
+        // workflow tile (when invoked from a workflow node).
+        if let Some(nid) = workflow_node_id {
+            match &ev {
+                ClaudeCodeEvent::ToolUse { id, name, input } => {
+                    let summary = summarize_tool_input(name, input);
+                    let write_file = if name == "Write" {
+                        input
+                            .get("file_path")
+                            .and_then(|v| v.as_str())
+                            .map(|p| {
+                                std::path::Path::new(p)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or(p)
+                                    .to_string()
+                            })
+                    } else {
+                        None
+                    };
+                    let tool = NodeLiveTool {
+                        id: id.clone(),
+                        name: name.clone(),
+                        summary,
+                    };
+                    publish_node_live(nid, move |s| {
+                        s.thinking = false;
+                        s.active_tool = Some(tool);
+                        if let Some(f) = write_file {
+                            s.last_write_file = Some(f);
+                        }
+                    });
+                }
+                ClaudeCodeEvent::ToolResult { tool_use_id, .. } => {
+                    let id = tool_use_id.clone();
+                    publish_node_live(nid, move |s| {
+                        if s.active_tool
+                            .as_ref()
+                            .map(|t| t.id == id)
+                            .unwrap_or(false)
+                        {
+                            s.active_tool = None;
+                        }
+                    });
+                }
+                ClaudeCodeEvent::Thinking(_) => {
+                    publish_node_live(nid, |s| {
+                        s.thinking = true;
+                        s.active_tool = None;
+                    });
+                }
+                _ => {}
+            }
+        }
+
         if let ClaudeCodeEvent::ToolUse { name, input, .. } = &ev {
             if name == "Write" {
                 if let Some(file_path) =
@@ -579,8 +666,29 @@ pub async fn run_skill_on_source_with_revision_notes(
             }
         }
         match ev {
-            ClaudeCodeEvent::Done { .. } => break,
+            ClaudeCodeEvent::Done { .. } => {
+                if let Some(nid) = workflow_node_id {
+                    crate::shell::companion_state::NODE_LIVE_STATE.with_mut(|m| {
+                        m.remove(&nid);
+                    });
+                    if let Some(g) = node_live_guard.as_mut() {
+                        g.disarm();
+                    }
+                }
+                break;
+            }
             ClaudeCodeEvent::Error(msg) => {
+                if let Some(nid) = workflow_node_id {
+                    let reason = msg.clone();
+                    publish_node_live(nid, move |s| {
+                        s.thinking = false;
+                        s.active_tool = None;
+                        s.last_error = Some(reason);
+                    });
+                    if let Some(g) = node_live_guard.as_mut() {
+                        g.disarm();
+                    }
+                }
                 if let Some(repo) = chat_repo {
                     let _ = repo.append(
                         chat_session_id,

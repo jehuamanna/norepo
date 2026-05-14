@@ -2234,6 +2234,31 @@ html, body {
   letter-spacing: 0.8px;
   opacity: 0.85;
 }
+.operon-workflow-node-live {
+  font-size: 11px;
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  fill: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+  opacity: 0.9;
+}
+.operon-workflow-node-live-tool {
+  fill: var(--operon-accent, #007fd4);
+}
+.operon-workflow-node-live-thinking {
+  fill: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+  font-style: italic;
+  animation: operon-workflow-node-live-pulse 1.4s ease-in-out infinite;
+}
+.operon-workflow-node-live-write {
+  fill: var(--vscode-editor-foreground);
+}
+.operon-workflow-node-live-error {
+  fill: var(--vscode-errorforeground, #f48771);
+  font-weight: 600;
+}
+@keyframes operon-workflow-node-live-pulse {
+  0%, 100% { opacity: 0.55; }
+  50%      { opacity: 1.0; }
+}
 .operon-workflow-node-view { cursor: pointer; }
 .operon-workflow-node-view-bg {
   fill: var(--vscode-editor-background, #1e1e1e);

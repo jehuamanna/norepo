@@ -303,6 +303,132 @@ pub struct McpLiveStatus {
 
 pub static MCP_LIVE_STATUS: GlobalSignal<McpLiveStatus> = Signal::global(McpLiveStatus::default);
 
+/// Live activity for the currently-executing tool call on a workflow
+/// node. Set when a `ToolUse` event lands; cleared when the matching
+/// `ToolResult` lands (or when the run terminates).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeLiveTool {
+    pub id: String,
+    pub name: String,
+    /// One-line human summary derived from the tool input
+    /// (e.g. `"Write epic-01.md"`, `"Bash: cargo check"`).
+    pub summary: String,
+}
+
+/// Per-cascade-node real-time state, surfaced from the executor's
+/// `AgentEvent` drain so the canvas can render activity on each node
+/// tile while a cascade runs.
+///
+/// Streaming `Text` deltas are intentionally NOT mirrored here — they
+/// fire dozens of times per second and would force a full canvas
+/// re-render on every keystroke. The chat panel handles letter-by-
+/// letter rendering via `INPROGRESS_ASSISTANT`; node tiles show
+/// coarser activity (current tool, thinking pulse, last write).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeLiveState {
+    pub active_tool: Option<NodeLiveTool>,
+    pub thinking: bool,
+    /// Filename (not full path) of the most recent `Write` tool input.
+    /// Sticks on the tile until the next `Write` or run end.
+    pub last_write_file: Option<String>,
+    pub last_error: Option<String>,
+}
+
+/// Per-node live state keyed by workflow `NodeId`. Same `GlobalSignal
+/// <HashMap<…>>` shape as `ARTIFACT_RUN_STATE` for the same reason:
+/// the executor writes from `spawn_forever` work that lives in the
+/// virtual root scope, so component-scoped `Signal`s would drop the
+/// writes.
+pub static NODE_LIVE_STATE: GlobalSignal<HashMap<Uuid, NodeLiveState>> =
+    Signal::global(HashMap::new);
+
+/// Apply `f` to the live-state entry for `node_id`, inserting a
+/// default if no entry exists. Shared by `workflow::executor` and
+/// `artifact::runner` so both code paths publish through the same
+/// helper.
+pub fn publish_node_live(node_id: Uuid, f: impl FnOnce(&mut NodeLiveState)) {
+    NODE_LIVE_STATE.with_mut(|m| {
+        f(m.entry(node_id).or_default());
+    });
+}
+
+/// One-line human summary of a tool's JSON input for display on the
+/// canvas tile. Best-effort: unknown tools fall back to the bare name.
+pub fn summarize_tool_input(name: &str, input: &serde_json::Value) -> String {
+    let truncate = |s: &str, n: usize| -> String {
+        if s.chars().count() <= n {
+            s.to_string()
+        } else {
+            let mut out: String = s.chars().take(n).collect();
+            out.push('\u{2026}');
+            out
+        }
+    };
+    let basename = |path: &str| -> String {
+        std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path)
+            .to_string()
+    };
+    match name {
+        "Write" | "Edit" | "Read" | "NotebookEdit" => input
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(|p| format!("{name} {}", basename(p)))
+            .unwrap_or_else(|| name.to_string()),
+        "Bash" => input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|c| format!("Bash: {}", truncate(c, 48)))
+            .unwrap_or_else(|| "Bash".to_string()),
+        "Task" => input
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|d| format!("Task: {}", truncate(d, 48)))
+            .unwrap_or_else(|| "Task".to_string()),
+        "Glob" => input
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .map(|p| format!("Glob: {}", truncate(p, 48)))
+            .unwrap_or_else(|| "Glob".to_string()),
+        "Grep" => input
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .map(|p| format!("Grep: {}", truncate(p, 48)))
+            .unwrap_or_else(|| "Grep".to_string()),
+        _ => name.to_string(),
+    }
+}
+
+/// Drop-guard that clears `NODE_LIVE_STATE[node_id]` if a run is
+/// cancelled before reaching a terminal event. Happy paths
+/// (Done / Error) call `disarm()` so the terminal entry (e.g.
+/// `last_error`) survives. Shared by `executor` and `runner`.
+pub struct NodeLiveGuard {
+    node_id: Option<Uuid>,
+}
+
+impl NodeLiveGuard {
+    pub fn armed(node_id: Uuid) -> Self {
+        Self { node_id: Some(node_id) }
+    }
+
+    pub fn disarm(&mut self) {
+        self.node_id = None;
+    }
+}
+
+impl Drop for NodeLiveGuard {
+    fn drop(&mut self) {
+        if let Some(node_id) = self.node_id.take() {
+            NODE_LIVE_STATE.with_mut(|m| {
+                m.remove(&node_id);
+            });
+        }
+    }
+}
+
 /// Shared `ClaudeCodeChatPlugin` instance — one Arc lives at App scope
 /// so both the companion (interactive chat) and the workflow executor
 /// (cascade Run) talk to the same long-lived `claude` subprocess

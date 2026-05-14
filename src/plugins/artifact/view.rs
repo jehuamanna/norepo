@@ -1479,6 +1479,7 @@ fn spawn_runner(
                 skill_note_id,
                 extra_revision_notes,
                 Vec::new(),
+                None,
                 cancel,
             )
             .await;

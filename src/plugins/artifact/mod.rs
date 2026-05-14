@@ -17,6 +17,8 @@ pub mod revisions;
 pub mod cascade;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod cascade_graph;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod claude_context;
 pub mod frontmatter;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod migrate_v018;
