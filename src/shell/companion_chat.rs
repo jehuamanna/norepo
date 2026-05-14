@@ -306,6 +306,12 @@ pub fn CompanionChat() -> Element {
     };
     let crate::local_mode::desktop::LocalSettingsRepo(settings_repo_for_prefs) =
         use_context();
+    // Resolver wired up by `desktop.rs::Workspace` — opens the note in
+    // a tab, sets `selected_note`, and asks the explorer to expand the
+    // path so the note becomes visible. Optional so tests / sandboxed
+    // previews without the resolver render mention chips as inert spans.
+    let note_link_resolver =
+        try_consume_context::<crate::plugins::markdown::render::NoteLinkResolver>();
     let session_version = match try_consume_context::<crate::shell::companion_state::ChatSessionVersion>() {
         Some(crate::shell::companion_state::ChatSessionVersion(v)) => v,
         None => {
@@ -907,7 +913,7 @@ pub fn CompanionChat() -> Element {
                         }
                     }
                     for (i, item) in transcript.read().iter().enumerate() {
-                        {render_item(i, item)}
+                        {render_item(i, item, note_link_resolver)}
                     }
                     // Inline permission prompts. These come from the
                     // MCP bridge — `claude --print` can't show its own
@@ -924,6 +930,7 @@ pub fn CompanionChat() -> Element {
                                 tool_name: entry.tool_name.clone(),
                                 input: entry.input.clone(),
                             },
+                            note_link_resolver,
                         )}
                     }
                     // Streaming surface (Phase G): live letter-by-
@@ -1290,7 +1297,10 @@ pub fn CompanionChat() -> Element {
     }
 }
 
-fn render_user_segments(text: &str) -> Vec<Element> {
+fn render_user_segments(
+    text: &str,
+    resolver: Option<crate::plugins::markdown::render::NoteLinkResolver>,
+) -> Vec<Element> {
     let re = mention_link_regex();
     let mut out: Vec<Element> = Vec::new();
     let mut last = 0usize;
@@ -1304,16 +1314,47 @@ fn render_user_segments(text: &str) -> Vec<Element> {
             idx += 1;
         }
         let title = cap.get(1).map(|x| x.as_str().to_string()).unwrap_or_default();
-        let note_id = cap.get(2).map(|x| x.as_str().to_string()).unwrap_or_default();
+        let note_id_str = cap.get(2).map(|x| x.as_str().to_string()).unwrap_or_default();
+        let parsed_uuid = Uuid::parse_str(&note_id_str).ok();
         let k = format!("um-{idx}");
-        out.push(rsx! {
-            span {
-                key: "{k}",
-                class: "operon-mention-chip",
-                "data-note-id": "{note_id}",
-                "{title}"
+        // When a `NoteLinkResolver` is available AND the uuid parses,
+        // the chip becomes clickable: the resolver opens the note in a
+        // tab and writes to `RevealNoteRequest`, which the explorer's
+        // reveal effect picks up to expand the owning project + walk
+        // ancestors. Tests / sandboxed previews without the resolver
+        // get the plain-span fallback.
+        match (resolver, parsed_uuid) {
+            (Some(crate::plugins::markdown::render::NoteLinkResolver(cb)), Some(uuid)) => {
+                out.push(rsx! {
+                    span {
+                        key: "{k}",
+                        class: "operon-mention-chip operon-mention-chip-clickable",
+                        "data-note-id": "{note_id_str}",
+                        role: "button",
+                        tabindex: "0",
+                        onclick: move |_| { cb.call(uuid); },
+                        onkeydown: move |evt| {
+                            let key = evt.key().to_string();
+                            if key == "Enter" || key == " " {
+                                evt.prevent_default();
+                                cb.call(uuid);
+                            }
+                        },
+                        "{title}"
+                    }
+                });
             }
-        });
+            _ => {
+                out.push(rsx! {
+                    span {
+                        key: "{k}",
+                        class: "operon-mention-chip",
+                        "data-note-id": "{note_id_str}",
+                        "{title}"
+                    }
+                });
+            }
+        }
         idx += 1;
         last = m.end();
     }
@@ -1325,7 +1366,11 @@ fn render_user_segments(text: &str) -> Vec<Element> {
     out
 }
 
-fn render_item(i: usize, item: &TranscriptItem) -> Element {
+fn render_item(
+    i: usize,
+    item: &TranscriptItem,
+    resolver: Option<crate::plugins::markdown::render::NoteLinkResolver>,
+) -> Element {
     let key = format!("{i}");
     match item {
         TranscriptItem::UserText(t) => rsx! {
@@ -1333,7 +1378,7 @@ fn render_item(i: usize, item: &TranscriptItem) -> Element {
                 key: "{key}",
                 class: "operon-companion-msg operon-companion-msg-user",
                 "data-role": "user",
-                {render_user_segments(t).into_iter()}
+                {render_user_segments(t, resolver).into_iter()}
             }
         },
         TranscriptItem::AssistantText(body) => rsx! {

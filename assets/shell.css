@@ -1853,6 +1853,17 @@ html, body {
   opacity: 0.7;
   margin-right: 1px;
 }
+.operon-mention-chip-clickable {
+  cursor: pointer;
+  user-select: none;
+}
+.operon-mention-chip-clickable:hover {
+  background: rgba(64, 128, 220, 0.24);
+}
+.operon-mention-chip-clickable:focus-visible {
+  outline: 2px solid var(--operon-accent, #4080dc);
+  outline-offset: 1px;
+}
 
 /* ------------ Cost meter footer ------------ */
 .operon-companion-cost-meter {

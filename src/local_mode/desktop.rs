@@ -658,6 +658,15 @@ pub fn provide_local_app_signals() {
     let tree_queue: Signal<TreeStateQueue> =
         use_signal(|| TreeStateQueue::new(tree_repo.clone()));
     use_context_provider(|| WorkspaceTreeQueueCtx(tree_queue));
+
+    // Cross-component reveal request. Companion-chat mention chips and
+    // the markdown note-link resolver write the target note's id here;
+    // an effect inside `ExplorerPanel` reads it, expands ancestors, and
+    // clears it back to None.
+    let reveal_note_request: Signal<Option<Uuid>> = use_signal(|| None);
+    use_context_provider(|| {
+        crate::local_mode::explorer::RevealNoteRequest(reveal_note_request)
+    });
     // Re-hydrate `workspace_open` whenever the project list changes — covers
     // freshly-created projects whose state wasn't fetched on first mount.
     {
@@ -792,6 +801,7 @@ pub fn provide_local_app_signals() {
     let tabs_for_note_link = tabs;
     let scheduler_for_note_link = scheduler.clone();
     let mut selected_note_for_note_link_setter = selected_note_for_links;
+    let mut reveal_request_for_note_link = reveal_note_request;
     let note_link_resolver = use_hook(move || {
         Callback::new(move |note_id: Uuid| {
             let snap_projects = project_repo_for_note_link.list().unwrap_or_default();
@@ -807,6 +817,11 @@ pub fn provide_local_app_signals() {
                             note.kind,
                         );
                         selected_note_for_note_link_setter.set(Some(note_id));
+                        // Ask the explorer to expand the owning project
+                        // + walk the ancestor chain so the note is
+                        // actually visible (the tab open + selection
+                        // alone don't expand collapsed parents).
+                        reveal_request_for_note_link.set(Some(note_id));
                         return;
                     }
                 }

@@ -222,6 +222,16 @@ pub struct WorkspaceOpenMap(pub Signal<HashMap<String, bool>>);
 #[derive(Clone, Copy)]
 pub struct WorkspaceTreeQueueCtx(pub Signal<TreeStateQueue>);
 
+/// App-scope reveal-request signal. External components (companion-chat
+/// mention chips, note-link resolvers, etc.) write a note's UUID here
+/// and the explorer's reveal effect picks it up: expands the owning
+/// project, walks the parent chain expanding each ancestor, sets
+/// `selected_note`, then clears the signal back to `None`. Decouples
+/// "reveal this note" from the explorer's local `project_note_open`
+/// signal which isn't accessible outside `ExplorerPanel`.
+#[derive(Clone, Copy)]
+pub struct RevealNoteRequest(pub Signal<Option<Uuid>>);
+
 const SCOPE_WORKSPACE: &str = "workspace";
 
 /// Plans-Phase-4-multiselect-aria: replace OS-unsafe characters with `_` so
@@ -703,6 +713,45 @@ pub fn ExplorerPanel() -> Element {
             cursor = parent_by_id.get(&id).copied().flatten();
         }
     };
+
+    // Cross-component reveal: external callers (companion-chat mention
+    // chips, the markdown note-link resolver, etc.) write a target note
+    // id to `RevealNoteRequest`; we walk it here. Expanding the owning
+    // project + the parent chain makes the note visible regardless of
+    // current tree-state, then `selected_note` puts the cursor on it.
+    // Cleared back to None at the end so the next bump re-fires this
+    // effect even for the same note.
+    {
+        let RevealNoteRequest(mut reveal_request) = use_context();
+        let notes_by_project_for_reveal = notes_by_project;
+        let mut open_project_for_reveal = open_project_workspace.clone();
+        let mut expand_ancestors_for_reveal = expand_ancestors.clone();
+        let mut selected_note_for_reveal = selected_note;
+        use_effect(move || {
+            let Some(target) = *reveal_request.read() else {
+                return;
+            };
+            // Locate the note's project + parent chain. The memo is
+            // keyed on `note_version`, so newly-created notes show up
+            // by the time the user can plausibly click a mention to
+            // them. If the lookup misses (cross-vault id, deleted
+            // note), still clear the signal so we don't loop.
+            let project_and_parent = {
+                let snap = notes_by_project_for_reveal.read();
+                snap.iter().find_map(|(pid, list)| {
+                    list.iter()
+                        .find(|n| n.id == target)
+                        .map(|n| (*pid, n.parent_id))
+                })
+            };
+            if let Some((pid, parent_id)) = project_and_parent {
+                open_project_for_reveal(pid);
+                expand_ancestors_for_reveal(pid, parent_id);
+                selected_note_for_reveal.set(Some(target));
+            }
+            reveal_request.set(None);
+        });
+    }
 
     let note_repo_for_add_root = note_repo.clone();
     let mut open_project_for_root = open_project_workspace.clone();
