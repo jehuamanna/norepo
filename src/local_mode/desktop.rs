@@ -596,9 +596,22 @@ async fn reload_open_tabs_from_disk(
         let is_artifact = matches!(kind, Some(NoteKind::Artifact));
 
         if is_artifact {
-            // Build a `claude` revision row from the disk-vs-tab diff
-            // and stitch it into the body BEFORE writing back. Order
-            // of operations: append → set tab content → save. By the
+            // PostToolUse hook is wired up: it owns the revision-row
+            // append and ships Claude's actual explanation as the
+            // summary. We just sync the tab buffer to disk here so
+            // the user sees the new content immediately; the hook's
+            // subsequent save lands the row a moment later.
+            if crate::local_mode::reload_socket::is_bound() {
+                let mut tabs_sig = tabs;
+                let mut tabs_w = tabs_sig.write();
+                tabs_w.reload_content(tid, body);
+                updated_any = true;
+                continue;
+            }
+            // Hook unavailable — keep the original behaviour: build
+            // a `claude` revision row from the disk-vs-tab diff and
+            // stitch it into the body BEFORE writing back. Order of
+            // operations: append → set tab content → save. By the
             // time `persistence.save` re-fires the notify watcher,
             // `tab.content` already equals `body_with_row`, so the
             // next pass sees prior == disk and short-circuits.
@@ -656,6 +669,125 @@ fn now_unix_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Reload the open tab whose persistence-resolved on-disk path matches
+/// `incoming` from disk, and for artifact tabs append a revision row
+/// using `summary` (or a diff-based fallback when `summary` is None).
+/// Used by the PostToolUse hook bridge: `operon-posttool-hook` reports
+/// the absolute path Claude just wrote plus Claude's preceding
+/// explanation, and we walk every open tab to find the one that maps
+/// to it.
+///
+/// Path comparison canonicalizes both sides where possible (so a
+/// symlinked vault or a path with `..` components still matches);
+/// falls back to lexical equality when canonicalize fails (the most
+/// common reason: the target was just deleted, in which case we
+/// skip — there's nothing to reload).
+///
+/// When the matched tab is an Artifact, this function takes ownership
+/// of the revision-row append (the inotify watcher defers to us via
+/// [`reload_socket::is_bound`]). The save's hash is recorded in the
+/// shared `PendingSelfWrites` map so the watcher's next sweep silently
+/// reloads instead of stacking another row.
+async fn reload_open_tab_by_path(
+    persistence: Arc<dyn Persistence>,
+    tabs: Signal<TabManager>,
+    note_repo: Arc<dyn LocalNoteRepository>,
+    pending: PendingSelfWrites,
+    incoming: PathBuf,
+    summary: Option<String>,
+) {
+    let incoming_canon = std::fs::canonicalize(&incoming).unwrap_or(incoming);
+    let tab_snapshot: Vec<(TabId, String)> = tabs
+        .read()
+        .iter()
+        .map(|t| (t.id, t.note_id.clone()))
+        .collect();
+    for (tid, note_id_str) in tab_snapshot {
+        let Some(resolved) = persistence.resolved_path(&note_id_str) else {
+            continue;
+        };
+        let resolved_canon = std::fs::canonicalize(&resolved).unwrap_or(resolved);
+        if resolved_canon != incoming_canon {
+            continue;
+        }
+        let bytes = match persistence.load(&note_id_str).await {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let body = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let id = match Uuid::parse_str(&note_id_str) {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let prior_body = tabs.read().get(tid).map(|t| t.content.clone());
+        // Artifact branch: build + persist a revision row whose
+        // summary is Claude's preceding explanation when we have it,
+        // falling back to the diff-based summary used by the watcher
+        // when the hook couldn't extract a transcript text block.
+        let kind = note_repo
+            .find_project_for_note(id)
+            .ok()
+            .flatten()
+            .and_then(|pid| note_repo.list_for_project(pid).ok())
+            .and_then(|notes| notes.into_iter().find(|n| n.id == id).map(|n| n.kind));
+        let is_artifact = matches!(kind, Some(NoteKind::Artifact));
+
+        if is_artifact {
+            // Skip if disk + tab + (no new summary) all agree —
+            // re-saves with no real change would otherwise stack a
+            // row per identical write.
+            if prior_body.as_deref() == Some(body.as_str()) && summary.is_none() {
+                return;
+            }
+            let summary_text = summary.unwrap_or_else(|| {
+                revision_table::compute_summary(prior_body.as_deref(), Some(body.as_str()))
+            });
+            let date = revision_table::format_revision_date(now_unix_ms());
+            let row = revision_table::RevisionRow {
+                revision: revision_table::next_revision_number(&body),
+                date,
+                derived_from: "claude".to_string(),
+                summary: summary_text,
+            };
+            let body_with_row = revision_table::append_revision_row(&body, row);
+            let mut tabs_sig = tabs;
+            {
+                let mut tabs_w = tabs_sig.write();
+                tabs_w.reload_content(tid, body_with_row.clone());
+            }
+            {
+                let mut pending_lock = pending.lock().await;
+                pending_lock
+                    .entry(note_id_str.clone())
+                    .or_default()
+                    .insert(hash_body(&body_with_row));
+            }
+            if let Err(e) = persistence
+                .save(&note_id_str, body_with_row.as_bytes())
+                .await
+            {
+                tracing::warn!(
+                    target: "operon::revision",
+                    "hook write-back of revision row for {id} failed: {e}"
+                );
+            }
+        } else {
+            // Non-artifact: silent reload, matches the watcher path.
+            if prior_body.as_deref() == Some(body.as_str()) {
+                return;
+            }
+            let mut tabs_sig = tabs;
+            let mut tabs_w = tabs_sig.write();
+            tabs_w.reload_content(tid, body);
+        }
+        *crate::shell::companion_state::LOCAL_NOTE_VERSION.write() += 1;
+        return;
+    }
 }
 
 /// Lift every Local-Mode app-scope signal to App scope so the Cloud `Shell`
@@ -980,6 +1112,54 @@ pub fn provide_local_app_signals() {
         });
     }
 
+    // PostToolUse reload bridge: Claude's `operon-posttool-hook` posts
+    // `{tool,path,summary}` over the Unix socket bound by
+    // `reload_socket::start()`. We walk every open tab, ask its
+    // persistence layer for the on-disk path, and reload the matching
+    // tab from disk — and for artifacts, append a revision row using
+    // Claude's preceding assistant text as the summary so the table
+    // says "Updated criterion to 8x8 round" instead of the diff-based
+    // "Edited body (61 lines)".
+    //
+    // Deterministic backstop for the inotify watchers (#1 and #2):
+    // notify can drop events on NFS / encrypted overlays / atomic-
+    // rename sequences, but Claude itself tells us exactly which
+    // file it just wrote.
+    {
+        let persistence_for_hook = persistence.clone();
+        let tabs_for_hook = tabs;
+        let LocalNoteRepo(note_repo_for_hook) = use_context::<LocalNoteRepo>();
+        // Reuse the artifact watcher's self-write echo map so saves
+        // we initiate from the hook path are recognised by the
+        // watcher's next sweep — no duplicate revision rows.
+        let pending_for_hook: PendingSelfWrites =
+            use_hook(|| Arc::new(AsyncMutex::new(HashMap::new())));
+        use_hook(move || {
+            let persistence = persistence_for_hook.clone();
+            let tabs_sig = tabs_for_hook;
+            let note_repo = note_repo_for_hook.clone();
+            let pending = pending_for_hook.clone();
+            spawn(async move {
+                let Some(mut rx) =
+                    crate::local_mode::reload_socket::take_receiver().await
+                else {
+                    return;
+                };
+                while let Some(evt) = rx.recv().await {
+                    reload_open_tab_by_path(
+                        persistence.clone(),
+                        tabs_sig,
+                        note_repo.clone(),
+                        pending.clone(),
+                        evt.path,
+                        evt.summary,
+                    )
+                    .await;
+                }
+            });
+        });
+    }
+
     // TOC auto-refresh: any time `LOCAL_NOTE_VERSION` bumps (rename,
     // create, delete, reparent, …), walk every open tab whose body
     // carries the `<!-- operon:toc -->` sentinel and regenerate the
@@ -1243,6 +1423,44 @@ pub fn provide_local_app_signals() {
                     .and_then(|p| p.repo_path)
             });
             active_setter.set(next);
+        });
+    }
+
+    // PostToolUse reload hook: bind the per-process Unix socket once
+    // at app start, then install / refresh the hook entry in
+    // `<repo>/.claude/settings.local.json` whenever the bound repo
+    // changes. Skipped silently when the hook binary can't be
+    // resolved (e.g. running from a build that didn't ship the
+    // sidecar) — the inotify watchers remain as the fallback.
+    {
+        let socket_for_install =
+            crate::local_mode::reload_socket::start();
+        let active_for_hook = active_repo_path;
+        use_effect(move || {
+            let Some(repo) = active_for_hook.read().clone() else {
+                return;
+            };
+            let Some(socket) = socket_for_install.clone() else {
+                return;
+            };
+            let Some(hook_bin) =
+                crate::shell::companion_chat::resolve_operon_posttool_hook()
+            else {
+                tracing::warn!(
+                    target: "operon::posttool_hook",
+                    "operon-posttool-hook binary not found; PostToolUse reloads disabled"
+                );
+                return;
+            };
+            if let Err(e) = crate::shell::posttool_hook::install(
+                &repo, &hook_bin, &socket,
+            ) {
+                tracing::warn!(
+                    target: "operon::posttool_hook",
+                    "install hook for {}: {e}",
+                    repo.display()
+                );
+            }
         });
     }
 

@@ -36,6 +36,8 @@ pub mod permission_persist;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod permission_prompt;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod posttool_hook;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod project_claude_settings;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod project_tool_permissions;

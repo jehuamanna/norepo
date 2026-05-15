@@ -8,20 +8,24 @@ category = "Productivity"
 short_description = "Operon — local-first notes editor"
 long_description = "Operon-dioxus is a local-first, project-aware notes editor."
 
-# Sidecar binary: ship the `operon-mcp-permission` MCP shim alongside the
-# main binary so tool-call approvals (Bash/Edit/Write) work in installed
-# release builds. Cross-platform mechanism — `dx bundle` looks for a file
-# named `operon-mcp-permission-<target-triple>` at the crate root and
-# copies it next to the main exe inside the package (so the runtime
-# sibling-probe in `resolve_shim_from_exe` finds it on every OS).
+# Sidecar binaries: shipped alongside the main binary so the runtime
+# sibling-probe in `resolve_shim_from_exe` / `resolve_operon_posttool_hook`
+# finds them in installed release builds.
 #
-# Build pipeline: `scripts/build-release.sh` runs `cargo build --release
-# --bin operon-mcp-permission`, then renames the output to the expected
-# `-<triple>` filename before invoking `dx bundle`. Layout per OS:
-#   .deb / .AppImage  →  /usr/bin/operon-mcp-permission (sibling of main)
-#   .app / .dmg       →  Operon.app/Contents/MacOS/operon-mcp-permission
+# - operon-mcp-permission: MCP shim for tool-call approvals (Bash/Edit/Write).
+# - operon-posttool-hook: PostToolUse reload hook — Claude Code dispatches
+#   this after every Write/Edit/MultiEdit so Operon can reload the matching
+#   open tab from disk over a Unix socket (more reliable than inotify).
+#
+# Cross-platform mechanism — `dx bundle` looks for a file named
+# `<bin>-<target-triple>` at the crate root and copies it next to the main
+# exe. Build pipeline: `scripts/build-release.sh` runs
+# `cargo build --release --bin <bin>` for each, renames to the expected
+# `-<triple>` filename, then invokes `dx bundle`. Layout per OS:
+#   .deb / .AppImage  →  /usr/bin/<bin> (sibling of main)
+#   .app / .dmg       →  Operon.app/Contents/MacOS/<bin>
 #   .msi / .exe       →  alongside operon-dioxus.exe in the install dir
-external_bin = ["operon-mcp-permission"]
+external_bin = ["operon-mcp-permission", "operon-posttool-hook"]
 
 [web.app]
 

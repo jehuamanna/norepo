@@ -20,6 +20,8 @@ pub mod images;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod note_lookup;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod reload_socket;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod vault;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod vault_picker;

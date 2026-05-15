@@ -151,6 +151,41 @@ fn resolve_shim_from_exe(exe: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Locate the `operon-posttool-hook` binary that gets baked into the
+/// project's `.claude/settings.local.json` as a PostToolUse hook
+/// command. Mirrors [`resolve_mcp_permission_shim`] exactly: env
+/// override, sibling of `current_exe()`, then the `target/debug`
+/// fallback used during `dx serve`.
+pub fn resolve_operon_posttool_hook() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("OPERON_POSTTOOL_HOOK_BIN") {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let bin_name = if cfg!(windows) {
+        "operon-posttool-hook.exe"
+    } else {
+        "operon-posttool-hook"
+    };
+    let sibling = dir.join(bin_name);
+    if sibling.is_file() {
+        return Some(sibling);
+    }
+    for ancestor in dir.ancestors() {
+        if ancestor.file_name().and_then(|n| n.to_str()) == Some("target") {
+            let probe = ancestor.join("debug").join(bin_name);
+            if probe.is_file() {
+                return Some(probe);
+            }
+            break;
+        }
+    }
+    None
+}
+
 #[component]
 pub fn CompanionChat() -> Element {
     // Pull the shared plugin from context (provided in

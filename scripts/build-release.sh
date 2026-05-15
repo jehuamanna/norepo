@@ -135,26 +135,29 @@ EOF
   fi
 fi
 
-# --- build the sidecar shim ----------------------------------------------
-echo "==> Building operon-mcp-permission (sidecar shim, release)..."
-cargo build --release --bin operon-mcp-permission
+# --- build the sidecar binaries ------------------------------------------
+echo "==> Building operon-mcp-permission + operon-posttool-hook (sidecars, release)..."
+cargo build --release --bin operon-mcp-permission --bin operon-posttool-hook
 
 # Discover host triple so the dx `external_bin` lookup matches.
 triple=$(rustc -vV | awk -F': ' '/^host:/ {print $2}')
 [[ -n "$triple" ]] || { echo "error: could not detect rustc host triple" >&2; exit 2; }
 
-shim_src="target/release/operon-mcp-permission"
 shim_ext=""
 if [[ "$target_os" == windows ]]; then
   shim_ext=".exe"
-  shim_src+=".exe"
 fi
-shim_dest="operon-mcp-permission-${triple}${shim_ext}"
 
-echo "==> Staging sidecar as ./${shim_dest} for dx external_bin lookup..."
-cp -f "$shim_src" "$shim_dest"
-chmod +x "$shim_dest" 2>/dev/null || true
-trap 'rm -f "$shim_dest"' EXIT
+declare -a staged_sidecars=()
+for bin in operon-mcp-permission operon-posttool-hook; do
+  src="target/release/${bin}${shim_ext}"
+  dest="${bin}-${triple}${shim_ext}"
+  echo "==> Staging ${bin} as ./${dest} for dx external_bin lookup..."
+  cp -f "$src" "$dest"
+  chmod +x "$dest" 2>/dev/null || true
+  staged_sidecars+=("$dest")
+done
+trap 'rm -f "${staged_sidecars[@]}"' EXIT
 
 # --- bundle --------------------------------------------------------------
 pt_args=()
