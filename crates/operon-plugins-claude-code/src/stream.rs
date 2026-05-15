@@ -358,9 +358,10 @@ mod tests {
             SessionBinding {
                 cwd: PathBuf::from("/tmp/repo"),
                 claude_session_id: None,
-                model: None,
                 permission_mode: None,
                 bridge: None,
+                bash_via_operon: false,
+                extra_dirs: Vec::new(),
             },
         );
         Arc::new(Mutex::new(state))
@@ -483,9 +484,10 @@ mod tests {
             SessionBinding {
                 cwd: PathBuf::from("/tmp/other"),
                 claude_session_id: Some("preexisting-B".into()),
-                model: None,
                 permission_mode: None,
                 bridge: None,
+                bash_via_operon: false,
+                extra_dirs: Vec::new(),
             },
         );
         let _ = parse_line(line, &state, sid_a);

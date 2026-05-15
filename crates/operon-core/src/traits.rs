@@ -141,6 +141,18 @@ pub trait ChatPlugin: Plugin {
     async fn complete(&self, req: ChatRequest, ct: CancellationToken) -> OperonResult<ChatStream>;
 }
 
+/// One streamed chunk from a tool's stdout/stderr (or arbitrary multi-
+/// channel output). The runtime relays these through
+/// `Step::ToolChunk` → `AgentEvent::ToolChunk` so the UI can render a
+/// live terminal-style region while the tool is running.
+#[derive(Clone, Debug)]
+pub struct ToolChunk {
+    /// `"stdout"` or `"stderr"` for shell-style tools. Plugins are
+    /// free to pick their own labels (e.g. `"progress"`).
+    pub kind: String,
+    pub bytes: Vec<u8>,
+}
+
 #[async_trait]
 pub trait ToolPlugin: Plugin {
     fn schema(&self) -> ToolDef;
@@ -149,6 +161,24 @@ pub trait ToolPlugin: Plugin {
         args: serde_json::Value,
         ct: CancellationToken,
     ) -> OperonResult<serde_json::Value>;
+
+    /// Streaming variant of [`invoke`]. Tools that produce incremental
+    /// output (`Bash`, long file scans, …) override this and send
+    /// chunks down `chunk_tx` as they arrive while still returning a
+    /// final aggregated result. Default implementation falls back to
+    /// the non-streaming `invoke` so existing plugins keep working.
+    /// `chunk_tx` is dropped by the runtime once `invoke_streaming`
+    /// returns; sends after that are no-ops.
+    async fn invoke_streaming(
+        &self,
+        args: serde_json::Value,
+        ct: CancellationToken,
+        _chunk_tx: tokio::sync::mpsc::UnboundedSender<ToolChunk>,
+    ) -> OperonResult<serde_json::Value> {
+        // Default: non-streaming. Channel goes unused, dropped on
+        // return like the spec promises.
+        self.invoke(args, ct).await
+    }
 }
 
 #[async_trait]

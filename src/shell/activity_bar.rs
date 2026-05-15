@@ -114,6 +114,11 @@ pub fn ActivityBar() -> Element {
                 }
             }
             div { style: "flex: 1 1 auto;" }
+            // Pending-permissions badge — hidden when nothing pending.
+            // Bridges the activity bar to the queued-approvals drawer
+            // so a background cascade's prompt can be acted on from
+            // anywhere in the app, not just inside the source chat.
+            crate::shell::permission_drawer::PermissionBadge {}
             if let (true, Some(so_ctx)) = (is_local, settings_open) {
                 button {
                     r#type: "button",

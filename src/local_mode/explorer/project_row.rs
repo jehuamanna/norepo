@@ -61,6 +61,12 @@ pub struct ProjectRowProps {
     /// belong in the generic "Add note" submenu alongside Markdown /
     /// Code / Skill.
     pub on_add_phase: Callback<Uuid>,
+    /// Migration 021 follow-up: project-level "New CE" command.
+    /// Creates a `NoteKind::Ce` note at project root (the
+    /// peer of Phase — both are root-level containers anchoring a
+    /// subtree of artifacts) and triggers inline rename. Distinct
+    /// from `on_add_note` for the same reason `on_add_phase` is.
+    pub on_add_ce: Callback<Uuid>,
     /// Plans-Phase-6-image-notes: external image-file drops onto this
     /// project row land as top-level image-notes in the project. Tuple is
     /// (project_id, bytes, suggested filename).
@@ -139,6 +145,7 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     let on_toggle = props.on_toggle;
     let on_add_note = props.on_add_note;
     let on_add_phase = props.on_add_phase;
+    let on_add_ce = props.on_add_ce;
     let on_drop_image_file = props.on_drop_image_file;
     let on_cut = props.on_cut;
     let on_copy = props.on_copy;
@@ -278,6 +285,12 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
             "New phase",
             Callback::new(move |_| {
                 on_add_phase.call(id);
+            }),
+        ),
+        ContextMenuItem::new(
+            "New CE",
+            Callback::new(move |_| {
+                on_add_ce.call(id);
             }),
         ),
         ContextMenuItem::new("Import skills\u{2026}", import_skills),

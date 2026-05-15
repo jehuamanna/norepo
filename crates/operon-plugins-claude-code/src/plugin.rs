@@ -99,6 +99,21 @@ pub(crate) struct SessionBinding {
     /// of silently denying. Skipped when `permission_mode` is
     /// `bypassPermissions` (claude won't ask in that mode anyway).
     pub bridge: Option<Arc<PermissionBridge>>,
+    /// When `true`, `spawn_turn` adds `--disallowedTools Bash` so
+    /// claude's built-in Bash tool is unavailable; the model should
+    /// reach for `mcp__operon__operon_bash` instead, which the
+    /// bridge advertises in `tools/list` when its shell executor is
+    /// installed. Opt-in via the per-repo `AutoApprovePolicy
+    /// .bash_via_operon` setting.
+    pub bash_via_operon: bool,
+    /// Additional directories passed to claude via `--add-dir` on
+    /// each `spawn_turn`. Lets the model `Read`/`Edit`/`Write` files
+    /// outside the session's `cwd` — primarily the vault's
+    /// `notes_dir` so `@[..](note:..)`-referenced notes can be
+    /// modified from a project-scoped chat whose cwd is the project
+    /// repo, not the vault. Preserved across `cwd` rebinds (the dirs
+    /// are orthogonal to which working directory claude runs in).
+    pub extra_dirs: Vec<PathBuf>,
 }
 
 impl ClaudeCodeChatPlugin {
@@ -125,15 +140,27 @@ impl ClaudeCodeChatPlugin {
     pub fn bind_session(&self, operon_session: Uuid, cwd: PathBuf) {
         let mut s = self.state.lock().expect("plugin state mutex poisoned");
         let existing = s.bindings.get(&operon_session).cloned();
-        let (claude_session_id, permission_mode, bridge) = match existing {
-            Some(b) if b.cwd == cwd => (b.claude_session_id, b.permission_mode, b.bridge),
+        let (claude_session_id, permission_mode, bridge, extra_dirs, bash_via_operon) = match existing {
+            Some(b) if b.cwd == cwd => (
+                b.claude_session_id,
+                b.permission_mode,
+                b.bridge,
+                b.extra_dirs,
+                b.bash_via_operon,
+            ),
             // cwd changed: invalidate the cached claude session id (it
             // was tied to the previous directory) but keep the
-            // permission-mode override + bridge — those are deliberate
-            // caller decisions that don't depend on the working
-            // directory.
-            Some(b) => (None, b.permission_mode, b.bridge),
-            None => (None, None, None),
+            // permission-mode override, bridge, extra_dirs, and
+            // bash_via_operon — those are deliberate caller decisions
+            // that don't depend on the working directory.
+            Some(b) => (
+                None,
+                b.permission_mode,
+                b.bridge,
+                b.extra_dirs,
+                b.bash_via_operon,
+            ),
+            None => (None, None, None, Vec::new(), false),
         };
         s.bindings.insert(
             operon_session,
@@ -142,8 +169,34 @@ impl ClaudeCodeChatPlugin {
                 claude_session_id,
                 permission_mode,
                 bridge,
+                bash_via_operon,
+                extra_dirs,
             },
         );
+    }
+
+    /// Toggle the per-session bash-via-operon flag. Reads back in
+    /// `spawn_turn` to decide whether to add `--disallowedTools Bash`
+    /// to the claude CLI. Defaults to `false`; the shell-side wiring
+    /// flips it on after consulting `AutoApprovePolicy.bash_via_operon`.
+    /// No-op if `bind_session` hasn't been called for `operon_session`.
+    pub fn set_session_bash_via_operon(&self, operon_session: Uuid, enabled: bool) {
+        let mut s = self.state.lock().expect("plugin state mutex poisoned");
+        if let Some(b) = s.bindings.get_mut(&operon_session) {
+            b.bash_via_operon = enabled;
+        }
+    }
+
+    /// Replace the extra-dirs list for `operon_session`. Companion shell
+    /// uses this to pin `<vault>/notes` so referenced-note edits work
+    /// in project-scoped chats whose `cwd` is the project repo. The
+    /// dirs are emitted as `--add-dir <path>` on each `spawn_turn`.
+    /// No-op when the session isn't bound — call `bind_session` first.
+    pub fn set_session_extra_dirs(&self, operon_session: Uuid, dirs: Vec<PathBuf>) {
+        let mut s = self.state.lock().expect("plugin state mutex poisoned");
+        if let Some(b) = s.bindings.get_mut(&operon_session) {
+            b.extra_dirs = dirs;
+        }
     }
 
     /// Drop a session's binding. After this, `complete()` calls referencing
@@ -309,7 +362,15 @@ impl ClaudeCodeChatPlugin {
         operon_session: Uuid,
         ct: CancellationToken,
     ) -> OperonResult<UnboundedReceiver<ClaudeCodeEvent>> {
-        let (cwd, claude_session_id, model_override, permission_mode, bridge) = {
+        let (
+            cwd,
+            claude_session_id,
+            model_override,
+            permission_mode,
+            bridge,
+            bash_via_operon,
+            extra_dirs,
+        ) = {
             let s = self.state.lock().expect("plugin state mutex poisoned");
             let binding = s.bindings.get(&operon_session).ok_or_else(|| {
                 OperonError::Provider {
@@ -336,6 +397,8 @@ impl ClaudeCodeChatPlugin {
                 s.default_model.clone(),
                 effective_mode,
                 binding.bridge.clone(),
+                binding.bash_via_operon,
+                binding.extra_dirs.clone(),
             )
         };
 
@@ -365,6 +428,36 @@ impl ClaudeCodeChatPlugin {
         }
         if let Some(mode) = &permission_mode {
             cmd.arg("--permission-mode").arg(mode);
+        }
+        // Allow tool access to dirs outside cwd. Typically populated
+        // with the vault's `notes_dir` by the companion shell so the
+        // `Read`/`Edit`/`Write` calls against `@[..](note:..)`
+        // references succeed in project-scoped chats whose cwd is the
+        // project repo. `--add-dir` accepts a list; one flag per path
+        // is the simplest call shape.
+        for dir in &extra_dirs {
+            cmd.arg("--add-dir").arg(dir);
+        }
+        // Log the resolved spawn shape once per turn so a hung tool
+        // call against a vault note can be diagnosed without
+        // attaching a debugger. Visible with `RUST_LOG=operon=info`
+        // (or equivalent tracing-subscriber config).
+        tracing::info!(
+            target: "operon::claude_spawn",
+            "spawn cwd={} extra_dirs={:?} perm_mode={:?} bridge={} bash_via_operon={}",
+            cwd.display(),
+            extra_dirs,
+            permission_mode,
+            bridge.is_some(),
+            bash_via_operon,
+        );
+        // Phase 6 bash-via-operon: claude's built-in Bash is barred
+        // for this session so the model has to call
+        // `mcp__operon__operon_bash` (advertised by the bridge when
+        // its shell executor is installed). Streams stdout/stderr
+        // live into the chat UI and supports per-tool Cancel.
+        if bash_via_operon {
+            cmd.arg("--disallowedTools").arg("Bash");
         }
 
         // Wire the inline-permission-prompt MCP tool when a session has
@@ -652,6 +745,58 @@ mod tests {
             plugin.current_claude_session(sid).as_deref(),
             Some("claude-session-A")
         );
+    }
+
+    #[test]
+    fn set_session_extra_dirs_replaces_list_and_persists_across_rebind() {
+        let plugin = ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
+            claude_bin: "/usr/bin/false".into(),
+            model: None,
+            shim_bin: None,
+        });
+        let sid = Uuid::new_v4();
+        plugin.bind_session(sid, "/tmp/repo-a".into());
+        plugin.set_session_extra_dirs(
+            sid,
+            vec![PathBuf::from("/vault/notes"), PathBuf::from("/extra")],
+        );
+        {
+            let st = plugin.state.lock().unwrap();
+            let b = st.bindings.get(&sid).unwrap();
+            assert_eq!(b.extra_dirs.len(), 2);
+            assert_eq!(b.extra_dirs[0], PathBuf::from("/vault/notes"));
+            assert_eq!(b.extra_dirs[1], PathBuf::from("/extra"));
+        }
+
+        // Same UUID, new cwd → extra_dirs survives (orthogonal to cwd).
+        plugin.bind_session(sid, "/tmp/repo-b".into());
+        {
+            let st = plugin.state.lock().unwrap();
+            let b = st.bindings.get(&sid).unwrap();
+            assert_eq!(b.extra_dirs.len(), 2);
+        }
+
+        // Replace with a different list — old entries gone.
+        plugin.set_session_extra_dirs(sid, vec![PathBuf::from("/new")]);
+        {
+            let st = plugin.state.lock().unwrap();
+            let b = st.bindings.get(&sid).unwrap();
+            assert_eq!(b.extra_dirs, vec![PathBuf::from("/new")]);
+        }
+    }
+
+    #[test]
+    fn set_session_extra_dirs_no_op_when_unbound() {
+        let plugin = ClaudeCodeChatPlugin::new(ClaudeCodeConfig {
+            claude_bin: "/usr/bin/false".into(),
+            model: None,
+            shim_bin: None,
+        });
+        let sid = Uuid::new_v4();
+        // No bind_session call → setter must NOT create a binding.
+        plugin.set_session_extra_dirs(sid, vec![PathBuf::from("/x")]);
+        let st = plugin.state.lock().unwrap();
+        assert!(st.bindings.get(&sid).is_none());
     }
 
     #[test]

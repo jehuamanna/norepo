@@ -167,6 +167,19 @@ pub struct SkillContract {
     /// declare it don't fail to load; the runner just doesn't
     /// honor it. Safe to leave in skill frontmatter; safe to omit.
     pub emit_workflow: bool,
+    /// MCP server requirements. Each entry is a substring matched
+    /// case-insensitively against connected MCP server names AND the
+    /// full tool inventory (e.g. `mcp__figma__get_figma_data`) on the
+    /// most recent `system/init`. The runner refuses to fire the skill
+    /// when any entry has no match — `requires_mcp: figma` halts the
+    /// BA epic-discovery skill whenever no Figma MCP server is
+    /// recognized, regardless of whether the source body actually
+    /// references a Figma design. Skills only declare MCP requirements
+    /// that they truly cannot run without; the gate is unconditional.
+    ///
+    /// Frontmatter accepts a comma-separated list, e.g.
+    /// `requires_mcp: figma` or `requires_mcp: figma, slack`.
+    pub requires_mcp: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -211,6 +224,15 @@ pub fn contract(lines: &[&str]) -> SkillContract {
         field(lines, "emit_workflow"),
         Some("true") | Some("True") | Some("TRUE") | Some("yes") | Some("Yes")
     );
+    let requires_mcp = field(lines, "requires_mcp")
+        .map(|raw| {
+            raw.split([',', ' '])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_lowercase())
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
     SkillContract {
         input_kind,
         output_kind,
@@ -221,6 +243,7 @@ pub fn contract(lines: &[&str]) -> SkillContract {
         inherit,
         cascade_stop,
         emit_workflow,
+        requires_mcp,
     }
 }
 

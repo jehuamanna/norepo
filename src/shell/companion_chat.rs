@@ -25,9 +25,10 @@
 use dioxus::prelude::*;
 use operon_core::traits::Usage;
 use operon_core::agent_event::{AgentBackend, AgentEvent};
+use regex::Regex;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
 
 use crate::agent::plugins::{ClaudeCodeChatPlugin, ClaudeCodeConfig};
@@ -74,21 +75,6 @@ pub enum TranscriptItem {
         input: Value,
     },
 }
-
-/// Common slash commands surfaced in the composer's "/" popover. The
-/// list is intentionally short — claude maintains its own dynamic
-/// per-install set, but this v1 just gets the user to *the most
-/// common ones* without typing. Selecting a command replaces the
-/// composer text wholesale; the user clicks Send to dispatch it.
-const SLASH_COMMANDS: &[&str] = &[
-    "/help",
-    "/clear",
-    "/compact",
-    "/cost",
-    "/context",
-    "/model",
-    "/login",
-];
 
 /// Resolve the path of the `claude` binary at startup. Tries, in order:
 /// 1. `OPERON_CLAUDE_BIN` env override.
@@ -210,7 +196,16 @@ pub fn CompanionChat() -> Element {
 
     let transcript = use_signal::<Vec<TranscriptItem>>(Vec::new);
     let mut composer = use_signal(String::new);
-    let mut slash_open = use_signal(|| false);
+    let mut mention_picker = use_signal::<Option<MentionPickerState>>(|| None);
+    // Notes the user has explicitly attached to this turn via drag-drop
+    // or the explorer's right-click "Send to chat". Rendered as a chip
+    // row above the textarea; appended to the composer text as
+    // `@[title](note:uuid)` tokens at send time and then cleared so
+    // each new turn starts with a clean tray. Stored title is the
+    // value at attach time and serves as the persistence fallback;
+    // the chip's *displayed* title is re-resolved live through
+    // `NoteTitleResolver` so renames update inline.
+    let mut attached_notes = use_signal::<Vec<(Uuid, String)>>(Vec::new);
     let in_flight = use_signal(|| false);
     let active_ct = use_signal::<Option<CancellationToken>>(|| None);
     let usage_total = use_signal::<Usage>(Usage::default);
@@ -326,6 +321,53 @@ pub fn CompanionChat() -> Element {
             inbox.set(None);
         }
     }
+    // Append-semantics sibling — the side-bar's "Send to chat"
+    // right-click writes a `@[<title>](note:<uuid>)` token here.
+    // Instead of clobbering the composer's text, parse the token into
+    // an entry on the attachment tray. peek + set on render-body is
+    // enough; the signal flips back to None after consumption.
+    let composer_append =
+        try_consume_context::<crate::shell::companion_state::CompanionComposerAppend>()
+            .map(|c| c.0);
+    if let Some(mut append) = composer_append {
+        let pending = append.peek().clone();
+        if let Some(text) = pending {
+            if let Some(cap) = mention_link_regex().captures(&text) {
+                if let (Some(title_m), Some(id_m)) = (cap.get(1), cap.get(2)) {
+                    if let Ok(uuid) = Uuid::parse_str(id_m.as_str()) {
+                        let title = title_m.as_str().to_string();
+                        let already = attached_notes
+                            .read()
+                            .iter()
+                            .any(|(u, _)| *u == uuid);
+                        if !already {
+                            attached_notes.write().push((uuid, title));
+                        }
+                    }
+                }
+            }
+            append.set(None);
+        }
+    }
+
+    // Optional context bundle for resolving `@[<title>](note:<uuid>)`
+    // mentions: the note repo + persistence supply title/body at send
+    // time, the project repo handles cross-scope title lookup for
+    // drag-drop, the drag session relays note IDs from the explorer's
+    // `ondragstart`, and the note-link resolver lets transcript chips
+    // click through to open the referenced note.
+    let note_link_resolver =
+        try_consume_context::<crate::plugins::markdown::render::NoteLinkResolver>();
+    let note_title_resolver =
+        try_consume_context::<crate::plugins::markdown::render::NoteTitleResolver>();
+    let note_repo_for_mentions: Option<Arc<dyn operon_store::repos::LocalNoteRepository>> =
+        try_consume_context::<crate::local_mode::desktop::LocalNoteRepo>().map(|c| c.0);
+    let persistence_for_mentions: Option<Arc<dyn crate::persistence::Persistence>> =
+        try_consume_context::<Arc<dyn crate::persistence::Persistence>>();
+    let project_repo_for_mentions: Option<Arc<dyn operon_store::repos::LocalProjectRepository>> =
+        try_consume_context::<LocalProjectRepo>().map(|c| c.0);
+    let drag_session_for_drop =
+        try_consume_context::<crate::local_mode::ui::DragSession>().map(|s| s.0);
 
     // Resolve cwd for the active scope. For Project scope, look the
     // repo_path up directly from `local_project` keyed by the scope's
@@ -338,7 +380,11 @@ pub fn CompanionChat() -> Element {
         Some(LocalProjectRepo(r)) => Some(r),
         None => None,
     };
+    // Sibling clone for the bind-effect's --add-dir computation. The
+    // memo below moves its own copy; this stays in the enclosing scope.
+    let project_repo_for_extras = project_repo_for_cwd.clone();
     let project_version = try_consume_context::<LocalProjectVersion>().map(|c| c.0);
+    let project_version_for_extras = project_version;
     let cwd_for_scope = use_memo(move || -> Option<PathBuf> {
         let _ = active_repo.read();
         if let Some(v) = project_version.as_ref() {
@@ -367,11 +413,21 @@ pub fn CompanionChat() -> Element {
         let backend_for_effect = active_backend;
         let session = session_signal;
         let cwd = cwd_for_scope;
+        let vault_for_effect = vault_root;
+        // `project_repo_for_extras` and `project_version_for_extras`
+        // are siblings of the cwd_for_scope memo's captures — declared
+        // before it so both consumers get their own owned/copied value.
+        let project_repo_for_extras = project_repo_for_extras.clone();
+        let project_version_for_extras = project_version_for_extras;
         use_effect(move || {
+            if let Some(v) = project_version_for_extras.as_ref() {
+                let _ = v.read();
+            }
             let backend = backend_for_effect.read().clone();
             let claude_plugin = plugin_for_effect.read().clone();
             let sid = *session.read();
             let cwd = cwd.read().clone();
+            let vault_root = vault_for_effect;
             match (sid, cwd) {
                 (Some(sid), Some(cwd)) => {
                     let cwd_for_bind = cwd.clone();
@@ -389,11 +445,81 @@ pub fn CompanionChat() -> Element {
                     // runtime — the runtime emits permission requests via
                     // `AgentEvent::PermissionRequest` instead.
                     if backend.id() == "claude-code" {
+                        // Race-fix: the async `bind_session(...).await`
+                        // above runs in a `spawn` and may not have
+                        // executed yet by the time the setters below
+                        // run synchronously. With no binding, every
+                        // `set_session_*` is a silent no-op — extras
+                        // never land and `--add-dir` never makes it to
+                        // claude's argv. Call the plugin's sync
+                        // `bind_session` directly here so the binding
+                        // exists *before* the setters fire. The async
+                        // trait call above is then idempotent on the
+                        // same cwd (it preserves everything we just
+                        // wrote). The artifact runner uses the same
+                        // pattern at `plugins/artifact/runner.rs:592`.
+                        claude_plugin.bind_session(sid, cwd.clone());
+                        // Match the artifact runner: pin the session to
+                        // `acceptEdits` so File/Edit/Write auto-approve
+                        // and only the genuinely-gated tools (Bash, Web,
+                        // exotic MCP servers) surface a prompt. Without
+                        // this, a session inherits the global default —
+                        // typically `default`, which prompts for every
+                        // tool call including read-only Bash and makes
+                        // the figma-MCP-check pattern hang waiting for
+                        // approval on a trivial command.
+                        claude_plugin.set_session_permission_mode(
+                            sid,
+                            Some("acceptEdits".into()),
+                        );
+                        // Pin extra directories for claude's `--add-dir`
+                        // so its `Read`/`Edit`/`Write` tools reach every
+                        // file a referenced note might live in:
+                        //   - `<vault>/notes/` for non-artifact notes
+                        //     (opaque UUID-named files outside any
+                        //     project repo).
+                        //   - Each project's per-project operon dir
+                        //     `<vault>/.operon/<project-id>/` for
+                        //     artifact bodies (`artifacts/.../index.md`)
+                        //     and skill/workflow outputs (`outputs/`).
+                        //     Pinning the per-project root covers every
+                        //     operon-managed artifact and output for
+                        //     that project without enumerating slugs.
+                        // Multi-project pinning lets a Vault-scope chat
+                        // (cwd = vault, not any one project) still
+                        // reach an artifact in any project the user
+                        // has open.
+                        //
+                        // NOTE: `<repo>/.operon/` is intentionally not
+                        // pinned here — operon no longer writes inside
+                        // the user's repo, so Claude has no reason to
+                        // see it. Business source code lives at `cwd`
+                        // (= repo_path) and stays cleanly separated
+                        // from operon's own metadata.
+                        let mut extra_dirs: Vec<PathBuf> = Vec::new();
+                        if let Some(v) = vault_root.read().as_ref() {
+                            extra_dirs.push(v.notes_dir());
+                            if let Some(prepo) = project_repo_for_extras.as_ref() {
+                                if let Ok(projects) = prepo.list() {
+                                    for p in projects {
+                                        extra_dirs.push(v.project_operon_dir(p.id));
+                                    }
+                                }
+                            }
+                        }
+                        if !extra_dirs.is_empty() {
+                            tracing::info!(
+                                target: "operon::companion",
+                                "session {sid}: pinning --add-dir paths: {extra_dirs:?}"
+                            );
+                            claude_plugin.set_session_extra_dirs(sid, extra_dirs);
+                        }
                         let cwd_for_bridge = cwd;
+                        let claude_plugin_for_bridge = claude_plugin.clone();
                         spawn(async move {
                             if let Err(e) =
                                 crate::shell::companion_state::ensure_session_bridge(
-                                    &claude_plugin,
+                                    &claude_plugin_for_bridge,
                                     sid,
                                     cwd_for_bridge,
                                 )
@@ -733,7 +859,7 @@ pub fn CompanionChat() -> Element {
                         }
                     }
                     for (i, item) in transcript.read().iter().enumerate() {
-                        {render_item(i, item)}
+                        {render_item(i, item, note_link_resolver, note_title_resolver)}
                     }
                     // Inline permission prompts. These come from the
                     // MCP bridge — `claude --print` can't show its own
@@ -741,16 +867,31 @@ pub fn CompanionChat() -> Element {
                     // for permission the bridge surfaces the request
                     // here instead of silently failing. Rendered after
                     // the transcript so a pending prompt always sits
-                    // at the bottom where the user is looking.
-                    for (j, entry) in PERMISSION_PROMPTS.read().iter().enumerate() {
-                        {render_item(
-                            transcript.read().len() + j,
-                            &TranscriptItem::PermissionRequest {
-                                id: entry.id.clone(),
-                                tool_name: entry.tool_name.clone(),
-                                input: entry.input.clone(),
-                            },
-                        )}
+                    // at the bottom where the user is looking. The
+                    // rich `PermissionPrompt` card shows category +
+                    // diff preview + editable JSON + Allow/Always/Skip
+                    // /Deny (and runtime-only Cancel call) all in one
+                    // unit; Phase 1 of the per-tool-call permission
+                    // overhaul.
+                    for entry in PERMISSION_PROMPTS.read().iter() {
+                        {
+                            let status = PERMISSION_DECISIONS
+                                .read()
+                                .get(&entry.id)
+                                .cloned()
+                                .unwrap_or(PermissionStatus::Pending);
+                            let entry_id_for_handler = entry.id.clone();
+                            rsx! {
+                                crate::shell::permission_prompt::PermissionPrompt {
+                                    key: "{entry.id}",
+                                    entry: entry.clone(),
+                                    status: status,
+                                    on_decision: move |dec| {
+                                        dispatch_card_decision(&entry_id_for_handler, dec);
+                                    },
+                                }
+                            }
+                        }
                     }
                     // Streaming surface (Phase G): live letter-by-
                     // letter Claude text + "Claude is thinking…"
@@ -764,14 +905,21 @@ pub fn CompanionChat() -> Element {
                                 INPROGRESS_ASSISTANT.read().get(&id).cloned()
                             })
                             .filter(|s| !s.is_empty());
-                        let is_running = sid_now
-                            .map(|id| {
-                                matches!(
-                                    ARTIFACT_RUN_STATE.read().get(&id),
-                                    Some(ArtifactRunState::Running)
-                                )
-                            })
-                            .unwrap_or(false);
+                        // `is_running` catches artifact/cascade runs.
+                        // `in_flight` catches plain chat turns submitted
+                        // from the composer (Cmd/Ctrl+Enter or Send), which
+                        // never touch ARTIFACT_RUN_STATE. Both should
+                        // surface the same "Claude is thinking…" loader so
+                        // the user has feedback while the turn is pending.
+                        let is_running = *in_flight.read()
+                            || sid_now
+                                .map(|id| {
+                                    matches!(
+                                        ARTIFACT_RUN_STATE.read().get(&id),
+                                        Some(ArtifactRunState::Running)
+                                    )
+                                })
+                                .unwrap_or(false);
                         // Cascade-level indicator: separate from the
                         // per-skill `ARTIFACT_RUN_STATE.Running`
                         // signal, this lights up while any cascade
@@ -840,36 +988,118 @@ pub fn CompanionChat() -> Element {
                 div { class: "operon-companion-chat-composer",
                     "data-testid": "companion-composer-wrap",
                     div { class: "operon-companion-composer-toolbar",
-                        button {
-                            r#type: "button",
-                            class: "operon-companion-slash-button",
-                            "data-testid": "companion-slash-button",
-                            title: "Slash commands",
-                            onclick: move |_| {
-                                let next = !*slash_open.read();
-                                slash_open.set(next);
-                            },
-                            "/"
-                        }
-                        if *slash_open.read() {
+                        if let Some(picker) = mention_picker.read().clone() {
                             ul {
                                 class: "operon-companion-slash-popover",
-                                "data-testid": "companion-slash-popover",
-                                for cmd in SLASH_COMMANDS.iter() {
+                                "data-testid": "companion-mention-popover",
+                                for (idx, (uuid, title, path)) in picker.candidates.iter().enumerate() {
                                     {
-                                        let cmd = *cmd;
+                                        let uuid = *uuid;
+                                        let title = title.clone();
+                                        let path = path.clone();
+                                        let at_off = picker.at_byte_offset;
+                                        let is_selected = idx == picker.selected;
                                         rsx! {
                                             li {
-                                                key: "{cmd}",
+                                                key: "{uuid}",
                                                 button {
                                                     r#type: "button",
-                                                    class: "operon-companion-slash-item",
-                                                    onclick: move |_| {
-                                                        composer.set(cmd.into());
-                                                        slash_open.set(false);
+                                                    class: if is_selected {
+                                                        "operon-companion-slash-item operon-companion-slash-item-selected"
+                                                    } else {
+                                                        "operon-companion-slash-item"
                                                     },
-                                                    "{cmd}"
+                                                    "data-testid": "companion-mention-candidate",
+                                                    // Native tooltip — reveals the full breadcrumb
+                                                    // (`Project / Parent / Leaf`) so users can pick
+                                                    // between duplicate-titled notes.
+                                                    title: "{path}",
+                                                    onmousedown: move |evt| {
+                                                        // mousedown not click so the splice happens
+                                                        // before the textarea loses focus (which
+                                                        // would otherwise close the picker via the
+                                                        // next render).
+                                                        evt.prevent_default();
+                                                        let token = format_mention_token(&title, uuid);
+                                                        let cur = composer.read().clone();
+                                                        let mut next = String::with_capacity(cur.len() + token.len());
+                                                        next.push_str(&cur[..at_off]);
+                                                        next.push_str(&token);
+                                                        composer.set(next);
+                                                        mention_picker.set(None);
+                                                    },
+                                                    "{title}"
                                                 }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !attached_notes.read().is_empty() {
+                        div {
+                            class: "operon-companion-attachments",
+                            "data-testid": "companion-attachments",
+                            for (uuid, frozen_title) in attached_notes.read().clone().into_iter() {
+                                {
+                                    // Live title from the resolver; falls back to
+                                    // the title captured at attach time (deleted
+                                    // note, resolver not installed).
+                                    let live_title = note_title_resolver
+                                        .and_then(|crate::plugins::markdown::render::NoteTitleResolver(cb)| cb.call(uuid))
+                                        .unwrap_or_else(|| frozen_title.clone());
+                                    let is_stale = note_title_resolver
+                                        .is_some_and(|crate::plugins::markdown::render::NoteTitleResolver(cb)| cb.call(uuid).is_none());
+                                    // Hover tooltip: full breadcrumb when the
+                                    // repo lookup succeeds; `(note removed)` if
+                                    // the note's been deleted.
+                                    let tooltip = if is_stale {
+                                        "(note removed)".to_string()
+                                    } else {
+                                        note_repo_for_mentions
+                                            .as_ref()
+                                            .and_then(|nr| {
+                                                crate::local_mode::note_lookup::lookup_note_path(
+                                                    nr,
+                                                    project_repo_for_mentions.as_ref(),
+                                                    uuid,
+                                                )
+                                            })
+                                            .unwrap_or_else(|| live_title.clone())
+                                    };
+                                    let id_for_remove = uuid;
+                                    let link_cb = note_link_resolver;
+                                    rsx! {
+                                        span {
+                                            key: "{uuid}",
+                                            class: "operon-companion-attachment-chip",
+                                            "data-testid": "companion-attachment",
+                                            "data-note-id": "{uuid}",
+                                            title: "{tooltip}",
+                                            // Clicking the title opens the
+                                            // referenced note in the editor.
+                                            button {
+                                                r#type: "button",
+                                                class: "operon-companion-attachment-link",
+                                                onclick: move |_| {
+                                                    if let Some(crate::plugins::markdown::render::NoteLinkResolver(cb)) = link_cb {
+                                                        cb.call(uuid);
+                                                    }
+                                                },
+                                                "{live_title}"
+                                            }
+                                            button {
+                                                r#type: "button",
+                                                class: "operon-companion-attachment-remove",
+                                                "data-testid": "companion-attachment-remove",
+                                                "aria-label": "Remove attachment",
+                                                onclick: move |_| {
+                                                    attached_notes
+                                                        .write()
+                                                        .retain(|(u, _)| *u != id_for_remove);
+                                                },
+                                                "×"
                                             }
                                         }
                                     }
@@ -889,15 +1119,160 @@ pub fn CompanionChat() -> Element {
                             "Bind a repository or pick a vault to start…"
                         },
                         disabled: !has_cwd || !has_session,
-                        oninput: move |e| composer.set(e.value()),
+                        oninput: {
+                            let oninput_note_repo = note_repo_for_mentions.clone();
+                            let oninput_project_repo = project_repo_for_mentions.clone();
+                            move |e: Event<FormData>| {
+                                composer.set(e.value());
+                                // Drive the `@` autocomplete picker off the trailing
+                                // portion of the composer. Detection is purely textual
+                                // — no caret-position dependency — so it works across
+                                // browser quirks.
+                                let text = composer.read().clone();
+                                let trigger = detect_trailing_mention(&text);
+                                match (trigger, oninput_note_repo.as_ref()) {
+                                    (Some((at_off, q)), Some(nrepo)) => {
+                                        let scope_now = *scope_signal.read();
+                                        let candidates = list_mention_candidates(
+                                            &q,
+                                            nrepo,
+                                            oninput_project_repo.as_ref(),
+                                            scope_now,
+                                        );
+                                        if candidates.is_empty() {
+                                            mention_picker.set(None);
+                                        } else {
+                                            mention_picker.set(Some(MentionPickerState {
+                                                query: q,
+                                                candidates,
+                                                selected: 0,
+                                                at_byte_offset: at_off,
+                                            }));
+                                        }
+                                    }
+                                    _ => mention_picker.set(None),
+                                }
+                            }
+                        },
+                        ondragover: move |evt| evt.prevent_default(),
+                        ondrop: {
+                            let drop_note_repo = note_repo_for_mentions.clone();
+                            let drop_project_repo = project_repo_for_mentions.clone();
+                            let drag_session_opt = drag_session_for_drop;
+                            move |evt: Event<DragData>| {
+                                // Only handle in-app note drags from the explorer;
+                                // ignore other drops (text, files) and let the
+                                // textarea's native behavior take over.
+                                let Some(mut drag_session) = drag_session_opt else {
+                                    return;
+                                };
+                                let kind = *drag_session.peek();
+                                let note_id = match kind {
+                                    Some(crate::local_mode::ui::DragKind::Note(id)) => id,
+                                    _ => return,
+                                };
+                                evt.prevent_default();
+                                let Some(note_repo) = drop_note_repo.as_ref() else {
+                                    drag_session.set(None);
+                                    return;
+                                };
+                                let title = crate::local_mode::note_lookup::lookup_note_title(
+                                    note_repo,
+                                    drop_project_repo.as_ref(),
+                                    note_id,
+                                )
+                                .unwrap_or_else(|| note_id.to_string());
+                                let already = attached_notes
+                                    .read()
+                                    .iter()
+                                    .any(|(u, _)| *u == note_id);
+                                if !already {
+                                    attached_notes.write().push((note_id, title));
+                                }
+                                drag_session.set(None);
+                            }
+                        },
                         onkeydown: {
                             let repo = message_repo.clone();
                             let srepo = session_repo.clone();
+                            let kd_note_repo = note_repo_for_mentions.clone();
+                            let kd_persistence = persistence_for_mentions.clone();
                             move |e: KeyboardEvent| {
                                 if !has_cwd || !has_session { return; }
+                                // Mention-picker navigation takes precedence over
+                                // plain typing / send. Keys we own do NOT propagate
+                                // (so ArrowDown doesn't move the caret).
+                                let picker_open = mention_picker.read().is_some();
+                                if picker_open {
+                                    match e.key() {
+                                        Key::Escape => {
+                                            mention_picker.set(None);
+                                            e.prevent_default();
+                                            return;
+                                        }
+                                        Key::ArrowDown => {
+                                            let mut st = mention_picker.read().clone();
+                                            if let Some(s) = st.as_mut() {
+                                                if !s.candidates.is_empty() {
+                                                    s.selected = (s.selected + 1) % s.candidates.len();
+                                                }
+                                            }
+                                            mention_picker.set(st);
+                                            e.prevent_default();
+                                            return;
+                                        }
+                                        Key::ArrowUp => {
+                                            let mut st = mention_picker.read().clone();
+                                            if let Some(s) = st.as_mut() {
+                                                let n = s.candidates.len();
+                                                if n > 0 {
+                                                    s.selected = (s.selected + n - 1) % n;
+                                                }
+                                            }
+                                            mention_picker.set(st);
+                                            e.prevent_default();
+                                            return;
+                                        }
+                                        Key::Enter | Key::Tab => {
+                                            let st = mention_picker.read().clone();
+                                            if let Some(s) = st {
+                                                if let Some((uuid, title, _path)) =
+                                                    s.candidates.get(s.selected).cloned()
+                                                {
+                                                    let token = format_mention_token(&title, uuid);
+                                                    let cur = composer.read().clone();
+                                                    let mut next = String::with_capacity(
+                                                        cur.len() + token.len(),
+                                                    );
+                                                    next.push_str(&cur[..s.at_byte_offset]);
+                                                    next.push_str(&token);
+                                                    composer.set(next);
+                                                    mention_picker.set(None);
+                                                    e.prevent_default();
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
                                 if e.key() == Key::Enter && (e.modifiers().ctrl() || e.modifiers().meta()) {
                                     if let Some(sid) = active_session {
-                                        run_turn(active_backend, sid, transcript, composer, in_flight, active_ct, usage_total, pending_assistant, repo.clone(), srepo.clone(), session_version);
+                                        let handshake = bridge_handshake_for_turn(
+                                            &active_backend, &plugin, &cwd_for_scope,
+                                        );
+                                        let scope_now = *scope_signal.read();
+                                        let vault_notes_now =
+                                            vault_root.read().as_ref().map(|v| v.notes_dir());
+                                        run_turn(
+                                            active_backend, sid, transcript, composer,
+                                            attached_notes,
+                                            in_flight, active_ct, usage_total,
+                                            pending_assistant, repo.clone(), srepo.clone(),
+                                            session_version, handshake,
+                                            kd_note_repo.clone(), kd_persistence.clone(),
+                                            scope_now, vault_notes_now,
+                                        );
                                     }
                                 }
                             }
@@ -910,9 +1285,25 @@ pub fn CompanionChat() -> Element {
                         onclick: {
                             let repo = message_repo.clone();
                             let srepo = session_repo.clone();
+                            let send_note_repo = note_repo_for_mentions.clone();
+                            let send_persistence = persistence_for_mentions.clone();
                             move |_| {
                                 if let Some(sid) = active_session {
-                                    run_turn(active_backend, sid, transcript, composer, in_flight, active_ct, usage_total, pending_assistant, repo.clone(), srepo.clone(), session_version);
+                                    let handshake = bridge_handshake_for_turn(
+                                        &active_backend, &plugin, &cwd_for_scope,
+                                    );
+                                    let scope_now = *scope_signal.read();
+                                    let vault_notes_now =
+                                        vault_root.read().as_ref().map(|v| v.notes_dir());
+                                    run_turn(
+                                        active_backend, sid, transcript, composer,
+                                        attached_notes,
+                                        in_flight, active_ct, usage_total,
+                                        pending_assistant, repo.clone(), srepo.clone(),
+                                        session_version, handshake,
+                                        send_note_repo.clone(), send_persistence.clone(),
+                                        scope_now, vault_notes_now,
+                                    );
                                 }
                             }
                         },
@@ -927,7 +1318,12 @@ pub fn CompanionChat() -> Element {
     }
 }
 
-fn render_item(i: usize, item: &TranscriptItem) -> Element {
+fn render_item(
+    i: usize,
+    item: &TranscriptItem,
+    link_resolver: Option<crate::plugins::markdown::render::NoteLinkResolver>,
+    title_resolver: Option<crate::plugins::markdown::render::NoteTitleResolver>,
+) -> Element {
     let key = format!("{i}");
     match item {
         TranscriptItem::UserText(t) => rsx! {
@@ -935,7 +1331,7 @@ fn render_item(i: usize, item: &TranscriptItem) -> Element {
                 key: "{key}",
                 class: "operon-companion-msg operon-companion-msg-user",
                 "data-role": "user",
-                "{t}"
+                {render_user_segments(t, link_resolver, title_resolver).into_iter()}
             }
         },
         TranscriptItem::AssistantText(body) => rsx! {
@@ -1012,6 +1408,8 @@ fn render_permission_request(
         PermissionStatus::Pending => "Awaiting decision",
         PermissionStatus::Allowed => "Allowed",
         PermissionStatus::AllowedAlways => "Allowed (always)",
+        PermissionStatus::AllowedAuto => "Auto-approved",
+        PermissionStatus::Skipped => "Skipped",
         PermissionStatus::Denied => "Denied",
     };
     rsx! {
@@ -1124,17 +1522,100 @@ fn resolve_permission(id: &str, choice: PermissionStatus) {
         return;
     };
     let decision = match choice {
-        PermissionStatus::Pending => return, // unreachable from buttons
+        // Unreachable from buttons — Pending is the initial state, not
+        // a click outcome. AllowedAuto only happens inside the bridge
+        // handler before any UI renders, so the responder there is
+        // never parked under this id and `take_permission_responder`
+        // would have already returned None.
+        PermissionStatus::Pending | PermissionStatus::AllowedAuto => return,
         PermissionStatus::Allowed | PermissionStatus::AllowedAlways => {
             operon_plugins_claude_code::PermissionDecision::Allow {
                 updated_input: None,
             }
         }
+        PermissionStatus::Skipped => operon_plugins_claude_code::PermissionDecision::Skip {
+            synthetic_result: "User skipped this tool; proceed without it.".into(),
+        },
         PermissionStatus::Denied => operon_plugins_claude_code::PermissionDecision::Deny {
             message: "Denied by user".into(),
         },
     };
     let _ = responder.send(decision);
+}
+
+/// Resolve a permission prompt from the rich card. Generalises
+/// `resolve_permission` for the new `CardDecision` shape — handles
+/// updated_input rewriting, synthetic-skip messages, and Allow-always
+/// rule persistence in one place. Used by the inline `PermissionPrompt`
+/// component as its `on_decision` callback.
+fn dispatch_card_decision(
+    id: &str,
+    decision: crate::shell::permission_prompt::CardDecision,
+) {
+    use crate::shell::permission_prompt::CardDecision;
+    // Pick the terminal status the UI should display and the matching
+    // wire decision the bridge responder gets.
+    let (status, wire) = match &decision {
+        CardDecision::Allow { updated_input } => (
+            PermissionStatus::Allowed,
+            Some(operon_plugins_claude_code::PermissionDecision::Allow {
+                updated_input: updated_input.clone(),
+            }),
+        ),
+        CardDecision::AllowAlways { updated_input } => (
+            PermissionStatus::AllowedAlways,
+            Some(operon_plugins_claude_code::PermissionDecision::Allow {
+                updated_input: updated_input.clone(),
+            }),
+        ),
+        CardDecision::Skip { synthetic_result } => (
+            PermissionStatus::Skipped,
+            Some(operon_plugins_claude_code::PermissionDecision::Skip {
+                synthetic_result: synthetic_result.clone(),
+            }),
+        ),
+        CardDecision::Deny { message } => (
+            PermissionStatus::Denied,
+            Some(operon_plugins_claude_code::PermissionDecision::Deny {
+                message: message.clone(),
+            }),
+        ),
+        // Runtime-only — Phase 3 plumbing will fire the per-tool
+        // CancellationToken. For Phase 1, no responder is involved
+        // (the cancel maps to the runtime's CT, not to the bridge),
+        // so we record the status and short-circuit.
+        CardDecision::Cancel => (PermissionStatus::Denied, None),
+    };
+
+    PERMISSION_DECISIONS
+        .write()
+        .insert(id.to_string(), status.clone());
+
+    if matches!(status, PermissionStatus::AllowedAlways) {
+        if let Some(entry) = PERMISSION_PROMPTS.read().iter().find(|e| e.id == id).cloned() {
+            if let Some(cwd) = entry.source_cwd.as_ref() {
+                let rule = crate::shell::permission_persist::derive_rule(
+                    &entry.tool_name,
+                    &entry.input,
+                );
+                if let Err(e) =
+                    crate::shell::permission_persist::append_allow_rule(cwd, &rule)
+                {
+                    tracing::warn!(
+                        target: "operon::permission",
+                        "persist allow rule {rule} for {}: {e}",
+                        cwd.display()
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(d) = wire {
+        if let Some(responder) = take_permission_responder(id) {
+            let _ = responder.send(d);
+        }
+    }
 }
 
 #[derive(Props, Clone, PartialEq)]
@@ -1200,12 +1681,30 @@ fn estimate_cost_usd(prompt: u64, prompt_cached: u64, completion: u64) -> f64 {
 /// On the first user message of a session whose label is still "New chat",
 /// derives a label from the message and renames the session — same pattern
 /// the VS Code extension uses to keep the rail readable.
+/// Snapshot the bridge-handshake material for `run_turn` when the
+/// active backend is `claude-code` and the session has a bound cwd.
+/// Returns `None` for the in-process runtime backend (no shim
+/// involved) and when no repo is bound (send_rich would fail with the
+/// same error anyway).
+fn bridge_handshake_for_turn(
+    backend: &Signal<Arc<dyn AgentBackend>>,
+    plugin: &Signal<Arc<ClaudeCodeChatPlugin>>,
+    cwd: &Memo<Option<PathBuf>>,
+) -> Option<(Arc<ClaudeCodeChatPlugin>, PathBuf)> {
+    if backend.read().id() != "claude-code" {
+        return None;
+    }
+    let cwd_now = cwd.read().clone()?;
+    Some((plugin.read().clone(), cwd_now))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_turn(
     backend: Signal<Arc<dyn AgentBackend>>,
     chat_session: Uuid,
     mut transcript: Signal<Vec<TranscriptItem>>,
     mut composer: Signal<String>,
+    mut attached_notes: Signal<Vec<(Uuid, String)>>,
     mut in_flight: Signal<bool>,
     mut active_ct: Signal<Option<CancellationToken>>,
     mut usage_total: Signal<Usage>,
@@ -1213,15 +1712,51 @@ fn run_turn(
     repo: Arc<dyn crate::shell::companion_state::ChatMessageRepository>,
     session_repo: Arc<dyn crate::shell::companion_state::ChatSessionRepository>,
     mut session_version: Signal<u64>,
+    // Bridge-ready handshake material. When the active backend is
+    // claude-code, the spawn block `await`s
+    // `ensure_session_bridge(...)` immediately before `send_rich` so
+    // the first turn after a session opens can't race ahead of the
+    // bridge bind and ship a turn without `--permission-prompt-tool`
+    // (which would leave gated tools like `Bash` stuck at "RUNNING…"
+    // forever). `None` cwd means the session has no bound repo — we
+    // skip the wait; `send_rich` will fail with the same error anyway.
+    bridge_handshake: Option<(Arc<ClaudeCodeChatPlugin>, PathBuf)>,
+    // Optional context bundle used to resolve `@[..](note:..)` mentions
+    // in `text` into inlined-body blocks before send. The transcript
+    // and persisted user row both keep the raw `text`; only the wire
+    // payload to Claude is the rewritten form. When either repo or
+    // persistence is missing (tests / standalone), mentions stay
+    // literal and the rewriter is a no-op.
+    note_repo: Option<Arc<dyn operon_store::repos::LocalNoteRepository>>,
+    persistence: Option<Arc<dyn crate::persistence::Persistence>>,
+    scope: ChatScope,
+    vault_notes_dir: Option<PathBuf>,
 ) {
     if *in_flight.read() {
         return;
     }
-    let text = composer.read().trim().to_string();
+    let body = composer.read().trim().to_string();
+    // Each attached note becomes a trailing `@[title](note:uuid)` token
+    // appended to the user line. The transcript bubble + persisted user
+    // row keep the combined form, so reloading the chat shows the
+    // attachments as chips alongside any inline @-mentions.
+    let attached = attached_notes.read().clone();
+    let attach_tokens: Vec<String> = attached
+        .iter()
+        .map(|(uuid, title)| format_mention_token(title, *uuid))
+        .collect();
+    let text = if attach_tokens.is_empty() {
+        body
+    } else if body.is_empty() {
+        attach_tokens.join(" ")
+    } else {
+        format!("{body} {}", attach_tokens.join(" "))
+    };
     if text.is_empty() {
         return;
     }
     composer.set(String::new());
+    attached_notes.set(Vec::new());
     transcript
         .write()
         .push(TranscriptItem::UserText(text.clone()));
@@ -1244,7 +1779,39 @@ fn run_turn(
     let backend_arc: Arc<dyn AgentBackend> = backend.read().clone();
     let repo_for_task = repo.clone();
     spawn(async move {
-        let mut rx = match backend_arc.send_rich(text, chat_session, ct).await {
+        // Wait for the per-session permission bridge to be bound
+        // before sending. `ensure_session_bridge` is idempotent —
+        // first caller does the bind, subsequent callers cheaply
+        // await the same `OnceCell` — so this adds ~0 overhead on
+        // every turn after the first.
+        if let Some((plugin, cwd)) = bridge_handshake {
+            if let Err(e) = crate::shell::companion_state::ensure_session_bridge(
+                &plugin,
+                chat_session,
+                cwd,
+            )
+            .await
+            {
+                tracing::warn!(
+                    target: "operon::permission",
+                    "ensure_session_bridge({chat_session}) before send_rich: {e}"
+                );
+            }
+        }
+
+        // Resolve any `@[<title>](note:<uuid>)` mentions in `text`
+        // into inlined-body blocks before send. Transcript + persisted
+        // user line use the raw `text` (what the user sees); Claude
+        // receives the rewritten form with bodies.
+        let prompt_for_claude = resolve_mentions_for_prompt(
+            &text,
+            note_repo,
+            persistence,
+            scope,
+            vault_notes_dir,
+        )
+        .await;
+        let mut rx = match backend_arc.send_rich(prompt_for_claude, chat_session, ct).await {
             Ok(rx) => rx,
             Err(e) => {
                 let msg = format!("error: {e}");
@@ -1332,11 +1899,27 @@ fn apply_event(
                 tracing::warn!(target: "operon::companion", "persist tool_use: {e}");
             }
         }
+        AgentEvent::ToolChunk {
+            tool_use_id,
+            kind,
+            bytes,
+        } => {
+            // Live chunk from a streaming tool — runtime backend only.
+            // claude-code never emits these. Append to the per-tool
+            // rolling buffer so the tool_card's live region renders;
+            // we deliberately don't touch the transcript or the chat
+            // store (the final `ToolResult` is what's audited).
+            crate::shell::companion_state::append_tool_chunk(&tool_use_id, &kind, &bytes);
+        }
         AgentEvent::ToolResult {
             tool_use_id,
             content,
             is_error,
         } => {
+            // Stop the live-output timer; the buffered stream stays
+            // in TOOL_STREAM_OUTPUT for audit (it's effectively a
+            // local terminal log of the run).
+            crate::shell::companion_state::mark_tool_stream_complete(&tool_use_id);
             // Patch in-memory.
             let mut tx = transcript.write();
             let mut patched: Option<(String, serde_json::Value)> = None;
@@ -1425,12 +2008,16 @@ fn apply_event(
             // Step 5 wires the inline `PermissionPrompt` component to
             // resolve this back through the runtime's `PermissionGate`.
             flush_pending_assistant(transcript, pending_assistant, chat_session, repo);
+            let category = crate::shell::tool_category::of(&kind);
             let entry = crate::shell::companion_state::PermissionPromptEntry {
                 id: id.clone(),
                 tool_name: kind,
                 input: raw_input,
                 source_session: Some(chat_session),
                 source_cwd: None,
+                category,
+                created_at: std::time::SystemTime::now(),
+                backend_id: "runtime".to_string(),
             };
             crate::shell::companion_state::push_permission_prompt(entry);
             tracing::debug!(
@@ -1578,6 +2165,568 @@ fn transcript_item_from_message(m: &ChatMessage) -> Option<TranscriptItem> {
             .get("text")
             .and_then(|v| v.as_str())
             .map(|s| TranscriptItem::System(s.to_string())),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Note-reference mentions
+//
+// The composer supports three insertion paths for a `@[<title>](note:<uuid>)`
+// token: (a) the `@` autocomplete picker, (b) drag-drop from the
+// explorer, (c) the explorer's right-click "Send to chat" action. All
+// three go through this module's helpers so the on-wire shape stays
+// uniform.
+//
+// At send time, `resolve_mentions_for_prompt` rewrites the user line
+// into the prompt actually shipped to Claude, inlining each
+// referenced note's body under a `--- referenced note ---` block.
+// The transcript + persisted user row keep the original composer
+// text so the chat history stays cache-friendly and the chip UX is
+// preserved across reloads.
+
+/// Source-of-truth for one resolved mention used by
+/// [`build_mention_inlined_prompt`]. The rewriter doesn't care where
+/// title/body/path come from — production wires this to the
+/// `LocalNoteRepository` + `Persistence` context; tests use a static
+/// in-memory map.
+#[derive(Debug, Clone)]
+pub struct ResolvedNote {
+    /// Display title used in the inlined block header.
+    pub title: String,
+    /// Note body inlined verbatim under the block header.
+    pub body: String,
+    /// Path Claude should pass to `Write` / `Edit` to modify this
+    /// note. Prefer absolute (`<vault>/notes/<uuid>`) so the same
+    /// path works regardless of which `cwd` the chat session was
+    /// spawned with. Falls back to `notes/<uuid>` when the vault
+    /// root isn't available.
+    pub path: String,
+}
+
+fn mention_link_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"@\[([^\]]*)\]\(note:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\)",
+        )
+        .expect("mention_link_regex compiles")
+    })
+}
+
+fn mention_bare_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"\bnote:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b",
+        )
+        .expect("mention_bare_regex compiles")
+    })
+}
+
+const MENTION_SYSTEM_PROMPT_PREAMBLE: &str = "\
+You are working in a project where the user can attach notes to the chat \
+via `@[<title>](note:<uuid>)` mentions. When the user mentions a note, its \
+full body is inlined below under `--- referenced note ---` blocks. If the \
+user asks you to modify a mentioned note, edit the file at the `path` \
+shown in that note's header (relative to the current working directory) \
+using your `Write` or `Edit` tool. The app watches that directory and \
+will pick up your changes automatically; you do not need a custom tool to \
+\"save\" the note.";
+
+/// Extract every unique referenced-note UUID from `user_text` in the
+/// order it first appears. Both the structured form
+/// `@[<title>](note:<uuid>)` and the bare form `note:<uuid>` are
+/// scanned. UUID syntax that fails to parse is silently skipped.
+pub fn extract_mention_uuids(user_text: &str) -> Vec<Uuid> {
+    let mut seen: Vec<Uuid> = Vec::new();
+    let mut push = |u: Uuid| {
+        if !seen.contains(&u) {
+            seen.push(u);
+        }
+    };
+    for cap in mention_link_regex().captures_iter(user_text) {
+        if let Ok(u) = Uuid::parse_str(&cap[2]) {
+            push(u);
+        }
+    }
+    for cap in mention_bare_regex().captures_iter(user_text) {
+        if let Ok(u) = Uuid::parse_str(&cap[1]) {
+            push(u);
+        }
+    }
+    seen
+}
+
+/// Rewrite the user's composer text into the prompt actually sent to
+/// Claude: inlines every referenced note's body under
+/// `--- referenced note: <title> (id: <uuid>, path: <path>) ---`
+/// blocks, prepends a short preamble teaching Claude how to edit the
+/// notes via `Write`/`Edit`, and leaves the original
+/// `@[..](note:..)` tokens in the user text intact so Claude can map
+/// each mention back to its inlined block.
+pub fn build_mention_inlined_prompt<F>(user_text: &str, lookup: F) -> String
+where
+    F: Fn(Uuid) -> Option<ResolvedNote>,
+{
+    let uuids = extract_mention_uuids(user_text);
+    if uuids.is_empty() {
+        return user_text.to_string();
+    }
+
+    let mut out = String::with_capacity(user_text.len() + 2048);
+    out.push_str(MENTION_SYSTEM_PROMPT_PREAMBLE);
+    out.push_str(
+        "\n\n--- referenced notes (the user mentioned these; bodies inlined for context) ---\n\n",
+    );
+
+    for uuid in &uuids {
+        match lookup(*uuid) {
+            Some(note) => {
+                out.push_str(&format!(
+                    "--- referenced note: {} (id: {}, path: {}) ---\n",
+                    note.title, uuid, note.path,
+                ));
+                out.push_str(&note.body);
+                if !note.body.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(&format!("--- end note: {} ---\n\n", note.title));
+            }
+            None => {
+                out.push_str(&format!(
+                    "_(referenced note {} not found in current scope)_\n\n",
+                    uuid,
+                ));
+            }
+        }
+    }
+
+    out.push_str("--- end referenced notes ---\n\n");
+    out.push_str(user_text);
+    out
+}
+
+/// State for the composer's `@` autocomplete picker.
+#[derive(Debug, Clone)]
+struct MentionPickerState {
+    /// Chars typed after the `@`. Kept for future "highlight matching
+    /// chars in the candidate row" UX; currently only used at construction.
+    #[allow(dead_code)]
+    query: String,
+    /// Notes matching `query` in the current scope (capped at 8).
+    /// Tuple is `(id, title, path)` — `path` is the full breadcrumb
+    /// (`Project / Parent / Leaf`) used as the candidate row's hover
+    /// tooltip so duplicate-title notes can be told apart.
+    candidates: Vec<(Uuid, String, String)>,
+    /// Highlighted candidate index. Wraps at the bounds.
+    selected: usize,
+    /// Byte offset of the triggering `@` within the composer text.
+    /// Used on accept to replace `@<query>` with the full mention token.
+    at_byte_offset: usize,
+}
+
+/// Walk backward from end of `text` looking for an "open" `@`
+/// mention — the last `@` whose chars-after are a valid in-progress
+/// query (no whitespace, no bracket/paren that would close a token).
+/// The `@` must be at the start of `text` or preceded by whitespace;
+/// `@` embedded in a word (e.g. `user@email`) is NOT a mention trigger.
+pub fn detect_trailing_mention(text: &str) -> Option<(usize, String)> {
+    let mut at_idx: Option<usize> = None;
+    for (i, ch) in text.char_indices().rev() {
+        if ch == '@' {
+            at_idx = Some(i);
+            break;
+        }
+        if ch.is_whitespace() || matches!(ch, '[' | ']' | '(' | ')') {
+            return None;
+        }
+    }
+    let i = at_idx?;
+    let prev_char = text[..i].chars().rev().next();
+    match prev_char {
+        None => {}
+        Some(c) if c.is_whitespace() => {}
+        _ => return None,
+    }
+    let query = text[i + 1..].to_string();
+    Some((i, query))
+}
+
+/// Filter the notes visible in `scope` by case-insensitive title
+/// substring match. Empty query lists the first 8 notes from the
+/// repo (whatever order it returns). Each row also carries the
+/// note's breadcrumb path (`Project / Parent / Leaf`) so the picker
+/// can surface it as a hover tooltip for disambiguating duplicate
+/// titles.
+fn list_mention_candidates(
+    query: &str,
+    note_repo: &Arc<dyn operon_store::repos::LocalNoteRepository>,
+    project_repo: Option<&Arc<dyn operon_store::repos::LocalProjectRepository>>,
+    scope: ChatScope,
+) -> Vec<(Uuid, String, String)> {
+    let query_lower = query.to_lowercase();
+    let notes: Vec<operon_store::repos::LocalNote> = match scope {
+        ChatScope::Project(pid) => note_repo.list_for_project(pid).unwrap_or_default(),
+        ChatScope::Vault => {
+            let mut all = Vec::new();
+            if let Some(prepo) = project_repo {
+                if let Ok(projects) = prepo.list() {
+                    for p in projects {
+                        if let Ok(notes) = note_repo.list_for_project(p.id) {
+                            all.extend(notes);
+                        }
+                    }
+                }
+            }
+            all
+        }
+    };
+    notes
+        .into_iter()
+        .filter(|n| query.is_empty() || n.title.to_lowercase().contains(&query_lower))
+        .take(8)
+        .map(|n| {
+            let path = crate::local_mode::note_lookup::lookup_note_path(
+                note_repo,
+                project_repo,
+                n.id,
+            )
+            .unwrap_or_else(|| n.title.clone());
+            (n.id, n.title, path)
+        })
+        .collect()
+}
+
+/// Format the canonical mention token. Centralised so picker /
+/// drag-drop / right-click all emit identical text.
+fn format_mention_token(title: &str, note_id: Uuid) -> String {
+    format!("@[{title}](note:{note_id})")
+}
+
+/// Append `addition` to `current`, prefixing a space when `current` is
+/// non-empty and doesn't already end with whitespace. Used by the
+/// drag-drop and right-click append paths so a mention token doesn't
+/// run into the previous word.
+fn append_to_composer(current: &str, addition: &str) -> String {
+    if current.is_empty() {
+        addition.to_string()
+    } else if current.ends_with(' ') || current.ends_with('\n') {
+        format!("{current}{addition}")
+    } else {
+        format!("{current} {addition}")
+    }
+}
+
+/// Walk every referenced-note UUID in `user_text`, resolve each to a
+/// [`ResolvedNote`] via the in-scope note repo + persistence, and
+/// return the prompt text Claude should actually receive (mention
+/// bodies inlined under `--- referenced note ---` blocks; original
+/// tokens left intact in the user line).
+///
+/// Returns `user_text` verbatim when the chat has no
+/// `LocalNoteRepository` / `Persistence` context (tests, standalone),
+/// or when no mentions are present.
+async fn resolve_mentions_for_prompt(
+    user_text: &str,
+    note_repo: Option<Arc<dyn operon_store::repos::LocalNoteRepository>>,
+    persistence: Option<Arc<dyn crate::persistence::Persistence>>,
+    scope: ChatScope,
+    vault_notes_dir: Option<PathBuf>,
+) -> String {
+    let (Some(note_repo), Some(persistence)) = (note_repo, persistence) else {
+        return user_text.to_string();
+    };
+    let uuids = extract_mention_uuids(user_text);
+    if uuids.is_empty() {
+        return user_text.to_string();
+    }
+    let mut resolved: std::collections::HashMap<Uuid, ResolvedNote> =
+        std::collections::HashMap::new();
+    for u in uuids {
+        let project_id = match scope {
+            ChatScope::Project(pid) => Some(pid),
+            ChatScope::Vault => note_repo.find_project_for_note(u).ok().flatten(),
+        };
+        let title = project_id
+            .and_then(|pid| note_repo.list_for_project(pid).ok())
+            .and_then(|notes| notes.into_iter().find(|n| n.id == u).map(|n| n.title))
+            .unwrap_or_else(|| u.to_string());
+        let id_str = u.to_string();
+        let body = match persistence.load(&id_str).await {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(_) => "(non-UTF-8 body — not inlined)".to_string(),
+            },
+            Err(_) => continue,
+        };
+        // Ask the persistence layer for the *actual* on-disk path. For
+        // artifact notes that's `<repo>/.operon/artifacts/.../index.md`;
+        // for non-artifact notes it's `<vault>/notes/<uuid>`. Falling
+        // back to a guess (`<vault>/notes/<uuid>`) would send Claude
+        // chasing a path that doesn't exist for artifacts — Edit lands
+        // on a non-existent file and Write creates a stray.
+        let path = persistence
+            .resolved_path(&id_str)
+            .map(|p| p.to_string_lossy().to_string())
+            .or_else(|| {
+                vault_notes_dir
+                    .as_ref()
+                    .map(|dir| dir.join(&id_str).to_string_lossy().to_string())
+            })
+            .unwrap_or_else(|| format!("notes/{u}"));
+        resolved.insert(u, ResolvedNote { title, body, path });
+    }
+    build_mention_inlined_prompt(user_text, |u| resolved.get(&u).cloned())
+}
+
+/// Split a user-message string on `mention_link_regex` and emit a
+/// clickable `<span class="operon-mention-chip">` chip per match,
+/// interleaved with plain-text spans. The chip's display label comes
+/// from a live `NoteTitleResolver` when one is installed (rename
+/// reactivity); otherwise it falls back to the frozen title captured
+/// in the markdown link text at insertion time.
+fn render_user_segments(
+    text: &str,
+    link_resolver: Option<crate::plugins::markdown::render::NoteLinkResolver>,
+    title_resolver: Option<crate::plugins::markdown::render::NoteTitleResolver>,
+) -> Vec<Element> {
+    let re = mention_link_regex();
+    let mut out: Vec<Element> = Vec::new();
+    let mut last = 0usize;
+    let mut idx = 0usize;
+    for cap in re.captures_iter(text) {
+        let m = cap.get(0).unwrap();
+        if m.start() > last {
+            let s = text[last..m.start()].to_string();
+            let k = format!("ut-{idx}");
+            out.push(rsx! { span { key: "{k}", "{s}" } });
+            idx += 1;
+        }
+        let frozen_title = cap
+            .get(1)
+            .map(|x| x.as_str().to_string())
+            .unwrap_or_default();
+        let note_id_str = cap
+            .get(2)
+            .map(|x| x.as_str().to_string())
+            .unwrap_or_default();
+        let parsed_uuid = Uuid::parse_str(&note_id_str).ok();
+        let k = format!("um-{idx}");
+
+        // Live title: ask the resolver for the current title; fall back
+        // to the frozen one (note deleted, resolver missing, etc.) and
+        // mark the chip stale via aria-label.
+        let (live_title, is_stale) = match (title_resolver, parsed_uuid) {
+            (Some(crate::plugins::markdown::render::NoteTitleResolver(cb)), Some(uuid)) => {
+                match cb.call(uuid) {
+                    Some(t) => (t, false),
+                    None => (frozen_title.clone(), true),
+                }
+            }
+            _ => (frozen_title.clone(), false),
+        };
+        let aria_label = if is_stale {
+            "(note removed)".to_string()
+        } else {
+            String::new()
+        };
+
+        match (link_resolver, parsed_uuid) {
+            (Some(crate::plugins::markdown::render::NoteLinkResolver(cb)), Some(uuid)) => {
+                out.push(rsx! {
+                    span {
+                        key: "{k}",
+                        class: "operon-mention-chip operon-mention-chip-clickable",
+                        "data-note-id": "{note_id_str}",
+                        "aria-label": "{aria_label}",
+                        role: "button",
+                        tabindex: "0",
+                        onclick: move |_| { cb.call(uuid); },
+                        onkeydown: move |evt| {
+                            let key = evt.key().to_string();
+                            if key == "Enter" || key == " " {
+                                evt.prevent_default();
+                                cb.call(uuid);
+                            }
+                        },
+                        "{live_title}"
+                    }
+                });
+            }
+            _ => {
+                out.push(rsx! {
+                    span {
+                        key: "{k}",
+                        class: "operon-mention-chip",
+                        "data-note-id": "{note_id_str}",
+                        "aria-label": "{aria_label}",
+                        "{live_title}"
+                    }
+                });
+            }
+        }
+        idx += 1;
+        last = m.end();
+    }
+    if last < text.len() {
+        let s = text[last..].to_string();
+        let k = format!("ut-{idx}");
+        out.push(rsx! { span { key: "{k}", "{s}" } });
+    }
+    out
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn uuid(s: &str) -> Uuid {
+        Uuid::parse_str(s).unwrap()
+    }
+
+    fn make_lookup(
+        entries: Vec<(Uuid, &str, &str, &str)>,
+    ) -> impl Fn(Uuid) -> Option<ResolvedNote> {
+        let map: HashMap<Uuid, ResolvedNote> = entries
+            .into_iter()
+            .map(|(u, title, body, path)| {
+                (
+                    u,
+                    ResolvedNote {
+                        title: title.into(),
+                        body: body.into(),
+                        path: path.into(),
+                    },
+                )
+            })
+            .collect();
+        move |u: Uuid| map.get(&u).cloned()
+    }
+
+    #[test]
+    fn resolves_structured_mention() {
+        let u = uuid("550e8400-e29b-41d4-a716-446655440000");
+        let text = format!("Summarize @[note-A](note:{u}) for me");
+        let lookup = make_lookup(vec![(u, "note-A", "body-of-note-A", "notes/550e...")]);
+        let out = build_mention_inlined_prompt(&text, lookup);
+        assert!(out.contains(MENTION_SYSTEM_PROMPT_PREAMBLE));
+        assert!(out.contains("--- referenced note: note-A (id:"));
+        assert!(out.contains("body-of-note-A"));
+        assert!(out.contains("--- end note: note-A ---"));
+        assert!(
+            out.ends_with(&text),
+            "original user text should be preserved at the end"
+        );
+    }
+
+    #[test]
+    fn resolves_bare_uuid_mention() {
+        let u = uuid("11111111-2222-3333-4444-555555555555");
+        let text = format!("Look at note:{u} please");
+        let lookup = make_lookup(vec![(u, "bare-note", "BARE-BODY", "notes/1111...")]);
+        let out = build_mention_inlined_prompt(&text, lookup);
+        assert!(out.contains("--- referenced note: bare-note"));
+        assert!(out.contains("BARE-BODY"));
+    }
+
+    #[test]
+    fn missing_uuid_emits_placeholder_without_aborting() {
+        let u = uuid("00000000-0000-0000-0000-000000000000");
+        let text = format!("Modify @[ghost](note:{u}) thanks");
+        let lookup = make_lookup(vec![]);
+        let out = build_mention_inlined_prompt(&text, lookup);
+        assert!(out.contains(&format!(
+            "_(referenced note {u} not found in current scope)_"
+        )));
+        assert!(out.contains(MENTION_SYSTEM_PROMPT_PREAMBLE));
+        assert!(out.ends_with(&text));
+    }
+
+    #[test]
+    fn duplicate_mention_dedupes_to_one_block() {
+        let u = uuid("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        let text = format!("First @[x](note:{u}) and again note:{u} ok?");
+        let lookup = make_lookup(vec![(u, "x", "ONE", "notes/aaaa...")]);
+        let out = build_mention_inlined_prompt(&text, lookup);
+        let block_count = out.matches("--- referenced note: x").count();
+        assert_eq!(block_count, 1, "duplicates of the same UUID inline once");
+    }
+
+    #[test]
+    fn zero_mentions_passes_text_through_unchanged() {
+        let text = "just a normal message, no mentions here";
+        let out = build_mention_inlined_prompt(text, |_| None);
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn extract_mention_uuids_preserves_first_seen_order() {
+        let a = uuid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        let b = uuid("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        let c = uuid("cccccccc-cccc-cccc-cccc-cccccccccccc");
+        let text = format!("@[B](note:{b}) then @[A](note:{a}) then note:{c} and note:{a}");
+        let uuids = extract_mention_uuids(&text);
+        assert_eq!(uuids, vec![b, a, c]);
+    }
+
+    #[test]
+    fn detect_trailing_mention_opens_at_end() {
+        let (at, query) = detect_trailing_mention("Look at @foo").unwrap();
+        assert_eq!(at, 8);
+        assert_eq!(query, "foo");
+    }
+
+    #[test]
+    fn detect_trailing_mention_empty_query_just_after_at() {
+        let (at, query) = detect_trailing_mention("Look at @").unwrap();
+        assert_eq!(at, 8);
+        assert_eq!(query, "");
+    }
+
+    #[test]
+    fn detect_trailing_mention_at_start_of_text() {
+        let (at, query) = detect_trailing_mention("@foo").unwrap();
+        assert_eq!(at, 0);
+        assert_eq!(query, "foo");
+    }
+
+    #[test]
+    fn detect_trailing_mention_returns_none_after_space() {
+        assert!(detect_trailing_mention("Look at @foo bar").is_none());
+    }
+
+    #[test]
+    fn detect_trailing_mention_returns_none_when_at_is_word_embedded() {
+        assert!(detect_trailing_mention("contact user@email").is_none());
+    }
+
+    #[test]
+    fn detect_trailing_mention_returns_none_after_close_bracket() {
+        assert!(detect_trailing_mention("Look at @[foo](note:x)").is_none());
+    }
+
+    #[test]
+    fn extract_mention_uuids_handles_no_matches() {
+        assert!(extract_mention_uuids("just text").is_empty());
+        assert!(extract_mention_uuids("@[foo](http://example.com)").is_empty());
+        assert!(
+            extract_mention_uuids("550e8400-e29b-41d4-a716-446655440000").is_empty()
+        );
+    }
+
+    #[test]
+    fn append_to_composer_handles_separators() {
+        assert_eq!(append_to_composer("", "X"), "X");
+        assert_eq!(append_to_composer("hello", "X"), "hello X");
+        assert_eq!(append_to_composer("hello ", "X"), "hello X");
+        assert_eq!(append_to_composer("hello\n", "X"), "hello\nX");
+    }
+
+    #[test]
+    fn format_mention_token_shape() {
+        let u = uuid("12345678-1234-1234-1234-123456789012");
+        assert_eq!(format_mention_token("foo", u), format!("@[foo](note:{u})"));
     }
 }
 

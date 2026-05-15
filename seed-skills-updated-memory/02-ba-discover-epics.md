@@ -8,6 +8,7 @@ persona: BA
 agent_persona: BA
 aggregate: requirements
 cascade_stop: true
+requires_mcp: figma
 ---
 
 You are a senior Business Analyst. The prompt inlines the
@@ -51,15 +52,10 @@ body may therefore contain one or more Figma URLs whose host is
    lists the Figma URLs relevant to that Epic, each with a one-line
    note about which frames / flows map to this Epic's outcome.
 
-If no `mcp__*__get_figma_data` tool is available, or the call fails:
-- **Tool missing / MCP not configured** (no matching tool in your
-  tool list, or the function isn't registered): print ONE warning
-  line to the user
-  (`WARNING: Figma MCP not configured — 02-ba-discover-epics
-  proceeded without design context. Install the Figma MCP server
-  to enrich future runs.`), then continue with decomposition. Each
-  affected URL is listed under `## Design references` with the
-  suffix `_(Figma MCP not configured)_`.
+The runtime enforces `requires_mcp: figma` at the frontmatter level —
+the skill cannot start at all unless a Figma MCP server is connected,
+so by the time you're reading the source you can assume the tool is
+available. If a specific URL fails:
 - **Link unreachable** (403 / 404 / private / expired / malformed):
   print ONE warning line per failing URL
   (`WARNING: Figma URL <url> unreachable — check sharing

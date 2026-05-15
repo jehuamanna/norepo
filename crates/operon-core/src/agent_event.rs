@@ -57,6 +57,18 @@ pub enum AgentEvent {
         content: String,
         is_error: bool,
     },
+    /// Streaming bytes from a running tool — emitted between
+    /// `ToolUse` and `ToolResult` for tools that opt into chunk
+    /// streaming. Companion UI accumulates these per `tool_use_id`
+    /// into a live output region so long Bash commands surface
+    /// progress instead of looking stuck.
+    ToolChunk {
+        tool_use_id: String,
+        /// `"stdout"` or `"stderr"` for shell tools; tool-specific
+        /// labels otherwise.
+        kind: String,
+        bytes: Vec<u8>,
+    },
     /// Turn finished. `usage` lands in the cost meter.
     Done {
         stop_reason: StopReason,
@@ -110,6 +122,17 @@ pub trait AgentBackend: Send + Sync {
     /// need it; claude-code uses this to clean up subprocess bookkeeping.
     async fn unbind_session(&self, _operon_session: Uuid) -> OperonResult<()> {
         Ok(())
+    }
+
+    /// Cancel a single in-flight tool call by `tool_use_id` without
+    /// killing the rest of the turn. Returns `true` when a matching
+    /// in-flight tool was found and signalled. Default returns
+    /// `false` — claude-code backend can't reach into its own
+    /// subprocess at this granularity, so cancelling a single tool
+    /// there always degrades to "stop the whole turn". The in-process
+    /// runtime backend overrides this with a real per-tool cancel.
+    async fn cancel_tool(&self, _operon_session: Uuid, _tool_use_id: &str) -> bool {
+        false
     }
 
     /// Override the per-session permission mode (e.g. force `acceptEdits`

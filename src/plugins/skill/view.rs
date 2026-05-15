@@ -2,20 +2,25 @@
 //! frontmatter header, plus a ▶ Play toolbar that materializes the skill
 //! to disk and pushes an invocation prompt into the active companion
 //! chat session.
+//!
+//! **Revise/Cancel/Done flow.** Skills (like every other note) default
+//! to View mode. The toolbar's `Revise` button flips the active tab to
+//! Edit, snapshots the body as `prior_body`, and reveals a `Cancel`
+//! button + a `Done` button. `Done` opens a confirm dialog with a
+//! required single-line summary; on Confirm the revision row is
+//! appended to the body via `revision_table::append_revision_row` with
+//! `derived_from = "manual"`, persisted, and the tab flips back to
+//! View. `Cancel` reverts buffer + disk to `prior_body` (no row
+//! recorded) and flips back to View. The revision table lives in the
+//! editable note body, but `materialize::to_claude_compat` strips it
+//! before writing to `.claude/skills/<slug>.md` so it never reaches
+//! the LLM prompt.
 
 use dioxus::prelude::*;
-use std::path::PathBuf;
-use uuid::Uuid;
 
-use crate::local_mode::desktop::{LocalNoteRepo, LocalProjectRepo};
-use crate::local_mode::explorer::SelectedNote;
 use crate::plugins::markdown::MarkdownView;
+use crate::plugins::revise_flow::RevisionFlowButtons;
 use crate::plugins::skill::frontmatter;
-use crate::plugins::skill::materialize;
-use crate::shell::companion_state::{
-    ActiveChatScope, ActiveChatSession, ChatScope, ChatSessionRepo, ChatSessionVersion,
-    CompanionComposerInbox,
-};
 
 #[derive(Props, Clone, PartialEq)]
 pub struct SkillViewProps {
@@ -121,178 +126,38 @@ struct SkillToolbarProps {
     skill_version: Option<String>,
 }
 
+/// Toolbar above a skill's body: hosts the Revise/Cancel/Done cluster
+/// next to the skill's name+version meta. The historical `▶ Run skill`
+/// button has been removed — skills are now invoked via the cascade
+/// runner, the companion composer (`Use the skill named "<slug>"`),
+/// or workflow nodes. `materialize::write_skill_to_repo` is still
+/// available for callers that need to push the body to
+/// `.claude/skills/<slug>.md` (the toolbar simply doesn't invoke it).
 #[component]
 fn SkillToolbar(props: SkillToolbarProps) -> Element {
-    let LocalProjectRepo(project_repo) = use_context();
-    let LocalNoteRepo(note_repo) = use_context();
-    let ChatSessionRepo(session_repo) = use_context();
-    let SelectedNote(_selected_note) = use_context();
-    let ActiveChatSession(mut active_session) = use_context();
-    let ActiveChatScope(mut active_scope) = use_context();
-    let ChatSessionVersion(mut session_version) = use_context();
-    let CompanionComposerInbox(mut composer_inbox) = use_context();
-
-    let last_status: Signal<Option<Result<String, String>>> = use_signal(|| None);
-    let mut status_setter = last_status;
-
-    let note_id_str = props.note_id.clone();
-    let content_for_play = props.content.clone();
+    let _ = props.content; // skill body is consumed by the parent view, not here.
     let skill_name = props.skill_name.clone();
     let skill_version_display = props.skill_version.clone();
-    let on_play = move |_| {
-        play_skill(
-            &note_id_str,
-            &content_for_play,
-            skill_name.as_deref(),
-            &project_repo,
-            &note_repo,
-            &session_repo,
-            &mut active_session,
-            &mut active_scope,
-            &mut session_version,
-            &mut composer_inbox,
-            &mut status_setter,
-        );
-    };
-
     rsx! {
         div { class: "operon-skill-toolbar",
             "data-testid": "skill-toolbar",
-            button {
-                r#type: "button",
-                class: "operon-skill-play",
-                "data-testid": "skill-play",
-                title: "Run this skill in the project's Companion session",
-                onclick: on_play,
-                "\u{25B6} Run skill"
+            RevisionFlowButtons {
+                note_id: props.note_id.clone(),
+                class_root: "operon-skill-revise".to_string(),
+                testid_prefix: "skill-revise".to_string(),
+            }
+            if let Some(name) = skill_name.as_ref() {
+                span { class: "operon-skill-toolbar-spacer" }
+                span {
+                    class: "operon-skill-toolbar-meta",
+                    "data-testid": "skill-toolbar-name",
+                    "{name}"
+                }
             }
             if let Some(v) = skill_version_display.as_ref() {
                 span { class: "operon-skill-toolbar-spacer" }
                 span { class: "operon-skill-toolbar-meta", "v{v}" }
             }
-            if let Some(status) = last_status.read().as_ref() {
-                span { class: "operon-skill-toolbar-spacer" }
-                match status {
-                    Ok(msg) => rsx! {
-                        span {
-                            class: "operon-skill-toolbar-status operon-skill-toolbar-status-ok",
-                            "data-testid": "skill-status-ok",
-                            "{msg}"
-                        }
-                    },
-                    Err(msg) => rsx! {
-                        span {
-                            class: "operon-skill-toolbar-status operon-skill-toolbar-status-error",
-                            "data-testid": "skill-status-error",
-                            "{msg}"
-                        }
-                    },
-                }
-            }
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn play_skill(
-    note_id_str: &str,
-    content: &str,
-    declared_skill_name: Option<&str>,
-    project_repo: &std::sync::Arc<dyn operon_store::repos::LocalProjectRepository>,
-    note_repo: &std::sync::Arc<dyn operon_store::repos::LocalNoteRepository>,
-    session_repo: &std::sync::Arc<dyn operon_store::repos::ChatSessionRepository>,
-    active_session: &mut Signal<Option<Uuid>>,
-    active_scope: &mut Signal<ChatScope>,
-    session_version: &mut Signal<u64>,
-    composer_inbox: &mut Signal<Option<String>>,
-    status: &mut Signal<Option<Result<String, String>>>,
-) {
-    // 1. Resolve the skill note's project.
-    let note_uuid = match Uuid::parse_str(note_id_str) {
-        Ok(u) => u,
-        Err(_) => {
-            status.set(Some(Err("invalid note id".into())));
-            return;
-        }
-    };
-    let project_id = match note_repo.find_project_for_note(note_uuid) {
-        Ok(Some(pid)) => pid,
-        Ok(None) => {
-            status.set(Some(Err("skill note has no project".into())));
-            return;
-        }
-        Err(e) => {
-            status.set(Some(Err(format!("lookup project: {e}"))));
-            return;
-        }
-    };
-
-    // 2. Resolve the project's repo_path.
-    let projects = match project_repo.list() {
-        Ok(rows) => rows,
-        Err(e) => {
-            status.set(Some(Err(format!("list projects: {e}"))));
-            return;
-        }
-    };
-    let project = match projects.into_iter().find(|p| p.id == project_id) {
-        Some(p) => p,
-        None => {
-            status.set(Some(Err("project no longer exists".into())));
-            return;
-        }
-    };
-    let repo_path: PathBuf = match project.repo_path {
-        Some(p) => p,
-        None => {
-            status.set(Some(Err(
-                "set the project's repository (right-click → Set repository\u{2026}) before running a skill".into(),
-            )));
-            return;
-        }
-    };
-
-    // 3. Materialize the skill body to <repo>/.claude/skills/<slug>.md.
-    let slug = declared_skill_name
-        .map(frontmatter::slugify)
-        .unwrap_or_else(|| frontmatter::slugify(note_id_str));
-    if let Err(e) = materialize::write_skill_to_repo(&repo_path, &slug, content) {
-        status.set(Some(Err(format!("materialize: {e}"))));
-        return;
-    }
-
-    // 4. Switch the rail to this project's scope and create a fresh
-    //    session named "Run: <slug>". The companion will pick it up via
-    //    the ActiveChatSession signal.
-    let scope = ChatScope::Project(project_id);
-    let new_session = match session_repo.create(scope, &format!("Run: {slug}")) {
-        Ok(s) => s,
-        Err(e) => {
-            status.set(Some(Err(format!("create session: {e}"))));
-            return;
-        }
-    };
-    active_scope.set(scope);
-    active_session.set(Some(new_session.id));
-
-    // 5. Pre-fill the companion composer with the invocation prompt
-    //    AND tell claude to capture the run's output to disk so future
-    //    workflows can chain to this skill's output without scraping
-    //    the chat transcript. Path is unified with workflow runs:
-    //    `<repo>/.operon/outputs/<slug>-output.md`. Re-running the same
-    //    skill (Play button OR a workflow node referencing it)
-    //    overwrites the same file.
-    let outputs_dir = repo_path.join(".operon").join("outputs");
-    let _ = std::fs::create_dir_all(&outputs_dir);
-    let output_path = outputs_dir.join(format!("{slug}-output.md"));
-    let prompt = format!(
-        "Use the skill named \"{slug}\".\n\nWrite your output (markdown body, optionally with YAML frontmatter) to the absolute path: {}",
-        output_path.display()
-    );
-    composer_inbox.set(Some(prompt));
-    session_version.with_mut(|v| *v += 1);
-    status.set(Some(Ok(format!(
-        "Materialized {slug}.md \u{2192} session ready \u{2022} output will land at {}",
-        output_path.display()
-    ))));
 }

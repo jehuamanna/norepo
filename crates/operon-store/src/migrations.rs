@@ -103,6 +103,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "020_local_note_kind_phase",
         include_str!("../migrations/020_local_note_kind_phase.sql"),
     ),
+    (
+        21,
+        "021_local_note_kind_ce",
+        include_str!("../migrations/021_local_note_kind_ce.sql"),
+    ),
 ];
 
 fn ensure_migrations_table(conn: &Connection) -> Result<(), StoreError> {
@@ -126,13 +131,35 @@ fn applied_versions(conn: &Connection) -> Result<Vec<i64>, StoreError> {
 }
 
 /// Apply any migrations whose version is not yet recorded.
+///
+/// Tolerates **forward-applied versions** that the current binary
+/// doesn't know about: this covers two real-world scenarios that
+/// otherwise wipe the user's persistence by failing `Store::open` ahead
+/// of any data access:
+///
+/// 1. **Downgrade:** the user ran a newer build that applied migration
+///    `N+1`, then went back to an older binary that only knows up to
+///    `N`. Refusing to open the store would force them to delete it.
+/// 2. **Migration removal mid-development:** a dev registered a
+///    migration in a branch, the local DB recorded it, the migration
+///    later got removed (e.g. the feature changed shape). The applied
+///    row now points at a version the code doesn't carry — exactly
+///    the scenario that bit migration 022 (`local_note_revision`)
+///    when its feature was reworked into an in-body table.
+///
+/// In both cases the unknown version is logged once via `eprintln!`
+/// (no tracing dep in this crate) and migration-up continues — every
+/// missing-from-DB migration in `MIGRATIONS` is still applied.
 pub fn migrate_up(conn: &mut Connection) -> Result<(), StoreError> {
     ensure_migrations_table(conn)?;
     let applied = applied_versions(conn)?;
     let known: Vec<i64> = MIGRATIONS.iter().map(|(v, _, _)| *v).collect();
     for v in &applied {
         if !known.contains(v) {
-            return Err(StoreError::UnknownAppliedVersion(*v));
+            eprintln!(
+                "operon-store: applied migration version {v} is not present in the current binary; \
+                 ignoring (likely a downgraded build or a removed in-development migration)."
+            );
         }
     }
     for (version, _name, sql) in MIGRATIONS {

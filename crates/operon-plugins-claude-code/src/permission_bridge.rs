@@ -56,6 +56,13 @@ pub enum PermissionDecision {
     /// Reject the tool call. `message` is surfaced back to the model as
     /// the tool result so it understands why and can adapt.
     Deny { message: String },
+    /// "Skip this tool but continue the turn." Returns a synthetic
+    /// result body to the model in place of running the tool. On the
+    /// wire we send the same shape as `Deny` (claude treats it as a
+    /// tool failure that the model can recover from); the host UI
+    /// distinguishes Skipped from Denied for audit purposes via the
+    /// status label, not the protocol.
+    Skip { synthetic_result: String },
 }
 
 /// Host-supplied callback. Receives the request and a one-shot back
@@ -83,6 +90,63 @@ pub const MCP_SERVER_NAME: &str = "operon";
 /// Tool name claude calls to ask for permission. Combined with
 /// `MCP_SERVER_NAME` to form `mcp__operon__permission_prompt`.
 pub const PERMISSION_TOOL_NAME: &str = "permission_prompt";
+/// Optional companion tool: when the host registers a [`ShellExecutor`]
+/// the bridge advertises this tool name so claude can route Bash calls
+/// through Operon's own subprocess runner (which streams stdout/stderr
+/// live + supports per-tool cancel). Disabled by default.
+pub const SHELL_TOOL_NAME: &str = "operon_bash";
+/// M4 — typed artifact creation tool. When the host registers an
+/// [`ArtifactExecutor`] (via [`PermissionBridge::set_artifact_executor`])
+/// the bridge advertises `mcp__operon__create_artifact` so Claude can
+/// emit SDLC artifacts as typed tool calls (kind + parent_id are
+/// arguments, not English instructions in the prompt). The matching
+/// host-side executor creates a `NoteKind::Artifact` note under the
+/// supplied parent, eliminating the legacy "Write to a directory and
+/// mtime-scan after the run" handshake and the heuristic re-parenting
+/// it required.
+pub const CREATE_ARTIFACT_TOOL_NAME: &str = "create_artifact";
+
+/// Host-supplied shell executor wired in via [`PermissionBridge::with_shell_executor`].
+/// When set, the bridge advertises [`SHELL_TOOL_NAME`] in its `tools/list`
+/// response and routes incoming `operon_bash` calls through this trait.
+///
+/// The host gets to decide how to actually run the command and where
+/// to send streaming chunks — typically [`operon-plugins-tools::ShellTool`]
+/// with a chunk sink that pushes into the Operon UI's `TOOL_STREAM_OUTPUT`
+/// signal. Returning `None` from `execute` is the "shell executor declined
+/// or failed" path; the bridge surfaces it to claude as a tool error so
+/// the model can recover.
+pub trait ShellExecutor: Send + Sync + 'static {
+    fn execute<'a>(
+        &'a self,
+        tool_use_id: String,
+        args: Value,
+    ) -> futures::future::BoxFuture<'a, OperonResult<Value>>;
+}
+
+/// Host-supplied typed-artifact creator wired in via
+/// [`PermissionBridge::set_artifact_executor`]. When set, the bridge
+/// advertises [`CREATE_ARTIFACT_TOOL_NAME`] and routes
+/// `tools/call create_artifact` invocations through `create`.
+///
+/// `args` is the JSON object Claude passed; the host validates fields
+/// (kind, parent_id, title, body), performs the actual artifact note
+/// creation, and returns either a success payload with the new note's
+/// id or an error so the model can recover. The returned `Value` is
+/// serialised verbatim into the MCP tool-result content.
+///
+/// Returns a [`LocalBoxFuture`] (not `BoxFuture`) because Operon's
+/// [`Persistence`] futures hold wasm `JsValue` handles and are
+/// intentionally `!Send`. The bridge awaits the future inline on the
+/// connection task rather than spawning it.
+pub trait ArtifactExecutor: Send + Sync + 'static {
+    fn create<'a>(
+        &'a self,
+        args: Value,
+    ) -> futures::future::LocalBoxFuture<'a, OperonResult<Value>>;
+}
+
+use operon_core::error::OperonResult;
 
 /// Live per-session permission server. Drop it to revoke the binding
 /// (any pending JSON-RPC requests then resolve to deny via the handler
@@ -90,6 +154,16 @@ pub const PERMISSION_TOOL_NAME: &str = "permission_prompt";
 pub struct PermissionBridge {
     socket_path: PathBuf,
     accept_task: Option<JoinHandle<()>>,
+    /// Host-installed shell executor. `None` means the bridge does
+    /// not advertise `operon_bash` in `tools/list`. Wired by
+    /// [`PermissionBridge::with_shell_executor`] before the bind
+    /// — adding it after is supported but the new tool isn't visible
+    /// to claude until the next session restart.
+    shell_executor: Arc<std::sync::Mutex<Option<Arc<dyn ShellExecutor>>>>,
+    /// Host-installed artifact executor. `None` means the bridge does
+    /// not advertise `create_artifact` in `tools/list`. Set via
+    /// [`PermissionBridge::set_artifact_executor`].
+    artifact_executor: Arc<std::sync::Mutex<Option<Arc<dyn ArtifactExecutor>>>>,
 }
 
 impl PermissionBridge {
@@ -112,12 +186,20 @@ impl PermissionBridge {
         }
         let listener = UnixListener::bind(&socket_path)?;
         let handler = Arc::new(handler);
+        let shell_executor: Arc<std::sync::Mutex<Option<Arc<dyn ShellExecutor>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let artifact_executor: Arc<std::sync::Mutex<Option<Arc<dyn ArtifactExecutor>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let shell_for_accept = shell_executor.clone();
+        let artifact_for_accept = artifact_executor.clone();
         let accept_task = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         let h = handler.clone();
-                        tokio::spawn(handle_connection(stream, h));
+                        let s = shell_for_accept.clone();
+                        let a = artifact_for_accept.clone();
+                        tokio::spawn(handle_connection(stream, h, s, a));
                     }
                     Err(e) => {
                         tracing::warn!(target: "operon::permission", "accept: {e}");
@@ -131,11 +213,35 @@ impl PermissionBridge {
         Ok(Self {
             socket_path,
             accept_task: Some(accept_task),
+            shell_executor,
+            artifact_executor,
         })
     }
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// Install a shell executor. Once set, the bridge advertises the
+    /// `operon_bash` tool in subsequent `tools/list` responses and
+    /// routes incoming `operon_bash` calls through `executor`. Pass
+    /// `None` to detach; the bridge stops advertising the tool for
+    /// new sessions (in-flight ones already consumed the previous
+    /// `tools/list`).
+    pub fn set_shell_executor(&self, executor: Option<Arc<dyn ShellExecutor>>) {
+        if let Ok(mut s) = self.shell_executor.lock() {
+            *s = executor;
+        }
+    }
+
+    /// Install a typed-artifact executor. Once set, the bridge
+    /// advertises `create_artifact` in subsequent `tools/list`
+    /// responses and routes calls through `executor`. Pass `None` to
+    /// detach.
+    pub fn set_artifact_executor(&self, executor: Option<Arc<dyn ArtifactExecutor>>) {
+        if let Ok(mut s) = self.artifact_executor.lock() {
+            *s = executor;
+        }
     }
 }
 
@@ -151,7 +257,12 @@ impl Drop for PermissionBridge {
     }
 }
 
-async fn handle_connection<H: PermissionHandler>(stream: UnixStream, handler: Arc<H>) {
+async fn handle_connection<H: PermissionHandler>(
+    stream: UnixStream,
+    handler: Arc<H>,
+    shell: Arc<std::sync::Mutex<Option<Arc<dyn ShellExecutor>>>>,
+    artifact: Arc<std::sync::Mutex<Option<Arc<dyn ArtifactExecutor>>>>,
+) {
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half).lines();
     let writer = Arc::new(Mutex::new(write_half));
@@ -198,24 +309,65 @@ async fn handle_connection<H: PermissionHandler>(stream: UnixStream, handler: Ar
                 // to the UI and the user might still respond.
             }
             "tools/list" => {
-                let resp = json_rpc_result(
-                    id,
-                    serde_json::json!({
-                        "tools": [{
-                            "name": PERMISSION_TOOL_NAME,
-                            "description": "Ask the user to approve a Claude tool call",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "tool_name": { "type": "string" },
-                                    "input": { "type": "object" },
-                                    "tool_use_id": { "type": "string" }
-                                },
-                                "required": ["tool_name", "input"]
-                            }
-                        }]
-                    }),
-                );
+                let mut tools = vec![serde_json::json!({
+                    "name": PERMISSION_TOOL_NAME,
+                    "description": "Ask the user to approve a Claude tool call",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "tool_name": { "type": "string" },
+                            "input": { "type": "object" },
+                            "tool_use_id": { "type": "string" }
+                        },
+                        "required": ["tool_name", "input"]
+                    }
+                })];
+                // Advertise the bash-hijack tool only when the host
+                // has installed an executor. The CLI-side
+                // `bash_via_operon` toggle is what gates that
+                // installation so users opt in explicitly.
+                let shell_active = shell
+                    .lock()
+                    .ok()
+                    .map(|g| g.is_some())
+                    .unwrap_or(false);
+                if shell_active {
+                    tools.push(serde_json::json!({
+                        "name": SHELL_TOOL_NAME,
+                        "description": "Run a bash command through Operon's runner. Operon streams stdout/stderr live to the chat UI and supports per-tool cancellation.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "command":    { "type": "string" },
+                                "cwd":        { "type": "string" },
+                                "timeout_ms": { "type": "integer", "minimum": 1 }
+                            },
+                            "required": ["command"]
+                        }
+                    }));
+                }
+                let artifact_active = artifact
+                    .lock()
+                    .ok()
+                    .map(|g| g.is_some())
+                    .unwrap_or(false);
+                if artifact_active {
+                    tools.push(serde_json::json!({
+                        "name": CREATE_ARTIFACT_TOOL_NAME,
+                        "description": "Create an SDLC artifact note in Operon (typed alternative to writing a .md file). Use this when a skill says it produces an artifact of a declared `output_kind` — the kind and parent are validated against Operon's note tree at the moment of the call, so structural mistakes are rejected immediately instead of being patched up post-hoc.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "kind":      { "type": "string", "description": "Artifact kind, e.g. epic, feature, story, task, plan, architecture." },
+                                "parent_id": { "type": "string", "description": "UUID of the parent artifact (or master_requirement). Must already exist in this project." },
+                                "title":     { "type": "string", "description": "Human-readable title for the artifact note." },
+                                "body":      { "type": "string", "description": "Markdown body. Operon ensures the YAML frontmatter declares `artifact_kind` and `parent` consistent with the typed arguments above." }
+                            },
+                            "required": ["kind", "parent_id", "title", "body"]
+                        }
+                    }));
+                }
+                let resp = json_rpc_result(id, serde_json::json!({ "tools": tools }));
                 send(&writer, resp).await;
             }
             "tools/call" => {
@@ -225,6 +377,127 @@ async fn handle_connection<H: PermissionHandler>(stream: UnixStream, handler: Ar
                     .and_then(|n| n.as_str())
                     .unwrap_or("")
                     .to_string();
+                // operon_bash branch: route to the host's ShellExecutor
+                // if one is installed; otherwise fall through to the
+                // unknown-tool error below.
+                if name == SHELL_TOOL_NAME {
+                    let executor = shell
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.as_ref().cloned());
+                    if let Some(exec) = executor {
+                        let args = params
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        let tool_use_id = args
+                            .get("tool_use_id")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| {
+                                uuid::Uuid::new_v4().to_string()
+                            });
+                        let writer = writer.clone();
+                        tokio::spawn(async move {
+                            let result = exec.execute(tool_use_id, args).await;
+                            let resp = match result {
+                                Ok(v) => json_rpc_result(
+                                    id,
+                                    serde_json::json!({
+                                        "content": [{
+                                            "type": "text",
+                                            "text": v.to_string(),
+                                        }]
+                                    }),
+                                ),
+                                Err(e) => json_rpc_result(
+                                    id,
+                                    serde_json::json!({
+                                        "content": [{
+                                            "type": "text",
+                                            "text": format!("{{\"error\":\"{}\"}}", e),
+                                        }],
+                                        "isError": true,
+                                    }),
+                                ),
+                            };
+                            send(&writer, resp).await;
+                        });
+                        continue;
+                    }
+                    let resp = json_rpc_error(
+                        id,
+                        -32601,
+                        "operon_bash advertised but no executor installed".to_string(),
+                    );
+                    send(&writer, resp).await;
+                    continue;
+                }
+                if name == CREATE_ARTIFACT_TOOL_NAME {
+                    let executor = artifact
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.as_ref().cloned());
+                    if let Some(exec) = executor {
+                        let args = params
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        let writer = writer.clone();
+                        // The executor's future is `!Send` because
+                        // Operon's `Persistence` futures hold wasm
+                        // `JsValue` handles. `spawn_blocking` parks
+                        // it on a dedicated blocking thread where
+                        // `block_on` can drive it without Send.
+                        // Then we await the JoinHandle from the
+                        // (Send) connection task.
+                        tokio::spawn(async move {
+                            let result = tokio::task::spawn_blocking(move || {
+                                futures::executor::block_on(exec.create(args))
+                            })
+                            .await;
+                            let inner = match result {
+                                Ok(r) => r,
+                                Err(join_err) => Err(operon_core::error::OperonError::Plugin {
+                                    plugin: "create_artifact".into(),
+                                    source: Box::new(std::io::Error::other(format!(
+                                        "blocking task panicked: {join_err}"
+                                    ))),
+                                }),
+                            };
+                            let resp = match inner {
+                                Ok(v) => json_rpc_result(
+                                    id,
+                                    serde_json::json!({
+                                        "content": [{
+                                            "type": "text",
+                                            "text": v.to_string(),
+                                        }]
+                                    }),
+                                ),
+                                Err(e) => json_rpc_result(
+                                    id,
+                                    serde_json::json!({
+                                        "content": [{
+                                            "type": "text",
+                                            "text": format!("{{\"error\":\"{}\"}}", e),
+                                        }],
+                                        "isError": true,
+                                    }),
+                                ),
+                            };
+                            send(&writer, resp).await;
+                        });
+                        continue;
+                    }
+                    let resp = json_rpc_error(
+                        id,
+                        -32601,
+                        "create_artifact advertised but no executor installed".to_string(),
+                    );
+                    send(&writer, resp).await;
+                    continue;
+                }
                 if name != PERMISSION_TOOL_NAME {
                     let resp = json_rpc_error(
                         id,
@@ -307,6 +580,10 @@ fn decision_to_payload(decision: &PermissionDecision) -> Value {
         PermissionDecision::Deny { message } => serde_json::json!({
             "behavior": "deny",
             "message": message,
+        }),
+        PermissionDecision::Skip { synthetic_result } => serde_json::json!({
+            "behavior": "deny",
+            "message": synthetic_result,
         }),
     }
 }
@@ -421,8 +698,142 @@ mod tests {
         .await;
         assert_eq!(resp["id"], 2);
         let tools = resp["result"]["tools"].as_array().unwrap();
+        // Without artifact + shell executors, only the permission
+        // prompt is advertised.
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], PERMISSION_TOOL_NAME);
+    }
+
+    // ===== M4: create_artifact tool surface =====
+
+    /// Test artifact executor that records calls and returns a fixed
+    /// JSON payload. Used by the two M4 tests below.
+    struct TestArtifactExecutor {
+        captured: Arc<StdMutex<Vec<Value>>>,
+        result: Value,
+    }
+
+    impl ArtifactExecutor for TestArtifactExecutor {
+        fn create<'a>(
+            &'a self,
+            args: Value,
+        ) -> futures::future::LocalBoxFuture<'a, operon_core::error::OperonResult<Value>>
+        {
+            let captured = self.captured.clone();
+            let result = self.result.clone();
+            Box::pin(async move {
+                captured.lock().unwrap().push(args);
+                Ok(result)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_list_advertises_create_artifact_when_executor_installed() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("perm.sock");
+        let bridge = PermissionBridge::bind(sock.clone(), allow_all())
+            .await
+            .unwrap();
+        bridge.set_artifact_executor(Some(Arc::new(TestArtifactExecutor {
+            captured: Arc::new(StdMutex::new(Vec::new())),
+            result: serde_json::json!({"id": "00000000-0000-0000-0000-000000000000"}),
+        })));
+
+        let mut stream = UnixStream::connect(&sock).await.unwrap();
+        let resp = rpc(
+            &mut stream,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/list",
+                "params": {}
+            }),
+        )
+        .await;
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        // Two tools now: permission_prompt + create_artifact.
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&PERMISSION_TOOL_NAME));
+        assert!(names.contains(&CREATE_ARTIFACT_TOOL_NAME));
+    }
+
+    #[tokio::test]
+    async fn tools_call_create_artifact_routes_to_executor() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("perm.sock");
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let bridge = PermissionBridge::bind(sock.clone(), allow_all())
+            .await
+            .unwrap();
+        bridge.set_artifact_executor(Some(Arc::new(TestArtifactExecutor {
+            captured: captured.clone(),
+            result: serde_json::json!({
+                "id": "abcd1234-0000-0000-0000-000000000000",
+                "kind": "epic",
+            }),
+        })));
+
+        let mut stream = UnixStream::connect(&sock).await.unwrap();
+        let resp = rpc(
+            &mut stream,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": CREATE_ARTIFACT_TOOL_NAME,
+                    "arguments": {
+                        "kind": "epic",
+                        "parent_id": "11111111-2222-3333-4444-555555555555",
+                        "title": "Auth flow",
+                        "body": "## Goals\n\n- ship it"
+                    }
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(resp["id"], 8);
+        let payload_text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(payload_text.contains("abcd1234"), "{payload_text}");
+
+        let cap = captured.lock().unwrap();
+        assert_eq!(cap.len(), 1);
+        assert_eq!(cap[0]["kind"], "epic");
+        assert_eq!(cap[0]["title"], "Auth flow");
+    }
+
+    #[tokio::test]
+    async fn tools_call_create_artifact_without_executor_returns_error() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("perm.sock");
+        // Bind the bridge but DO NOT install an artifact executor.
+        let _bridge = PermissionBridge::bind(sock.clone(), allow_all())
+            .await
+            .unwrap();
+
+        let mut stream = UnixStream::connect(&sock).await.unwrap();
+        let resp = rpc(
+            &mut stream,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": CREATE_ARTIFACT_TOOL_NAME,
+                    "arguments": {}
+                }
+            }),
+        )
+        .await;
+        // Since the tool isn't advertised (no executor installed),
+        // calling it falls through to the unknown-tool branch.
+        assert_eq!(resp["id"], 9);
+        assert_eq!(resp["error"]["code"], -32601);
     }
 
     #[tokio::test]

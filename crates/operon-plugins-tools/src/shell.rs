@@ -2,7 +2,7 @@
 
 use operon_core::error::{OperonError, OperonResult};
 use operon_core::traits::{
-    CancellationToken, Capabilities, Plugin, ToolDef, ToolPlugin,
+    CancellationToken, Capabilities, Plugin, ToolChunk, ToolDef, ToolPlugin,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -12,6 +12,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -60,6 +61,22 @@ impl ToolPlugin for ShellTool {
         args: serde_json::Value,
         ct: CancellationToken,
     ) -> OperonResult<serde_json::Value> {
+        // Delegate to the streaming path with a discarded chunk
+        // channel — chunks are emitted into the receiver, which is
+        // dropped immediately after this call returns. This keeps a
+        // single implementation of the bash spawn/wait/cancel logic
+        // (the runtime calls `invoke_streaming` directly; the
+        // non-streaming path is just for parity with the trait).
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ToolChunk>();
+        self.invoke_streaming(args, ct, tx).await
+    }
+
+    async fn invoke_streaming(
+        &self,
+        args: serde_json::Value,
+        ct: CancellationToken,
+        chunk_tx: UnboundedSender<ToolChunk>,
+    ) -> OperonResult<serde_json::Value> {
         let input: ShellInput = serde_json::from_value(args).map_err(|e| OperonError::Plugin {
             plugin: "shell".into(),
             source: Box::new(e),
@@ -86,47 +103,15 @@ impl ToolPlugin for ShellTool {
                 return Ok(json!({ "error": format!("spawn failed: {e}") }));
             }
         };
-        let mut stdout_pipe = child.stdout.take().expect("stdout piped");
-        let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+        let stdout_pipe = child.stdout.take().expect("stdout piped");
+        let stderr_pipe = child.stderr.take().expect("stderr piped");
 
-        let read_stdout = async {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
-            loop {
-                let n = match stdout_pipe.read(&mut chunk).await {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
-                if buf.len() + n <= MAX_OUTPUT_BYTES {
-                    buf.extend_from_slice(&chunk[..n]);
-                } else {
-                    let take = MAX_OUTPUT_BYTES.saturating_sub(buf.len());
-                    buf.extend_from_slice(&chunk[..take]);
-                    break;
-                }
-            }
-            String::from_utf8_lossy(&buf).to_string()
-        };
-        let read_stderr = async {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
-            loop {
-                let n = match stderr_pipe.read(&mut chunk).await {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
-                if buf.len() + n <= MAX_OUTPUT_BYTES {
-                    buf.extend_from_slice(&chunk[..n]);
-                } else {
-                    let take = MAX_OUTPUT_BYTES.saturating_sub(buf.len());
-                    buf.extend_from_slice(&chunk[..take]);
-                    break;
-                }
-            }
-            String::from_utf8_lossy(&buf).to_string()
-        };
+        let read_stdout = drain_stream(stdout_pipe, "stdout", chunk_tx.clone());
+        let read_stderr = drain_stream(stderr_pipe, "stderr", chunk_tx.clone());
+        // Drop our chunk_tx clone so the channel closes once both
+        // drain tasks have finished — the runtime's forwarder uses
+        // that as the signal to exit.
+        drop(chunk_tx);
 
         let wait = async {
             let (so, se, status) = tokio::join!(read_stdout, read_stderr, child.wait());
@@ -136,6 +121,10 @@ impl ToolPlugin for ShellTool {
         let result = tokio::select! {
             r = timeout(Duration::from_millis(timeout_ms), wait) => r,
             _ = ct.cancelled() => {
+                // `kill_on_drop(true)` (line 81) means the child dies
+                // when `child` drops at the end of this scope; we
+                // return immediately to surface the cancel without
+                // waiting for the natural exit.
                 return Ok(json!({ "error": "cancelled", "stdout": "", "stderr": "" }));
             }
         };
@@ -159,6 +148,44 @@ impl ToolPlugin for ShellTool {
             }
         }
     }
+}
+
+/// Drain one of the child's pipes: forward every read as a `ToolChunk`
+/// AND accumulate the bytes into a capped buffer for the final
+/// `ToolResult`. Returns the (lossy-decoded) full text once EOF is
+/// hit. Stops appending to the buffer at [`MAX_OUTPUT_BYTES`] but
+/// keeps streaming chunks until EOF so the UI sees the complete
+/// run.
+async fn drain_stream<R>(
+    mut pipe: R,
+    kind: &'static str,
+    chunk_tx: UnboundedSender<ToolChunk>,
+) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = match pipe.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let slice = &chunk[..n];
+        // Best-effort send. A closed receiver (runtime task gone)
+        // just means streaming is no longer being consumed — keep
+        // draining so the final result is still complete.
+        let _ = chunk_tx.send(ToolChunk {
+            kind: kind.to_string(),
+            bytes: slice.to_vec(),
+        });
+        if buf.len() < MAX_OUTPUT_BYTES {
+            let take = MAX_OUTPUT_BYTES.saturating_sub(buf.len()).min(n);
+            buf.extend_from_slice(&slice[..take]);
+        }
+    }
+    String::from_utf8_lossy(&buf).to_string()
 }
 
 #[cfg(test)]

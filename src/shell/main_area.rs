@@ -31,7 +31,6 @@ pub fn MainArea() -> Element {
             )
         })
     };
-
     let body: Element = match active_info {
         None => rsx! {
             div { class: "operon-main-empty",
@@ -205,9 +204,15 @@ pub fn MainArea() -> Element {
             role: "main",
             "aria-label": "Editor",
             TabStrip {}
-            // Local Mode hides the View/Edit/Live Preview/Split toolbar — mode
-            // switching happens via the note row's right-click context menu.
-            if !is_local { ModeToolbar {} }
+            // ModeToolbar hosts View / Edit / Cancel / Done / Split for the
+            // active tab. In Local Mode it's the only visible entry point
+            // into the revise/save flow for markdown (and other non-skill
+            // formats) — without it markdown notes have no on-screen way
+            // to switch out of the default read-only View mode. Skills
+            // also need it so View / Split show up; their Edit cluster
+            // lives inside their own toolbar instead, see
+            // `mode_toolbar::build_revise_cluster`.
+            ModeToolbar {}
             div { class: "operon-main-body", {body} }
         }
     }

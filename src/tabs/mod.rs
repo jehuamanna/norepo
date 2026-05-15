@@ -177,6 +177,20 @@ impl TabManager {
         }
     }
 
+    /// Replace the buffer for `id` with `content` and clear the dirty
+    /// flag. Used by the filesystem watcher when an external write
+    /// (typically Claude's `Write`/`Edit` tool against a referenced
+    /// note) lands on disk: the buffer is now in sync with the file,
+    /// so flipping `dirty` to false matches reality. Caller is
+    /// expected to skip the call when `content` already matches the
+    /// existing buffer to avoid spurious re-renders.
+    pub fn reload_content(&mut self, id: TabId, content: String) {
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+            t.content = content;
+            t.dirty = false;
+        }
+    }
+
     /// Close the tab with `id`. No-op if it doesn't exist. If the closed tab was active,
     /// activates the right neighbor; if none, the left; if none, sets active to `None`.
     pub fn close(&mut self, id: TabId) {

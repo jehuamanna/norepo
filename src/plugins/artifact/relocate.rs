@@ -2,8 +2,9 @@
 //!
 //! Wraps an inner [`LocalNoteRepository`] so renames, reparents, and deletes
 //! that change an artifact's canonical on-disk path also move (or remove)
-//! the corresponding directory under `.operon/artifacts/`. Non-artifact
-//! mutations pass through unchanged.
+//! the corresponding directory under
+//! `<vault>/.operon/<project-id>/artifacts/`. Non-artifact mutations pass
+//! through unchanged.
 //!
 //! The wrapper is installed in `provide_local_state` / `LocalStateProvider`,
 //! so every caller that uses the `LocalNoteRepo` context handle picks it up
@@ -14,43 +15,37 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use operon_store::repos::{
-    LocalNote, LocalNoteRepository, LocalProjectRepository, NoteKind, SubtreeSnapshot,
+    LocalNote, LocalNoteRepository, NoteKind, SubtreeSnapshot,
 };
 use operon_store::StoreError;
 use uuid::Uuid;
+
+use crate::local_mode::vault::VaultRoot;
 
 use super::paths::ArtifactPathResolver;
 
 pub struct RelocatingNoteRepo {
     inner: Arc<dyn LocalNoteRepository>,
-    project_repo: Arc<dyn LocalProjectRepository>,
+    vault: Option<VaultRoot>,
 }
 
 impl RelocatingNoteRepo {
     pub fn new(
         inner: Arc<dyn LocalNoteRepository>,
-        project_repo: Arc<dyn LocalProjectRepository>,
+        vault: Option<VaultRoot>,
     ) -> Self {
-        Self { inner, project_repo }
-    }
-
-    fn repo_path_for_project(&self, project_id: Uuid) -> Option<PathBuf> {
-        self.project_repo
-            .list()
-            .ok()?
-            .into_iter()
-            .find(|p| p.id == project_id)
-            .and_then(|p| p.repo_path)
+        Self { inner, vault }
     }
 
     /// Resolve `note_id`'s canonical artifact dir using the current DB
-    /// state. Returns `None` for non-artifact notes, missing rows, projects
-    /// without `repo_path`, or unset slugs (pre-migration).
+    /// state. Returns `None` for non-artifact notes, missing rows, when
+    /// the vault isn't configured, or unset slugs (pre-migration).
     fn canonical_dir(&self, note_id: Uuid) -> Option<PathBuf> {
+        let vault = self.vault.as_ref()?;
         let project_id = self.inner.find_project_for_note(note_id).ok().flatten()?;
-        let repo_path = self.repo_path_for_project(project_id)?;
         let notes = self.inner.list_for_project(project_id).ok()?;
-        ArtifactPathResolver::new(&repo_path, &notes).artifact_dir(note_id)
+        let artifacts_root = vault.project_artifacts_dir(project_id);
+        ArtifactPathResolver::new(&artifacts_root, &notes).artifact_dir(note_id)
     }
 
     /// Best-effort move from `old` to `new`. Logs and swallows errors —

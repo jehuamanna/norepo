@@ -220,6 +220,14 @@ pub async fn run_skill_on_source_with_revision_notes(
     workflow_node_id: Option<Uuid>,
     cancel: CancellationToken,
 ) -> Result<RunOutcome, RunnerError> {
+    // 0. MCP health gate. Refuse to run any skill while a previously
+    //    reported MCP server is in a non-connected state — surfacing a
+    //    failure now (with the offending server name) beats producing an
+    //    artifact under degraded tool capabilities.
+    if let Some(msg) = crate::shell::companion_state::mcp_health_gate_error() {
+        return Err(RunnerError::Gated(msg));
+    }
+
     // 1. Resolve project + repo_path.
     let project_id = note_repo
         .find_project_for_note(source_note_id)
@@ -256,6 +264,18 @@ pub async fn run_skill_on_source_with_revision_notes(
     let (skill_fm_lines, _) = split_skill(&skill_body);
     let lines = skill_fm_lines.unwrap_or_default();
     let contract = parse_skill_contract(&lines);
+
+    // 3a. MCP requirement gate. Every `requires_mcp` entry must
+    //     correspond to a connected MCP server or a known tool —
+    //     unconditional. A skill that declares it needs a tool and
+    //     finds the tool absent halts immediately rather than
+    //     producing degraded output. Belt-and-suspenders with the
+    //     general MCP health gate at the top of this function.
+    if let Some(msg) =
+        crate::shell::companion_state::mcp_skill_requirements_gate_error(&contract.requires_mcp)
+    {
+        return Err(RunnerError::Gated(msg));
+    }
 
     // 3-pre. Input-kind resolution. When the caller fires this skill
     //   from a source whose `artifact_kind` doesn't match the skill's
@@ -500,16 +520,18 @@ pub async fn run_skill_on_source_with_revision_notes(
         };
 
     // 4. Where claude is going to write the new artifact files.
-    //    Migration 018: this is a per-run tempdir under `.operon/`, not
-    //    a UUID-named directory under `.operon/artifacts/`. Canonical
-    //    artifact bodies live at
-    //    `.operon/artifacts/<resolved-slug-path>/index.md` (written by
-    //    `ArtifactPersistence` during `import_produced_artifacts`); the
-    //    tempdir is just a buffer Claude streams files into and is
-    //    auto-cleaned when `_staging_guard` drops at function end.
-    let operon_dir = repo_path.join(".operon");
-    std::fs::create_dir_all(&operon_dir)?;
-    let _staging_guard = tempfile::tempdir_in(&operon_dir)?;
+    //    This is an auto-cleaned per-run tempdir in the system temp
+    //    directory — NOT in the user's repo and NOT in the vault.
+    //    Canonical artifact bodies are persisted by
+    //    `ArtifactPersistence` during `import_produced_artifacts` to
+    //    `<vault>/.operon/<project-id>/artifacts/<slug>/index.md`; the
+    //    tempdir is just a scratch buffer Claude streams files into
+    //    and is removed when `_staging_guard` drops at function end.
+    //    Keeping staging out of `<repo>` ensures the user's source
+    //    tree never accumulates operon transients.
+    let _staging_guard = tempfile::Builder::new()
+        .prefix("operon-staging-")
+        .tempdir()?;
     let artifacts_dir = _staging_guard.path().to_path_buf();
     let run_started_at = SystemTime::now();
 
@@ -577,10 +599,21 @@ pub async fn run_skill_on_source_with_revision_notes(
     //     clickable prompt in the active companion chat instead of
     //     silently denying. Idempotent per session; safe to call on
     //     every runner invocation.
-    if let Err(e) = crate::shell::companion_state::ensure_session_bridge(
+    // M4 — install the typed-artifact MCP tool for this session.
+    // The runner has note_repo / persistence / project_id in scope,
+    // so we can wire up create_artifact end-to-end. Bridge already
+    // bound (idempotent via OnceCell) for non-cascade callers gets
+    // its ctx installed on first cascade entry.
+    let artifact_ctx = Some(crate::shell::companion_state::ArtifactBridgeCtx {
+        note_repo: note_repo.clone(),
+        persistence: persistence.clone(),
+        project_id,
+    });
+    if let Err(e) = crate::shell::companion_state::ensure_session_bridge_with_ctx(
         plugin,
         chat_session_id,
         repo_path.clone(),
+        artifact_ctx,
     )
     .await
     {
@@ -590,13 +623,31 @@ pub async fn run_skill_on_source_with_revision_notes(
         );
     }
 
-    // 9. Run claude. The runner forces `acceptEdits` on this
-    //    session so its automated Write tool calls don't hang
+    // 9. Run claude. By default the runner forces `acceptEdits` on
+    //    this session so its automated Write tool calls don't hang
     //    waiting for stdin approval — even when the user's global
     //    permission picker is set to "default". Normal companion
     //    chats keep using whatever the user picked, since they
     //    don't set a per-session override.
-    plugin.set_session_permission_mode(chat_session_id, Some("acceptEdits".into()));
+    //
+    //    Phase 4 opt-in: when the project's `AutoApprovePolicy` has
+    //    `cascade_uses_auto_approve_policy: true`, drop the forced
+    //    override. The permission-bridge handler then applies the
+    //    same per-category gate cascades and interactive chats both
+    //    share — so e.g. a user with `fs_write=false` sees a prompt
+    //    for every cascade-spawned Edit. The 5-minute pending-prompt
+    //    watchdog in `cascade.rs` keeps a hung cascade from running
+    //    forever waiting on a missed approval.
+    let cascade_honors_policy =
+        crate::shell::auto_approve::load(&repo_path).cascade_uses_auto_approve_policy;
+    if !cascade_honors_policy {
+        plugin.set_session_permission_mode(chat_session_id, Some("acceptEdits".into()));
+    } else {
+        // Clear any stale override that a previous turn may have
+        // installed so the per-category bridge gate gets the final
+        // say.
+        plugin.set_session_permission_mode(chat_session_id, None);
+    }
     // Pass the caller's cancellation token straight through to the
     // plugin so the in-flight `claude` subprocess dies when the user
     // clicks Stop. `drive_stream` does `proc.child.start_kill()` on
@@ -1229,6 +1280,54 @@ fn build_artifact_path_label(
     }
 }
 
+/// Where in the explorer tree should a newly produced artifact be
+/// parented? Defaults to `source_note_id` (today's behavior — produced
+/// artifacts hang off their source). The single exception is the
+/// `master_requirement → {epic, architecture}` edge: those outputs are
+/// hoisted to the master_requirement's own parent (the phase note) so
+/// they render as siblings of the master_requirement under the phase
+/// instead of children of it. Returns `source_note_id` whenever the
+/// source isn't a master_requirement, the output isn't one of the
+/// hoisted kinds, the source has no parent, or the source note can't
+/// be located.
+async fn resolve_target_parent(
+    persistence: &Arc<dyn Persistence>,
+    all_notes: &[LocalNote],
+    source_note_id: Uuid,
+    output_kind: Option<&str>,
+) -> Uuid {
+    let hoist_kind = matches!(output_kind, Some("epic") | Some("architecture"));
+    if !hoist_kind {
+        return source_note_id;
+    }
+    let Some(source) = all_notes.iter().find(|n| n.id == source_note_id) else {
+        return source_note_id;
+    };
+    let Some(parent_id) = source.parent_id else {
+        return source_note_id;
+    };
+    if !matches!(source.kind, NoteKind::Artifact) {
+        return source_note_id;
+    }
+    let Ok(bytes) = persistence.load(&source_note_id.to_string()).await else {
+        return source_note_id;
+    };
+    let Ok(body) = String::from_utf8(bytes) else {
+        return source_note_id;
+    };
+    let fm = crate::plugins::artifact::frontmatter::parse(&body);
+    let is_master = fm
+        .artifact_kind
+        .as_ref()
+        .map(|k| k.as_str() == "master_requirement")
+        .unwrap_or(false);
+    if is_master {
+        parent_id
+    } else {
+        source_note_id
+    }
+}
+
 /// Import a list of skill-produced `.md` files as `NoteKind::Artifact`
 /// notes under `source_note_id`. Shared between the cascade orchestrator
 /// (`run_skill_on_source` above) and the workflow-canvas executor
@@ -1289,13 +1388,31 @@ pub async fn import_produced_artifacts(
         )
         .await;
     }
-    let existing_siblings: Vec<LocalNote> = note_repo
-        .list_for_project(project_id)
-        .unwrap_or_default()
-        .into_iter()
+
+    // Placement rule: when a `master_requirement` produces an `epic`
+    // or `architecture`, parent the produced artifact to the source's
+    // *parent* (the phase note) instead of the master_requirement
+    // itself. This keeps epics + architecture as siblings of the
+    // master_requirement under the phase, matching the BA chain's
+    // conceptual structure (peer artifacts of the discovery phase,
+    // not sub-elements of the requirement document). Deeper levels
+    // (epic → feature → story → task) keep today's source-parented
+    // placement.
+    let all_notes = note_repo.list_for_project(project_id).unwrap_or_default();
+    let target_parent_id = resolve_target_parent(
+        persistence,
+        &all_notes,
+        source_note_id,
+        contract.output_kind.as_deref(),
+    )
+    .await;
+
+    let existing_siblings: Vec<LocalNote> = all_notes
+        .iter()
         .filter(|n| {
-            n.parent_id == Some(source_note_id) && matches!(n.kind, NoteKind::Artifact)
+            n.parent_id == Some(target_parent_id) && matches!(n.kind, NoteKind::Artifact)
         })
+        .cloned()
         .collect();
 
     let mut created_ids: Vec<Uuid> = Vec::new();
@@ -1320,7 +1437,7 @@ pub async fn import_produced_artifacts(
             Some(id) => id,
             None => match note_repo.create_with_kind(
                 project_id,
-                Some(source_note_id),
+                Some(target_parent_id),
                 &title,
                 NoteKind::Artifact,
             ) {
@@ -1349,6 +1466,7 @@ pub async fn import_produced_artifacts(
         fm.source_artifact_id = Some(source_note_id);
         fm.source_skill_id = Some(skill_note_id);
         let final_body = rewrite_artifact_fm(&body, &fm);
+        let final_body = crate::plugins::toc::seed_sentinel(&final_body);
         if let Err(e) = persistence
             .save(&row_id.to_string(), final_body.as_bytes())
             .await
@@ -1492,6 +1610,7 @@ async fn import_normalizer_rewrite(
         }
     };
     let final_body = rewrite_artifact_fm(&new_body, &fm);
+    let final_body = crate::plugins::toc::seed_sentinel(&final_body);
     if let Err(e) = persistence
         .save(&source_note_id.to_string(), final_body.as_bytes())
         .await

@@ -42,12 +42,10 @@ pub struct CascadeTranscriptSink {
     pub chat_repo: Arc<dyn ChatMessageRepository>,
 }
 
-/// Canonical project-scoped outputs directory. Skill ▶ runs and
-/// workflow node runs both target this directory so the explorer's
-/// `Outputs` note can list everything in one place.
-pub fn output_dir(repo_path: &Path) -> PathBuf {
-    repo_path.join(".operon").join("outputs")
-}
+// Outputs directory is owned by the vault (`VaultRoot::project_outputs_dir`)
+// — callers resolve it and pass it through to `run_node` as
+// `outputs_base`. Keeping the path resolution at the caller side means
+// this executor doesn't need to know about `VaultRoot` directly.
 
 /// Result of one successful node run. Caller writes these back into
 /// the node before kicking off the next step in a cascade.
@@ -115,19 +113,20 @@ impl From<std::io::Error> for ExecError {
 pub async fn run_node(
     plugin: Arc<dyn AgentBackend>,
     operon_session: Uuid,
-    repo_path: PathBuf,
+    // Per-project outputs root, resolved by the caller from
+    // `VaultRoot::project_outputs_dir(project_id)`. Lives under the
+    // vault, not the user's repository, so operon outputs stay out
+    // of the user's source tree.
+    outputs_base: PathBuf,
     workflow_id: Uuid,
     node_id: NodeId,
     node: &Node,
     skill_body: &str,
     skill_version: &str,
-    // `skill_slug` is derived from the skill's note title and drives
-    // the output filename: `<repo>/.operon/outputs/<slug>-output.md`.
-    // Re-runs of the same skill (whether triggered from the standalone
-    // Play button, a workflow cascade, or a per-node ▶) overwrite the
-    // same file. Two workflow nodes referencing the same skill share
-    // one file by design — the caller is responsible for slug
-    // uniqueness if that matters.
+    // `skill_slug` is derived from the skill's note title. Legacy
+    // single-file slug naming is no longer used (multi-output skills
+    // write N files into a per-(workflow, node) directory) but the
+    // parameter is kept so existing callers don't have to rewire.
     skill_slug: &str,
     upstream_outputs: &[(NodeId, String)],
     graph_for_hash: &WorkflowGraph,
@@ -137,13 +136,33 @@ pub async fn run_node(
         return Err(ExecError::NoSkillBody(node.skill_note_id));
     }
 
+    if let Some(msg) = crate::shell::companion_state::mcp_health_gate_error() {
+        return Err(ExecError::Plugin(msg));
+    }
+
+    // Per-skill MCP requirement gate. Parse just enough of the skill
+    // contract to read `requires_mcp` and refuse to fire when any
+    // declared server/tool is missing from the latest `system/init`
+    // inventory.
+    {
+        use crate::plugins::skill::frontmatter::{contract as parse_skill_contract, split as split_skill};
+        let (fm_lines, _) = split_skill(skill_body);
+        let lines = fm_lines.unwrap_or_default();
+        let contract = parse_skill_contract(&lines);
+        if let Some(msg) =
+            crate::shell::companion_state::mcp_skill_requirements_gate_error(&contract.requires_mcp)
+        {
+            return Err(ExecError::Plugin(msg));
+        }
+    }
+
     // Per-node output directory: each run's produced .md files are
     // imported as their own Outputs notes, so multi-output skills
     // (ba-discover-epics, ba-decompose-features, …) can write N
     // separate files. Path is keyed on (workflow_id, node_id) so
     // re-runs on the same node clear and repopulate ONE dir, while
     // sibling nodes don't collide.
-    let out_dir = output_dir(&repo_path)
+    let out_dir = outputs_base
         .join(workflow_id.to_string())
         .join(node_id.to_string());
     // Clear stale outputs from any prior run on this node so the
@@ -292,6 +311,7 @@ pub async fn run_node(
             AgentEvent::Thinking(_) => "Thinking",
             AgentEvent::ToolUse { .. } => "ToolUse",
             AgentEvent::ToolResult { .. } => "ToolResult",
+            AgentEvent::ToolChunk { .. } => "ToolChunk",
             AgentEvent::PermissionRequest { .. } => "PermissionRequest",
             AgentEvent::SessionInit { .. } => "SessionInit",
         };
@@ -393,7 +413,16 @@ pub async fn run_node(
                     }
                 }
             }
+            AgentEvent::ToolChunk { tool_use_id, kind, bytes } => {
+                // Live chunk from a streaming tool — runtime backend
+                // only. Mirror to the global TOOL_STREAM_OUTPUT so
+                // tool cards in any visible chat render the rolling
+                // output. The cascade transcript persists only the
+                // final ToolResult, not every chunk.
+                crate::shell::companion_state::append_tool_chunk(&tool_use_id, &kind, &bytes);
+            }
             AgentEvent::ToolResult { tool_use_id, content, is_error } => {
+                crate::shell::companion_state::mark_tool_stream_complete(&tool_use_id);
                 publish_node_live(node_id, |s| {
                     if s.active_tool
                         .as_ref()

@@ -25,7 +25,7 @@ pub use search::{
 pub use tree_node::{flatten_visible, NoteForest};
 pub use tree_state::TreeStateQueue;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dioxus::prelude::*;
@@ -452,6 +452,48 @@ pub fn ExplorerPanel() -> Element {
     // a context so descendant-aware DnD validation lives in NoteRow without
     // having to thread the snapshot through twenty props.
     use_context_provider(|| NotesByProjectCtx(notes_by_project));
+
+    // Migration 021 follow-up: flip legacy CE artifacts (root-level
+    // `Artifact` + `artifact_kind: requirement`) to `NoteKind::Ce`
+    // once per project per session. The conversion is idempotent —
+    // re-runs on a project with no qualifying rows are no-ops — but
+    // we still track the per-session set so we don't repeatedly load
+    // every root body just to discover there's nothing to do.
+    let migrated_ce_projects: Signal<HashSet<Uuid>> = use_signal(HashSet::new);
+    {
+        let note_repo_for_ce = note_repo.clone();
+        let persistence_for_ce: Arc<dyn Persistence> = use_context();
+        let mut migrated = migrated_ce_projects;
+        let mut bump = note_version;
+        use_effect(move || {
+            let project_list = projects.read().clone();
+            for p in project_list {
+                if migrated.peek().contains(&p.id) {
+                    continue;
+                }
+                migrated.with_mut(|s| {
+                    s.insert(p.id);
+                });
+                let note_repo_inner = note_repo_for_ce.clone();
+                let persistence_inner = persistence_for_ce.clone();
+                let pid = p.id;
+                spawn(async move {
+                    let n = crate::plugins::phase::migrate_legacy_ce(
+                        &note_repo_inner,
+                        &persistence_inner,
+                        pid,
+                    )
+                    .await;
+                    if n > 0 {
+                        eprintln!(
+                            "operon::ce_migration: project {pid} converted {n} legacy CE note(s) to NoteKind::Ce"
+                        );
+                        bump.with_mut(|v| *v += 1);
+                    }
+                });
+            }
+        });
+    }
     // Plans-Phase-4-explorer-undo-stack: panel-scope undo history. Capacity
     // 100; wrapped handlers below push inverses before each commit.
     let mut history: Signal<history::ExplorerHistory> =
@@ -901,10 +943,13 @@ pub fn ExplorerPanel() -> Element {
                 // Seed an empty phase frontmatter so downstream
                 // tooling (cascade re-instancing, phase listing) can
                 // parse the note before the user adds any content.
+                // The toc sentinel rides along so the Contents
+                // section auto-refreshes from creation onward.
                 let body = crate::plugins::phase::serialize(
                     &crate::plugins::phase::PhaseFrontmatter::default(),
                     "",
                 );
+                let body = crate::plugins::toc::seed_sentinel(&body);
                 let persistence = persistence_for_add_phase.clone();
                 let new_id = n.id;
                 spawn(async move {
@@ -924,6 +969,103 @@ pub fn ExplorerPanel() -> Element {
         }
     });
 
+    // Three-tier SDLC + CE (Customer Engineering): create a project-root
+    // CE singleton. Conceptually the peer of `NoteKind::Phase` (see
+    // `on_add_project_phase` above) — both sit at the project root and
+    // anchor a subtree of artifacts. Body is seeded with the toc
+    // sentinel only; CE has no frontmatter requirements of its own.
+    let note_repo_for_add_ce = note_repo.clone();
+    let persistence_for_add_ce: Arc<dyn Persistence> = use_context();
+    let mut open_project_for_ce = open_project_workspace.clone();
+    let on_add_project_ce = use_callback(move |project_id: Uuid| {
+        open_project_for_ce(project_id);
+        match note_repo_for_add_ce.create_with_kind(
+            project_id,
+            None,
+            "",
+            NoteKind::Ce,
+        ) {
+            Ok(n) => {
+                history.write().push(history::ExplorerAction::Create {
+                    id: n.id,
+                    blob_path: None,
+                });
+                let body = crate::plugins::toc::seed_sentinel("");
+                let persistence = persistence_for_add_ce.clone();
+                let new_id = n.id;
+                spawn(async move {
+                    if let Err(e) = persistence
+                        .save(&new_id.to_string(), body.as_bytes())
+                        .await
+                    {
+                        eprintln!(
+                            "operon: write ce scaffold body for {new_id}: {e}"
+                        );
+                    }
+                });
+                note_version.with_mut(|v| *v += 1);
+                renaming_note_setter.set(Some(n.id));
+            }
+            Err(e) => eprintln!("operon: create ce failed: {e}"),
+        }
+    });
+
+    // On-demand "Insert Contents" — opt any note into the
+    // auto-managed TOC. The same machinery CE/Phase/Artifact get from
+    // creation, but user-initiated. Loads the body, no-ops if the
+    // sentinel is already there (CE/Phase/Artifact case, or a second
+    // invocation), otherwise appends the sentinel + empty Contents
+    // block + persists. The load-hook in `on_select_note` takes it
+    // from there on subsequent opens.
+    let note_repo_for_insert_toc = note_repo.clone();
+    let persistence_for_insert_toc: Arc<dyn Persistence> = use_context();
+    let on_insert_toc = use_callback(move |note_id: Uuid| {
+        let project_id = {
+            let snap = notes_by_project.read();
+            snap.iter()
+                .find_map(|(pid, list)| {
+                    list.iter().find(|n| n.id == note_id).map(|_| *pid)
+                })
+        };
+        let Some(project_id) = project_id else {
+            eprintln!("operon::toc: insert: note {note_id} has no owning project");
+            return;
+        };
+        let notes = match note_repo_for_insert_toc.list_for_project(project_id) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "operon::toc: insert: list_for_project {project_id} failed: {e}"
+                );
+                return;
+            }
+        };
+        let pers = persistence_for_insert_toc.clone();
+        let id_str = note_id.to_string();
+        let mut bump = note_version;
+        spawn(async move {
+            let body = match pers.load(&id_str).await {
+                Ok(bytes) => String::from_utf8(bytes).unwrap_or_default(),
+                Err(crate::persistence::PersistError::NotFound) => String::new(),
+                Err(e) => {
+                    eprintln!("operon::toc: insert: load {id_str} failed: {e:?}");
+                    return;
+                }
+            };
+            if body.contains(crate::plugins::toc::TOC_SENTINEL) {
+                return;
+            }
+            let entries = crate::plugins::toc::build_toc(note_id, &notes);
+            let rendered = crate::plugins::toc::render_toc(&entries);
+            let new_body = crate::plugins::toc::splice_toc(&body, &rendered);
+            if let Err(e) = pers.save(&id_str, new_body.as_bytes()).await {
+                eprintln!("operon::toc: insert: save {id_str} failed: {e:?}");
+                return;
+            }
+            bump.with_mut(|v| *v += 1);
+        });
+    });
+
     // ===== Note handlers =====
     let mut tabs_for_select = tabs;
     let scheduler_for_select = save_scheduler.clone();
@@ -939,16 +1081,22 @@ pub fn ExplorerPanel() -> Element {
     let on_select_note = use_callback(move |note_id: Uuid| {
         selected_note.set(Some(note_id));
         selected_project.set(None);
-        // Find note metadata to get the title + kind; fall back to id +
-        // Markdown so the editor still mounts (textarea path) for missing
-        // rows.
-        let (title, kind) = notes_by_project
-            .read()
-            .values()
-            .flat_map(|list| list.iter())
-            .find(|n| n.id == note_id)
-            .map(|n| (n.title.clone(), n.kind))
-            .unwrap_or_else(|| (note_id.to_string(), NoteKind::Markdown));
+        // Find note metadata to get the title + kind + owning
+        // project; fall back to id + Markdown so the editor still
+        // mounts (textarea path) for missing rows. Project id is
+        // needed downstream so the TOC refresh hook can resolve the
+        // note's subtree before handing content to the editor.
+        let (title, kind, owning_project_id): (String, NoteKind, Option<Uuid>) = {
+            let snap = notes_by_project.read();
+            let mut found = (note_id.to_string(), NoteKind::Markdown, None);
+            for (pid, list) in snap.iter() {
+                if let Some(n) = list.iter().find(|n| n.id == note_id) {
+                    found = (n.title.clone(), n.kind, Some(*pid));
+                    break;
+                }
+            }
+            found
+        };
 
         // Plans-Phase-9-monaco-desktop (rev 15): "click on note in
         // explorer" buffer-init logic.
@@ -1017,6 +1165,41 @@ pub fn ExplorerPanel() -> Element {
             #[cfg(target_arch = "wasm32")]
             let synchronous_content = inherited.as_ref().cloned().unwrap_or_default();
 
+            // Sentinel-driven TOC refresh. Notes opted in by the
+            // creation seed (CE / Phase / Artifact) or the explicit
+            // "Insert Contents" command carry `<!-- operon:toc -->`
+            // in their body; everything from that marker to EOF is
+            // an auto-managed Contents section regenerated on each
+            // load. Persist back asynchronously so the on-disk copy
+            // matches what the editor mounts.
+            let synchronous_content = if let Some(pid) = owning_project_id {
+                let snap = notes_by_project.read();
+                if let Some(list) = snap.get(&pid) {
+                    let refreshed = crate::plugins::toc::refresh_if_managed(
+                        &synchronous_content,
+                        note_id,
+                        list,
+                    );
+                    if refreshed != synchronous_content {
+                        let pers = persistence_for_select.clone();
+                        let id_str = note_id_str.clone();
+                        let bytes = refreshed.clone().into_bytes();
+                        spawn(async move {
+                            if let Err(e) = pers.save(&id_str, &bytes).await {
+                                eprintln!(
+                                    "operon::toc: post-refresh save failed for {id_str}: {e:?}"
+                                );
+                            }
+                        });
+                    }
+                    refreshed
+                } else {
+                    synchronous_content
+                }
+            } else {
+                synchronous_content
+            };
+
             let new_tab_id = open_local_note_tab(
                 tabs_for_select,
                 scheduler_for_select.clone(),
@@ -1035,11 +1218,28 @@ pub fn ExplorerPanel() -> Element {
                     let pers = persistence_for_select.clone();
                     let mut tabs_handle = tabs_for_select;
                     let note_id_load = note_id_str.clone();
+                    // Capture the current project's note list so the
+                    // async load can rebuild the TOC sentinel block
+                    // without re-reading the Memo from a spawned
+                    // closure (Memos are scope-bound).
+                    let toc_notes: Option<Vec<LocalNote>> = owning_project_id
+                        .and_then(|pid| notes_by_project.read().get(&pid).cloned());
                     spawn(async move {
                         match pers.load(&note_id_load).await {
                             Ok(bytes) => {
                                 if let Ok(content) = String::from_utf8(bytes) {
-                                    tabs_handle.write().set_content(new_tab_id, content);
+                                    let refreshed = match toc_notes.as_ref() {
+                                        Some(list) => crate::plugins::toc::refresh_if_managed(
+                                            &content, note_id, list,
+                                        ),
+                                        None => content.clone(),
+                                    };
+                                    if refreshed != content {
+                                        let _ = pers
+                                            .save(&note_id_load, refreshed.as_bytes())
+                                            .await;
+                                    }
+                                    tabs_handle.write().set_content(new_tab_id, refreshed);
                                 }
                             }
                             Err(PersistError::NotFound) => {}
@@ -1112,6 +1312,10 @@ pub fn ExplorerPanel() -> Element {
                     }
                 }
                 note_version.with_mut(|v| *v += 1);
+                // Live-resolved chip titles in the companion chat read
+                // through this signal so a rename re-renders the chips
+                // referencing this note across every open session.
+                *crate::shell::companion_state::NOTE_TITLE_VERSION.write() += 1;
                 renaming_note_setter.set(None);
 
                 // Walk every referrer and rewrite `[[OldTitle]]` / etc to
@@ -1431,6 +1635,11 @@ pub fn ExplorerPanel() -> Element {
     // referrer-body rewrite during a Rename redo).
     let link_repo_for_redo = link_repo_for_undo.clone();
     let persistence_for_redo = persistence_for_undo.clone();
+    // Trash-on-redo: re-run the cleanup helper on Delete redo so a
+    // subsequent undo can recover the disk side-effects again.
+    let project_repo_for_redo = project_repo_for_undo.clone();
+    let persistence_for_redo_delete = persistence_for_undo.clone();
+    let crate::local_mode::CurrentVaultRoot(vault_root_for_redo) = use_context();
     // Plans-Phase-8: app-scope toast slot for surfacing undo failures.
     let crate::local_mode::ui::ToastSlot(mut toast_slot) = use_context();
     let on_undo = use_callback(move |_: ()| {
@@ -1504,7 +1713,7 @@ pub fn ExplorerPanel() -> Element {
                 // Plans-Phase-11: MoveWithin not redoable — see the
                 // variant doc-comment for rationale.
             }
-            history::ExplorerAction::Delete { snapshot } => {
+            history::ExplorerAction::Delete { snapshot, trash } => {
                 if let Err(e) = note_repo_for_undo.restore_subtree(&snapshot) {
                     eprintln!("operon: undo delete failed: {e}");
                     toast_slot.set(Some(crate::local_mode::ui::Toast {
@@ -1513,9 +1722,17 @@ pub fn ExplorerPanel() -> Element {
                     }));
                     return;
                 }
+                // Move any trashed on-disk side-effects back to their
+                // original locations: artifact dirs, materialized
+                // skills, orphaned blobs. Failures are logged inside
+                // `restore` — a partial restore is preferable to
+                // aborting the undo.
+                trash.restore();
                 // Plans-Phase-11: Delete is redoable — the snapshot
                 // carries everything needed for the forward direction
-                // (re-delete root_id).
+                // (re-delete root_id). Redo re-runs the cleanup
+                // helper so a subsequent undo can recover the disk
+                // state again.
                 history.write().push_redo(redo_clone);
             }
             history::ExplorerAction::Paste { pasted_root_id } => {
@@ -1615,17 +1832,54 @@ pub fn ExplorerPanel() -> Element {
                     }
                 }
             }
-            history::ExplorerAction::Delete { ref snapshot } => {
-                // Forward direction: re-delete the root id. Cascade kills
-                // descendants automatically via the FK.
-                if let Err(e) = note_repo_for_redo.delete(snapshot.root_id) {
-                    eprintln!("operon: redo delete failed: {e}");
-                    toast_slot.set(Some(crate::local_mode::ui::Toast {
-                        message: format!("Redo failed: {e}"),
-                        kind: crate::local_mode::ui::ToastKind::Error,
-                    }));
-                    return;
-                }
+            history::ExplorerAction::Delete { ref snapshot, .. } => {
+                // Forward direction: re-run the cleanup helper so the
+                // SQLite cascade fires AND the disk side-effects get
+                // re-trashed. The fresh `outcome.trash` is pushed onto
+                // undo so a subsequent Ctrl-Z can restore the disk
+                // state again.
+                let root = snapshot.root_id;
+                let note_repo = note_repo_for_redo.clone();
+                let project_repo = project_repo_for_redo.clone();
+                let persistence = persistence_for_redo_delete.clone();
+                let vault = vault_root_for_redo.read().clone();
+                let mut history_signal = history;
+                let mut note_version_signal = note_version;
+                let mut toast_slot_signal = toast_slot;
+                spawn(async move {
+                    match crate::plugins::cleanup::note_delete::delete_note_with_disk_cleanup(
+                        root,
+                        &note_repo,
+                        &project_repo,
+                        &persistence,
+                        vault.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(outcome) => {
+                            if let Some(new_snap) = outcome.snapshot {
+                                history_signal.write().push_undo(
+                                    history::ExplorerAction::Delete {
+                                        snapshot: new_snap,
+                                        trash: outcome.trash,
+                                    },
+                                );
+                            }
+                            note_version_signal.with_mut(|v| *v += 1);
+                        }
+                        Err(e) => {
+                            eprintln!("operon: redo delete failed: {e}");
+                            toast_slot_signal.set(Some(crate::local_mode::ui::Toast {
+                                message: format!("Redo failed: {e}"),
+                                kind: crate::local_mode::ui::ToastKind::Error,
+                            }));
+                        }
+                    }
+                });
+                // Delete redo handles its own push_undo + version bump
+                // inside the spawn — return early so the post-match
+                // sync block doesn't double-push.
+                return;
             }
             // Variants dropped during undo never reach pop_redo, but the
             // exhaustive match keeps the compiler honest if a future
@@ -1706,8 +1960,8 @@ pub fn ExplorerPanel() -> Element {
     // happens through a separate confirmation flow that's still
     // single-target).
     let note_repo_for_bulk_delete = note_repo.clone();
-    let project_repo_for_bulk_gc = project_repo.clone();
-    let note_repo_for_bulk_gc = note_repo.clone();
+    let project_repo_for_bulk_delete = project_repo.clone();
+    let persistence_for_bulk_delete = persistence.clone();
     // Plans-Phase-4-multiselect-aria: bulk-delete now also handles
     // Project members of the multi-set (per the user's "notes + projects"
     // scope decision). We delete projects after notes so any project that
@@ -1717,77 +1971,13 @@ pub fn ExplorerPanel() -> Element {
     let mut tabs_for_bulk_delete = tabs;
     let on_confirm_bulk_delete = use_callback(move |_: ()| {
         let snapshot = multi_selected.read().clone();
-        // Plans-Phase-6-image-notes: snapshot blob_paths to potentially
-        // GC. We collect every blob_path of the targets + any descendants
-        // before the delete tx fires (FK cascade loses them after). Same
-        // walk also collects the note ids whose tabs we must close after
-        // the deletes commit.
-        let mut blobs: Vec<String> = Vec::new();
-        let mut deleted_note_ids: Vec<String> = Vec::new();
-        let snap = notes_by_project.read();
-        let target_ids: std::collections::HashSet<Uuid> = snapshot
-            .iter()
-            .filter_map(|k| match k {
-                NodeKey::Note(id) => Some(*id),
-                NodeKey::Project(_) => None,
-            })
-            .collect();
-        for tid in &target_ids {
-            deleted_note_ids.push(tid.to_string());
-        }
-        for list in snap.values() {
-            for n in list.iter() {
-                let touched = target_ids.contains(&n.id) || {
-                    let mut cur = n.parent_id;
-                    let mut hit = false;
-                    while let Some(pid) = cur {
-                        if target_ids.contains(&pid) {
-                            hit = true;
-                            break;
-                        }
-                        cur = list.iter().find(|x| x.id == pid).and_then(|x| x.parent_id);
-                    }
-                    hit
-                };
-                if touched {
-                    if let Some(p) = n.blob_path.clone() {
-                        blobs.push(p);
-                    }
-                    if !target_ids.contains(&n.id) {
-                        deleted_note_ids.push(n.id.to_string());
-                    }
-                }
-            }
-        }
-        drop(snap);
 
-        // Plans-Phase-8-explorer-undo: capture each top-level deleted node
-        // as its own Delete inverse. Bulk-undo therefore restores the
-        // selection one entry at a time (LIFO via repeated Cmd+Z), which
-        // is the same UX as repeated single-delete + undo.
-        let mut deleted: usize = 0;
-        let mut deleted_projects: usize = 0;
-        for key in snapshot.iter() {
-            if let NodeKey::Note(id) = key {
-                let inverse = note_repo_for_bulk_delete.snapshot_subtree(*id).ok();
-                match note_repo_for_bulk_delete.delete(*id) {
-                    Ok(()) => {
-                        deleted += 1;
-                        if let Some(s) = inverse {
-                            history.write().push(history::ExplorerAction::Delete {
-                                snapshot: s,
-                            });
-                        }
-                    }
-                    Err(e) => eprintln!("operon: bulk delete note {id} failed: {e}"),
-                }
-            }
-        }
         // Plans-Phase-4-multiselect-aria: delete project members. Done
-        // after the note loop so project-row gymnastics (children flushed
-        // first) match single-project delete semantics. No undo entry
-        // pushed: the existing single-project delete path doesn't have a
-        // snapshot/restore inverse either, so bulk parity is fine.
+        // before the async note loop so project-row gymnastics (children
+        // flushed first) match single-project delete semantics. No undo
+        // entry pushed: the existing single-project delete path doesn't
+        // have a snapshot/restore inverse either, so bulk parity is fine.
+        let mut deleted_projects: usize = 0;
         for key in snapshot.iter() {
             if let NodeKey::Project(id) = key {
                 match project_repo_for_bulk_project_delete.delete(*id) {
@@ -1805,42 +1995,72 @@ pub fn ExplorerPanel() -> Element {
             project_version.with_mut(|v| *v += 1);
             note_version.with_mut(|v| *v += 1);
         }
-        if deleted > 0 {
-            note_version.with_mut(|v| *v += 1);
-            // Close any open tabs for the deleted subtree(s).
-            let to_close: Vec<crate::tabs::TabId> = {
-                let snap = tabs_for_bulk_delete.read();
-                snap.iter()
-                    .filter(|t| deleted_note_ids.iter().any(|d| d == &t.note_id))
-                    .map(|t| t.id)
-                    .collect()
-            };
-            if !to_close.is_empty() {
-                let mut tm = tabs_for_bulk_delete.write();
-                for tid in to_close {
-                    tm.close(tid);
-                }
-            }
-            if let Some(vault) = vault_root_for_bulk_gc.read().clone() {
-                let projects = project_repo_for_bulk_gc.list().unwrap_or_default();
-                for blob in blobs {
-                    let mut still_referenced = false;
-                    'outer: for p in &projects {
-                        if let Ok(notes) = note_repo_for_bulk_gc.list_for_project(p.id) {
-                            for n in notes {
-                                if n.blob_path.as_deref() == Some(blob.as_str()) {
-                                    still_referenced = true;
-                                    break 'outer;
-                                }
+
+        // Async note-delete loop: each top-level NodeKey::Note goes
+        // through the unified cleanup helper. The FK cascade in SQLite
+        // wipes descendants per top-level call.
+        let target_note_ids: Vec<Uuid> = snapshot
+            .iter()
+            .filter_map(|k| match k {
+                NodeKey::Note(id) => Some(*id),
+                NodeKey::Project(_) => None,
+            })
+            .collect();
+        let note_repo = note_repo_for_bulk_delete.clone();
+        let project_repo = project_repo_for_bulk_delete.clone();
+        let persistence = persistence_for_bulk_delete.clone();
+        let vault = vault_root_for_bulk_gc.read().clone();
+        let mut history_signal = history;
+        let mut tabs_signal = tabs_for_bulk_delete;
+        let mut note_version_signal = note_version;
+        spawn(async move {
+            let mut deleted: usize = 0;
+            let mut deleted_note_ids: Vec<String> = Vec::new();
+            for id in target_note_ids {
+                match crate::plugins::cleanup::note_delete::delete_note_with_disk_cleanup(
+                    id,
+                    &note_repo,
+                    &project_repo,
+                    &persistence,
+                    vault.as_ref(),
+                )
+                .await
+                {
+                    Ok(outcome) => {
+                        deleted += 1;
+                        if let Some(s) = outcome.snapshot {
+                            for n in &s.notes {
+                                deleted_note_ids.push(n.id.to_string());
                             }
+                            history_signal.write().push(history::ExplorerAction::Delete {
+                                snapshot: s,
+                                trash: outcome.trash,
+                            });
+                        } else {
+                            deleted_note_ids.push(id.to_string());
                         }
                     }
-                    if !still_referenced {
-                        let _ = std::fs::remove_file(vault.path().join(&blob));
+                    Err(e) => eprintln!("operon: bulk delete note {id} failed: {e}"),
+                }
+            }
+            if deleted > 0 {
+                note_version_signal.with_mut(|v| *v += 1);
+                let to_close: Vec<crate::tabs::TabId> = {
+                    let snap = tabs_signal.read();
+                    snap.iter()
+                        .filter(|t| deleted_note_ids.iter().any(|d| d == &t.note_id))
+                        .map(|t| t.id)
+                        .collect()
+                };
+                if !to_close.is_empty() {
+                    let mut tm = tabs_signal.write();
+                    for tid in to_close {
+                        tm.close(tid);
                     }
                 }
             }
-        }
+        });
+
         multi_selected.set(std::collections::BTreeSet::new());
         pending_bulk_delete_setter.set(false);
     });
@@ -1854,8 +2074,6 @@ pub fn ExplorerPanel() -> Element {
     // file. Title collisions get a numeric suffix.
     let project_repo_for_export = project_repo.clone();
     let note_repo_for_export = note_repo.clone();
-    let project_repo_for_gc = project_repo.clone();
-    let note_repo_for_gc = note_repo.clone();
     let persistence_for_export: Arc<dyn Persistence> = use_context();
     let crate::local_mode::CurrentVaultRoot(vault_root_for_export) = use_context();
     let on_bulk_export = use_callback(move |_: ()| {
@@ -2456,7 +2674,9 @@ pub fn ExplorerPanel() -> Element {
     });
 
     let project_repo_for_delete = project_repo.clone();
+    let project_repo_for_note_delete = project_repo.clone();
     let note_repo_for_delete = note_repo.clone();
+    let persistence_for_delete = persistence.clone();
     let mut tabs_for_delete = tabs;
     // Snapshot the per-note current editor mode from the tab manager so each
     // NoteRow can show the right context-menu items (View / Edit / Split).
@@ -2721,6 +2941,7 @@ pub fn ExplorerPanel() -> Element {
                             on_toggle_project: on_toggle_project,
                             on_add_project_note: on_add_project_note,
                             on_add_project_phase: on_add_project_phase,
+                            on_add_project_ce: on_add_project_ce,
                             on_drop_image_into_note: on_drop_image_into_note,
                             on_drop_image_into_project: on_drop_image_into_project,
                             on_select_note: on_select_note,
@@ -2748,6 +2969,7 @@ pub fn ExplorerPanel() -> Element {
                             on_bulk_cut: on_bulk_cut,
                             on_bulk_copy: on_bulk_copy,
                             on_bulk_request_delete: on_bulk_request_delete,
+                            on_insert_toc: on_insert_toc,
                             on_set_repo_path: on_set_repo_path,
                         }
                     }
@@ -2790,107 +3012,61 @@ pub fn ExplorerPanel() -> Element {
                 ),
                 confirm_label: "Delete".to_string(),
                 on_confirm: Callback::new(move |_| {
-                    // Plans-Phase-6-image-notes: snapshot the note's blob_path
-                    // (and the blob_paths of any descendants) BEFORE delete,
-                    // since the FK cascade will lose them. Same walk also
-                    // collects the note ids whose tabs we must close after
-                    // a successful delete.
-                    let mut blobs_to_check: Vec<String> = Vec::new();
-                    let mut deleted_note_ids: Vec<String> = vec![did.to_string()];
-                    let snap = notes_by_project.read();
-                    for list in snap.values() {
-                        // Collect the target plus all descendants whose
-                        // ancestor chain includes `did`.
-                        for n in list.iter() {
-                            if n.id == did {
-                                if let Some(ref p) = n.blob_path {
-                                    blobs_to_check.push(p.clone());
+                    let note_repo = note_repo_for_delete.clone();
+                    let project_repo = project_repo_for_note_delete.clone();
+                    let persistence = persistence_for_delete.clone();
+                    let vault = vault_root_for_export.read().clone();
+                    let mut history_signal = history;
+                    let mut tabs_signal = tabs_for_delete;
+                    let mut note_version_signal = note_version;
+                    let mut selected_note_signal = selected_note;
+                    spawn(async move {
+                        match crate::plugins::cleanup::note_delete::delete_note_with_disk_cleanup(
+                            did,
+                            &note_repo,
+                            &project_repo,
+                            &persistence,
+                            vault.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(outcome) => {
+                                let deleted_note_ids: Vec<String> = outcome
+                                    .snapshot
+                                    .as_ref()
+                                    .map(|s| s.notes.iter().map(|n| n.id.to_string()).collect())
+                                    .unwrap_or_else(|| vec![did.to_string()]);
+                                if let Some(snapshot) = outcome.snapshot {
+                                    history_signal.write().push(
+                                        history::ExplorerAction::Delete {
+                                            snapshot,
+                                            trash: outcome.trash,
+                                        },
+                                    );
                                 }
-                            }
-                            // Walk ancestors of n; if any ancestor is `did`,
-                            // n is being deleted too.
-                            let mut cur = n.parent_id;
-                            while let Some(pid) = cur {
-                                if pid == did {
-                                    if let Some(ref p) = n.blob_path {
-                                        blobs_to_check.push(p.clone());
+                                note_version_signal.with_mut(|v| *v += 1);
+                                if selected_note_now == Some(did) {
+                                    selected_note_signal.set(None);
+                                }
+                                let to_close: Vec<crate::tabs::TabId> = {
+                                    let snap = tabs_signal.read();
+                                    snap.iter()
+                                        .filter(|t| {
+                                            deleted_note_ids.iter().any(|d| d == &t.note_id)
+                                        })
+                                        .map(|t| t.id)
+                                        .collect()
+                                };
+                                if !to_close.is_empty() {
+                                    let mut tm = tabs_signal.write();
+                                    for tid in to_close {
+                                        tm.close(tid);
                                     }
-                                    deleted_note_ids.push(n.id.to_string());
-                                    break;
                                 }
-                                cur = list.iter().find(|x| x.id == pid).and_then(|x| x.parent_id);
                             }
+                            Err(e) => eprintln!("operon: delete local_note failed: {e}"),
                         }
-                    }
-                    drop(snap);
-                    // Plans-Phase-8-explorer-undo: snapshot the subtree before
-                    // delete so undo can re-INSERT it. Capture failure is
-                    // non-fatal (we still delete; the user just can't undo).
-                    let undo_snapshot =
-                        match note_repo_for_delete.snapshot_subtree(did) {
-                            Ok(s) => Some(s),
-                            Err(e) => {
-                                eprintln!(
-                                    "operon: snapshot before delete failed: {e}"
-                                );
-                                None
-                            }
-                        };
-                    match note_repo_for_delete.delete(did) {
-                        Ok(()) => {
-                            if let Some(snapshot) = undo_snapshot {
-                                history
-                                    .write()
-                                    .push(history::ExplorerAction::Delete { snapshot });
-                            }
-                            note_version.with_mut(|v| *v += 1);
-                            if selected_note_now == Some(did) {
-                                selected_note.set(None);
-                            }
-                            // Close any open tabs that referenced the deleted
-                            // subtree — multiple tabs can target the same
-                            // note_id (View / Edit / Split), so collect-then-
-                            // close to avoid mutating during iteration.
-                            let to_close: Vec<crate::tabs::TabId> = {
-                                let snap = tabs_for_delete.read();
-                                snap.iter()
-                                    .filter(|t| deleted_note_ids.iter().any(|d| d == &t.note_id))
-                                    .map(|t| t.id)
-                                    .collect()
-                            };
-                            if !to_close.is_empty() {
-                                let mut tm = tabs_for_delete.write();
-                                for tid in to_close {
-                                    tm.close(tid);
-                                }
-                            }
-                            // Refcount each blob: if no remaining note
-                            // references it, delete the on-disk file.
-                            if let Some(vault) = vault_root_for_export.read().clone() {
-                                let project_repo = project_repo_for_gc.clone();
-                                let note_repo = note_repo_for_gc.clone();
-                                let projects = project_repo.list().unwrap_or_default();
-                                for blob in blobs_to_check {
-                                    let mut still_referenced = false;
-                                    'outer: for p in &projects {
-                                        if let Ok(notes) = note_repo.list_for_project(p.id) {
-                                            for n in notes {
-                                                if n.blob_path.as_deref() == Some(blob.as_str()) {
-                                                    still_referenced = true;
-                                                    break 'outer;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if !still_referenced {
-                                        let abs = vault.path().join(&blob);
-                                        let _ = std::fs::remove_file(&abs);
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => eprintln!("operon: delete local_note failed: {e}"),
-                    }
+                    });
                     pending_delete_note_setter.set(None);
                 }),
                 on_cancel: Callback::new(move |_| {
@@ -2983,6 +3159,7 @@ struct ProjectSubtreeProps {
     on_toggle_project: Callback<Uuid>,
     on_add_project_note: Callback<(Uuid, CreatableKind)>,
     on_add_project_phase: Callback<Uuid>,
+    on_add_project_ce: Callback<Uuid>,
     on_drop_image_into_note: Callback<(Uuid, Vec<u8>, String)>,
     on_drop_image_into_project: Callback<(Uuid, Vec<u8>, String)>,
     on_select_note: Callback<Uuid>,
@@ -3013,6 +3190,9 @@ struct ProjectSubtreeProps {
     on_bulk_cut: Callback<()>,
     on_bulk_copy: Callback<()>,
     on_bulk_request_delete: Callback<()>,
+    /// User-initiated opt-in to the auto-managed Contents section on
+    /// any note. See `plugins::toc` for the sentinel-driven mechanic.
+    on_insert_toc: Callback<Uuid>,
     /// M1-companion-claude-code: bind / clear the project's git repository.
     on_set_repo_path: Callback<(Uuid, Option<std::path::PathBuf>)>,
 }
@@ -3085,6 +3265,7 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
             on_toggle: props.on_toggle_project,
             on_add_note: props.on_add_project_note,
             on_add_phase: props.on_add_project_phase,
+            on_add_ce: props.on_add_project_ce,
             on_drop_image_file: props.on_drop_image_into_project,
             on_cut: props.on_cut_project,
             on_copy: props.on_copy_project,
@@ -3138,6 +3319,10 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
                             .artifact_meta
                             .get(&note.id)
                             .map(|m| m.status),
+                        artifact_kind: props
+                            .artifact_meta
+                            .get(&note.id)
+                            .and_then(|m| m.kind.clone()),
                         in_rename: props.renaming_note == Some(note.id),
                         is_first_sibling: is_first,
                         is_last_sibling: is_last,
@@ -3165,6 +3350,7 @@ fn ProjectSubtree(props: ProjectSubtreeProps) -> Element {
                         on_bulk_cut: props.on_bulk_cut,
                         on_bulk_copy: props.on_bulk_copy,
                         on_bulk_request_delete: props.on_bulk_request_delete,
+                        on_insert_toc: props.on_insert_toc,
                     }
                 }
             }

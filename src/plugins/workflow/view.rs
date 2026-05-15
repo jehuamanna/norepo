@@ -671,6 +671,9 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
     let chat_message_repo_for_cascade: Option<
         std::sync::Arc<dyn operon_store::repos::ChatMessageRepository>,
     > = try_consume_context::<ChatMessageRepo>().map(|r| r.0);
+    #[cfg(not(target_arch = "wasm32"))]
+    let vault_signal_for_cascade: Option<Signal<Option<crate::local_mode::vault::VaultRoot>>> =
+        try_consume_context::<crate::local_mode::desktop::CurrentVaultRoot>().map(|c| c.0);
     let chat_session_version_for_cascade: Option<Signal<u64>> =
         try_consume_context::<ChatSessionVersion>().map(|v| v.0);
     let mut drag = use_signal::<Option<DragState>>(|| None);
@@ -1778,6 +1781,8 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                 chat_session_repo_for_cascade.clone();
                             let cascade_message_repo =
                                 chat_message_repo_for_cascade.clone();
+                            #[cfg(not(target_arch = "wasm32"))]
+                            let cascade_vault_signal = vault_signal_for_cascade;
                             let mut cascade_note_version = note_version_for_actions;
                             let mut cascade_session_version =
                                 chat_session_version_for_cascade;
@@ -1847,6 +1852,10 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                         );
                                         return;
                                     };
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    let cascade_vault_snapshot = cascade_vault_signal
+                                        .as_ref()
+                                        .and_then(|s| s.read().clone());
                                     crate::plugins::artifact::view::spawn_cascade(
                                         aref,
                                         note_repo,
@@ -1855,6 +1864,8 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
                                         plugin,
                                         session_repo,
                                         message_repo,
+                                        #[cfg(not(target_arch = "wasm32"))]
+                                        cascade_vault_snapshot,
                                         &mut note_version,
                                         &mut session_version,
                                         &mut active_session,
@@ -2988,6 +2999,8 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
     let ChatMessageRepo(chat_message_repo) = use_context();
     let LocalNoteVersion(note_version) = use_context();
     let ChatSessionVersion(chat_session_version) = use_context();
+    #[cfg(not(target_arch = "wasm32"))]
+    let crate::local_mode::desktop::CurrentVaultRoot(vault_signal_toolbar) = use_context();
     let on_apply = props.on_apply;
     let graph_text = props.graph_text.clone();
     let apply_with_undo = props.apply_with_undo;
@@ -3109,6 +3122,8 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
                     let mut active_scope_setter = active_scope_signal;
                     move |_| {
                         let Some(root_id) = seed_artifact_id else { return; };
+                        #[cfg(not(target_arch = "wasm32"))]
+                        let vault_snapshot_toolbar = vault_signal_toolbar.read().clone();
                         crate::plugins::artifact::view::spawn_cascade(
                             root_id,
                             note_repo.clone(),
@@ -3117,6 +3132,8 @@ fn WorkflowToolbar(props: WorkflowToolbarProps) -> Element {
                             plugin.clone(),
                             chat_session_repo.clone(),
                             chat_message_repo.clone(),
+                            #[cfg(not(target_arch = "wasm32"))]
+                            vault_snapshot_toolbar,
                             &mut note_version_setter,
                             &mut chat_session_version_setter,
                             &mut active_session_setter,
@@ -4231,9 +4248,8 @@ fn spawn_run_cascade(
                 chat_repo: chat_repo.clone(),
             });
         }
-        let operon_session = cascade_session_id;
         eprintln!(
-            "operon: cascade resolved session={operon_session} repo={} project_id={:?} \
+            "operon: cascade resolved cascade_session={cascade_session_id} repo={} project_id={:?} \
              rail_persist={}",
             repo_path.display(),
             project_id_opt,
@@ -4241,9 +4257,9 @@ fn spawn_run_cascade(
         );
 
         // M2 — refresh <repo>/.claude/CLAUDE.md with the project's
-        // current SDLC inventory before binding the session, so the
-        // first turn of this cascade sees up-to-date context. Failure
-        // is non-fatal: the cascade still runs without the doc.
+        // current SDLC inventory before any node runs, so the first
+        // turn of every per-node session sees up-to-date context.
+        // Failure is non-fatal: the cascade still runs without the doc.
         if let Some(project_id) = project_id_opt {
             let project_name = project_repo
                 .get(project_id)
@@ -4271,20 +4287,26 @@ fn spawn_run_cascade(
             }
         }
 
-        plugin.bind_session(operon_session, repo_path.clone());
+        // M5 — no upfront `plugin.bind_session(cascade_session_id, …)`
+        // here. Each node mints its own fresh `operon_session` inside
+        // the source-loop below so its `claude` subprocess starts
+        // without `--resume`, eliminating reasoning bleed from prior
+        // nodes. The cascade-wide `cascade_session_id` is only used
+        // for the rail (chat_session row + transcript persistence).
 
         // Switch the companion's rail to the cascade's session so the
         // user sees the streaming transcript, "Claude is thinking…"
-        // loader, and tool-call cards live as the cascade runs.
-        // Mirrors what the artifact view's spawn_runner does. The
-        // signals are plumbed from the toolbar's component body so
-        // the writes land on a runtime-bound Signal.
+        // loader, and tool-call cards live as the cascade runs. The
+        // rail tracks `cascade_session_id` (the chat_session row),
+        // not any per-node operon_session, so the rail UX stays one
+        // conversation per cascade even though each node spawns its
+        // own claude subprocess.
         if let Some(project_id) = project_id_opt {
             active_scope_signal.set(ChatScope::Project(project_id));
         }
-        active_session_signal.set(Some(operon_session));
+        active_session_signal.set(Some(cascade_session_id));
         eprintln!(
-            "operon: cascade rail-switch active_session={operon_session} \
+            "operon: cascade rail-switch active_session={cascade_session_id} \
              scope=Project({:?})",
             project_id_opt
         );
@@ -4344,8 +4366,19 @@ fn spawn_run_cascade(
             let mut accumulated_artifact_ids: Vec<Uuid> = Vec::new();
             let mut node_failed = false;
             for source_id in sources {
+                // M5 — fresh per-node claude session. Mint a brand-new
+                // UUID for every (node, source) iteration so claude's
+                // `--resume` doesn't carry context across nodes.
+                // `bind_session` is idempotent for a given UUID; per
+                // node we generate a new one so it's effectively a
+                // first-time bind. The transcript_sink keeps using
+                // `cascade_session_id` so the rail sees one
+                // conversation per cascade, not one per node.
+                let node_operon_session = Uuid::new_v4();
+                plugin.bind_session(node_operon_session, repo_path.clone());
                 eprintln!(
-                    "operon: cascade running node {node_id} (source={source_id})"
+                    "operon: cascade running node {node_id} (source={source_id}) \
+                     fresh operon_session={node_operon_session}"
                 );
                 // Stamp the source on the node so run_one_node's
                 // SDLC routing decision and run_one_node_sdlc both
@@ -4355,12 +4388,18 @@ fn spawn_run_cascade(
                     n.status = NodeStatus::Running;
                 }
                 apply_graph.call(graph.clone());
+                // `spawn_run_cascade` is dead code; pass a throwaway
+                // outputs_base under the repo so it still typechecks
+                // when someone resurrects it. Real callers go through
+                // `spawn_run_node`, which derives the path from the vault.
+                let outputs_base = repo_path.join("outputs");
                 let result = run_one_node(
                     &mut graph,
                     node_id,
                     workflow_id,
-                    operon_session,
+                    node_operon_session,
                     &repo_path,
+                    outputs_base,
                     plugin.clone(),
                     &persistence,
                     &note_repo,
@@ -4520,6 +4559,10 @@ fn spawn_run_node(
         Some(p) => p,
         None => return,
     };
+    #[cfg(not(target_arch = "wasm32"))]
+    let vault_snapshot_run_node: Option<crate::local_mode::vault::VaultRoot> =
+        try_consume_context::<crate::local_mode::desktop::CurrentVaultRoot>()
+            .and_then(|c| c.0.read().clone());
     let workflow_id = match Uuid::parse_str(&note_id_str) {
         Ok(u) => u,
         Err(_) => return,
@@ -4609,12 +4652,20 @@ fn spawn_run_node(
              scope=Project({:?})",
             project_id_opt
         );
+        #[cfg(not(target_arch = "wasm32"))]
+        let outputs_base = match (vault_snapshot_run_node.as_ref(), project_id_opt) {
+            (Some(v), Some(pid)) => v.project_outputs_dir(pid),
+            _ => repo_path.join("outputs"),
+        };
+        #[cfg(target_arch = "wasm32")]
+        let outputs_base = repo_path.join("outputs");
         match run_one_node(
             &mut graph,
             node_id,
             workflow_id,
             operon_session,
             &repo_path,
+            outputs_base,
             plugin.clone(),
             &persistence,
             &note_repo,
@@ -4733,6 +4784,7 @@ async fn run_one_node(
     workflow_id: Uuid,
     operon_session: Uuid,
     repo_path: &std::path::Path,
+    outputs_base: std::path::PathBuf,
     plugin: Arc<operon_plugins_claude_code::ClaudeCodeChatPlugin>,
     persistence: &Arc<dyn Persistence>,
     note_repo: &Arc<dyn LocalNoteRepository>,
@@ -4839,7 +4891,7 @@ async fn run_one_node(
     let artifact: RunArtifact = run_node(
         plugin,
         operon_session,
-        repo_path.to_path_buf(),
+        outputs_base,
         workflow_id,
         node_id,
         &node_snapshot,

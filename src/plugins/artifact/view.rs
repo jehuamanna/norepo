@@ -9,6 +9,7 @@
 use dioxus::prelude::*;
 use operon_store::repos::{LocalNote, LocalNoteRepository, NoteKind};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -156,14 +157,7 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
     // `use_context()` — the underlying Arc is cheap to clone.
     let persistence_for_clarification: Arc<dyn Persistence> = use_context();
 
-    // "Run skill" picker — collapsed by default; opens inline above
-    // the body. Filters skills by `input_kind` matching this
-    // artifact's kind (when both are set); otherwise lists all
-    // skills. Run picks up project / repo / chat-session context the
-    // same way the workflow cascade does.
-    let mut picker_open = use_signal(|| false);
     let source_uuid = Uuid::parse_str(&props.note_id).ok();
-    let source_kind_str = fm.artifact_kind.as_ref().map(|k| k.as_str().to_string());
     // Pipeline gate: a downstream skill may run on this artifact only
     // when the artifact is Approved, or when it's a root seed (no
     // upstream parent — e.g. a user-authored Requirements note).
@@ -216,17 +210,6 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
     // obvious the question's been resolved.
     let show_clarification_panel =
         is_clarification && !matches!(status, ArtifactStatus::Approved);
-    let run_button_title = if is_runnable_source {
-        "Run a skill on this artifact to produce child artifacts (Epics, Features, etc.).".to_string()
-    } else {
-        format!(
-            "Approve this {} first \u{2014} child skills are gated on parent approval.",
-            fm.artifact_kind
-                .as_ref()
-                .map(|k| k.display_name().to_lowercase())
-                .unwrap_or_else(|| "artifact".into())
-        )
-    };
     // Phase E: read run state from the global `ARTIFACT_RUN_STATE`
     // map. The map is keyed on the runner's deterministic
     // chat_session_id (so the companion's loader and this view
@@ -252,11 +235,17 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
     // actions toolbar (Run skill / Generate Cascade / etc.) is
     // unaffected. Centralising the mode-by-kind decision here keeps
     // the header rsx readable.
+    // Play visibility is purely kind+status driven. The previous
+    // `!body_editable → None` arm was a vestige from when the entire
+    // action toolbar was Edit-only; after the View-by-default toolbar
+    // redesign the four eligible kinds must surface Play in View mode
+    // too. The render-side `if let Some(mode) = primary_play_mode` at
+    // the header gates display; the body_editable check would have
+    // hidden it from every artifact on first open (since artifacts
+    // now default to View).
     let primary_play_mode: Option<crate::plugins::artifact::cascade::RunMode> = {
         use crate::plugins::artifact::cascade::RunMode;
-        if !body_editable {
-            None
-        } else if is_cascade_root && is_runnable_source {
+        if is_cascade_root && is_runnable_source {
             Some(if is_task {
                 RunMode::TaskPlanOnly
             } else {
@@ -291,6 +280,19 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
             "data-debug-on-change-some": "{dbg_on_change_some}",
             "data-debug-body-editable": "{dbg_body_editable}",
             div { class: "operon-artifact-header",
+                // Static kind label. Intentionally NOT interactive: the
+                // cascade runner assigns `artifact_kind` from the
+                // generating skill's contract (`runner.rs:1451`,
+                // `:1588`). Letting the user retype it from the UI
+                // risks (a) breaking skill input-kind matching so
+                // downstream cascade runs silently skip the artifact,
+                // (b) decoupling on-disk YAML from the implied SDLC
+                // hierarchy (Epic > Feature > Story > Task) that
+                // sibling notes and the explorer assume. If a
+                // mislabeled artifact needs fixing today, the right
+                // path is hand-editing the YAML or regenerating from
+                // the parent — both of which are deliberate and
+                // visible operations.
                 span { class: "operon-artifact-kind-badge", "{kind_label}" }
                 // Primary Play/Stop toggle, immediately next to the
                 // kind title. CascadePlayButton morphs to ⏹ Stop on
@@ -300,6 +302,13 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                     CascadePlayButton {
                         root_artifact_id: uuid,
                         run_mode: mode,
+                        // Toolbar redesign: single click-and-run
+                        // Play affordance, no per-stage dropdown.
+                        // The stages dropdown was hidden behind the
+                        // chevron next to the play button and
+                        // surfaced configuration that 99% of users
+                        // never touched.
+                        with_stages_dropdown: false,
                     }
                 }
                 span {
@@ -358,98 +367,92 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                     }
                 }
                 div { class: "operon-artifact-actions",
-                    if body_editable {
-                        button {
-                            r#type: "button",
-                            class: "operon-artifact-approve",
-                            "data-testid": "artifact-approve",
-                            disabled: status == ArtifactStatus::Approved,
-                            onclick: approve,
-                            "Approve"
-                        }
-                        button {
-                            r#type: "button",
-                            class: "operon-artifact-reject",
-                            "data-testid": "artifact-reject",
-                            disabled: status == ArtifactStatus::Rejected,
-                            onclick: reject,
-                            "Reject"
-                        }
-                        button {
-                            r#type: "button",
-                            class: "operon-artifact-mark-dirty",
-                            "data-testid": "artifact-mark-dirty",
-                            title: "Mark as dirty so this artifact is re-generated on the next run.",
-                            onclick: mark_dirty,
-                            "Mark dirty"
-                        }
-                        if let Some(uuid) = source_uuid {
-                            ReviseButton { artifact_id: uuid }
-                        }
-                        if status == ArtifactStatus::Dirty {
-                            if let (Some(parent), Some(skill), Some(self_id)) =
-                                (fm.source_artifact_id, fm.source_skill_id, source_uuid)
-                            {
-                                RerunButton {
-                                    parent_id: parent,
-                                    skill_id: skill,
-                                    artifact_id: self_id,
-                                    artifact_body: content_for_actions.clone(),
-                                }
-                            }
-                        }
-                        if is_cascade_root {
+                    // Revise ⇄ Done toggle is always visible; the
+                    // button morphs and (in Edit) surfaces a sibling
+                    // Cancel button. Drives the View → Edit and
+                    // Edit → View transitions.
+                    if let Some(uuid) = source_uuid {
+                        ReviseButton { artifact_id: uuid }
+                    }
+                    // Approve / Reject / Mark dirty — visible in
+                    // BOTH View and Edit modes per the toolbar
+                    // redesign. They go through `save_status_change`,
+                    // which handles the View-mode `on_change = None`
+                    // case gracefully (just no in-memory dispatch;
+                    // the watcher reload picks up the disk write).
+                    // Combined Approve/Reject toggle. Label and
+                    // action reflect the OPPOSITE of the current
+                    // status, so one click always flips state:
+                    //   - status == Approved → "Reject" (red)
+                    //   - status anything else → "Approve" (green)
+                    // The status pill in the header carries the
+                    // current state visually so the user always
+                    // knows what they're flipping FROM.
+                    {
+                        let is_approved = status == ArtifactStatus::Approved;
+                        let (label, cls, testid, onclick): (
+                            &str,
+                            &str,
+                            &str,
+                            Box<dyn FnMut(Event<MouseData>)>,
+                        ) = if is_approved {
+                            (
+                                "Reject",
+                                "operon-artifact-reject",
+                                "artifact-reject",
+                                Box::new(reject),
+                            )
+                        } else {
+                            (
+                                "Approve",
+                                "operon-artifact-approve",
+                                "artifact-approve",
+                                Box::new(approve),
+                            )
+                        };
+                        rsx! {
                             button {
                                 r#type: "button",
-                                class: "operon-artifact-run-skill",
-                                "data-testid": "artifact-run-skill",
-                                disabled: !is_runnable_source,
-                                title: "{run_button_title}",
-                                onclick: move |_| {
-                                    if is_runnable_source {
-                                        picker_open.with_mut(|v| *v = !*v);
-                                    }
-                                },
-                                if *picker_open.read() { "Hide skills" } else { "Run skill\u{2026}" }
-                            }
-                            if let Some(uuid) = source_uuid {
-                                if is_runnable_source {
-                                    GenerateCascadeButton { root_artifact_id: uuid }
-                                }
+                                class: "{cls}",
+                                "data-testid": "{testid}",
+                                onclick: onclick,
+                                "{label}"
                             }
                         }
-                        // Secondary "Create test cases" button —
-                        // regen-only (no rerun) variant of the
-                        // Implementation Play. Lives in the action
-                        // strip so the primary Play/Stop next to the
-                        // title stays a single button. Dirty
-                        // Implementations only.
-                        if is_implementation
-                            && !is_cascade_root
-                            && matches!(status, ArtifactStatus::Dirty)
+                    }
+                    button {
+                        r#type: "button",
+                        class: "operon-artifact-mark-dirty",
+                        "data-testid": "artifact-mark-dirty",
+                        title: "Mark as dirty so this artifact is re-generated on the next run.",
+                        onclick: mark_dirty,
+                        "Mark dirty"
+                    }
+                    // Rerun — only in View mode, only when the
+                    // artifact is Dirty and we have source info.
+                    // Hidden in Edit so the user isn't tempted to
+                    // re-run mid-revision.
+                    if !props.edit && status == ArtifactStatus::Dirty {
+                        if let (Some(parent), Some(skill), Some(self_id)) =
+                            (fm.source_artifact_id, fm.source_skill_id, source_uuid)
                         {
-                            if let Some(uuid) = source_uuid {
-                                CascadePlayButton {
-                                    root_artifact_id: uuid,
-                                    run_mode: crate::plugins::artifact::cascade::RunMode::GenerateTestCasesOnly,
-                                }
+                            RerunButton {
+                                parent_id: parent,
+                                skill_id: skill,
+                                artifact_id: self_id,
+                                artifact_body: content_for_actions.clone(),
                             }
                         }
                     }
+                    // Run skill / Generate Cascade / Create test
+                    // cases removed per the toolbar redesign. The
+                    // header Play button is the single cascade-run
+                    // entry point now. If users need the old
+                    // skill-picker / per-mode controls, surface
+                    // them in a dedicated "Advanced" panel later.
                 }
             }
-            if *picker_open.read() {
-                if let Some(src_uuid) = source_uuid {
-                    SkillPickerPanel {
-                        source_note_id: src_uuid,
-                        source_artifact_kind: source_kind_str.clone(),
-                        source_body: props.content.clone(),
-                        on_dismiss: Callback::new(move |_| picker_open.set(false)),
-                    }
-                }
-            }
-            // Inline run-status row, visible regardless of whether
-            // the picker is open. Empty before the first run;
+            // Inline run-status row. Empty before the first run;
             // shows the live state (Running / Done / Failed) keyed
             // off the global run-state map.
             match run_state_view {
@@ -811,6 +814,7 @@ pub fn patch_status_text(content: &str, next: ArtifactStatus) -> String {
     fm.status = next;
     rewrite(content, &fm)
 }
+
 
 fn status_css_class(s: ArtifactStatus) -> &'static str {
     match s {
@@ -1499,12 +1503,29 @@ fn RerunButton(props: RerunButtonProps) -> Element {
     }
 }
 
-/// Pipeline-revision affordance: walks every Approved descendant of
-/// this artifact in the note tree and flips them to Dirty so the user
-/// knows a re-run is needed against the now-edited parent. Pulls the
-/// note repo + persistence + version-bump signal from context, so the
-/// caller (the editable artifact action row) only passes the artifact
-/// id.
+/// Revise ⇄ Done toggle for artifact notes. The button itself has two
+/// modes (View / Edit) and orchestrates a confirm-dialog flow on the
+/// commit edge:
+///
+/// 1. **View → Revise click:** snapshot the body as `prior_body`,
+///    flip the tab to Edit. Monaco becomes editable.
+/// 2. **Edit → Done click:** open the confirm dialog, kick off a
+///    one-shot Claude call that examines the body diff + existing
+///    revision-history rows and drafts a summary in matching style.
+///    The dialog renders a spinner until Claude returns, then swaps
+///    in an editable textarea pre-filled with the draft. The user
+///    can edit, then click Confirm (commits the row + cascade-dirty
+///    + flips to View) or Cancel (closes the dialog, stays in Edit).
+///
+/// Implementation notes:
+/// - Local state (prior_body, dialog_open, draft, loading) lives
+///   inside this component so closing the dialog with Cancel is a
+///   pure UI operation; nothing else has to know about it.
+/// - The Claude call uses an ephemeral session UUID — bound to the
+///   artifact's project repo as cwd, spawned, consumed, unbound.
+///   No tools, no MCP bridge, no permission shim.
+/// - On Claude failure we still open the dialog with a template
+///   summary so the user can always confirm/edit and proceed.
 #[derive(Props, Clone, PartialEq)]
 struct ReviseButtonProps {
     artifact_id: Uuid,
@@ -1513,45 +1534,495 @@ struct ReviseButtonProps {
 #[component]
 fn ReviseButton(props: ReviseButtonProps) -> Element {
     let LocalNoteRepo(note_repo) = use_context();
+    let LocalProjectRepo(project_repo) = use_context();
     let persistence: Arc<dyn Persistence> = use_context();
     let LocalNoteVersion(note_version) = use_context();
+    let mut tabs: Signal<crate::tabs::TabManager> = use_context();
+    let ClaudeCodePluginCtx(claude_plugin) = use_context();
     let artifact_id = props.artifact_id;
+
+    // Body BEFORE the user clicked Revise. Used by the Claude
+    // prompt to describe the diff; `None` if Revise was never
+    // clicked this mount (defensive — shouldn't happen since the
+    // button is the only path into Edit mode).
+    let mut prior_body: Signal<Option<String>> = use_signal(|| None);
+
+    // Confirm-dialog state.
+    let mut dialog_open: Signal<bool> = use_signal(|| false);
+    let mut draft_summary: Signal<String> = use_signal(String::new);
+    let mut summary_loading: Signal<bool> = use_signal(|| false);
+    let mut summary_error: Signal<Option<String>> = use_signal(|| None);
+
+    // Active tab snapshot: id + mode + content. None when there's no
+    // active tab matching this artifact — render nothing in that case
+    // so the toolbar stays clean.
+    let active_snapshot: Option<(crate::tabs::TabId, crate::editor::EditorMode, String)> = {
+        let snap = tabs.read();
+        snap.active().map(|t| (t.id, t.mode, t.content.clone()))
+    };
+    let Some((tab_id, mode, body_now)) = active_snapshot else {
+        return rsx! {};
+    };
+    let in_edit = matches!(mode, crate::editor::EditorMode::Edit);
+
+    // cwd for the Claude ephemeral session: the artifact's project
+    // repo if we can resolve it, else "." as a harmless fallback (the
+    // one-shot call doesn't use any tools, so cwd is essentially
+    // ignored beyond satisfying the plugin's binding requirement).
+    let repo_path: PathBuf = note_repo
+        .find_project_for_note(artifact_id)
+        .ok()
+        .flatten()
+        .and_then(|pid| project_repo.list().ok().map(|ps| (pid, ps)))
+        .and_then(|(pid, ps)| ps.into_iter().find(|p| p.id == pid))
+        .and_then(|p| p.repo_path)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // Clone for the two click closures + the Confirm-time row build.
+    // `body_now` is a `String` so each closure that touches it needs
+    // its own copy; we hand them out by clone.
+    let body_for_button = body_now.clone();
+    let repo_path_for_button = repo_path.clone();
+    let claude_plugin_for_button = claude_plugin.clone();
+    let on_button_click = move |_| {
+        if !in_edit {
+            // Revise → Edit. Snapshot the body for the eventual
+            // Done-time Claude prompt; flip the mode.
+            prior_body.set(Some(body_for_button.clone()));
+            tabs.write().set_mode(tab_id, crate::editor::EditorMode::Edit);
+            return;
+        }
+        // Done → open the dialog. Reset state for a fresh round.
+        summary_error.set(None);
+        draft_summary.set(String::new());
+        summary_loading.set(true);
+        dialog_open.set(true);
+
+        // Spawn the Claude one-shot. On finish (success or fall-back)
+        // the dialog's loading state clears and the textarea becomes
+        // editable.
+        let prior = prior_body.read().clone();
+        let new_body = body_for_button.clone();
+        let plugin_for_call = claude_plugin_for_button.clone();
+        let cwd_for_call = repo_path_for_button.clone();
+        let mut draft_sink = draft_summary;
+        let mut loading_sink = summary_loading;
+        let mut error_sink = summary_error;
+        dioxus::core::spawn_forever(async move {
+            match draft_revision_summary(
+                plugin_for_call,
+                cwd_for_call,
+                prior.as_deref(),
+                &new_body,
+            )
+            .await
+            {
+                Ok(text) => {
+                    draft_sink.set(text);
+                }
+                Err(e) => {
+                    // Fallback: keep the dialog usable even when the
+                    // LLM call fails, so the user can still record a
+                    // manual revision summary.
+                    let fallback = crate::plugins::artifact::revision_table::compute_summary(
+                        prior.as_deref(),
+                        Some(new_body.as_str()),
+                    );
+                    draft_sink.set(fallback);
+                    error_sink.set(Some(e));
+                }
+            }
+            loading_sink.set(false);
+        });
+    };
+
+    // Clone persistence + note_repo before each closure that needs
+    // them so the second closure (Revise cancel) doesn't see them
+    // moved out by the first (Confirm). The closures themselves do
+    // `persistence.clone()` again to hand into the spawn tasks they
+    // launch, which is fine — clones of an `Arc` are cheap.
+    let persistence_for_confirm = persistence.clone();
+    let note_repo_for_confirm = note_repo.clone();
+    let on_confirm = move |_| {
+        let persistence = persistence_for_confirm.clone();
+        let note_repo = note_repo_for_confirm.clone();
+        let final_summary = draft_summary.read().trim().to_string();
+        if final_summary.is_empty() {
+            return;
+        }
+        let date = crate::plugins::artifact::revision_table::format_revision_date(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        );
+        let row = crate::plugins::artifact::revision_table::RevisionRow {
+            revision: crate::plugins::artifact::revision_table::next_revision_number(
+                &body_now,
+            ),
+            date,
+            derived_from: "manual".to_string(),
+            summary: final_summary,
+        };
+        let body_with_row =
+            crate::plugins::artifact::revision_table::append_revision_row(&body_now, row);
+
+        // Optimistic pre-save buffer update so the user sees the new
+        // revision row immediately. Uses `reload_content` (clears
+        // dirty) — we're about to persist, so the buffer matches
+        // disk. `set_content` would leave dirty=true and confuse
+        // downstream save logic.
+        tabs.write()
+            .reload_content(tab_id, body_with_row.clone());
+
+        let note_id_str = artifact_id.to_string();
+        let persistence_for_save = persistence.clone();
+        let note_repo_for_dirty = note_repo.clone();
+        let persistence_for_dirty = persistence.clone();
+        let _ = note_version;
+        let body_for_save = body_with_row.clone();
+        let mut tabs_for_reassert = tabs;
+        let tab_id_for_reassert = tab_id;
+        dioxus::core::spawn_forever(async move {
+            if let Err(e) = persistence_for_save
+                .save(&note_id_str, body_for_save.as_bytes())
+                .await
+            {
+                tracing::warn!(
+                    target: "operon::artifact",
+                    "Done: save({artifact_id}): {e}"
+                );
+            }
+            // Re-assert the buffer AFTER the save. When the sync
+            // `set_mode(View)` below triggers Monaco to unmount, its
+            // teardown fires one last `on_change` with the pre-Confirm
+            // buffer — clobbering our `reload_content` above. By the
+            // time we land here (post-save, post-unmount), Monaco has
+            // had its chance; re-asserting now wins the race so the
+            // View renders the body containing the new row.
+            tabs_for_reassert
+                .write()
+                .reload_content(tab_id_for_reassert, body_for_save.clone());
+            match mark_descendants_dirty(
+                &note_repo_for_dirty,
+                &persistence_for_dirty,
+                artifact_id,
+            )
+            .await
+            {
+                Ok(n) => tracing::info!(
+                    target: "operon::artifact",
+                    "Done: marked {n} descendant(s) of {artifact_id} dirty"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "operon::artifact",
+                    "Done: mark_descendants_dirty({artifact_id}): {e}"
+                ),
+            }
+            crate::shell::companion_state::LOCAL_NOTE_VERSION
+                .with_mut(|v| *v = v.saturating_add(1));
+        });
+
+        // Close dialog, clear scratch state, flip back to View.
+        dialog_open.set(false);
+        prior_body.set(None);
+        draft_summary.set(String::new());
+        summary_error.set(None);
+        tabs.write().set_mode(tab_id, crate::editor::EditorMode::View);
+    };
+
+    let on_dialog_cancel = move |_| {
+        // Dialog Cancel = close the dialog only; the user stays in
+        // Edit so they can keep tweaking the body and click Done
+        // again. The toolbar Cancel below is the one that actually
+        // abandons the revise session.
+        dialog_open.set(false);
+        draft_summary.set(String::new());
+        summary_error.set(None);
+        summary_loading.set(false);
+    };
+
+    // Toolbar Cancel handler — bound only when the Cancel button
+    // renders (Edit mode). Abandons the whole revise session: reverts
+    // the tab buffer + disk to the body snapshotted at Revise click,
+    // closes the dialog if open, and flips the tab back to View.
+    let persistence_for_revise_cancel = persistence.clone();
+    let on_revise_cancel = move |_| {
+        // The pre-Revise snapshot may be absent if Revise was never
+        // clicked this mount (defensive — shouldn't happen). When
+        // absent we still flip back to View without touching disk.
+        let prior = prior_body.read().clone();
+        // Tear down dialog + scratch state up front so the user
+        // doesn't see them flash through View mode.
+        dialog_open.set(false);
+        draft_summary.set(String::new());
+        summary_error.set(None);
+        summary_loading.set(false);
+
+        if let Some(prior) = prior {
+            // Optimistic pre-save buffer update so the user sees the
+            // revert immediately. `reload_content` (not `set_content`)
+            // keeps the dirty flag clean since the buffer matches
+            // what we're about to persist.
+            tabs.write().reload_content(tab_id, prior.clone());
+            let note_id_str = artifact_id.to_string();
+            let pers = persistence_for_revise_cancel.clone();
+            let mut tabs_for_reassert = tabs;
+            let tab_id_for_reassert = tab_id;
+            let prior_for_reassert = prior.clone();
+            dioxus::core::spawn_forever(async move {
+                if let Err(e) = pers.save(&note_id_str, prior.as_bytes()).await {
+                    tracing::warn!(
+                        target: "operon::artifact",
+                        "Revise cancel: revert save({artifact_id}): {e}"
+                    );
+                }
+                // Re-assert after save: Monaco's unmount on the View
+                // flip below fires one last `on_change` with its
+                // internal buffer (the user's mid-revise edits),
+                // which would otherwise clobber the revert. Post-save
+                // we win the race.
+                tabs_for_reassert
+                    .write()
+                    .reload_content(tab_id_for_reassert, prior_for_reassert);
+            });
+        }
+        prior_body.set(None);
+        tabs.write().set_mode(tab_id, crate::editor::EditorMode::View);
+    };
+
+    let label = if in_edit { "Done" } else { "Revise" };
+    let title_attr = if in_edit {
+        "Open the revision-summary dialog: Claude drafts a one-line summary you can edit before committing."
+    } else {
+        "Switch to Edit mode. Click Done when finished to record the revision."
+    };
 
     rsx! {
         button {
             r#type: "button",
             class: "operon-artifact-revise",
             "data-testid": "artifact-revise",
-            title: "Cascade: mark every approved descendant as Dirty so they get re-run against this revised parent.",
-            onclick: move |_| {
-                let note_repo = note_repo.clone();
-                let persistence = persistence.clone();
-                let _ = note_version; // bridge effect handles the local Signal
-                dioxus::core::spawn_forever(async move {
-                    match mark_descendants_dirty(&note_repo, &persistence, artifact_id).await {
-                        Ok(n) => {
-                            tracing::info!(
-                                target: "operon::artifact",
-                                "revise: marked {n} descendant(s) of {artifact_id} dirty"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "operon::artifact",
-                                "revise walk failed for {artifact_id}: {e}"
-                            );
-                        }
-                    }
-                    // GlobalSignal write from spawn_forever's detached
-                    // scope (the bridge in desktop.rs::Workspace mirrors
-                    // this back into the component-scope Signal).
-                    crate::shell::companion_state::LOCAL_NOTE_VERSION
-                        .with_mut(|v| *v = v.saturating_add(1));
-                });
-            },
-            "Revise"
+            title: "{title_attr}",
+            onclick: on_button_click,
+            "{label}"
+        }
+        if in_edit {
+            button {
+                r#type: "button",
+                class: "operon-artifact-revise-cancel",
+                "data-testid": "artifact-revise-cancel",
+                title: "Abandon this revise session: discard any in-progress edits and return to View.",
+                onclick: on_revise_cancel,
+                "Cancel"
+            }
+        }
+        if *dialog_open.read() {
+            RevisionConfirmDialog {
+                draft: draft_summary,
+                loading: summary_loading,
+                error: summary_error,
+                on_confirm: EventHandler::new(on_confirm),
+                on_cancel: EventHandler::new(on_dialog_cancel),
+            }
         }
     }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct RevisionConfirmDialogProps {
+    draft: Signal<String>,
+    loading: Signal<bool>,
+    error: Signal<Option<String>>,
+    on_confirm: EventHandler<()>,
+    on_cancel: EventHandler<()>,
+}
+
+#[component]
+fn RevisionConfirmDialog(props: RevisionConfirmDialogProps) -> Element {
+    let mut draft = props.draft;
+    let loading = props.loading;
+    let error = props.error;
+    let confirm_handler = props.on_confirm;
+    let cancel_handler = props.on_cancel;
+
+    let is_loading = *loading.read();
+    let confirm_disabled = is_loading || draft.read().trim().is_empty();
+
+    rsx! {
+        div {
+            class: "operon-revision-dialog-scrim",
+            "data-testid": "artifact-revision-dialog-scrim",
+            onclick: move |_| cancel_handler.call(()),
+        }
+        div {
+            class: "operon-revision-dialog",
+            "data-testid": "artifact-revision-dialog",
+            role: "dialog",
+            "aria-modal": "true",
+            onkeydown: move |evt| {
+                if evt.key().to_string() == "Escape" {
+                    cancel_handler.call(());
+                }
+            },
+            div { class: "operon-revision-dialog-header",
+                h3 { class: "operon-revision-dialog-title", "Record revision" }
+                p { class: "operon-revision-dialog-hint",
+                    "Claude is drafting a summary based on what changed and your previous entries. Review and edit before committing."
+                }
+            }
+            if is_loading {
+                div { class: "operon-revision-dialog-loading",
+                    span { class: "operon-companion-thinking-spinner" }
+                    span { class: "operon-revision-dialog-loading-label",
+                        "Drafting summary\u{2026}"
+                    }
+                }
+            } else {
+                textarea {
+                    class: "operon-revision-dialog-textarea",
+                    "data-testid": "artifact-revision-dialog-textarea",
+                    rows: "4",
+                    value: "{draft}",
+                    placeholder: "Summary of revision\u{2026}",
+                    oninput: move |e| draft.set(e.value()),
+                }
+                if let Some(err) = error.read().clone() {
+                    div { class: "operon-revision-dialog-error",
+                        "Claude draft failed: {err}. Edit the fallback summary above and confirm."
+                    }
+                }
+            }
+            div { class: "operon-revision-dialog-actions",
+                button {
+                    r#type: "button",
+                    class: "operon-revision-dialog-cancel",
+                    "data-testid": "artifact-revision-dialog-cancel",
+                    onclick: move |_| cancel_handler.call(()),
+                    "Cancel"
+                }
+                button {
+                    r#type: "button",
+                    class: "operon-revision-dialog-confirm",
+                    "data-testid": "artifact-revision-dialog-confirm",
+                    disabled: confirm_disabled,
+                    onclick: move |_| confirm_handler.call(()),
+                    "Confirm"
+                }
+            }
+        }
+    }
+}
+
+/// One-shot Claude call: examine the artifact's existing revision
+/// history (parsed from `new_body`) and the diff between `prior` and
+/// `new_body`, then return a single-line revision summary in the
+/// style of the existing entries.
+///
+/// Implementation: binds an ephemeral session on the shared
+/// `ClaudeCodeChatPlugin`, calls `send_rich`, accumulates `Text`
+/// events into a string, and unbinds when the stream finishes. The
+/// session has no MCP bridge attached, so Claude only generates text
+/// — no tool calls, no permissions, no side effects on disk.
+async fn draft_revision_summary(
+    plugin: Arc<operon_plugins_claude_code::ClaudeCodeChatPlugin>,
+    cwd: PathBuf,
+    prior: Option<&str>,
+    new_body: &str,
+) -> Result<String, String> {
+    use futures::StreamExt;
+    use operon_plugins_claude_code::ClaudeCodeEvent;
+
+    let existing_table = crate::plugins::artifact::revision_table::parse_revision_table(new_body);
+    let existing_table_md = render_existing_table_for_prompt(existing_table.as_ref());
+    let prompt = build_summary_prompt(
+        &existing_table_md,
+        prior.unwrap_or("(no prior body)"),
+        new_body,
+    );
+
+    let sid = Uuid::new_v4();
+    plugin.bind_session(sid, cwd);
+    let ct = crate::agent::CancellationToken::new();
+    let mut rx = plugin
+        .send_rich(prompt, sid, ct)
+        .await
+        .map_err(|e| format!("send_rich: {e}"))?;
+
+    let mut accumulated = String::new();
+    let mut had_error: Option<String> = None;
+    while let Some(ev) = rx.next().await {
+        match ev {
+            ClaudeCodeEvent::Text(t) => accumulated.push_str(&t),
+            ClaudeCodeEvent::Done { .. } => break,
+            ClaudeCodeEvent::Error(e) => {
+                had_error = Some(e);
+                break;
+            }
+            _ => {}
+        }
+    }
+    plugin.unbind_session(sid);
+
+    if let Some(e) = had_error {
+        return Err(e);
+    }
+    let cleaned = accumulated.trim().to_string();
+    if cleaned.is_empty() {
+        return Err("empty response".to_string());
+    }
+    // Trim to a single line: collapse any newlines into spaces. Even if
+    // Claude responded with multi-line markdown, the table cell needs a
+    // one-liner.
+    let one_line = cleaned.lines().collect::<Vec<_>>().join(" ").trim().to_string();
+    Ok(one_line)
+}
+
+fn render_existing_table_for_prompt(
+    t: Option<&crate::plugins::artifact::revision_table::RevisionTable>,
+) -> String {
+    let Some(t) = t else {
+        return "(no prior revision entries)".to_string();
+    };
+    if t.rows.is_empty() {
+        return "(no prior revision entries)".to_string();
+    }
+    let mut out = String::new();
+    out.push_str("| Revision | Date | Derived from | Summary |\n");
+    out.push_str("|----------|------|--------------|---------|\n");
+    for r in &t.rows {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            r.revision, r.date, r.derived_from, r.summary
+        ));
+    }
+    out
+}
+
+fn build_summary_prompt(existing_table_md: &str, prior_body: &str, new_body: &str) -> String {
+    format!(
+        "You are recording a single revision of an artifact note. The author has just edited the body. Write ONE concise sentence describing what changed, matching the style of the existing entries.\n\
+\n\
+# Existing revision entries\n\
+\n\
+{existing_table_md}\n\
+\n\
+# Body BEFORE this revision\n\
+\n\
+```\n\
+{prior_body}\n\
+```\n\
+\n\
+# Body AFTER this revision\n\
+\n\
+```\n\
+{new_body}\n\
+```\n\
+\n\
+# Task\n\
+\n\
+Respond with exactly one short sentence describing what changed in this revision. Match the terse, declarative style of the prior entries (no emoji, no quotes, no preamble). End with a period. Do NOT include the date or revision number — just the summary text.",
+    )
 }
 
 /// Render the user's answer to a clarification artifact into a
@@ -1806,8 +2277,8 @@ pub async fn mark_descendants_dirty(
 /// keyed on this artifact), the Play button morphs into a red ⏹ Stop
 /// button that cancels the cooperative `CancellationToken`.
 #[derive(Props, Clone, PartialEq)]
-struct CascadePlayButtonProps {
-    root_artifact_id: Uuid,
+pub struct CascadePlayButtonProps {
+    pub root_artifact_id: Uuid,
     /// Which slice of the SDLC chain this Play click should run. The
     /// parent (`ArtifactView`) picks the mode from the artifact's kind
     /// + status:
@@ -1822,11 +2293,19 @@ struct CascadePlayButtonProps {
     /// "Create test cases" button on Dirty Implementations, not this
     /// Play one.
     #[props(default)]
-    run_mode: crate::plugins::artifact::cascade::RunMode,
+    pub run_mode: crate::plugins::artifact::cascade::RunMode,
+    /// When `false`, the chevron (▾) toggle and the per-stage
+    /// dropdown panel are NOT rendered — the button is a single
+    /// click-and-run affordance. Used by the artifact view header
+    /// after the toolbar redesign that hid stage-level controls
+    /// behind a later "Advanced" surface. Defaults to `true` for
+    /// legacy callers (workflow plugin, etc.).
+    #[props(default = true)]
+    pub with_stages_dropdown: bool,
 }
 
 #[component]
-fn CascadePlayButton(props: CascadePlayButtonProps) -> Element {
+pub fn CascadePlayButton(props: CascadePlayButtonProps) -> Element {
     let LocalNoteRepo(note_repo) = use_context();
     let LocalProjectRepo(project_repo) = use_context();
     let persistence: Arc<dyn Persistence> = use_context();
@@ -1837,6 +2316,8 @@ fn CascadePlayButton(props: CascadePlayButtonProps) -> Element {
     let ChatSessionVersion(chat_session_version) = use_context();
     let crate::shell::companion_state::ActiveChatSession(active_session) = use_context();
     let crate::shell::companion_state::ActiveChatScope(active_scope) = use_context();
+    #[cfg(not(target_arch = "wasm32"))]
+    let crate::local_mode::desktop::CurrentVaultRoot(vault_signal) = use_context();
 
     let root_id = props.root_artifact_id;
     let mut stages_open = use_signal(|| false);
@@ -1966,6 +2447,8 @@ fn CascadePlayButton(props: CascadePlayButtonProps) -> Element {
                         if blocked {
                             return;
                         }
+                        #[cfg(not(target_arch = "wasm32"))]
+                        let vault_snapshot = vault_signal.read().clone();
                         spawn_cascade(
                             root_id,
                             note_repo.clone(),
@@ -1974,6 +2457,8 @@ fn CascadePlayButton(props: CascadePlayButtonProps) -> Element {
                             plugin.clone(),
                             chat_session_repo.clone(),
                             chat_message_repo.clone(),
+                            #[cfg(not(target_arch = "wasm32"))]
+                            vault_snapshot,
                             &mut note_version_setter,
                             &mut chat_session_version_setter,
                             &mut active_session_setter,
@@ -1984,13 +2469,25 @@ fn CascadePlayButton(props: CascadePlayButtonProps) -> Element {
                     }
                 }
             },
-            if is_running { "{label_stop}" } else { "{label_play}" }
+            if is_running {
+                // Spinner-and-label combo while a cascade is in flight.
+                // The spinner gives a constant visual signal that work
+                // is happening even when the cascade pauses between
+                // skills (no other UI update during inter-stage gaps).
+                span {
+                    class: "operon-cascade-spinner",
+                    "aria-hidden": "true",
+                }
+                "{label_stop}"
+            } else {
+                "{label_play}"
+            }
         }
         // Stage-picker chevron only makes sense for the generic Play
         // button — the "Create test cases" variant runs a fixed
         // single-skill mode (08), so exposing a stage picker would
         // confuse users into thinking they can toggle stages off.
-        if !is_test_cases_button {
+        if !is_test_cases_button && props.with_stages_dropdown {
             button {
                 r#type: "button",
                 class: "operon-artifact-cascade-stages-toggle",
@@ -2000,7 +2497,7 @@ fn CascadePlayButton(props: CascadePlayButtonProps) -> Element {
                 "\u{25BE}"
             }
         }
-        if *stages_open.read() {
+        if props.with_stages_dropdown && *stages_open.read() {
             // Click-outside dismissal: a transparent fixed-position
             // backdrop sits below the dropdown's z-index, so any
             // click outside the panel closes it. Panel itself stops
@@ -2279,8 +2776,8 @@ fn open_cascade_workflow_tab(
 /// Inline panel rendered under the Play button: lists every project
 /// skill as a checkbox row, in pipeline order (Requirements → Epic →
 /// Feature → … → Summary inferred from `input_kind`/`output_kind`).
-/// Persists toggles to `<repo>/.operon/cascade-stages.json` via the
-/// `cascade::stages_sidecar` helpers.
+/// Persists toggles to `<vault>/.operon/<project-id>/cascade-stages.json`
+/// via the `cascade::stages_sidecar` helpers.
 #[derive(Props, Clone, PartialEq)]
 struct CascadeStagesDropdownProps {
     root_artifact_id: Uuid,
@@ -2290,10 +2787,14 @@ struct CascadeStagesDropdownProps {
 #[component]
 fn CascadeStagesDropdown(props: CascadeStagesDropdownProps) -> Element {
     let LocalNoteRepo(note_repo) = use_context();
-    let LocalProjectRepo(project_repo) = use_context();
+    #[cfg(not(target_arch = "wasm32"))]
+    let vault_signal = {
+        let crate::local_mode::desktop::CurrentVaultRoot(s) = use_context();
+        s
+    };
 
-    // Resolve project + repo path. Without a repo path we can't store
-    // the sidecar, so the panel renders read-only with a hint.
+    // Resolve project. Without a vault we can't read/write the sidecar,
+    // so the panel renders read-only with a hint.
     let project_id = match note_repo.find_project_for_note(props.root_artifact_id) {
         Ok(Some(p)) => p,
         _ => {
@@ -2310,11 +2811,11 @@ fn CascadeStagesDropdown(props: CascadeStagesDropdownProps) -> Element {
             };
         }
     };
-    let repo_path: Option<std::path::PathBuf> = project_repo
-        .list()
-        .ok()
-        .and_then(|all| all.into_iter().find(|p| p.id == project_id))
-        .and_then(|p| p.repo_path);
+    #[cfg(not(target_arch = "wasm32"))]
+    let vault_snapshot: Option<crate::local_mode::vault::VaultRoot> =
+        vault_signal.read().clone();
+    #[cfg(target_arch = "wasm32")]
+    let vault_snapshot: Option<()> = None;
 
     // List project skills — same source as the regular Run-skill picker.
     let project_notes = note_repo.list_for_project(project_id).unwrap_or_default();
@@ -2326,10 +2827,17 @@ fn CascadeStagesDropdown(props: CascadeStagesDropdownProps) -> Element {
     let all_ids: std::collections::HashSet<Uuid> = skill_rows.iter().map(|n| n.id).collect();
 
     // Load enabled set (sidecar or "everything" if absent).
-    let enabled_initial = match repo_path.as_ref() {
-        Some(p) => crate::plugins::artifact::cascade::stages_sidecar::resolve_or_all(p, &all_ids),
+    #[cfg(not(target_arch = "wasm32"))]
+    let enabled_initial = match vault_snapshot.as_ref() {
+        Some(v) => crate::plugins::artifact::cascade::stages_sidecar::resolve_or_all(
+            v,
+            project_id,
+            &all_ids,
+        ),
         None => all_ids.clone(),
     };
+    #[cfg(target_arch = "wasm32")]
+    let enabled_initial = all_ids.clone();
     let mut enabled = use_signal(|| enabled_initial);
 
     rsx! {
@@ -2361,7 +2869,8 @@ fn CascadeStagesDropdown(props: CascadeStagesDropdownProps) -> Element {
                             let skill_id = skill.id;
                             let skill_title = skill.title.clone();
                             let checked = enabled.read().contains(&skill_id);
-                            let repo_path_for_save = repo_path.clone();
+                            #[cfg(not(target_arch = "wasm32"))]
+                            let vault_for_save = vault_snapshot.clone();
                             rsx! {
                                 li {
                                     key: "{skill_id}",
@@ -2377,10 +2886,15 @@ fn CascadeStagesDropdown(props: CascadeStagesDropdownProps) -> Element {
                                                     if now_checked { set.insert(skill_id); }
                                                     else { set.remove(&skill_id); }
                                                 });
-                                                if let Some(path) = repo_path_for_save.as_ref() {
+                                                #[cfg(not(target_arch = "wasm32"))]
+                                                if let Some(v) = vault_for_save.as_ref() {
                                                     let snapshot = enabled.read().clone();
                                                     if let Err(e) =
-                                                        crate::plugins::artifact::cascade::stages_sidecar::save(path, &snapshot)
+                                                        crate::plugins::artifact::cascade::stages_sidecar::save(
+                                                            v,
+                                                            project_id,
+                                                            &snapshot,
+                                                        )
                                                     {
                                                         tracing::warn!(
                                                             target: "operon::cascade",
@@ -2398,9 +2912,9 @@ fn CascadeStagesDropdown(props: CascadeStagesDropdownProps) -> Element {
                     }
                 }
             }
-            if repo_path.is_none() {
+            if vault_snapshot.is_none() {
                 div { class: "operon-artifact-skill-picker-empty",
-                    "Bind a repository to this project to persist your selection across sessions."
+                    "Pick a vault directory to persist your selection across sessions."
                 }
             }
         }
@@ -2513,6 +3027,8 @@ pub fn spawn_cascade(
     plugin: Arc<operon_plugins_claude_code::ClaudeCodeChatPlugin>,
     chat_session_repo: Arc<dyn operon_store::repos::ChatSessionRepository>,
     chat_message_repo: Arc<dyn operon_store::repos::ChatMessageRepository>,
+    #[cfg(not(target_arch = "wasm32"))]
+    vault: Option<crate::local_mode::vault::VaultRoot>,
     note_version: &mut Signal<u64>,
     chat_session_version: &mut Signal<u64>,
     active_session: &mut Signal<Option<Uuid>>,
@@ -2588,8 +3104,17 @@ pub fn spawn_cascade(
         .filter(|n| matches!(n.kind, operon_store::repos::NoteKind::Skill))
         .map(|n| n.id)
         .collect();
-    let enabled =
-        crate::plugins::artifact::cascade::stages_sidecar::resolve_or_all(&repo_path, &all_skill_ids);
+    #[cfg(not(target_arch = "wasm32"))]
+    let enabled = match vault.as_ref() {
+        Some(v) => crate::plugins::artifact::cascade::stages_sidecar::resolve_or_all(
+            v,
+            project_id,
+            &all_skill_ids,
+        ),
+        None => all_skill_ids.clone(),
+    };
+    #[cfg(target_arch = "wasm32")]
+    let enabled = all_skill_ids.clone();
 
     // Walk up the source_artifact_id chain to find the *seed* — the
     // topmost ancestor with no source_artifact_id (typically a

@@ -60,6 +60,11 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 # Plans-Phase-4-multiselect-aria: regex preview in the bulk rename modal.
 regex = "1"
 
+# IDE-grade permission card diff preview: render upcoming Edit/Write
+# changes as a unified diff before approval. Used by `permission_prompt`
+# and the audit drawer.
+similar = "2"
+
 # `web_sys` bindings used only on the wasm web build for localStorage + prefers-color-scheme.
 # Native tests stub these out so the dependency is wasm-only.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

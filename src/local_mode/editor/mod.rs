@@ -94,6 +94,18 @@ pub fn install_save_action(
             tab.dirty
         );
 
+        // Short-circuit on dirty=false: a held Ctrl+S keyrepeats at
+        // ~30/s on Linux, and both the SAVE_REQUEST_TICK effect and
+        // the shell's onkeydown handler dispatch into this callback,
+        // so a single sustained keypress can fire dozens of flushes
+        // per second against a buffer nobody touched. Skip the FS
+        // write + touch_updated + link-graph rebuild when there's
+        // nothing to persist. Same shape as a typical IDE's
+        // "save on clean buffer is a no-op".
+        if !tab.dirty {
+            return;
+        }
+
         spawn(async move {
             match scheduler.flush(tab_id, &note_id, &content).await {
                 Ok(()) => {
@@ -289,18 +301,18 @@ pub fn rebuild_link_graph_for_source(
 /// Open (or focus) a Local-Mode note tab for `note_uuid`. The tab uses the
 /// `manual_save = true` path so the debounced autosave never fires.
 ///
-/// Plans-Phase-9-monaco-desktop (rev 14): "click on a note in the
-/// explorer" semantics:
-/// - If an Edit-mode tab for the note already exists, focus it.
-/// - If a non-Edit (View / Split / LivePreview) tab exists for the
-///   note, leave it alone and open a *new* Edit tab alongside.
-/// - If no tab exists, open a new Edit tab.
+/// "Click on a note" semantics: if **any** tab is already open for this
+/// note (regardless of its mode), focus it. Otherwise open a fresh tab
+/// in the kind-appropriate `initial_mode` (View for Markdown / Skill /
+/// Artifact / CE / Phase / Image / etc.; Edit for Workflow canvases
+/// since the canvas itself is the editor).
 ///
-/// The intent: the user can keep a View / Split tab open as a
-/// reference and click the note again to get a fresh editable
-/// buffer in a new tab. Each tab carries its own buffer; saves go
-/// through the same `Persistence` row keyed by note id, so
-/// last-write-wins on the SQLite side.
+/// Mode switching happens **in place** on the existing tab via the row's
+/// inline mode buttons or the right-click submenu (both route through
+/// `on_set_note_mode` in `explorer/mod.rs`), not by opening a duplicate
+/// tab. This matches the user-facing contract — "by default markdown,
+/// skills or any other notes must be readonly" — and avoids the
+/// "every click spawns a new tab" surprise.
 pub fn open_local_note_tab(
     mut tabs: Signal<TabManager>,
     save_scheduler: crate::tabs::SaveScheduler,
@@ -310,21 +322,24 @@ pub fn open_local_note_tab(
     kind: operon_store::repos::NoteKind,
 ) -> TabId {
     let note_id_str = note_uuid.to_string();
-    // Look for an existing Edit-mode tab to focus.
-    let existing_edit = {
+    // Look for ANY existing tab for this note and focus it. Earlier
+    // versions matched only Edit-mode tabs (rev-14 "reference + scratch"
+    // intent), but `initial_mode` is now View for every kind except
+    // Workflow — so an Edit-only lookup never matched the freshly-opened
+    // View tab and each click produced a duplicate.
+    let existing_any = {
         let snap = tabs.read();
         let id = snap
             .iter()
-            .find(|t| t.note_id == note_id_str && matches!(t.mode, EditorMode::Edit))
+            .find(|t| t.note_id == note_id_str)
             .map(|t| t.id);
         id
     };
-    if let Some(tid) = existing_edit {
+    if let Some(tid) = existing_any {
         tabs.write().activate(tid);
         return tid;
     }
-    // No Edit-mode tab — force a new tab so View / Split tabs
-    // remain undisturbed. format_id is derived from the note's kind so
+    // No existing tab — open a fresh one. format_id is derived from the note's kind so
     // MainArea can dispatch to the right FormatPlugin (markdown → textarea
     // fallback inside LocalNoteEditor; mdx/canvas/excalidraw/kanban/code →
     // their own plugin's render_edit).
@@ -337,6 +352,21 @@ pub fn open_local_note_tab(
     // — auto-save through the debounced `SaveScheduler` is the right
     // default. Free-form kinds (markdown, mdx, code, …) keep
     // manual-save so users have explicit control over text edits.
+    // Pick the initial editor mode.
+    //   - Workflow: Edit. Workflow notes are interactive canvases —
+    //     dragging a node *is* an edit, so there's no meaningful
+    //     "view" surface to default to.
+    //   - Everything else (Markdown / Skill / Artifact / CE / Phase /
+    //     Image / Kanban / …): View. Read-only is the safe default;
+    //     edits go through an explicit Revise click which records a
+    //     revision-history entry on commit (see the per-format
+    //     Revise/Cancel/Done flows). This matches the user's stated
+    //     contract — "by default markdown, skills or any other notes
+    //     must be readonly".
+    let initial_mode = match kind {
+        operon_store::repos::NoteKind::Workflow => EditorMode::Edit,
+        _ => EditorMode::View,
+    };
     let id = if matches!(kind, operon_store::repos::NoteKind::Workflow) {
         tabs.write().open_auto_save_new(
             note_id_str,
@@ -354,7 +384,7 @@ pub fn open_local_note_tab(
         save_scheduler.set_manual_save(new_id);
         new_id
     };
-    tabs.write().set_mode(id, EditorMode::Edit);
+    tabs.write().set_mode(id, initial_mode);
     id
 }
 
@@ -1329,3 +1359,4 @@ pub fn LocalNoteEditor(tab_id: TabId, action: LocalSaveAction) -> Element {
         }
     }
 }
+

@@ -1,9 +1,14 @@
 //! Desktop (non-wasm) implementation of Local Mode UI + repo wiring.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+
+use tokio::sync::Mutex as AsyncMutex;
 
 use dioxus::prelude::*;
 use operon_store::repos::{
@@ -24,7 +29,11 @@ use super::explorer::{
 };
 use super::ui::{ClipKind, ClipPayload, Clipboard, DragKind, DragSession, LocalClipboard};
 use super::{MODE_VALUE_CLOUD, MODE_VALUE_LOCAL, SETTINGS_KEY_MODE_REMEMBERED};
-use crate::persistence::Persistence;
+use crate::persistence::{
+    fs::FilesystemWatcher, NoteWatcher, Persistence, WatchEvent, WatchHandle,
+};
+use crate::tabs::TabId;
+use crate::plugins::artifact::revision_table;
 use crate::rbag::state::{AppState, Mode};
 use crate::tabs::TabManager;
 
@@ -42,12 +51,18 @@ pub fn LocalStateProvider(children: Element) -> Element {
     let raw_note_repo: Arc<dyn LocalNoteRepository> =
         Arc::new(SqliteLocalNoteRepository::new(store.clone()));
     // Migration 018: wrap the note repo so artifact renames / moves /
-    // deletes also relocate the on-disk `.operon/artifacts/<slug>/.../`
-    // directory to match the UI tree.
+    // deletes also relocate the on-disk `<vault>/.operon/<project-id>/
+    // artifacts/<slug>/.../` directory to match the UI tree. Vault is
+    // snapshotted from settings here; first-run users who pick a vault
+    // mid-session need a restart for relocation to start working (the
+    // SQLite row is still source-of-truth in the meantime).
+    let vault_snapshot = crate::local_mode::vault::load(&settings_repo)
+        .ok()
+        .flatten();
     let note_repo: Arc<dyn LocalNoteRepository> =
         Arc::new(crate::plugins::artifact::relocate::RelocatingNoteRepo::new(
             raw_note_repo,
-            project_repo.clone(),
+            vault_snapshot,
         ));
     let tree_repo: Arc<dyn LocalTreeStateRepository> =
         Arc::new(SqliteLocalTreeStateRepository::new(store.clone()));
@@ -138,10 +153,13 @@ pub fn provide_local_state() {
         Arc::new(SqliteLocalNoteRepository::new(store.clone()));
     // Migration 018: same FS-relocating wrapper as `LocalStateProvider`
     // installs above. Renames in the UI move on-disk artifact folders.
+    let vault_snapshot = crate::local_mode::vault::load(&settings_repo)
+        .ok()
+        .flatten();
     let note_repo: Arc<dyn LocalNoteRepository> =
         Arc::new(crate::plugins::artifact::relocate::RelocatingNoteRepo::new(
             raw_note_repo,
-            project_repo.clone(),
+            vault_snapshot,
         ));
     let tree_repo: Arc<dyn LocalTreeStateRepository> =
         Arc::new(SqliteLocalTreeStateRepository::new(store.clone()));
@@ -173,14 +191,30 @@ pub fn provide_local_state() {
 fn open_local_store() -> Store {
     let path = default_store_path();
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            panic!(
+                "operon: cannot create local store directory {parent:?}: {e}\n\
+                 Persistence is unavailable. Fix the directory's permissions (or set $HOME) \
+                 and restart."
+            );
+        }
     }
-    Store::open(StoreConfig::local(&path))
-        .or_else(|e| {
-            eprintln!("operon: failed to open local store at {path:?} ({e}); using :memory:");
-            Store::open_in_memory()
-        })
-        .expect("local store: in-memory fallback must succeed")
+    // Previously this fell back to `:memory:` on failure, which silently
+    // discarded every settings write across sessions (mode_remembered,
+    // vault.root.path, …). Persistence-by-RAM was indistinguishable from
+    // a fresh install on every restart. Now we panic loudly with the
+    // underlying error so the failure mode is at least debuggable.
+    match Store::open(StoreConfig::local(&path)) {
+        Ok(store) => store,
+        Err(e) => panic!(
+            "operon: failed to open local store at {path:?}: {e}\n\
+             Persistence is unavailable. Common causes:\n\
+               - The file was created by a newer build that applied a migration\n\
+                 this binary doesn't know about. Inspect _schema_migrations.\n\
+               - Disk permissions on {path:?}.\n\
+               - Corrupt SQLite file. Removing it restores a fresh install."
+        ),
+    }
 }
 
 fn default_store_path() -> std::path::PathBuf {
@@ -284,6 +318,10 @@ pub fn SettingsPanel(open: Signal<bool>, username: Signal<String>) -> Element {
                 // Global Claude defaults — bottom tier of the
                 // three-tier hierarchy (chat → project → global).
                 crate::shell::settings::ClaudeDefaultsSection {}
+                // Per-project tool-permissions auto-approve toggles.
+                // Reads/writes the active repo's
+                // .claude/settings.local.json operonAutoApprove key.
+                crate::shell::settings::ToolPermissionsSection {}
                 div {
                     class: "operon-modal-actions",
                     button {
@@ -304,6 +342,12 @@ pub fn SettingsPanel(open: Signal<bool>, username: Signal<String>) -> Element {
                 crate::local_mode::VaultDirPicker {
                     blocking: false,
                     on_chosen: move |root: crate::local_mode::vault::VaultRoot| {
+                        // Wipe any leftover Ctrl+Z trash in the new vault;
+                        // trash is session-scoped and shouldn't survive a
+                        // vault switch.
+                        crate::plugins::cleanup::trash::wipe_trash_root(
+                            &crate::plugins::cleanup::trash::vault_trash_root(root.path()),
+                        );
                         vault_root.set(Some(root));
                         show_change_picker.set(false);
                     },
@@ -313,8 +357,17 @@ pub fn SettingsPanel(open: Signal<bool>, username: Signal<String>) -> Element {
     }
 }
 
-/// Two-button chooser shown on first launch (or whenever
+/// Single-button chooser shown on first launch (or whenever
 /// `local_app_settings.mode_remembered` is empty).
+///
+/// Previously offered Local + Cloud (RBAG). Cloud was removed per
+/// product direction — only Local remains. Once the user picks Local
+/// the setting persists in `local_app_settings.mode_remembered`, so
+/// subsequent launches skip the chooser entirely.
+///
+/// `MODE_VALUE_CLOUD` is preserved as a constant so any historical
+/// DB row carrying it still round-trips through `read_remembered_mode`
+/// without panicking — but no UI path produces a new one.
 #[component]
 pub fn StartupChooser() -> Element {
     let LocalSettingsRepo(settings_repo) = use_context();
@@ -329,36 +382,21 @@ pub fn StartupChooser() -> Element {
             mode_chosen.set(true);
         }
     };
-    let pick_cloud = {
-        let settings = settings_repo.clone();
-        move |_| {
-            let _ = settings.set(SETTINGS_KEY_MODE_REMEMBERED, MODE_VALUE_CLOUD);
-            state.with_mut(|s| s.mode = Mode::NonLocal);
-            mode_chosen.set(true);
-        }
-    };
 
     rsx! {
         div {
             class: "flex flex-col items-center justify-center h-screen w-screen gap-6 bg-[var(--operon-bg)] text-[var(--operon-fg)]",
             "data-testid": "mode-chooser",
-            h1 { class: "text-lg font-semibold", "Choose how to run Operon" }
-            div {
-                class: "flex gap-4",
-                button {
-                    r#type: "button",
-                    class: "px-8 py-6 rounded-md border border-[var(--operon-border)] hover:bg-[var(--operon-hover)] text-base font-medium",
-                    "data-testid": "chooser-local",
-                    onclick: pick_local,
-                    "Local"
-                }
-                button {
-                    r#type: "button",
-                    class: "px-8 py-6 rounded-md border border-[var(--operon-border)] hover:bg-[var(--operon-hover)] text-base font-medium",
-                    "data-testid": "chooser-cloud",
-                    onclick: pick_cloud,
-                    "Cloud (RBAG)"
-                }
+            h1 { class: "text-lg font-semibold", "Welcome to Operon" }
+            p { class: "text-sm opacity-70 max-w-md text-center",
+                "Operon runs against a local notes vault on this machine. Click below to continue."
+            }
+            button {
+                r#type: "button",
+                class: "px-8 py-6 rounded-md border border-[var(--operon-border)] hover:bg-[var(--operon-hover)] text-base font-medium",
+                "data-testid": "chooser-local",
+                onclick: pick_local,
+                "Start"
             }
         }
     }
@@ -455,6 +493,158 @@ pub fn read_vault_root(
     crate::local_mode::vault::load(settings).ok().flatten()
 }
 
+/// note_id -> set of body hashes we ourselves wrote and expect notify
+/// to echo back. Inserted just before `persistence.save` and removed
+/// on the first matching watcher sweep so our own augmented save
+/// doesn't keep retriggering the diff/append path and grow the
+/// revision table unboundedly.
+type PendingSelfWrites = Arc<AsyncMutex<HashMap<String, HashSet<u64>>>>;
+
+fn hash_body(body: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    body.as_bytes().hash(&mut h);
+    h.finish()
+}
+
+/// Walk every open tab, reload its body via `persistence.load(note_id)`,
+/// and write back via `TabManager::reload_content` only when the content
+/// actually changed. Used by the artifact watcher to round-trip
+/// `<repo>/.operon/artifacts/.../index.md` writes back into the editor
+/// without requiring the file-event to identify a specific note id
+/// (artifact paths are slug-based, not uuid-based).
+///
+/// Skips no-op writes so a re-render isn't triggered when content
+/// matches. Bumps `LOCAL_NOTE_VERSION` once at the end if anything
+/// changed so explorer rows etc. re-render.
+async fn reload_open_tabs_from_disk(
+    persistence: Arc<dyn Persistence>,
+    tabs: Signal<TabManager>,
+    note_repo: Arc<dyn LocalNoteRepository>,
+    pending: PendingSelfWrites,
+) {
+    let tab_snapshot: Vec<(TabId, String)> = tabs
+        .read()
+        .iter()
+        .map(|t| (t.id, t.note_id.clone()))
+        .collect();
+    let mut updated_any = false;
+    for (tid, note_id_str) in tab_snapshot {
+        let bytes = match persistence.load(&note_id_str).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let body = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let id = match Uuid::parse_str(&note_id_str) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        // Echo check: if the disk content matches a body we ourselves
+        // just wrote (via the augmented-save path below), drop the
+        // pending entry, silently sync the tab, and skip diff/append.
+        // Without this, our own atomic temp+rename save re-triggers
+        // notify, the prior_body == disk_body short-circuit races
+        // against the rename event ordering, and the revision table
+        // grows by one row per echo forever.
+        let disk_hash = hash_body(&body);
+        {
+            let mut pending_lock = pending.lock().await;
+            if let Some(set) = pending_lock.get_mut(&note_id_str) {
+                if set.remove(&disk_hash) {
+                    if set.is_empty() {
+                        pending_lock.remove(&note_id_str);
+                    }
+                    drop(pending_lock);
+                    let mut tabs_sig = tabs;
+                    let mut tabs_w = tabs_sig.write();
+                    tabs_w.reload_content(tid, body);
+                    updated_any = true;
+                    continue;
+                }
+            }
+        }
+        // Snapshot the tab's pre-reload body so we can decide whether
+        // to short-circuit AND so the artifact branch below can
+        // summarise the delta.
+        let prior_body = tabs.read().get(tid).map(|t| t.content.clone());
+        if prior_body.as_deref() == Some(body.as_str()) {
+            continue;
+        }
+        // Is this note an Artifact? Only artifacts get the in-body
+        // revision-history table. Non-artifacts: silent reload.
+        let kind = note_repo
+            .find_project_for_note(id)
+            .ok()
+            .flatten()
+            .and_then(|pid| note_repo.list_for_project(pid).ok())
+            .and_then(|notes| notes.into_iter().find(|n| n.id == id).map(|n| n.kind));
+        let is_artifact = matches!(kind, Some(NoteKind::Artifact));
+
+        if is_artifact {
+            // Build a `claude` revision row from the disk-vs-tab diff
+            // and stitch it into the body BEFORE writing back. Order
+            // of operations: append → set tab content → save. By the
+            // time `persistence.save` re-fires the notify watcher,
+            // `tab.content` already equals `body_with_row`, so the
+            // next pass sees prior == disk and short-circuits.
+            let summary = revision_table::compute_summary(
+                prior_body.as_deref(),
+                Some(body.as_str()),
+            );
+            let date = revision_table::format_revision_date(now_unix_ms());
+            let row = revision_table::RevisionRow {
+                revision: revision_table::next_revision_number(&body),
+                date,
+                derived_from: "claude".to_string(),
+                summary,
+            };
+            let body_with_row = revision_table::append_revision_row(&body, row);
+            let mut tabs_sig = tabs;
+            {
+                let mut tabs_w = tabs_sig.write();
+                tabs_w.reload_content(tid, body_with_row.clone());
+            }
+            // Record the expected echo before we hit disk so the
+            // watcher's next sweep can recognise it as our own write
+            // rather than treating it as another external edit.
+            {
+                let mut pending_lock = pending.lock().await;
+                pending_lock
+                    .entry(note_id_str.clone())
+                    .or_default()
+                    .insert(hash_body(&body_with_row));
+            }
+            if let Err(e) = persistence
+                .save(&note_id_str, body_with_row.as_bytes())
+                .await
+            {
+                tracing::warn!(
+                    target: "operon::revision",
+                    "watcher write-back of revision row for {id} failed: {e}"
+                );
+            }
+            updated_any = true;
+        } else {
+            let mut tabs_sig = tabs;
+            let mut tabs_w = tabs_sig.write();
+            tabs_w.reload_content(tid, body);
+            updated_any = true;
+        }
+    }
+    if updated_any {
+        *crate::shell::companion_state::LOCAL_NOTE_VERSION.write() += 1;
+    }
+}
+
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Lift every Local-Mode app-scope signal to App scope so the Cloud `Shell`
 /// chrome (mode-aware StatusBar / ActivityBar / SideBar plugin contributions)
 /// can read them without prop-drilling. Call from `app.rs` only when
@@ -462,8 +652,135 @@ pub fn read_vault_root(
 pub fn provide_local_app_signals() {
     let LocalUserRepo(user_repo) = use_context();
     let LocalNoteRepo(note_repo) = use_context();
+    let LocalProjectRepo(project_repo_for_app_signals) = use_context();
+    let CurrentVaultRoot(vault_root_for_trash_wipe) = use_context();
     let persistence: Arc<dyn Persistence> = use_context();
     let tabs: Signal<TabManager> = use_context();
+    // Same vault signal as the trash-wipe block, but used by the
+    // filesystem watcher below to (re)build a watcher whenever the
+    // user changes vaults.
+    let vault_root_for_watcher = vault_root_for_trash_wipe;
+
+    // Session start: wipe any leftover trash from a previous run.
+    // Per-project artifact trash lives at
+    // `<vault>/.operon/<project-id>/trash/`; vault-wide blob trash at
+    // `<vault>/.operon/trash/`; per-repo skill trash at
+    // `<repo>/.claude/trash/`. Trash is session-scoped — Ctrl+Z within
+    // a session restores; nothing persists across restarts.
+    {
+        let project_repo = project_repo_for_app_signals.clone();
+        let vault_root = vault_root_for_trash_wipe;
+        use_hook(move || {
+            use crate::plugins::cleanup::trash;
+            let vault_snapshot = vault_root.peek().clone();
+            if let Ok(projects) = project_repo.list() {
+                for p in projects {
+                    if let Some(repo) = p.repo_path.as_ref() {
+                        trash::wipe_trash_root(&trash::repo_skill_trash_root(repo));
+                    }
+                    if let Some(ref vault) = vault_snapshot {
+                        trash::wipe_trash_root(&trash::project_trash_root(vault, p.id));
+                    }
+                }
+            }
+            if let Some(vault) = vault_snapshot {
+                trash::wipe_trash_root(&trash::vault_trash_root(vault.path()));
+            }
+        });
+    }
+
+    // Filesystem watcher #1 — `<vault>/notes/` for non-artifact notes
+    // (opaque UUID-named files). Detect external writes (typically
+    // Claude's `Write`/`Edit` tool against a referenced note) and
+    // reload the matching open editor tab so the user sees the new
+    // content without re-opening the file. Auto-reload is silent: if
+    // the user has unsaved local edits they're overwritten by disk
+    // content (matches the system-prompt promise to Claude that "the
+    // app watches that directory and will pick up your changes
+    // automatically"). Body only — SQLite metadata (titles, parent
+    // IDs) isn't touched here.
+    //
+    // Watcher #2 is built further down for each project's
+    // `<repo>/.operon/artifacts/` (recursive) so artifact-kind notes
+    // round-trip too.
+    //
+    // The handle is held in a `Rc<RefCell<Option<(PathBuf, _)>>>` so we
+    // can compare against the current vault's `notes_dir` and skip
+    // rebuilds when nothing changed, and drop the previous handle when
+    // the user switches vaults. notify's callback runs on its own OS
+    // thread; we bridge to the UI through an `unbounded_channel` whose
+    // receiver task is spawned via `dioxus::spawn` (so it owns the
+    // runtime context required to write to component-scope signals).
+    {
+        let watch_holder: Rc<RefCell<Option<(std::path::PathBuf, WatchHandle)>>> =
+            use_hook(|| Rc::new(RefCell::new(None)));
+        let vault_signal = vault_root_for_watcher;
+        let persistence_for_watcher = persistence.clone();
+        let tabs_for_watcher = tabs;
+        use_effect(move || {
+            let Some(notes_dir) = vault_signal.read().as_ref().map(|v| v.notes_dir()) else {
+                return;
+            };
+            // Skip when we're already watching this directory.
+            if let Some((current_dir, _)) = watch_holder.borrow().as_ref() {
+                if current_dir == &notes_dir {
+                    return;
+                }
+            }
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Uuid>();
+            let watcher = FilesystemWatcher::new(notes_dir.clone());
+            let handle = watcher.subscribe(Box::new(move |evt: WatchEvent| {
+                let name = match evt {
+                    WatchEvent::Modified(n) | WatchEvent::Created(n) => n,
+                    _ => return,
+                };
+                if let Ok(uuid) = Uuid::parse_str(&name) {
+                    let _ = tx.send(uuid);
+                }
+            }));
+
+            let persistence_for_task = persistence_for_watcher.clone();
+            let tabs_for_task = tabs_for_watcher;
+            spawn(async move {
+                while let Some(uuid) = rx.recv().await {
+                    let note_id_str = uuid.to_string();
+                    let bytes = match persistence_for_task.load(&note_id_str).await {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+                    let body = match String::from_utf8(bytes) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let mut tabs_sig = tabs_for_task;
+                    let mut updated = false;
+                    {
+                        let mut tabs_w = tabs_sig.write();
+                        let tab_ids: Vec<TabId> = tabs_w
+                            .iter()
+                            .filter(|t| t.note_id == note_id_str && t.content != body)
+                            .map(|t| t.id)
+                            .collect();
+                        if !tab_ids.is_empty() {
+                            updated = true;
+                            for tid in tab_ids {
+                                tabs_w.reload_content(tid, body.clone());
+                            }
+                        }
+                    }
+                    if updated {
+                        // Non-artifact notes don't carry a revision
+                        // table — the cascade runner's `<details>`
+                        // history covers what little auditing is
+                        // needed elsewhere.
+                        *crate::shell::companion_state::LOCAL_NOTE_VERSION.write() += 1;
+                    }
+                }
+            });
+
+            *watch_holder.borrow_mut() = Some((notes_dir, handle));
+        });
+    }
 
     // Seed username from the DB; upsert a default row when missing so the
     // status bar always renders a value.
@@ -492,6 +809,135 @@ pub fn provide_local_app_signals() {
     use_context_provider(|| LocalProjectVersion(project_version));
     let note_version: Signal<u64> = use_signal(|| 0);
     use_context_provider(|| LocalNoteVersion(note_version));
+
+    // Filesystem watcher #2 — each project's `<repo>/.operon/artifacts/`.
+    // Artifact notes don't live in the vault's opaque UUID store; their
+    // bodies are at `<repo>/.operon/artifacts/<slug>/.../index.md` (see
+    // `ArtifactPathResolver`). The filename is `index.md`, not a UUID,
+    // so the watcher can't identify a specific note from the event —
+    // instead we reload every open tab's body from `persistence` on
+    // any change. `persistence.load` routes through `ArtifactPersistence`
+    // which knows the correct path per note id; `reload_content` skips
+    // tabs whose buffer already matches, so the broad reload is
+    // mostly idempotent.
+    //
+    // Re-runs when `project_version` bumps so newly-added projects get
+    // watched (and removed projects' watchers go away on the next
+    // rebuild).
+    {
+        let watch_holder: Rc<RefCell<Vec<(PathBuf, WatchHandle)>>> =
+            use_hook(|| Rc::new(RefCell::new(Vec::new())));
+        let project_repo_for_watcher = project_repo_for_app_signals.clone();
+        let persistence_for_artifact_watcher = persistence.clone();
+        let tabs_for_artifact_watcher = tabs;
+        let project_version_for_watcher: Signal<u64> = project_version;
+        // The artifact watcher's reload sweep needs the note repo to
+        // distinguish artifacts (which get the in-body revision row
+        // append) from other kinds. Snapshot once per effect run.
+        let LocalNoteRepo(note_repo_for_artifact_watcher) = use_context::<LocalNoteRepo>();
+        use_effect(move || {
+            // Subscribe to project_version so the effect re-runs on
+            // create/rename/remove.
+            let _ = project_version_for_watcher.read();
+
+            let projects = match project_repo_for_watcher.list() {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let mut target_dirs: Vec<PathBuf> = Vec::new();
+            for p in &projects {
+                if let Some(rp) = p.repo_path.as_ref() {
+                    target_dirs.push(rp.join(".operon").join("artifacts"));
+                }
+            }
+            // Skip when the watcher set is already pointing at the same
+            // paths (cheap PartialEq on Vec<PathBuf>).
+            {
+                let current: Vec<PathBuf> = watch_holder
+                    .borrow()
+                    .iter()
+                    .map(|(p, _)| p.clone())
+                    .collect();
+                if current == target_dirs {
+                    return;
+                }
+            }
+            // Tear down the previous set and rebuild. Dropping each
+            // `WatchHandle` stops the underlying notify watcher.
+            watch_holder.borrow_mut().clear();
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            for dir in &target_dirs {
+                // Create the dir if missing so notify can attach. Tiny
+                // cost on each effect run; tolerates pre-existing dirs.
+                if let Err(e) = std::fs::create_dir_all(dir) {
+                    tracing::warn!(
+                        target: "operon::watcher",
+                        "create artifacts dir {dir:?}: {e}"
+                    );
+                    continue;
+                }
+                // Recursive notify watcher inline — the existing
+                // `FilesystemWatcher` helper is NonRecursive + emits
+                // basenames only, both wrong for artifact paths.
+                let tx_for_dir = tx.clone();
+                let watch_result = (|| -> Result<WatchHandle, ()> {
+                    use notify::{recommended_watcher, EventKind, RecursiveMode, Watcher};
+                    let mut watcher = recommended_watcher(
+                        move |res: notify::Result<notify::Event>| {
+                            let Ok(ev) = res else { return };
+                            if !matches!(
+                                ev.kind,
+                                EventKind::Create(_) | EventKind::Modify(_)
+                            ) {
+                                return;
+                            }
+                            let _ = tx_for_dir.send(());
+                        },
+                    )
+                    .map_err(|_| ())?;
+                    watcher
+                        .watch(dir.as_path(), RecursiveMode::Recursive)
+                        .map_err(|_| ())?;
+                    Ok(WatchHandle {
+                        _inner: Some(Box::new(watcher)),
+                    })
+                })();
+                match watch_result {
+                    Ok(handle) => {
+                        watch_holder.borrow_mut().push((dir.clone(), handle));
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "operon::watcher",
+                            "failed to attach artifact watcher to {dir:?}"
+                        );
+                    }
+                }
+            }
+            // Single reader task: any event from any artifact dir
+            // triggers a full-tab reload sweep. Coalesce bursts via an
+            // inner `try_recv` drain so a Write tool's tempfile +
+            // rename (2-3 events) becomes one sweep.
+            let persistence_for_task = persistence_for_artifact_watcher.clone();
+            let tabs_for_task = tabs_for_artifact_watcher;
+            let note_repo_for_task = note_repo_for_artifact_watcher.clone();
+            let pending_for_task: PendingSelfWrites =
+                Arc::new(AsyncMutex::new(HashMap::new()));
+            spawn(async move {
+                while rx.recv().await.is_some() {
+                    while rx.try_recv().is_ok() {}
+                    reload_open_tabs_from_disk(
+                        persistence_for_task.clone(),
+                        tabs_for_task,
+                        note_repo_for_task.clone(),
+                        pending_for_task.clone(),
+                    )
+                    .await;
+                }
+            });
+        });
+    }
     // Bridge: detached-scope writers (artifact `spawn_forever` cascade,
     // workflow executor) bump `LOCAL_NOTE_VERSION` (a `GlobalSignal`)
     // because writes from the virtual root scope to a component-scope
@@ -506,6 +952,77 @@ pub fn provide_local_app_signals() {
         use_effect(move || {
             let _v = *crate::shell::companion_state::LOCAL_NOTE_VERSION.read();
             local.with_mut(|v| *v = v.saturating_add(1));
+        });
+    }
+
+    // TOC auto-refresh: any time `LOCAL_NOTE_VERSION` bumps (rename,
+    // create, delete, reparent, …), walk every open tab whose body
+    // carries the `<!-- operon:toc -->` sentinel and regenerate the
+    // Contents block against the current note tree. The on-open
+    // refresh path in the explorer already covers the first render;
+    // this covers everything after — so a child rename surfaces in
+    // the parent's Contents without the user having to close and
+    // reopen the tab.
+    //
+    // Loop avoidance: we update the tab buffer BEFORE writing back to
+    // disk. The filesystem watcher's identity check (`disk_body ==
+    // tab.content`) then short-circuits the watcher's reload sweep,
+    // so the artifact-row auto-append path in the watcher doesn't
+    // also fire from our save.
+    {
+        let persistence_for_toc = persistence.clone();
+        let tabs_for_toc = tabs;
+        let LocalNoteRepo(note_repo_for_toc) = use_context::<LocalNoteRepo>();
+        use_effect(move || {
+            // Subscribe to the bump.
+            let _v = *crate::shell::companion_state::LOCAL_NOTE_VERSION.read();
+            // Snapshot every open tab's id + note_id + body so the
+            // async sweep below can release the read lock immediately.
+            let tab_snapshot: Vec<(TabId, String, String)> = tabs_for_toc
+                .read()
+                .iter()
+                .map(|t| (t.id, t.note_id.clone(), t.content.clone()))
+                .collect();
+            let pers = persistence_for_toc.clone();
+            let nr = note_repo_for_toc.clone();
+            let tabs_sig = tabs_for_toc;
+            spawn(async move {
+                for (tid, note_id_str, body) in tab_snapshot {
+                    if !body.contains(crate::plugins::toc::TOC_SENTINEL) {
+                        continue;
+                    }
+                    let Ok(uuid) = Uuid::parse_str(&note_id_str) else {
+                        continue;
+                    };
+                    let project_id = match nr.find_project_for_note(uuid) {
+                        Ok(Some(p)) => p,
+                        _ => continue,
+                    };
+                    let notes = match nr.list_for_project(project_id) {
+                        Ok(n) => n,
+                        Err(_) => continue,
+                    };
+                    let refreshed = crate::plugins::toc::refresh_if_managed(
+                        &body, uuid, &notes,
+                    );
+                    if refreshed == body {
+                        continue;
+                    }
+                    // Update tab buffer first so the next filesystem
+                    // watcher tick sees disk == buffer and skips.
+                    {
+                        let mut tabs_sig = tabs_sig;
+                        let mut tabs_w = tabs_sig.write();
+                        tabs_w.reload_content(tid, refreshed.clone());
+                    }
+                    if let Err(e) = pers.save(&note_id_str, refreshed.as_bytes()).await {
+                        tracing::warn!(
+                            target: "operon::toc",
+                            "auto-refresh save({note_id_str}): {e}"
+                        );
+                    }
+                }
+            });
         });
     }
     let selected_project: Signal<Option<Uuid>> = use_signal(|| None);
@@ -831,6 +1348,30 @@ pub fn provide_local_app_signals() {
     });
     use_context_provider(|| {
         crate::plugins::markdown::render::NoteLinkResolver(note_link_resolver)
+    });
+
+    // Sibling resolver for *current* note title. Companion chat mention
+    // chips read this through `try_consume_context` so a rename in the
+    // explorer re-renders every chat chip referencing the note. Subscribes
+    // to `NOTE_TITLE_VERSION` (bumped by the rename path) inside the
+    // callback body — calling the callback inside an rsx scope auto-
+    // subscribes that scope to the signal.
+    let note_repo_for_title = note_repo_for_links.clone();
+    let project_repo_for_title = project_repo.clone();
+    let note_title_resolver = use_hook(move || {
+        Callback::new(move |note_id: Uuid| -> Option<String> {
+            let _ = crate::shell::companion_state::NOTE_TITLE_VERSION.read();
+            let project_repo_opt: Option<&Arc<dyn LocalProjectRepository>> =
+                Some(&project_repo_for_title);
+            crate::local_mode::note_lookup::lookup_note_title(
+                &note_repo_for_title,
+                project_repo_opt,
+                note_id,
+            )
+        })
+    });
+    use_context_provider(|| {
+        crate::plugins::markdown::render::NoteTitleResolver(note_title_resolver)
     });
 
     // Plans-Phase-9-wikilink-picker (rev 3): shared per-shell cache for

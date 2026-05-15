@@ -151,6 +151,7 @@ impl ArtifactKind {
             Self::Other(s) => s.clone(),
         }
     }
+
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

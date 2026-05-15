@@ -8,8 +8,14 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
 use dioxus::prelude::*;
+use operon_core::agent_event::AgentBackend;
 use serde_json::Value;
+
+use crate::shell::companion_state::{ActiveChatSession, AgentBackendCtx, TOOL_STREAM_OUTPUT};
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct ToolResultBody {
@@ -70,8 +76,137 @@ pub fn ToolCard(props: ToolCardProps) -> Element {
                     input: props.input.clone(),
                     result: props.result.clone(),
                 }
+                if pending {
+                    PendingToolFooter { id: props.id.clone() }
+                }
             }
         }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct PendingToolFooterProps {
+    id: String,
+}
+
+/// Live region rendered below a running tool's body: streaming output
+/// from `TOOL_STREAM_OUTPUT` (runtime backend only — claude-code
+/// never writes there), elapsed timer, and a runtime-only Cancel
+/// button that calls `backend.cancel_tool(session, id)`.
+#[component]
+fn PendingToolFooter(props: PendingToolFooterProps) -> Element {
+    let active_backend = try_consume_context::<AgentBackendCtx>().map(|c| c.0);
+    let active_session_ctx = try_consume_context::<ActiveChatSession>();
+
+    // Tick every 500ms so the elapsed timer keeps refreshing without
+    // requiring an explicit signal-bump from upstream.
+    let mut tick = use_signal(|| 0u64);
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            tick.with_mut(|t| *t = t.wrapping_add(1));
+        }
+    });
+    let _ = tick.read(); // subscribe
+
+    // Read stream + start time. Both are populated by
+    // AgentEvent::ToolChunk; if claude-code is the backend they stay
+    // empty and we just render the elapsed-time hint.
+    let stream = {
+        let map = TOOL_STREAM_OUTPUT.read();
+        map.get(&props.id).cloned()
+    };
+    let stdout = stream.as_ref().map(|s| s.stdout.clone()).unwrap_or_default();
+    let stderr = stream.as_ref().map(|s| s.stderr.clone()).unwrap_or_default();
+    let started_at = stream.as_ref().and_then(|s| s.started_at);
+    let elapsed = started_at
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .unwrap_or_default();
+    // `started_at` is populated by the first `ToolChunk` event. The
+    // runtime backend streams chunks; claude-code does not. Without an
+    // anchor `elapsed` stays at zero and the `< 1s` branch of
+    // `format_elapsed` would say "starting…" forever — misleading when
+    // the call is actually hung. Distinguish the two: with an anchor
+    // show the timer; without one show a static "(running…)" so
+    // hangs are visible.
+    let elapsed_label = if started_at.is_some() {
+        format_elapsed(elapsed)
+    } else {
+        "(running\u{2026})".to_string()
+    };
+
+    let backend_id = active_backend
+        .as_ref()
+        .map(|b| b.read().id().to_string())
+        .unwrap_or_default();
+    let runtime_backend = backend_id == "runtime";
+
+    let id_for_cancel = props.id.clone();
+    let cancel_click = move |_| {
+        let Some(backend_sig) = active_backend.as_ref() else {
+            return;
+        };
+        let Some(ActiveChatSession(sess_sig)) = active_session_ctx else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = backend_sig.read().clone();
+        let Some(session) = *sess_sig.read() else {
+            return;
+        };
+        let id = id_for_cancel.clone();
+        spawn(async move {
+            let ok = backend.cancel_tool(session, &id).await;
+            tracing::info!(
+                target: "operon::tool",
+                "cancel_tool({id}) on session {session} -> {ok}"
+            );
+        });
+    };
+
+    rsx! {
+        div {
+            class: "operon-tool-card-pending-footer",
+            "data-testid": "tool-pending-footer",
+            if !stdout.is_empty() {
+                pre { class: "operon-tool-card-pre operon-tool-card-stream-stdout",
+                    code { class: "md-code-block", "{stdout}" }
+                }
+            }
+            if !stderr.is_empty() {
+                pre { class: "operon-tool-card-pre operon-tool-card-stream-stderr",
+                    code { class: "md-code-block", "{stderr}" }
+                }
+            }
+            div { class: "operon-tool-card-pending-row",
+                span { class: "operon-tool-card-elapsed",
+                    "{elapsed_label}"
+                }
+                if runtime_backend {
+                    button {
+                        r#type: "button",
+                        class: "operon-tool-card-cancel-btn",
+                        "data-testid": "tool-cancel-btn",
+                        title: "Cancel this tool call (runtime backend)",
+                        onclick: cancel_click,
+                        "Cancel"
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn format_elapsed(d: Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs < 1.0 {
+        return "starting\u{2026}".to_string();
+    }
+    if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        let m = (secs / 60.0).floor() as u64;
+        let s = (secs - (m as f64) * 60.0).round() as u64;
+        format!("{m}m{s}s")
     }
 }
 

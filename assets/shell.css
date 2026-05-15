@@ -532,6 +532,60 @@ html, body {
   background: var(--vscode-charts-green, #2e7d32);
 }
 
+/* Inline action icons on artifact rows: Play / Approve‐Reject /
+ * Mark dirty / Revise. Always visible — they're the primary
+ * affordance for triggering cascade runs and status flips without
+ * opening the artifact. The strip only renders for `NoteKind::Artifact`
+ * rows (gated in `note_row.rs`), so non-artifact rows stay clean. */
+.operon-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  margin-left: 4px;
+}
+.operon-row-action {
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  padding: 0;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--vscode-foreground, inherit);
+  opacity: 0.7;
+}
+.operon-row-action:hover:not([disabled]) {
+  background: var(--vscode-list-hoverbackground, rgba(127, 127, 127, 0.18));
+  opacity: 1;
+}
+.operon-row-action[disabled] {
+  opacity: 0.25;
+  cursor: not-allowed;
+}
+.operon-row-action-play:hover:not([disabled]) {
+  color: #4caf50;
+}
+.operon-row-action-approve:hover:not([disabled]) {
+  color: #4caf50;
+}
+.operon-row-action-reject:hover:not([disabled]) {
+  color: #d75050;
+}
+.operon-row-action-dirty:hover:not([disabled]) {
+  color: #d99a3c;
+}
+.operon-row-action-done:hover:not([disabled]) {
+  color: #4caf50;
+}
+.operon-row-action-cancel:hover:not([disabled]) {
+  color: #d75050;
+}
+
 /* Artifact workflow status dot, anchored to the row's right edge.
  * Sits to the left of the (hover-only) add-child button so it stays
  * visible at rest. Colors mirror the artifact_status palette used by
@@ -1466,22 +1520,6 @@ html, body {
   gap: 4px;
   position: relative;
 }
-.operon-companion-slash-button {
-  width: 24px;
-  height: 24px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 12px;
-  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
-  background: transparent;
-  border: 1px solid var(--vscode-panel-border);
-  border-radius: 4px;
-  cursor: pointer;
-}
-.operon-companion-slash-button:hover {
-  background: var(--vscode-list-hoverbackground, rgba(127, 127, 127, 0.1));
-}
 .operon-companion-slash-popover {
   position: absolute;
   bottom: 32px;
@@ -1512,6 +1550,77 @@ html, body {
 }
 .operon-companion-slash-item:hover {
   background: var(--vscode-list-hoverbackground, rgba(127, 127, 127, 0.1));
+}
+.operon-companion-slash-item-selected {
+  background: var(--vscode-list-activeSelectionBackground, rgba(14, 99, 156, 0.25));
+  color: var(--vscode-list-activeSelectionForeground, inherit);
+}
+
+
+.operon-companion-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px 0;
+}
+.operon-companion-attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 2px 1px 6px;
+  background: var(--vscode-badge-background, rgba(127, 127, 127, 0.18));
+  color: var(--vscode-badge-foreground, var(--vscode-foreground));
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 10px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.operon-companion-attachment-link {
+  background: transparent;
+  border: none;
+  padding: 0 4px;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: rgba(127, 127, 127, 0.4);
+}
+.operon-companion-attachment-link:hover {
+  text-decoration-color: currentColor;
+}
+.operon-companion-attachment-remove {
+  background: transparent;
+  border: none;
+  padding: 0 4px;
+  color: inherit;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  opacity: 0.7;
+}
+.operon-companion-attachment-remove:hover {
+  opacity: 1;
+}
+
+/* Mention chip used in transcript user-message bubbles. */
+.operon-mention-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 6px;
+  background: var(--vscode-badge-background, rgba(127, 127, 127, 0.18));
+  color: var(--vscode-badge-foreground, var(--vscode-foreground));
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  margin: 0 1px;
+}
+.operon-mention-chip-clickable {
+  cursor: pointer;
+}
+.operon-mention-chip-clickable:hover {
+  background: var(--vscode-list-hoverbackground, rgba(127, 127, 127, 0.28));
 }
 
 .operon-companion-chat-input {
@@ -2483,6 +2592,14 @@ html, body {
   border-bottom: 1px solid var(--vscode-panel-border);
   background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
   flex: 0 0 auto;
+  /* Keep the toolbar visible while the body scrolls. The surface
+     above is flex-column so the header is pinned to the surface,
+     but if a higher ancestor (.operon-main-body) scrolls, the
+     position: sticky here keeps the toolbar glued to the top of
+     the viewport instead of scrolling off. */
+  position: sticky;
+  top: 0;
+  z-index: 5;
 }
 /* Phase notes stand out — they're project-root containers that group
    a batch of requirements + epics together. Background highlight on
@@ -2492,6 +2609,18 @@ html, body {
   color: var(--vscode-editor-background, #1e1e1e);
   opacity: 0.85 !important;
   font-weight: 600;
+}
+/* Master requirement artifacts are the cascade roots — the entry
+   point users hit to fire the full SDLC pipeline. Same treatment as
+   Phase: distinct background + bold, so the [mr] badge jumps out of a
+   long list of [ar] artifacts. Uses a warmer accent (amber) to
+   differentiate from Phase's cool accent. */
+.kind-artifact-master {
+  background: #d99a3c;
+  color: var(--vscode-editor-background, #1e1e1e);
+  opacity: 1 !important;
+  font-weight: 700;
+  letter-spacing: 0.5px;
 }
 
 .operon-artifact-kind-badge {
@@ -2773,23 +2902,245 @@ html, body {
   color: var(--vscode-descriptionforeground);
 }
 
+/* ===== Mode toolbar (View / Edit / Live Preview / Split) ===== */
+/* Per-tab toolbar mounted above the editor body. Without explicit
+   styles these buttons fall through to native browser appearance,
+   which on some themes left the hover state with matching text and
+   background — making the label invisible. The rules below give the
+   buttons a themed look with explicit, contrasting hover/active
+   states. */
+.operon-mode-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-editorWidget-background, rgba(127, 127, 127, 0.04));
+  flex: 0 0 auto;
+}
+.operon-mode-toolbar-empty {
+  padding: 0;
+  border-bottom: 0;
+  background: transparent;
+}
+.operon-mode-button {
+  padding: 3px 10px;
+  font-size: 12px;
+  line-height: 1.4;
+  background: transparent;
+  color: var(--vscode-editor-foreground, inherit);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.operon-mode-button:hover {
+  background: var(--vscode-list-hoverbackground, rgba(127, 127, 127, 0.15));
+  color: var(--vscode-editor-foreground, inherit);
+  border-color: var(--vscode-focusborder, var(--vscode-panel-border));
+}
+.operon-mode-button-active,
+.operon-mode-button-active:hover {
+  background: var(--vscode-button-background, var(--vscode-editor-selectionbackground));
+  color: var(--vscode-button-foreground, var(--vscode-editor-foreground));
+  border-color: var(--vscode-focusborder, var(--vscode-panel-border));
+}
+
 /* ===== Artifact: Revise / Re-run action buttons ===== */
+/* The skill toolbar and the global mode toolbar host the same
+   Revise/Cancel cluster (via `plugins::revise_flow::RevisionFlowButtons`);
+   they piggyback on the artifact base styles below by sharing class
+   suffixes (`-primary`, `-cancel`). */
 .operon-artifact-revise,
-.operon-artifact-rerun {
+.operon-artifact-rerun,
+.operon-skill-revise-primary,
+.operon-mode-button-revise-primary {
   font-size: 11px;
   padding: 2px 10px;
   border-radius: 3px;
   background: transparent;
   cursor: pointer;
 }
-.operon-artifact-revise {
+.operon-artifact-revise,
+.operon-skill-revise-primary,
+.operon-mode-button-revise-primary {
   border: 1px solid var(--vscode-descriptionforeground, currentColor);
   color: var(--vscode-descriptionforeground, inherit);
 }
-.operon-artifact-revise:hover {
+.operon-artifact-revise:hover,
+.operon-skill-revise-primary:hover,
+.operon-mode-button-revise-primary:hover {
   background: var(--vscode-descriptionforeground, currentColor);
   color: var(--vscode-editor-background, #1e1e1e);
 }
+.operon-artifact-revise[disabled],
+.operon-skill-revise-primary[disabled],
+.operon-mode-button-revise-primary[disabled] {
+  opacity: 0.4;
+  cursor: not-allowed;
+  background: transparent !important;
+  color: inherit !important;
+}
+.operon-artifact-revise-cancel,
+.operon-skill-revise-cancel,
+.operon-mode-button-revise-cancel {
+  border: 1px solid var(--vscode-descriptionforeground, currentColor);
+  color: var(--vscode-descriptionforeground, inherit);
+  background: transparent;
+  padding: 3px 10px;
+  font: inherit;
+  font-size: 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0.85;
+}
+.operon-artifact-revise-cancel:hover,
+.operon-skill-revise-cancel:hover,
+.operon-mode-button-revise-cancel:hover {
+  opacity: 1;
+  background: rgba(127, 127, 127, 0.12);
+}
+
+/* ===== Per-tab mode toolbar (View / Edit-cluster / Split) ===== */
+/* The container holds the View / Split mode buttons plus the
+   RevisionFlowButtons cluster (Edit / Cancel / Done). Without these
+   rules the children flow inline with no spacing and the plain mode
+   buttons are bare text — see plan
+   /home/jehu/.claude/plans/image-3-live-fuzzy-pnueli.md. */
+.operon-mode-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--operon-border, rgba(127, 127, 127, 0.18));
+  font-size: 12px;
+}
+.operon-mode-toolbar-empty {
+  min-height: 30px;
+}
+.operon-mode-button {
+  font-size: 11px;
+  padding: 2px 10px;
+  border-radius: 3px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--vscode-descriptionforeground, inherit);
+  cursor: pointer;
+}
+.operon-mode-button:hover {
+  border-color: var(--vscode-descriptionforeground, currentColor);
+}
+.operon-mode-button-active {
+  border-color: var(--operon-accent, var(--vscode-descriptionforeground, currentColor));
+  color: var(--vscode-foreground, inherit);
+  background: rgba(127, 127, 127, 0.10);
+}
+
+/* Revision-summary confirm dialog: modal overlay shown after Done click.
+   Sits above the editor while Claude drafts a summary; the user reviews
+   + edits, then Confirm/Cancel. */
+.operon-revision-dialog-scrim {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 990;
+}
+.operon-revision-dialog {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1000;
+  width: min(560px, 90vw);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 18px;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background, white));
+  color: var(--vscode-foreground, inherit);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+}
+.operon-revision-dialog-header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.operon-revision-dialog-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0;
+}
+.operon-revision-dialog-hint {
+  margin: 0;
+  font-size: 11px;
+  opacity: 0.75;
+}
+.operon-revision-dialog-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 18px 0;
+  justify-content: center;
+}
+.operon-revision-dialog-loading-label {
+  font-size: 12px;
+  font-style: italic;
+  opacity: 0.85;
+}
+.operon-revision-dialog-textarea {
+  width: 100%;
+  min-height: 80px;
+  resize: vertical;
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  background: var(--vscode-input-background, transparent);
+  color: var(--vscode-input-foreground, inherit);
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  border-radius: 4px;
+}
+.operon-revision-dialog-error {
+  font-size: 11px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: rgba(255, 80, 80, 0.08);
+  border: 1px solid rgba(255, 80, 80, 0.3);
+  color: var(--vscode-errorforeground, #d75050);
+}
+.operon-revision-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.operon-revision-dialog-cancel,
+.operon-revision-dialog-confirm {
+  padding: 4px 12px;
+  font: inherit;
+  font-size: 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  background: transparent;
+  border: 1px solid var(--vscode-panel-border);
+  color: inherit;
+}
+.operon-revision-dialog-cancel:hover {
+  background: var(--vscode-list-hoverbackground, rgba(127, 127, 127, 0.12));
+}
+.operon-revision-dialog-confirm {
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, white);
+  border-color: var(--vscode-button-background, #0e639c);
+}
+.operon-revision-dialog-confirm:hover:not([disabled]) {
+  background: var(--vscode-button-hoverBackground, #1177bb);
+}
+.operon-revision-dialog-confirm[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .operon-artifact-rerun {
   border: 1px solid #d99a3c;
   color: #d99a3c;
@@ -2833,6 +3184,30 @@ html, body {
   background: var(--vscode-errorforeground, #f48771);
   color: var(--vscode-editor-background, #1e1e1e);
   animation: none;
+}
+/* Loader inside the Play button while a cascade is in flight. Pure
+   CSS — a small ring with one segment that spins. Color tracks
+   currentColor so the spinner reads against any theme. */
+.operon-cascade-spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: -1px;
+  animation: operon-cascade-spin 0.8s linear infinite;
+}
+.operon-artifact-cascade-stop:hover .operon-cascade-spinner {
+  /* On hover the button background fills with red and the foreground
+     flips to the editor background; the spinner inherits via
+     currentColor so it stays readable. Pause the spin so the hover
+     state doesn't look glitchy with the simultaneous color flip. */
+  animation-play-state: paused;
+}
+@keyframes operon-cascade-spin {
+  to { transform: rotate(360deg); }
 }
 @keyframes operon-cascade-pulse {
   0%, 100% { opacity: 1; }

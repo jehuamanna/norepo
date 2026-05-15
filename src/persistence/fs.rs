@@ -117,6 +117,10 @@ impl Persistence for FilesystemPersistence {
         })
     }
 
+    fn resolved_path(&self, note_id: &str) -> Option<PathBuf> {
+        Some(self.path_for(note_id))
+    }
+
     fn rename<'a>(
         &'a self,
         from: &'a str,

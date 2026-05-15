@@ -167,50 +167,39 @@ pub async fn previous_phase_id(
 }
 
 /// Find the project-root note whose body declares
-/// `artifact_kind: requirement` AND that has no master_requirement
-/// ancestor. The "CE" customer-engagement bucket — a project-level
+/// `NoteKind::Ce`. The CE (Customer Engineering) bucket — a project-root
 /// singleton sitting alongside the phases. Used by the runner as the
 /// fallback inheritance source for Phase 0's architecture (when
 /// `previous_phase_id` returns `None`).
 ///
-/// Returns `None` if no such note exists. Convention: the user
-/// authors one `Artifact` note at the project root with kind
-/// `requirement`; everything under it (markdown, images, nested
-/// requirements) is part of CE.
+/// Migration 021 added `Ce` as a first-class kind; before that, CEs
+/// were modelled as root-level `Artifact` notes with
+/// `artifact_kind: requirement` in frontmatter. Legacy rows are
+/// flipped to `Ce` on first project open by [`ce_migration`].
+///
+/// Returns `None` if no such note exists.
+///
+/// The `_persistence` argument is retained for call-site
+/// compatibility (older callers passed it for body loading) — the
+/// kind-based lookup no longer needs it. Kept so callers don't have
+/// to thread a different signature.
 pub async fn find_ce_root(
     note_repo: &Arc<dyn LocalNoteRepository>,
-    persistence: &Arc<dyn Persistence>,
+    _persistence: &Arc<dyn Persistence>,
     project_id: Uuid,
 ) -> Option<Uuid> {
     let notes = note_repo.list_for_project(project_id).ok()?;
-    for n in &notes {
-        // CE is at project root (no parent).
-        if n.parent_id.is_some() {
-            continue;
-        }
-        if !matches!(n.kind, NoteKind::Artifact) {
-            continue;
-        }
-        let bytes = persistence.load(&n.id.to_string()).await.ok()?;
-        let body = String::from_utf8(bytes).ok()?;
-        let fm = crate::plugins::artifact::frontmatter::parse(&body);
-        if fm
-            .artifact_kind
-            .as_ref()
-            .map(|k| k.as_str() == "requirement" || k.as_str() == "requirements")
-            .unwrap_or(false)
-        {
-            return Some(n.id);
-        }
-    }
-    None
+    notes
+        .into_iter()
+        .find(|n| n.parent_id.is_none() && matches!(n.kind, NoteKind::Ce))
+        .map(|n| n.id)
 }
 
 /// Find the architecture artifact (`artifact_kind: architecture`)
-/// living directly under `phase_id`'s master_requirement. Walks
-/// children of `phase_id` looking for a master_requirement, then
-/// walks that master's children for an Architecture. Returns `None`
-/// when either is missing.
+/// directly under `phase_id`. Per the runner's placement rule, an
+/// architecture produced from a phase's master_requirement is parented
+/// to the phase note itself (sibling of the master_requirement), not
+/// nested under the master_requirement.
 pub async fn architecture_under_phase(
     note_repo: &Arc<dyn LocalNoteRepository>,
     persistence: &Arc<dyn Persistence>,
@@ -218,38 +207,8 @@ pub async fn architecture_under_phase(
     phase_id: Uuid,
 ) -> Option<Uuid> {
     let notes = note_repo.list_for_project(project_id).ok()?;
-    // Step 1: find master_requirement child of phase_id.
-    let master_id = {
-        let mut found: Option<Uuid> = None;
-        for n in &notes {
-            if n.parent_id != Some(phase_id) {
-                continue;
-            }
-            if !matches!(n.kind, NoteKind::Artifact) {
-                continue;
-            }
-            let Ok(bytes) = persistence.load(&n.id.to_string()).await else {
-                continue;
-            };
-            let Ok(body) = String::from_utf8(bytes) else {
-                continue;
-            };
-            let fm = crate::plugins::artifact::frontmatter::parse(&body);
-            if fm
-                .artifact_kind
-                .as_ref()
-                .map(|k| k.as_str() == "master_requirement")
-                .unwrap_or(false)
-            {
-                found = Some(n.id);
-                break;
-            }
-        }
-        found?
-    };
-    // Step 2: find architecture child of master_id.
     for n in &notes {
-        if n.parent_id != Some(master_id) {
+        if n.parent_id != Some(phase_id) {
             continue;
         }
         if !matches!(n.kind, NoteKind::Artifact) {

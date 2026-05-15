@@ -11,6 +11,7 @@
 //! contract.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -99,6 +100,23 @@ pub trait Persistence: Send + Sync {
         from: &'a str,
         to: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistError>> + 'a>>;
+
+    /// Resolve a note id to its canonical on-disk path, when one
+    /// exists. Used by the companion chat to tell Claude the *actual*
+    /// path of a referenced note so its `Read`/`Edit`/`Write` tools
+    /// land on the right file — artifact notes live at
+    /// `<repo>/.operon/artifacts/<slug>/.../index.md`, non-artifacts
+    /// at `<notes_dir>/<uuid>`, so the routing layer is the only
+    /// component that can answer this cheaply.
+    ///
+    /// Returns `None` for backends without an on-disk representation
+    /// (in-memory, OPFS, IndexedDB) or for ids that don't resolve in
+    /// the current scope. Callers should treat a `None` as "fall back
+    /// to whatever path you'd guess yourself, then accept that the
+    /// model may not be able to reach it".
+    fn resolved_path(&self, _note_id: &str) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// External-change notification. Desktop FS impl uses the `notify` crate; web impl is a no-op

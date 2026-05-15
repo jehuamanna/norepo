@@ -63,6 +63,16 @@ pub struct MarkdownImageResolver(pub Callback<String, Option<String>>);
 #[derive(Clone, Copy)]
 pub struct NoteLinkResolver(pub Callback<Uuid>);
 
+/// Optional sync resolver from a note UUID to its *current* display
+/// title. The Local-Mode shell installs this with a callback that
+/// reads `LocalNoteRepo` and subscribes to `NOTE_TITLE_VERSION` so
+/// renames invalidate any rendered chip text that reads through it.
+/// `None` (resolver missing, note removed, deleted) → callers fall
+/// back to the title literal embedded in the mention token, since the
+/// token is the only stable record once a note is gone.
+#[derive(Clone, Copy)]
+pub struct NoteTitleResolver(pub Callback<Uuid, Option<String>>);
+
 #[component]
 pub fn MarkdownView(content: String) -> Element {
     // Plans-Phase-5-vfs-wikilinks: post-process the AST to lift `[[…]]` and

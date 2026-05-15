@@ -2,7 +2,11 @@
 //!
 //! Parses CommonMark via `pulldown-cmark`, walks the events into an [`MdNode`] tree, and
 //! renders themed Dioxus RSX in View mode. Edit mode mounts MonacoBackend with the
-//! markdown language descriptor. LivePreview is deferred to Phase 4 (CodeMirror 6).
+//! markdown language descriptor.
+//!
+//! **LivePreview is intentionally not advertised.** The historical CodeMirror 6 host
+//! is a wasm-only mount and on desktop renders a placeholder; a Monaco-only LP would
+//! be visually identical to Edit. Users get View / Edit / Split, all distinct.
 
 use dioxus::prelude::*;
 
@@ -48,7 +52,7 @@ impl FormatPlugin for MarkdownFormatPlugin {
     }
 
     fn capabilities(&self) -> FormatCaps {
-        FormatCaps::VIEW | FormatCaps::EDIT | FormatCaps::LIVE_PREVIEW
+        FormatCaps::VIEW | FormatCaps::EDIT
     }
 
     fn render(&self, _note_id: &str, content: &str) -> Element {
@@ -74,21 +78,4 @@ impl FormatPlugin for MarkdownFormatPlugin {
         }
     }
 
-    fn render_live_preview(
-        &self,
-        note_id: &str,
-        content: &str,
-        on_change: EventHandler<String>,
-    ) -> Element {
-        let note_id = note_id.to_string();
-        let content = content.to_string();
-        rsx! {
-            crate::shell::codemirror_host::CodeMirrorEditorHost {
-                note_id,
-                content,
-                language: LanguageDescriptor::markdown(),
-                on_change,
-            }
-        }
-    }
 }

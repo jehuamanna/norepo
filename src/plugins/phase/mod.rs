@@ -16,9 +16,11 @@
 //! listing; `phase_label` is the free-form human name and falls back
 //! to the note's `title` column when absent.
 
+pub mod ce_migration;
 pub mod discovery;
 pub mod frontmatter;
 
+pub use ce_migration::migrate_legacy_ce;
 pub use discovery::{
     ancestor_phase_id, architecture_under_phase, find_ce_root, first_phase_id,
     is_in_first_phase, previous_phase_id,

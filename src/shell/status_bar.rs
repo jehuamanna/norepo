@@ -221,6 +221,7 @@ const fn path_extension_for_kind(k: NoteKind) -> &'static str {
         NoteKind::Workflow => "json",
         NoteKind::Artifact => "md",
         NoteKind::Phase => "md",
+        NoteKind::Ce => "md",
     }
 }
 

@@ -49,6 +49,17 @@ pub mod mcp_settings;
 mod session_rail;
 #[cfg(not(target_arch = "wasm32"))]
 mod tool_card;
+pub mod tool_category;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod auto_approve;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod diff_preview;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod permission_drawer;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod bridge_artifact_executor;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod bridge_shell_executor;
 pub mod dropdown;
 pub mod editor_host;
 pub mod layout;

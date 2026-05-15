@@ -4,6 +4,11 @@
 //! the absolute path the user picks on first run; markdown bodies live under
 //! `<vault>/notes/` and image blobs under `<vault>/.operon/images/`. The path
 //! is persisted in `local_app_settings` under `SETTINGS_KEY_VAULT_ROOT`.
+//!
+//! Per-project operon metadata (artifacts, outputs, trash, cascade state)
+//! lives at `<vault>/.operon/<project-id>/…`, NOT inside the user's git
+//! repository. Keeping it out of `<repo>` means Claude Code (whose `cwd`
+//! is the repo) sees only business source code.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -13,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use operon_store::repos::LocalSettingsRepository;
+use uuid::Uuid;
 
 use super::SETTINGS_KEY_VAULT_ROOT;
 
@@ -37,6 +43,34 @@ impl VaultRoot {
 
     fn lock_path(&self) -> PathBuf {
         self.path.join(".operon/lock")
+    }
+
+    /// Per-project operon root: `<vault>/.operon/<project-id>/`. Parent
+    /// of every per-project sidecar (artifacts, outputs, trash, etc.).
+    pub fn project_operon_dir(&self, project_id: Uuid) -> PathBuf {
+        self.path.join(".operon").join(project_id.to_string())
+    }
+
+    pub fn project_artifacts_dir(&self, project_id: Uuid) -> PathBuf {
+        self.project_operon_dir(project_id).join("artifacts")
+    }
+
+    pub fn project_outputs_dir(&self, project_id: Uuid) -> PathBuf {
+        self.project_operon_dir(project_id).join("outputs")
+    }
+
+    pub fn project_trash_dir(&self, project_id: Uuid) -> PathBuf {
+        self.project_operon_dir(project_id).join("trash")
+    }
+
+    pub fn project_cascade_stages_path(&self, project_id: Uuid) -> PathBuf {
+        self.project_operon_dir(project_id)
+            .join("cascade-stages.json")
+    }
+
+    pub fn project_artifact_layout_sentinel(&self, project_id: Uuid) -> PathBuf {
+        self.project_operon_dir(project_id)
+            .join(".artifact-layout-v1")
     }
 }
 

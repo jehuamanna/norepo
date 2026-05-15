@@ -48,6 +48,14 @@ pub struct NoteRowProps {
     /// dot at the row's right edge so users can see workflow progress
     /// at a glance. `None` for non-Artifact notes — no dot.
     pub artifact_status: Option<crate::plugins::artifact::frontmatter::ArtifactStatus>,
+    /// Frontmatter `artifact_kind` value for Artifact notes. Used to
+    /// (a) gate the inline Play icon to the four eligible kinds —
+    /// MasterRequirement / Task / ImplementationPlan / Implementation
+    /// — that the cascade runner can dispatch on, and (b) light up
+    /// the MasterRequirement visual marker so users can spot the
+    /// project's cascade root at a glance. `None` for non-artifact
+    /// rows or artifacts whose frontmatter doesn't carry a kind.
+    pub artifact_kind: Option<crate::plugins::artifact::frontmatter::ArtifactKind>,
     pub in_rename: bool,
     pub is_first_sibling: bool,
     pub is_last_sibling: bool,
@@ -103,6 +111,12 @@ pub struct NoteRowProps {
     pub on_bulk_cut: Callback<()>,
     pub on_bulk_copy: Callback<()>,
     pub on_bulk_request_delete: Callback<()>,
+    /// Opt this note into the auto-managed Contents section. Loads
+    /// the body, appends the toc sentinel + empty Contents block if
+    /// absent, and persists. Idempotent — re-invoking is a no-op once
+    /// the sentinel is present. Available on any note kind; CE /
+    /// Phase / Artifact already carry it from creation.
+    pub on_insert_toc: Callback<Uuid>,
 }
 
 #[component]
@@ -205,6 +219,7 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let on_bulk_cut = props.on_bulk_cut;
     let on_bulk_copy = props.on_bulk_copy;
     let on_bulk_request_delete = props.on_bulk_request_delete;
+    let on_insert_toc = props.on_insert_toc;
     // Plans-Phase-4-multiselect-aria: when this row is part of the
     // multi-selection AND the set has 2+ items, surface bulk-aware
     // menu labels ("Cut N items" etc.) and route Cut/Copy/Delete
@@ -292,7 +307,7 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
     let mut mode_items: Vec<ContextMenuItem> = Vec::new();
     if current_mode != Some(EditorMode::Edit) {
         mode_items.push(ContextMenuItem::new(
-            "Edit",
+            "Revise",
             Callback::new(move |_| {
                 on_set_mode.call((id, EditorMode::Edit));
             }),
@@ -358,6 +373,12 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
             build_creatable_menu(Callback::new(move |kind| {
                 on_add_sibling.call((id, kind));
             })),
+        ),
+        ContextMenuItem::new(
+            "Insert Contents",
+            Callback::new(move |_| {
+                on_insert_toc.call(id);
+            }),
         ),
         if is_bulk {
             ContextMenuItem::new(
@@ -1066,13 +1087,33 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                     }
                 }
                 {
-                    let icon = note.kind.icon();
-                    let kind_str = note.kind.as_str();
+                    // Master requirement is the project's cascade root —
+                    // the user's primary entry point. Distinguish it from
+                    // every other artifact (which all render `[ar]`) with
+                    // an `[mr]` badge and a bolder background, mirroring
+                    // the precedent set by Phase notes (`.kind-phase`).
+                    let is_master_requirement = matches!(
+                        props.artifact_kind,
+                        Some(crate::plugins::artifact::frontmatter::ArtifactKind::MasterRequirement)
+                    );
+                    let (icon, kind_class, kind_attr) = if is_master_requirement {
+                        ("mr", "kind-artifact-master", "artifact-master")
+                    } else {
+                        (note.kind.icon(), "kind-other", note.kind.as_str())
+                    };
+                    // For non-MR rows we still want the existing per-kind
+                    // accent class (`kind-artifact`, `kind-skill`, …) to
+                    // apply; for MR we override with the master class only.
+                    let kind_class_attr = if is_master_requirement {
+                        kind_class.to_string()
+                    } else {
+                        format!("kind-{}", note.kind.as_str())
+                    };
                     rsx! {
                         span {
-                            class: "kind-badge kind-{kind_str} text-[0.65rem] mr-1 px-1 rounded select-none opacity-60 shrink-0",
+                            class: "kind-badge {kind_class_attr} text-[0.65rem] mr-1 px-1 rounded select-none opacity-60 shrink-0",
                             "data-testid": "kind-badge",
-                            "data-note-kind": "{kind_str}",
+                            "data-note-kind": "{kind_attr}",
                             "[{icon}]"
                         }
                     }
@@ -1081,6 +1122,203 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                     class: "truncate flex-1",
                     "data-testid": "note-row-name",
                     "{title}"
+                }
+                // Inline action icons for artifact notes only. Each
+                // hits persistence directly without opening the
+                // artifact's tab. Position: between the title and the
+                // status dot. Mirrors the toolbar's Approve / Reject /
+                // Mark dirty buttons + the mode-toggle that the
+                // right-click menu also exposes.
+                //
+                // Icons render only when the row carries an
+                // `artifact_status` prop, which the parent panel sets
+                // exclusively for `NoteKind::Artifact` rows.
+                if let Some(current_status) = props.artifact_status {
+                    {
+                        let id_for_actions = id;
+                        let is_approved = current_status
+                            == crate::plugins::artifact::frontmatter::ArtifactStatus::Approved;
+                        let dirty_disabled = current_status
+                            == crate::plugins::artifact::frontmatter::ArtifactStatus::Dirty;
+                        // `current_mode` is `Option<EditorMode>` — None when
+                        // the note isn't open. Treat None as not-in-edit so
+                        // the icon shows the pencil (entering Revise). When
+                        // in Edit, Revise splits into two icons: ✓ Done
+                        // (commit) and ✕ Cancel (revert) — mirrors the
+                        // in-view artifact toolbar's Done+Cancel pair.
+                        let in_edit_mode = matches!(current_mode, Some(EditorMode::Edit));
+                        // Combined Approve/Reject: shows the OPPOSITE
+                        // of the current state, so one click always
+                        // flips the status. Mirrors the artifact view
+                        // toolbar's combined button.
+                        let approve_reject_label = if is_approved { "\u{2715}" } else { "\u{2713}" };
+                        let approve_reject_title = if is_approved { "Reject" } else { "Approve" };
+                        let approve_reject_class = if is_approved {
+                            "operon-row-action operon-row-action-reject"
+                        } else {
+                            "operon-row-action operon-row-action-approve"
+                        };
+                        let approve_reject_target = if is_approved {
+                            crate::plugins::artifact::frontmatter::ArtifactStatus::Rejected
+                        } else {
+                            crate::plugins::artifact::frontmatter::ArtifactStatus::Approved
+                        };
+                        // Cascade running state for this artifact. The
+                        // global CASCADE_STATE map is keyed by uuid;
+                        // an entry exists iff a cascade rooted on this
+                        // artifact is in flight.
+                        let is_cascading = matches!(
+                            crate::shell::companion_state::CASCADE_STATE.read().get(&id),
+                            Some(crate::shell::companion_state::CascadePhase::Running { .. })
+                        );
+                        // Play eligibility mirrors the artifact view's
+                        // `primary_play_mode` gate at view.rs:238-258:
+                        //   - MasterRequirement → always (root seed)
+                        //   - Task → Approved or Dirty
+                        //   - ImplementationPlan → Approved or Dirty
+                        //   - Implementation → Approved or Dirty
+                        // Every other kind hides Play. Stop stays
+                        // reachable when a cascade is somehow running
+                        // for an ineligible kind (defensive — keeps
+                        // the user able to cancel).
+                        let play_eligible = match (
+                            props.artifact_kind.as_ref(),
+                            current_status,
+                        ) {
+                            (
+                                Some(crate::plugins::artifact::frontmatter::ArtifactKind::MasterRequirement),
+                                _,
+                            ) => true,
+                            (
+                                Some(crate::plugins::artifact::frontmatter::ArtifactKind::Task),
+                                crate::plugins::artifact::frontmatter::ArtifactStatus::Approved
+                                | crate::plugins::artifact::frontmatter::ArtifactStatus::Dirty,
+                            ) => true,
+                            (
+                                Some(crate::plugins::artifact::frontmatter::ArtifactKind::ImplementationPlan),
+                                crate::plugins::artifact::frontmatter::ArtifactStatus::Approved
+                                | crate::plugins::artifact::frontmatter::ArtifactStatus::Dirty,
+                            ) => true,
+                            (
+                                Some(crate::plugins::artifact::frontmatter::ArtifactKind::Implementation),
+                                crate::plugins::artifact::frontmatter::ArtifactStatus::Approved
+                                | crate::plugins::artifact::frontmatter::ArtifactStatus::Dirty,
+                            ) => true,
+                            _ => false,
+                        };
+                        let show_play = play_eligible || is_cascading;
+                        let play_class = if is_cascading {
+                            "operon-row-action operon-row-action-stop"
+                        } else {
+                            "operon-row-action operon-row-action-play"
+                        };
+                        let play_title = if is_cascading {
+                            "Stop cascade"
+                        } else {
+                            "Open artifact (Play from the header)"
+                        };
+                        rsx! {
+                            div {
+                                class: "operon-row-actions",
+                                "data-testid": "row-actions",
+                                if show_play {
+                                    button {
+                                        r#type: "button",
+                                        class: "{play_class}",
+                                        "data-testid": "row-play",
+                                        title: "{play_title}",
+                                        onclick: move |evt| {
+                                            evt.stop_propagation();
+                                            if is_cascading {
+                                                if let Some(tok) =
+                                                    crate::shell::companion_state::CASCADE_CANCEL
+                                                        .read()
+                                                        .get(&id_for_actions)
+                                                        .cloned()
+                                                {
+                                                    tok.cancel();
+                                                }
+                                            } else {
+                                                on_select.call(id_for_actions);
+                                                on_set_mode.call((id_for_actions, EditorMode::View));
+                                            }
+                                        },
+                                        if is_cascading {
+                                            span {
+                                                class: "operon-cascade-spinner",
+                                                "aria-hidden": "true",
+                                            }
+                                            "\u{23F9}"
+                                        } else {
+                                            "\u{25B6}"
+                                        }
+                                    }
+                                }
+                                button {
+                                    r#type: "button",
+                                    class: "{approve_reject_class}",
+                                    "data-testid": "row-approve-reject",
+                                    title: "{approve_reject_title}",
+                                    onclick: move |evt| {
+                                        evt.stop_propagation();
+                                        apply_row_status(id_for_actions, approve_reject_target);
+                                    },
+                                    "{approve_reject_label}"
+                                }
+                                button {
+                                    r#type: "button",
+                                    class: "operon-row-action operon-row-action-dirty",
+                                    "data-testid": "row-mark-dirty",
+                                    title: "Mark dirty",
+                                    disabled: dirty_disabled,
+                                    onclick: move |evt| {
+                                        evt.stop_propagation();
+                                        apply_row_status(
+                                            id_for_actions,
+                                            crate::plugins::artifact::frontmatter::ArtifactStatus::Dirty,
+                                        );
+                                    },
+                                    "\u{25D0}"
+                                }
+                                if in_edit_mode {
+                                    button {
+                                        r#type: "button",
+                                        class: "operon-row-action operon-row-action-done",
+                                        "data-testid": "row-revise-done",
+                                        title: "Done (commit revision)",
+                                        onclick: move |evt| {
+                                            evt.stop_propagation();
+                                            apply_row_revise_done(id_for_actions);
+                                        },
+                                        "\u{2713}"
+                                    }
+                                    button {
+                                        r#type: "button",
+                                        class: "operon-row-action operon-row-action-cancel",
+                                        "data-testid": "row-revise-cancel",
+                                        title: "Cancel (revert to pre-Revise state)",
+                                        onclick: move |evt| {
+                                            evt.stop_propagation();
+                                            apply_row_revise_cancel(id_for_actions);
+                                        },
+                                        "\u{2716}"
+                                    }
+                                } else {
+                                    button {
+                                        r#type: "button",
+                                        class: "operon-row-action operon-row-action-revise",
+                                        "data-testid": "row-revise",
+                                        title: "Revise",
+                                        onclick: move |evt| {
+                                            evt.stop_propagation();
+                                            enter_row_revise(id_for_actions, on_set_mode);
+                                        },
+                                        "\u{270E}"
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 if let Some(s) = props.artifact_status {
                     {
@@ -1269,5 +1507,217 @@ fn ForbiddenIndicator() -> Element {
             style: "cursor: no-drop;",
             "data-testid": "drop-indicator-forbidden",
         }
+    }
+}
+
+/// Load an artifact's body via the in-scope persistence context,
+/// patch its frontmatter `status` to `next`, save back to disk, and
+/// bump `LOCAL_NOTE_VERSION` so explorer rows / open tabs re-render.
+///
+/// Used by the inline row-action icons (Approve / Reject / Mark
+/// dirty) so the user can flip an artifact's status without opening
+/// it in a tab. Errors are logged via `tracing::warn!`; the row
+/// stays put visually if the load or save fails (status dot reverts
+/// on the next render because the body wasn't updated).
+fn apply_row_status(
+    note_id: Uuid,
+    next: crate::plugins::artifact::frontmatter::ArtifactStatus,
+) {
+    let persistence: std::sync::Arc<dyn crate::persistence::Persistence> = use_context();
+    let id_str = note_id.to_string();
+    dioxus::core::spawn_forever(async move {
+        let bytes = match persistence.load(&id_str).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    target: "operon::explorer",
+                    "apply_row_status: load({id_str}) failed: {e}"
+                );
+                return;
+            }
+        };
+        let content = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let new_body = crate::plugins::artifact::view::patch_status_text(&content, next);
+        if let Err(e) = persistence.save(&id_str, new_body.as_bytes()).await {
+            tracing::warn!(
+                target: "operon::explorer",
+                "apply_row_status: save({id_str}) failed: {e}"
+            );
+            return;
+        }
+        crate::shell::companion_state::LOCAL_NOTE_VERSION
+            .with_mut(|v| *v = v.saturating_add(1));
+    });
+}
+
+/// Begin a Revise session from the explorer row: snapshot the
+/// artifact's current body into `ROW_REVISE_SNAPSHOTS` so a later
+/// Cancel can revert, then flip the tab to Edit. We snapshot from
+/// disk because the row's Revise button is only reachable when the
+/// tab is NOT in Edit mode — disk is authoritative there. If a tab
+/// is already open in View / Split, the buffer matches disk
+/// (manual-save tabs only diverge after the user types in Edit).
+///
+/// `on_set_mode` is invoked synchronously *after* the snapshot is
+/// stored so the renderer never sees Edit-mode with an empty
+/// snapshot entry.
+fn enter_row_revise(
+    note_id: Uuid,
+    on_set_mode: dioxus::prelude::Callback<(Uuid, crate::editor::EditorMode)>,
+) {
+    let persistence: std::sync::Arc<dyn crate::persistence::Persistence> = use_context();
+    let id_str = note_id.to_string();
+    dioxus::core::spawn_forever(async move {
+        let bytes = match persistence.load(&id_str).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    target: "operon::explorer",
+                    "enter_row_revise: load({id_str}) failed: {e}"
+                );
+                return;
+            }
+        };
+        let content = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        crate::shell::companion_state::ROW_REVISE_SNAPSHOTS.with_mut(|m| {
+            m.insert(note_id, content);
+        });
+        on_set_mode.call((note_id, crate::editor::EditorMode::Edit));
+    });
+}
+
+/// Commit a Revise session started from the row: append a revision
+/// row to the current tab buffer, save, mark Approved descendants
+/// dirty, flip back to View, clear the snapshot. Uses the in-buffer
+/// body (not disk) so any in-flight edits the user made during Edit
+/// mode are captured — manual-save artifact tabs hold pending edits
+/// in `TabManager` until an explicit save.
+fn apply_row_revise_done(note_id: Uuid) {
+    let persistence: std::sync::Arc<dyn crate::persistence::Persistence> = use_context();
+    let crate::local_mode::desktop::LocalNoteRepo(note_repo) = use_context();
+    let mut tabs: dioxus::prelude::Signal<crate::tabs::TabManager> = use_context();
+    let id_str = note_id.to_string();
+    // Resolve the tab + current buffer for this artifact. If no tab
+    // is open (shouldn't happen — Edit mode requires an open tab —
+    // but defensive) fall back to disk.
+    let tab_snapshot: Option<(crate::tabs::TabId, String)> = {
+        let snap = tabs.read();
+        let found = snap
+            .iter()
+            .find(|t| t.note_id == id_str)
+            .map(|t| (t.id, t.content.clone()));
+        found
+    };
+    dioxus::core::spawn_forever(async move {
+        let body_now = match &tab_snapshot {
+            Some((_, content)) => content.clone(),
+            None => match persistence.load(&id_str).await {
+                Ok(b) => String::from_utf8(b).unwrap_or_default(),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "operon::explorer",
+                        "apply_row_revise_done: load({id_str}) failed: {e}"
+                    );
+                    return;
+                }
+            },
+        };
+        let prior = crate::shell::companion_state::ROW_REVISE_SNAPSHOTS
+            .with_mut(|m| m.remove(&note_id));
+        let summary = crate::plugins::artifact::revision_table::compute_summary(
+            prior.as_deref(),
+            Some(body_now.as_str()),
+        );
+        let date = crate::plugins::artifact::revision_table::format_revision_date(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        );
+        let row = crate::plugins::artifact::revision_table::RevisionRow {
+            revision: crate::plugins::artifact::revision_table::next_revision_number(&body_now),
+            date,
+            derived_from: "manual".to_string(),
+            summary,
+        };
+        let body_with_row =
+            crate::plugins::artifact::revision_table::append_revision_row(&body_now, row);
+
+        if let Err(e) = persistence
+            .save(&id_str, body_with_row.as_bytes())
+            .await
+        {
+            tracing::warn!(
+                target: "operon::explorer",
+                "apply_row_revise_done: save({id_str}) failed: {e}"
+            );
+            return;
+        }
+        if let Some((tab_id, _)) = tab_snapshot {
+            tabs.write().reload_content(tab_id, body_with_row.clone());
+            tabs.write()
+                .set_mode(tab_id, crate::editor::EditorMode::View);
+        }
+        match crate::plugins::artifact::view::mark_descendants_dirty(
+            &note_repo,
+            &persistence,
+            note_id,
+        )
+        .await
+        {
+            Ok(n) => tracing::info!(
+                target: "operon::explorer",
+                "apply_row_revise_done: marked {n} descendant(s) of {note_id} dirty"
+            ),
+            Err(e) => tracing::warn!(
+                target: "operon::explorer",
+                "apply_row_revise_done: mark_descendants_dirty({note_id}): {e}"
+            ),
+        }
+        crate::shell::companion_state::LOCAL_NOTE_VERSION
+            .with_mut(|v| *v = v.saturating_add(1));
+    });
+}
+
+/// Cancel a Revise session started from the row: revert disk + tab
+/// buffer to the snapshot taken at Revise click, flip back to View,
+/// clear the snapshot. If no snapshot exists (e.g. user entered
+/// Edit through some other path) we still flip back to View without
+/// touching disk so the action stays predictable.
+fn apply_row_revise_cancel(note_id: Uuid) {
+    let persistence: std::sync::Arc<dyn crate::persistence::Persistence> = use_context();
+    let mut tabs: dioxus::prelude::Signal<crate::tabs::TabManager> = use_context();
+    let id_str = note_id.to_string();
+    let tab_id: Option<crate::tabs::TabId> = {
+        let snap = tabs.read();
+        let found = snap.iter().find(|t| t.note_id == id_str).map(|t| t.id);
+        found
+    };
+    let prior = crate::shell::companion_state::ROW_REVISE_SNAPSHOTS
+        .with_mut(|m| m.remove(&note_id));
+    if let Some(tid) = tab_id {
+        if let Some(ref body) = prior {
+            tabs.write().reload_content(tid, body.clone());
+        }
+        tabs.write().set_mode(tid, crate::editor::EditorMode::View);
+    }
+    if let Some(body) = prior {
+        dioxus::core::spawn_forever(async move {
+            if let Err(e) = persistence.save(&id_str, body.as_bytes()).await {
+                tracing::warn!(
+                    target: "operon::explorer",
+                    "apply_row_revise_cancel: revert save({id_str}) failed: {e}"
+                );
+                return;
+            }
+            crate::shell::companion_state::LOCAL_NOTE_VERSION
+                .with_mut(|v| *v = v.saturating_add(1));
+        });
     }
 }

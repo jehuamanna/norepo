@@ -101,6 +101,19 @@ impl AgentBackend for RuntimeAgentBackend {
         Ok(())
     }
 
+    async fn cancel_tool(&self, operon_session: Uuid, tool_use_id: &str) -> bool {
+        // Look up the session's runtime; cancelling a tool on an
+        // unbound session is a no-op (nothing to cancel).
+        let g = self.bindings.lock().await;
+        let Some(binding) = g.get(&operon_session) else {
+            return false;
+        };
+        let Some(rt) = binding.runtime.as_ref() else {
+            return false;
+        };
+        rt.cancel_tool(tool_use_id)
+    }
+
     async fn send_rich(
         &self,
         prompt: String,
@@ -150,6 +163,15 @@ fn map_step(step: Step) -> Option<AgentEvent> {
             tool_use_id,
             content: output.to_string(),
             is_error,
+        }),
+        Step::ToolChunk {
+            tool_use_id,
+            kind,
+            bytes,
+        } => Some(AgentEvent::ToolChunk {
+            tool_use_id,
+            kind,
+            bytes,
         }),
         Step::PermissionRequest {
             id,

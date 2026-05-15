@@ -17,6 +17,8 @@ use std::collections::VecDeque;
 use operon_store::repos::SubtreeSnapshot;
 use uuid::Uuid;
 
+use crate::plugins::cleanup::trash::TrashRecord;
+
 /// Inverse of a single user action. The variant carries the *previous*
 /// state, not the action's parameters — so undo is "restore the captured
 /// snapshot" rather than "compute the inverse of an op".
@@ -49,8 +51,12 @@ pub enum ExplorerAction {
         prev_index: i64,
     },
     /// Plans-Phase-8: full subtree captured before delete; undo re-inserts.
+    /// `trash` carries the on-disk side-effects the delete moved aside
+    /// (artifact dirs, materialized skills, orphaned blobs) so undo can
+    /// restore them in lockstep with the SQLite rows.
     Delete {
         snapshot: SubtreeSnapshot,
+        trash: TrashRecord,
     },
     /// Plans-Phase-8: paste of a copied subtree. Undo deletes the pasted
     /// subtree by id (cascade kills its descendants automatically).

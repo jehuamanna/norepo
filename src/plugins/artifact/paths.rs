@@ -2,7 +2,12 @@
 //! 1:1 with the UI tree).
 //!
 //! An artifact note's body lives at
-//! `<repo>/.operon/artifacts/<root-slug>/<...>/<self-slug>/index.md`.
+//! `<artifacts_root>/<root-slug>/<...>/<self-slug>/index.md`, where
+//! `<artifacts_root>` is the project's `<vault>/.operon/<project-id>/artifacts/`
+//! directory — produced by `VaultRoot::project_artifacts_dir(project_id)` at
+//! every call site. The resolver itself is unaware of vault / project / repo
+//! layout; it just walks slug chains against whatever root the caller supplies.
+//!
 //! The hierarchy is derived by walking the artifact's `parent_id` chain
 //! through other `Artifact`-kind ancestors, stopping at the first non-artifact
 //! parent (which is the cascade root's container, e.g. the project root) or
@@ -20,20 +25,22 @@ use operon_store::repos::{LocalNote, NoteKind};
 use uuid::Uuid;
 
 pub const ARTIFACT_INDEX_FILENAME: &str = "index.md";
-pub const ARTIFACTS_SUBDIR: &str = ".operon/artifacts";
 
 /// Snapshot view over a project's notes that resolves artifact paths in
 /// O(depth). Build it once per batch (e.g. once per cascade run, once per
 /// migration sweep) when you need to look up paths for many notes.
 pub struct ArtifactPathResolver<'a> {
-    repo_path: &'a Path,
+    artifacts_root: &'a Path,
     notes_by_id: HashMap<Uuid, &'a LocalNote>,
 }
 
 impl<'a> ArtifactPathResolver<'a> {
-    pub fn new(repo_path: &'a Path, notes: &'a [LocalNote]) -> Self {
+    /// `artifacts_root` is the per-project artifacts directory — typically
+    /// `<vault>/.operon/<project-id>/artifacts/`. Callers obtain it via
+    /// `VaultRoot::project_artifacts_dir(project_id)`.
+    pub fn new(artifacts_root: &'a Path, notes: &'a [LocalNote]) -> Self {
         let notes_by_id = notes.iter().map(|n| (n.id, n)).collect();
-        Self { repo_path, notes_by_id }
+        Self { artifacts_root, notes_by_id }
     }
 
     /// Directory containing the artifact's `index.md`. Returns `None` when
@@ -42,7 +49,7 @@ impl<'a> ArtifactPathResolver<'a> {
     /// should treat this as a transient condition).
     pub fn artifact_dir(&self, note_id: Uuid) -> Option<PathBuf> {
         let chain = self.collect_slug_chain(note_id)?;
-        let mut path = self.repo_path.join(ARTIFACTS_SUBDIR);
+        let mut path = self.artifacts_root.to_path_buf();
         for slug in chain {
             path.push(slug);
         }
@@ -139,14 +146,15 @@ mod tests {
             art(mid, Some(root), "epic-01"),
             art(leaf, Some(mid), "feature-01"),
         ];
-        let r = ArtifactPathResolver::new(Path::new("/repo"), &notes);
+        let artifacts_root = Path::new("/vault/.operon/00000000-0000-0000-0000-000000000000/artifacts");
+        let r = ArtifactPathResolver::new(artifacts_root, &notes);
         assert_eq!(
             r.artifact_index_path(leaf).unwrap(),
-            Path::new("/repo/.operon/artifacts/ce-inputs/epic-01/feature-01/index.md")
+            artifacts_root.join("ce-inputs/epic-01/feature-01/index.md")
         );
         assert_eq!(
             r.artifact_dir(root).unwrap(),
-            Path::new("/repo/.operon/artifacts/ce-inputs")
+            artifacts_root.join("ce-inputs")
         );
     }
 
@@ -160,10 +168,11 @@ mod tests {
             art(root, Some(folder), "ce-inputs"),
             art(leaf, Some(root), "epic-01"),
         ];
-        let r = ArtifactPathResolver::new(Path::new("/repo"), &notes);
+        let artifacts_root = Path::new("/vault/.operon/00000000-0000-0000-0000-000000000000/artifacts");
+        let r = ArtifactPathResolver::new(artifacts_root, &notes);
         assert_eq!(
             r.artifact_index_path(leaf).unwrap(),
-            Path::new("/repo/.operon/artifacts/ce-inputs/epic-01/index.md")
+            artifacts_root.join("ce-inputs/epic-01/index.md")
         );
     }
 
@@ -171,7 +180,8 @@ mod tests {
     fn non_artifact_target_returns_none() {
         let folder = Uuid::new_v4();
         let notes = vec![md(folder, None)];
-        let r = ArtifactPathResolver::new(Path::new("/repo"), &notes);
+        let artifacts_root = Path::new("/vault/.operon/00000000-0000-0000-0000-000000000000/artifacts");
+        let r = ArtifactPathResolver::new(artifacts_root, &notes);
         assert!(r.artifact_index_path(folder).is_none());
         assert!(!r.is_artifact(folder));
     }
@@ -182,7 +192,8 @@ mod tests {
         let mut n = art(id, None, "x");
         n.slug = None;
         let notes = vec![n];
-        let r = ArtifactPathResolver::new(Path::new("/repo"), &notes);
+        let artifacts_root = Path::new("/vault/.operon/00000000-0000-0000-0000-000000000000/artifacts");
+        let r = ArtifactPathResolver::new(artifacts_root, &notes);
         assert!(r.artifact_index_path(id).is_none());
     }
 }

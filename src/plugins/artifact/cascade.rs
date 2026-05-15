@@ -337,6 +337,16 @@ pub async fn run_cascade(
         )));
     }
 
+    // 0a. MCP health gate. Block at the cascade entry point too so the
+    //     user sees the failure immediately instead of after per-skill
+    //     bookkeeping (skill snapshot, gate filter, queue prime). The
+    //     per-skill runner gate at `run_skill_on_source_with_revision_notes`
+    //     re-checks before each fire so a server that fails mid-cascade
+    //     still halts further work.
+    if let Some(msg) = crate::shell::companion_state::mcp_health_gate_error() {
+        return Err(CascadeError::SkillRun(msg));
+    }
+
     // 0b. M2 — refresh <repo>/.claude/CLAUDE.md with the project's
     //     current SDLC inventory before any skill runs. Claude reads
     //     CLAUDE.md once at session start (this cascade uses --resume
@@ -1547,16 +1557,18 @@ async fn count_descendant_artifacts_of_kind(
     count
 }
 
-/// Find children of `parent_id` whose artifact frontmatter declares
-/// `source_skill_id == skill_id`. Used by the cascade to skip
-/// re-firing a (artifact, skill) pair on resume runs when the skill
-/// has already produced output. Returns ids in title-alphabetical
-/// order so the re-queue is deterministic.
+/// Find artifacts produced from `source_id` by `skill_id`. Matches by
+/// frontmatter provenance (`source_artifact_id == source_id` AND
+/// `source_skill_id == skill_id`) rather than `parent_id` — produced
+/// epics + architecture are hoisted to the master_requirement's parent
+/// (the phase note) by the runner's placement rule, so the children
+/// don't share `parent_id` with their source anymore. Returns ids in
+/// title-alphabetical order so the re-queue is deterministic.
 async fn existing_children_with_skill(
     note_repo: &Arc<dyn LocalNoteRepository>,
     persistence: &Arc<dyn Persistence>,
     project_id: Uuid,
-    parent_id: Uuid,
+    source_id: Uuid,
     skill_id: Uuid,
 ) -> Vec<Uuid> {
     let mut notes = match note_repo.list_for_project(project_id) {
@@ -1566,7 +1578,7 @@ async fn existing_children_with_skill(
     notes.sort_by(|a, b| a.title.cmp(&b.title));
     let mut out = Vec::new();
     for note in notes {
-        if note.parent_id != Some(parent_id) || !matches!(note.kind, NoteKind::Artifact) {
+        if !matches!(note.kind, NoteKind::Artifact) {
             continue;
         }
         let bytes = match persistence.load(&note.id.to_string()).await {
@@ -1578,7 +1590,7 @@ async fn existing_children_with_skill(
             Err(_) => continue,
         };
         let fm = parse_artifact_fm(&body);
-        if fm.source_skill_id == Some(skill_id) {
+        if fm.source_artifact_id == Some(source_id) && fm.source_skill_id == Some(skill_id) {
             out.push(note.id);
         }
     }
@@ -1841,36 +1853,41 @@ pub async fn approve_artifact(
 #[allow(dead_code)]
 fn _force_pub_use(_e: ArtifactKind, _r: RunnerError) {}
 
-/// JSON sidecar stored at `<repo>/.operon/cascade-stages.json` that
-/// records which skill ids are enabled for cascade runs in this
+/// JSON sidecar stored at `<vault>/.operon/<project-id>/cascade-stages.json`
+/// that records which skill ids are enabled for cascade runs in this
 /// project. Absent file = "all skills enabled" (the StagesDropdown
 /// renders every checkbox on by default). Present file with empty
 /// array = "no skills enabled" (Play does nothing — the user has
 /// explicitly opted out of every stage).
 ///
-/// Stored on the project's repo path rather than in SQLite so we
-/// don't need a migration; per-project follows the project's
-/// repository naturally.
+/// Stored under the vault rather than the user's git repository so
+/// the user's source tree stays free of operon sidecars.
 pub mod stages_sidecar {
     use super::*;
-    use std::path::{Path, PathBuf};
+    use crate::local_mode::vault::VaultRoot;
+    use std::path::PathBuf;
 
-    fn sidecar_path(repo_path: &Path) -> PathBuf {
-        repo_path.join(".operon").join("cascade-stages.json")
+    fn sidecar_path(vault: &VaultRoot, project_id: Uuid) -> PathBuf {
+        vault.project_cascade_stages_path(project_id)
     }
 
     /// Read the enabled-skill set. Returns `None` when the file is
     /// missing — caller should treat as "all skills enabled".
-    pub fn load(repo_path: &Path) -> Option<HashSet<Uuid>> {
-        let path = sidecar_path(repo_path);
+    pub fn load(vault: &VaultRoot, project_id: Uuid) -> Option<HashSet<Uuid>> {
+        let path = sidecar_path(vault, project_id);
         let bytes = std::fs::read(&path).ok()?;
         let ids: Vec<Uuid> = serde_json::from_slice(&bytes).ok()?;
         Some(ids.into_iter().collect())
     }
 
-    /// Write the enabled-skill set. Creates `.operon/` if missing.
-    pub fn save(repo_path: &Path, enabled: &HashSet<Uuid>) -> std::io::Result<()> {
-        let path = sidecar_path(repo_path);
+    /// Write the enabled-skill set. Creates the per-project operon dir
+    /// if missing.
+    pub fn save(
+        vault: &VaultRoot,
+        project_id: Uuid,
+        enabled: &HashSet<Uuid>,
+    ) -> std::io::Result<()> {
+        let path = sidecar_path(vault, project_id);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1887,10 +1904,11 @@ pub mod stages_sidecar {
     /// expand "no sidecar" to "everything" so a fresh project just
     /// works).
     pub fn resolve_or_all(
-        repo_path: &Path,
+        vault: &VaultRoot,
+        project_id: Uuid,
         all_skill_ids: &HashSet<Uuid>,
     ) -> HashSet<Uuid> {
-        load(repo_path).unwrap_or_else(|| all_skill_ids.clone())
+        load(vault, project_id).unwrap_or_else(|| all_skill_ids.clone())
     }
 }
 

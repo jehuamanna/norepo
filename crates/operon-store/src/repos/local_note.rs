@@ -51,6 +51,15 @@ pub enum NoteKind {
     /// cascade re-instances per phase by anchoring on the phase
     /// note's master_requirement child.
     Phase,
+    /// CE (Customer Engineering): a project-root singleton that
+    /// holds the raw customer materials (markdown, sketches, nested
+    /// requirements) feeding the BA's master_requirement discovery.
+    /// Conceptually a peer of `Phase` — both sit at the project root
+    /// and anchor a subtree of artifacts. Discovered by SQL kind
+    /// query rather than frontmatter sniffing (legacy CEs modelled
+    /// as `Artifact` + `artifact_kind: requirement` are flipped to
+    /// `Ce` on first project open by `plugins::phase::ce_migration`).
+    Ce,
 }
 
 impl NoteKind {
@@ -67,6 +76,7 @@ impl NoteKind {
             Self::Workflow => "workflow",
             Self::Artifact => "artifact",
             Self::Phase => "phase",
+            Self::Ce => "ce",
         }
     }
 
@@ -82,6 +92,7 @@ impl NoteKind {
             "workflow" => Self::Workflow,
             "artifact" => Self::Artifact,
             "phase" => Self::Phase,
+            "ce" => Self::Ce,
             _ => Self::Markdown,
         }
     }
@@ -89,8 +100,16 @@ impl NoteKind {
     /// Stable identifier the editor host uses to look up a `FormatPlugin`
     /// in `PluginRegistry`. Keep in sync with the `format_id` returned by
     /// each plugin's `manifest()`.
+    ///
+    /// `Ce` and `Phase` notes hold markdown bodies (raw customer
+    /// materials, phase scaffolding) and use the standard markdown
+    /// editor — they're SQL-level kinds for discovery / TOC purposes,
+    /// not separate formats.
     pub fn format_id(&self) -> &'static str {
-        self.as_str()
+        match self {
+            Self::Ce | Self::Phase => "markdown",
+            _ => self.as_str(),
+        }
     }
 
     /// Human-readable label for the explorer's + dropdown.
@@ -107,6 +126,7 @@ impl NoteKind {
             Self::Workflow => "Workflow",
             Self::Artifact => "Artifact",
             Self::Phase => "Phase",
+            Self::Ce => "CE",
         }
     }
 
@@ -124,7 +144,15 @@ impl NoteKind {
             Self::Workflow => "wf",
             Self::Artifact => "ar",
             Self::Phase => "ph",
+            Self::Ce => "ce",
         }
+    }
+
+    /// Whether a note of this kind should appear as an entry in another
+    /// note's auto-managed Contents section. Blob-only kinds (Image)
+    /// don't link nicely as plain text rows, so they're excluded.
+    pub fn shows_in_toc(&self) -> bool {
+        !matches!(self, Self::Image)
     }
 
     /// Variants the user can pick from the explorer's + dropdown, in the

@@ -84,6 +84,12 @@ pub fn to_claude_compat(body: &str, slug: &str) -> String {
     let has_name = fm_lines.iter().any(|l| line_has_key(l, "name"));
     let has_description = fm_lines.iter().any(|l| line_has_key(l, "description"));
 
+    // Strip the in-body `## Revision history` table. The table is
+    // editor-only UI metadata (what the user / Claude have changed
+    // across revisions) and is meaningless — actively confusing —
+    // inside the skill prompt that Claude Code's skill loader reads.
+    let rest = crate::plugins::artifact::revision_table::strip_revision_section(rest);
+
     let mut out = String::from("---\n");
     if !has_name {
         out.push_str(&format!("name: {slug}\n"));
@@ -97,7 +103,7 @@ pub fn to_claude_compat(body: &str, slug: &str) -> String {
         out.push('\n');
     }
     out.push_str("---\n\n");
-    out.push_str(rest);
+    out.push_str(&rest);
     out
 }
 
@@ -317,6 +323,18 @@ mod tests {
         let once = to_claude_compat(body, "ba-intake");
         let twice = to_claude_compat(&once, "ba-intake");
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn compat_strips_revision_history_from_body() {
+        // The revision-history table is in-app metadata and must not
+        // leak into the materialized prompt Claude Code reads.
+        let body = "---\nskill_name: ba-intake\n---\n\nYou are a BA.\n\n## Revision history\n\n| Revision | Date | Derived from | Summary |\n|-|-|-|-|\n| 1 | 2026-05-15 | manual | First. |\n";
+        let out = to_claude_compat(body, "ba-intake");
+        assert!(out.contains("You are a BA."));
+        assert!(!out.contains("Revision history"));
+        assert!(!out.contains("manual"));
+        assert!(!out.contains("| 1 |"));
     }
 
     #[test]

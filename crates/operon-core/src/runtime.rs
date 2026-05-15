@@ -10,6 +10,7 @@ use crate::traits::{
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -34,6 +35,20 @@ pub enum Step {
         tool_use_id: String,
         output: serde_json::Value,
         is_error: bool,
+    },
+    /// Streaming bytes from a running tool (e.g. stdout/stderr of a Bash
+    /// command). Emitted between `ToolCall` and `ToolResult` for tools
+    /// that opt into streaming via `ToolPlugin::invoke_streaming`. The
+    /// UI accumulates these per `tool_use_id` to render a live
+    /// terminal-style output region; the final `ToolResult.output`
+    /// remains the source of truth for the model's view of what
+    /// happened.
+    ToolChunk {
+        tool_use_id: String,
+        /// `"stdout"` or `"stderr"` for shell-style tools; arbitrary
+        /// labels for other tools that surface multi-stream output.
+        kind: String,
+        bytes: Vec<u8>,
     },
     /// Agent is asking the user to approve a privileged tool call. The runtime
     /// blocks (via `crate::permission::PermissionGate`) until a decision arrives
@@ -68,6 +83,13 @@ pub struct AgentRuntime {
     /// Per-runtime permission gate. Defaults to an auto-allow gate so existing
     /// callers see no behaviour change. Slice A12 wires the UI to a real gate.
     pub permission: PermissionGate,
+    /// Per-tool-call cancellation handles, keyed by `tool_use_id`.
+    /// Populated by the agent loop just before each `invoke_streaming`
+    /// and cleared on completion. The UI's "Cancel this tool" button
+    /// looks up the entry and fires it without killing the whole turn.
+    /// `Arc<Mutex<…>>` because two callers (the loop and the cancel
+    /// button) need to write/read concurrently across threads.
+    pub tool_cancellations: Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>,
 }
 
 impl AgentRuntime {
@@ -84,12 +106,30 @@ impl AgentRuntime {
             bus,
             max_iterations: 32,
             permission: PermissionGate::default(),
+            tool_cancellations: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
     pub fn with_permission(mut self, gate: PermissionGate) -> Self {
         self.permission = gate;
         self
+    }
+
+    /// Cancel a single in-flight tool call. Returns `true` when a
+    /// matching handle existed and was fired; `false` when the tool
+    /// already completed or never started. Wired to the UI's
+    /// tool-card Cancel button via the runtime backend.
+    pub fn cancel_tool(&self, tool_use_id: &str) -> bool {
+        let Ok(map) = self.tool_cancellations.lock() else {
+            return false;
+        };
+        match map.get(tool_use_id) {
+            Some(ct) => {
+                ct.cancel();
+                true
+            }
+            None => false,
+        }
     }
 
     fn now_ms() -> u64 {
@@ -343,7 +383,52 @@ async fn run_loop(
                 let (output, is_error) = match runtime.tool_by_name(name) {
                     Some(t) => {
                         tracing::info!(target: "operon::agent", tool = %name, "tool.invoke");
-                        match t.invoke(input.clone(), ct.clone()).await {
+                        // Per-tool child cancellation token so the UI's
+                        // tool-card Cancel button (Phase 3) can abort
+                        // a single tool call without killing the whole
+                        // turn. Spawning as a child of the outer `ct`
+                        // means turn-level Stop still cancels this
+                        // child by propagation.
+                        let tool_ct = ct.child_token();
+                        // Register the handle so `runtime.cancel_tool`
+                        // can fire it from anywhere.
+                        if let Ok(mut map) = runtime.tool_cancellations.lock() {
+                            map.insert(id.clone(), tool_ct.clone());
+                        }
+                        // Chunk channel: the runtime forwards every
+                        // chunk the tool emits as a `Step::ToolChunk`
+                        // event with the same `tool_use_id`. Dropped
+                        // (and thus the forwarding task finishes) when
+                        // `invoke_streaming` returns.
+                        let (chunk_tx, mut chunk_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<crate::traits::ToolChunk>();
+                        let id_for_forward = id.clone();
+                        let tx_for_forward = tx.clone();
+                        let forward_task = tokio::spawn(async move {
+                            while let Some(chunk) = chunk_rx.recv().await {
+                                let _ = tx_for_forward
+                                    .send(Step::ToolChunk {
+                                        tool_use_id: id_for_forward.clone(),
+                                        kind: chunk.kind,
+                                        bytes: chunk.bytes,
+                                    })
+                                    .await;
+                            }
+                        });
+                        let res = t
+                            .invoke_streaming(input.clone(), tool_ct, chunk_tx)
+                            .await;
+                        // Wait for the forward task to drain — once
+                        // chunk_tx is dropped (right after the await
+                        // above) the receiver closes naturally.
+                        let _ = forward_task.await;
+                        // Deregister the handle: either the tool
+                        // completed normally or it was cancelled —
+                        // either way the entry is no longer cancellable.
+                        if let Ok(mut map) = runtime.tool_cancellations.lock() {
+                            map.remove(id);
+                        }
+                        match res {
                             Ok(v) => (v, false),
                             Err(e) => (serde_json::json!({"error": e.to_string()}), true),
                         }

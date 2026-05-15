@@ -138,6 +138,26 @@ pub fn App() -> Element {
         )
     });
 
+    // App-scope visibility for the queued-permissions drawer. Toggled
+    // by the activity-bar badge; component overlays the app shell.
+    #[cfg(not(target_arch = "wasm32"))]
+    let permission_drawer_open: Signal<bool> = use_signal(|| false);
+    #[cfg(not(target_arch = "wasm32"))]
+    use_context_provider(|| {
+        crate::shell::permission_drawer::PermissionDrawerOpen(permission_drawer_open)
+    });
+
+    // Background watchdog: auto-denies pending permission prompts
+    // older than 5 minutes. Especially relevant once cascades opt
+    // into honoring the AutoApprovePolicy (Phase 4) — a missed
+    // approval would otherwise hang the cascade indefinitely.
+    // `use_hook` runs exactly once per component instance, which
+    // matches "spawn the ticker once at app boot."
+    #[cfg(not(target_arch = "wasm32"))]
+    use_hook(|| {
+        crate::shell::companion_state::start_permission_watchdog();
+    });
+
     #[cfg(not(target_arch = "wasm32"))]
     let initial_mode_remembered: Option<Mode> = {
         let crate::local_mode::LocalSettingsRepo(settings) = use_context();
@@ -330,6 +350,7 @@ pub fn App() -> Element {
         // renders nothing.
         RepoPermissionsPanelHost {}
         ProjectClaudeSettingsPanelHost {}
+        PermissionDrawerHost {}
     }
 }
 
@@ -364,6 +385,22 @@ fn ProjectClaudeSettingsPanelHost() -> Element {
     }
 }
 
+/// Desktop-only host for the queued-permissions drawer. The drawer's
+/// data (`PERMISSION_PROMPTS`, `PERMISSION_DECISIONS`) and bridge are
+/// non-wasm — there are no permission asks to display on wasm — so
+/// this just renders nothing in that case.
+#[component]
+fn PermissionDrawerHost() -> Element {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        rsx! { crate::shell::permission_drawer::PermissionDrawer {} }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        rsx! {}
+    }
+}
+
 /// Mounts only after the user has picked a mode. Owns every context
 /// provider whose initialiser depends on `AppState.mode` or the chosen
 /// vault so they are computed exactly once with the resolved values.
@@ -391,20 +428,22 @@ fn Workspace() -> Element {
             let LocalNoteRepo(note_repo) = use_context::<LocalNoteRepo>();
             let LocalProjectRepo(project_repo) = use_context::<LocalProjectRepo>();
             // One-shot legacy reshape: backfill slugs and migrate any
-            // `<repo>/.operon/artifacts/<UUID>/<title>.md` staging files +
-            // opaque `<notes_dir>/<UUID>` bodies onto the new canonical
-            // path. Sentinel-gated, so this is a no-op after first run.
+            // legacy `<UUID>/<title>.md` staging files + opaque
+            // `<notes_dir>/<UUID>` bodies onto the canonical
+            // `<vault>/.operon/<project-id>/artifacts/<slug>/index.md` path.
+            // Sentinel-gated per-project, so this is a no-op after first run.
             if let Some(ref vault) = vault_now {
                 crate::plugins::artifact::migrate_v018::migrate_all_projects(
                     &project_repo,
                     &note_repo,
                     &vault.notes_dir(),
+                    vault,
                 );
             }
             Arc::new(crate::persistence::ArtifactPersistence::new(
                 inner,
                 note_repo,
-                project_repo,
+                vault_now.clone(),
             )) as Arc<dyn Persistence>
         } else {
             inner

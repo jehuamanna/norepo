@@ -2,6 +2,7 @@
 
 pub mod artifact;
 pub mod canvas;
+pub mod cleanup;
 pub mod code;
 pub mod excalidraw;
 pub mod image;
@@ -14,6 +15,9 @@ pub mod mdx;
 pub mod notes_explorer;
 pub mod phase;
 pub mod plaintext;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod revise_flow;
 pub mod richtext_tiptap;
 pub mod skill;
+pub mod toc;
 pub mod workflow;
