@@ -761,6 +761,9 @@ html, body {
 .operon-modal-card {
   min-width: 18rem;
   max-width: min(28rem, 90vw);
+  max-height: 90vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 16px;
   background: var(--vscode-quickinput-background, var(--vscode-dropdown-background, #252526));
   color: var(--vscode-editor-foreground, currentColor);

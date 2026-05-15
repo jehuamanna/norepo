@@ -486,11 +486,24 @@ pub fn read_remembered_mode(settings: &Arc<dyn LocalSettingsRepository>) -> Opti
 
 /// Read the persisted vault root path. Used by `app.rs` in Local Mode to
 /// decide whether to render the [`VaultDirPicker`] or jump straight into the
-/// workspace. Returns `None` when no vault has been picked yet (first run).
+/// workspace. Returns `None` when no vault has been picked yet (first run)
+/// OR when the stored path no longer points at an existing directory — so
+/// a moved/deleted vault re-prompts on next launch instead of sailing into
+/// the workspace and failing every downstream write.
 pub fn read_vault_root(
     settings: &Arc<dyn LocalSettingsRepository>,
 ) -> Option<crate::local_mode::vault::VaultRoot> {
-    crate::local_mode::vault::load(settings).ok().flatten()
+    let stored = crate::local_mode::vault::load(settings).ok().flatten()?;
+    if stored.path.is_dir() {
+        Some(stored)
+    } else {
+        eprintln!(
+            "operon: stored vault {:?} no longer exists or is not a directory; \
+             re-prompting via VaultDirPicker.",
+            stored.path
+        );
+        None
+    }
 }
 
 /// note_id -> set of body hashes we ourselves wrote and expect notify
