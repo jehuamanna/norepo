@@ -38,6 +38,8 @@ pub mod permission_prompt;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod project_claude_settings;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod project_tool_permissions;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod repo_permissions;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod clarification_prompt;
@@ -439,6 +441,31 @@ fn install_global_shortcuts(
                     var shift = e.shiftKey;
                     var action = null;
 
+                    // Ctrl/Cmd+C: WebKitGTK silently drops the native
+                    // copy path for selections outside Monaco / inputs
+                    // (chat transcript, markdown preview, tool cards).
+                    // Same workaround Monaco uses (editor_host.rs:343):
+                    // grab the live selection JS-side and ship it to
+                    // Rust, which writes via arboard. We do NOT
+                    // preventDefault — when focus is in an editable
+                    // surface the native path / Monaco bridge owns it
+                    // and we early-return.
+                    if (!shift && (key === 'c' || key === 'C')) {
+                        var ae = document.activeElement;
+                        var inEditable = false;
+                        if (ae) {
+                            var tag = (ae.tagName || '').toUpperCase();
+                            inEditable = tag === 'INPUT' || tag === 'TEXTAREA' || ae.isContentEditable;
+                        }
+                        if (!inEditable) {
+                            var sel = window.getSelection ? window.getSelection().toString() : '';
+                            if (sel) {
+                                try { dioxus.send({type: 'shortcut', action: 'clipboard.copy', text: sel}); } catch (err) {}
+                            }
+                        }
+                        return;
+                    }
+
                     if (key === 'Tab') {
                         action = shift ? 'tab.prev' : 'tab.next';
                     } else if (!shift && key === 'PageDown') {
@@ -553,6 +580,19 @@ fn install_global_shortcuts(
                         // this hook installed at App scope.
                         crate::shell::companion_state::SAVE_REQUEST_TICK
                             .with_mut(|n| *n = n.saturating_add(1));
+                    }
+                    "clipboard.copy" => {
+                        // Ctrl/Cmd+C outside editable surfaces. The JS
+                        // shim already filtered out INPUT/TEXTAREA/
+                        // contentEditable and harvested the page
+                        // selection. Route the payload through arboard
+                        // — WebKitGTK's `clipboardData` / `execCommand`
+                        // paths silently no-op for non-input selections.
+                        if let Some(text) = msg.get("text").and_then(|v| v.as_str()) {
+                            if !text.is_empty() {
+                                let _ = crate::util::clipboard::write_clipboard_text(text);
+                            }
+                        }
                     }
                     other => {
                         if let Some(num) = other.strip_prefix("tab.") {

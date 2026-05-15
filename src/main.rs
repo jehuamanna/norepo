@@ -34,10 +34,43 @@ const CRITICAL_HEAD: &str = concat!(
 /// without this protocol the dynamic-import 404s and Monaco never
 /// mounts.
 ///
-/// Source dir is resolved at compile time via `CARGO_MANIFEST_DIR`,
-/// which works for `dx serve` / `cargo run`. For `dx bundle` builds
-/// the assets need to be relocated alongside the binary; that's a
-/// follow-up — this MVP gets us functional desktop Monaco in dev.
+/// Plans-Phase-9-monaco-desktop (rev 15): assets are embedded into
+/// the binary via `include_dir!` so installed bundles (.deb /
+/// .AppImage / .app / .msi) work without any sibling asset folder.
+/// `dx bundle` only copies `asset!()`-tagged files into the package,
+/// and the bridge ships ~120 chunks (monaco languages) that we can't
+/// realistically tag one-by-one. Embedding sidesteps the OS-specific
+/// "where do resources end up" problem entirely.
+///
+/// Dev override: setting `OPERON_BRIDGE_DIR` to an on-disk copy of
+/// the dist folder makes the handler read from there first, so
+/// editor-bridge iteration doesn't require a Rust rebuild. The
+/// embedded copy is the fallback path.
+#[cfg(feature = "desktop")]
+static BRIDGE_DIST: include_dir::Dir<'_> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/assets/editor-bridge/dist");
+
+#[cfg(feature = "desktop")]
+fn bridge_mime_for(path: &str) -> &'static str {
+    if path.ends_with(".js") || path.ends_with(".mjs") {
+        "application/javascript; charset=utf-8"
+    } else if path.ends_with(".css") {
+        "text/css; charset=utf-8"
+    } else if path.ends_with(".json") {
+        "application/json; charset=utf-8"
+    } else if path.ends_with(".ttf") {
+        "font/ttf"
+    } else if path.ends_with(".woff") {
+        "font/woff"
+    } else if path.ends_with(".woff2") {
+        "font/woff2"
+    } else if path.ends_with(".svg") {
+        "image/svg+xml"
+    } else {
+        "application/octet-stream"
+    }
+}
+
 #[cfg(feature = "desktop")]
 fn bridge_protocol_handler(
     _webview_id: dioxus::desktop::wry::WebViewId,
@@ -47,53 +80,53 @@ fn bridge_protocol_handler(
     use dioxus::desktop::wry::http::Response;
 
     let raw_path = req.uri().path().trim_start_matches('/');
-    // Defense in depth: reject `..` segments to prevent directory
-    // traversal outside the bridge dist folder.
-    if raw_path
-        .split('/')
-        .any(|seg| seg == ".." || seg == "." || seg.starts_with(".."))
+    // Defense in depth: reject `..` / `.` segments to prevent
+    // directory traversal outside the bridge dist folder. Empty
+    // segments (`//`) are also rejected for safety.
+    if raw_path.is_empty()
+        || raw_path.split('/').any(|seg| {
+            seg.is_empty()
+                || seg == ".."
+                || seg == "."
+                || seg.starts_with("..")
+        })
     {
         return Response::builder()
             .status(400)
             .body(Cow::Borrowed(b"" as &[u8]))
             .unwrap();
     }
-    let project_root = env!("CARGO_MANIFEST_DIR");
-    let file_path = format!(
-        "{}/assets/editor-bridge/dist/{}",
-        project_root, raw_path
-    );
-    match std::fs::read(&file_path) {
-        Ok(bytes) => {
-            let mime = if raw_path.ends_with(".js") || raw_path.ends_with(".mjs") {
-                "application/javascript; charset=utf-8"
-            } else if raw_path.ends_with(".css") {
-                "text/css; charset=utf-8"
-            } else if raw_path.ends_with(".json") {
-                "application/json; charset=utf-8"
-            } else if raw_path.ends_with(".ttf") {
-                "font/ttf"
-            } else if raw_path.ends_with(".woff") {
-                "font/woff"
-            } else if raw_path.ends_with(".woff2") {
-                "font/woff2"
-            } else if raw_path.ends_with(".svg") {
-                "image/svg+xml"
-            } else {
-                "application/octet-stream"
-            };
-            Response::builder()
-                .status(200)
-                .header("Content-Type", mime)
-                .header("Access-Control-Allow-Origin", "*")
-                .body(Cow::Owned(bytes))
-                .unwrap()
+
+    let ok = |bytes: Vec<u8>| {
+        Response::builder()
+            .status(200)
+            .header("Content-Type", bridge_mime_for(raw_path))
+            .header("Access-Control-Allow-Origin", "*")
+            .body(Cow::Owned(bytes))
+            .unwrap()
+    };
+
+    // 1) `OPERON_BRIDGE_DIR` override — point at any on-disk dist
+    //    copy. Used during editor-bridge dev iteration so JS edits
+    //    don't require a Rust rebuild.
+    if let Ok(env_root) = std::env::var("OPERON_BRIDGE_DIR") {
+        let p = std::path::PathBuf::from(env_root).join(raw_path);
+        if let Ok(bytes) = std::fs::read(&p) {
+            return ok(bytes);
         }
-        Err(_) => Response::builder()
-            .status(404)
-            .body(Cow::Borrowed(b"" as &[u8]))
-            .unwrap(),
     }
+
+    // 2) Embedded copy — the canonical path for installed bundles
+    //    AND for `cargo run` / `dx serve` (every run picks up the
+    //    dist baked into the build).
+    if let Some(file) = BRIDGE_DIST.get_file(raw_path) {
+        return ok(file.contents().to_vec());
+    }
+
+    Response::builder()
+        .status(404)
+        .body(Cow::Borrowed(b"" as &[u8]))
+        .unwrap()
 }
 
 fn main() {
@@ -104,10 +137,17 @@ fn main() {
         // `with_menu(None)` suppresses dioxus-desktop's default native
         // Window/Edit/Help menubar — Operon ships its own in-app Menubar
         // (`src/shell/menubar.rs`) and the OS-level strip is redundant.
+        //
+        // `with_disable_context_menu(false)` keeps the webview's native
+        // right-click menu (with Copy/Paste/Select All) in release builds.
+        // Dioxus-desktop's default is to inject a contextmenu-preventDefault
+        // script when `!cfg!(debug_assertions)`, which otherwise breaks copy
+        // from chat / transcript text in shipped builds.
         let cfg = dioxus::desktop::Config::new()
             .with_custom_head(CRITICAL_HEAD.to_string())
             .with_custom_protocol("bridge", bridge_protocol_handler)
-            .with_menu(None);
+            .with_menu(None)
+            .with_disable_context_menu(false);
         dioxus::LaunchBuilder::new()
             .with_cfg(cfg)
             .launch(operon_dioxus::app::App);

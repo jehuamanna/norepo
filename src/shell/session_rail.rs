@@ -146,18 +146,48 @@ pub fn SessionRail() -> Element {
     });
 
     // Auto-select the most-recent session when the active scope has none
-    // selected (or the selected one disappeared after a delete).
+    // selected (or the selected one disappeared after a delete). When the
+    // scope has zero sessions, mint one so the composer is always ready
+    // to send — the user shouldn't have to click "+ New chat" before the
+    // very first message of an app launch / scope switch / last-chat
+    // delete.
     {
         let sessions = sessions;
         let mut active_session_setter = active_session;
+        let session_repo_for_auto = session_repo.clone();
+        let active_scope_for_auto = active_scope;
+        let mut version_for_auto = version;
         use_effect(move || {
             let list = sessions.read();
             let cur = *active_session_setter.read();
             let still_present = cur
                 .map(|id| list.iter().any(|s| s.id == id))
                 .unwrap_or(false);
-            if !still_present {
-                active_session_setter.set(list.first().map(|s| s.id));
+            if still_present {
+                return;
+            }
+            if let Some(first) = list.first() {
+                active_session_setter.set(Some(first.id));
+                return;
+            }
+            // Empty scope. Auto-create + select so there's always a
+            // chat to send into. `version_for_auto.with_mut` triggers
+            // the rail list to refetch on the next tick; the next
+            // effect run finds the freshly-minted session in the list
+            // and the `still_present` check above short-circuits, so
+            // we don't create a second one.
+            let scope = *active_scope_for_auto.read();
+            match session_repo_for_auto.create(scope, "New chat") {
+                Ok(s) => {
+                    active_session_setter.set(Some(s.id));
+                    version_for_auto.with_mut(|v| *v += 1);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "operon::companion",
+                        "auto-create session in {scope:?}: {e}"
+                    );
+                }
             }
         });
     }

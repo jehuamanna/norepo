@@ -138,6 +138,19 @@ pub fn App() -> Element {
         )
     });
 
+    // App-scope target for the per-project Tool Permissions modal. Set
+    // to Some(project_id) by the explorer row's gear icon / context-menu
+    // entry; cleared by the modal's close paths. Desktop-only because
+    // the policy file lives on disk in the project's repo.
+    #[cfg(not(target_arch = "wasm32"))]
+    let project_tool_permissions_target: Signal<Option<uuid::Uuid>> = use_signal(|| None);
+    #[cfg(not(target_arch = "wasm32"))]
+    use_context_provider(|| {
+        crate::shell::project_tool_permissions::ProjectToolPermissionsTarget(
+            project_tool_permissions_target,
+        )
+    });
+
     // App-scope visibility for the queued-permissions drawer. Toggled
     // by the activity-bar badge; component overlays the app shell.
     #[cfg(not(target_arch = "wasm32"))]
@@ -350,6 +363,7 @@ pub fn App() -> Element {
         // renders nothing.
         RepoPermissionsPanelHost {}
         ProjectClaudeSettingsPanelHost {}
+        ProjectToolPermissionsPanelHost {}
         PermissionDrawerHost {}
     }
 }
@@ -378,6 +392,20 @@ fn ProjectClaudeSettingsPanelHost() -> Element {
     #[cfg(not(target_arch = "wasm32"))]
     {
         rsx! { crate::shell::project_claude_settings::ProjectClaudeSettingsPanel {} }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        rsx! {}
+    }
+}
+
+/// Per-project Tool Permissions modal host. Desktop-only because the
+/// policy is persisted to a file on disk in the project's bound repo.
+#[component]
+fn ProjectToolPermissionsPanelHost() -> Element {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        rsx! { crate::shell::project_tool_permissions::ProjectToolPermissionsPanel {} }
     }
     #[cfg(target_arch = "wasm32")]
     {

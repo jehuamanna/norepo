@@ -317,11 +317,11 @@ pub fn SettingsPanel(open: Signal<bool>, username: Signal<String>) -> Element {
                 crate::shell::settings::ProvidersSection {}
                 // Global Claude defaults — bottom tier of the
                 // three-tier hierarchy (chat → project → global).
+                // Per-project tool-permissions auto-approve toggles
+                // live on the project row itself (gear icon + context
+                // menu → Tool permissions…) — they're per-repo and
+                // belong on the project, not in global Settings.
                 crate::shell::settings::ClaudeDefaultsSection {}
-                // Per-project tool-permissions auto-approve toggles.
-                // Reads/writes the active repo's
-                // .claude/settings.local.json operonAutoApprove key.
-                crate::shell::settings::ToolPermissionsSection {}
                 div {
                     class: "operon-modal-actions",
                     button {
@@ -823,20 +823,24 @@ pub fn provide_local_app_signals() {
     let note_version: Signal<u64> = use_signal(|| 0);
     use_context_provider(|| LocalNoteVersion(note_version));
 
-    // Filesystem watcher #2 — each project's `<repo>/.operon/artifacts/`.
-    // Artifact notes don't live in the vault's opaque UUID store; their
-    // bodies are at `<repo>/.operon/artifacts/<slug>/.../index.md` (see
-    // `ArtifactPathResolver`). The filename is `index.md`, not a UUID,
-    // so the watcher can't identify a specific note from the event —
-    // instead we reload every open tab's body from `persistence` on
-    // any change. `persistence.load` routes through `ArtifactPersistence`
-    // which knows the correct path per note id; `reload_content` skips
+    // Filesystem watcher #2 — each project's
+    // `<vault>/.operon/<project-id>/artifacts/` directory. Artifact
+    // notes don't live in the vault's opaque UUID store; their bodies
+    // are written under the per-project artifacts dir by
+    // `ArtifactPersistence::save` (see `VaultRoot::project_artifacts_dir`).
+    // The filename is `index.md`, not a UUID, so the watcher can't
+    // identify a specific note from the event — instead we reload
+    // every open tab's body from `persistence` on any change.
+    // `persistence.load` routes through `ArtifactPersistence` which
+    // knows the correct path per note id; `reload_content` skips
     // tabs whose buffer already matches, so the broad reload is
     // mostly idempotent.
     //
-    // Re-runs when `project_version` bumps so newly-added projects get
-    // watched (and removed projects' watchers go away on the next
-    // rebuild).
+    // Re-runs when `project_version` bumps (so newly-added projects
+    // get watched and removed projects' watchers go away) AND when
+    // the vault root changes (so switching vaults retargets at the
+    // new on-disk layout instead of stale paths from the previous
+    // vault).
     {
         let watch_holder: Rc<RefCell<Vec<(PathBuf, WatchHandle)>>> =
             use_hook(|| Rc::new(RefCell::new(Vec::new())));
@@ -844,14 +848,24 @@ pub fn provide_local_app_signals() {
         let persistence_for_artifact_watcher = persistence.clone();
         let tabs_for_artifact_watcher = tabs;
         let project_version_for_watcher: Signal<u64> = project_version;
+        let vault_root_for_artifact_watcher = vault_root_for_watcher;
         // The artifact watcher's reload sweep needs the note repo to
         // distinguish artifacts (which get the in-body revision row
         // append) from other kinds. Snapshot once per effect run.
         let LocalNoteRepo(note_repo_for_artifact_watcher) = use_context::<LocalNoteRepo>();
         use_effect(move || {
-            // Subscribe to project_version so the effect re-runs on
-            // create/rename/remove.
+            // Subscribe to project_version + vault_root so the effect
+            // re-runs on create/rename/remove of projects AND on vault
+            // switch.
             let _ = project_version_for_watcher.read();
+            let vault_snapshot = vault_root_for_artifact_watcher.read().clone();
+            let Some(vault) = vault_snapshot else {
+                // No vault bound yet — tear down anything we were
+                // watching (a previous vault's dirs) and bail. The
+                // next vault-set will re-fire this effect.
+                watch_holder.borrow_mut().clear();
+                return;
+            };
 
             let projects = match project_repo_for_watcher.list() {
                 Ok(p) => p,
@@ -859,9 +873,7 @@ pub fn provide_local_app_signals() {
             };
             let mut target_dirs: Vec<PathBuf> = Vec::new();
             for p in &projects {
-                if let Some(rp) = p.repo_path.as_ref() {
-                    target_dirs.push(rp.join(".operon").join("artifacts"));
-                }
+                target_dirs.push(vault.project_artifacts_dir(p.id));
             }
             // Skip when the watcher set is already pointing at the same
             // paths (cheap PartialEq on Vec<PathBuf>).

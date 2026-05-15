@@ -127,13 +127,21 @@ pub fn resolve_mcp_permission_shim() -> Option<PathBuf> {
 /// tests can drive it without overriding `current_exe()`.
 fn resolve_shim_from_exe(exe: &Path) -> Option<PathBuf> {
     let dir = exe.parent()?;
-    let sibling = dir.join("operon-mcp-permission");
+    // dx bundle's `external_bin` copy strips the `-<triple>` suffix but
+    // preserves the OS-native extension, so the installed sibling is
+    // `operon-mcp-permission.exe` on Windows and bare elsewhere.
+    let bin_name = if cfg!(windows) {
+        "operon-mcp-permission.exe"
+    } else {
+        "operon-mcp-permission"
+    };
+    let sibling = dir.join(bin_name);
     if sibling.is_file() {
         return Some(sibling);
     }
     for ancestor in dir.ancestors() {
         if ancestor.file_name().and_then(|n| n.to_str()) == Some("target") {
-            let probe = ancestor.join("debug").join("operon-mcp-permission");
+            let probe = ancestor.join("debug").join(bin_name);
             if probe.is_file() {
                 return Some(probe);
             }
@@ -317,7 +325,13 @@ pub fn CompanionChat() -> Element {
     if let Some(mut inbox) = composer_inbox {
         let pending = inbox.peek().clone();
         if let Some(text) = pending {
-            composer.set(text);
+            // Route through the JS bridge so the DOM textarea (which
+            // is uncontrolled — see the `initial_value` note below)
+            // actually reflects the inbox value AND the change lands
+            // on the browser's undo stack. The `input` event the
+            // bridge dispatches will sync the `composer` signal via
+            // the existing oninput handler.
+            replace_composer_via_js(&text);
             inbox.set(None);
         }
     }
@@ -1025,7 +1039,7 @@ pub fn CompanionChat() -> Element {
                                                         let mut next = String::with_capacity(cur.len() + token.len());
                                                         next.push_str(&cur[..at_off]);
                                                         next.push_str(&token);
-                                                        composer.set(next);
+                                                        replace_composer_via_js(&next);
                                                         mention_picker.set(None);
                                                     },
                                                     "{title}"
@@ -1110,7 +1124,23 @@ pub fn CompanionChat() -> Element {
                     textarea {
                         class: "operon-companion-chat-input",
                         "data-testid": "companion-input",
-                        value: "{composer}",
+                        // Uncontrolled: `initial_value` writes
+                        // `defaultValue` once on mount and never re-
+                        // writes the DOM `value` on later renders.
+                        // Dioxus marks `value` as `volatile` in the
+                        // textarea element definition, which forces a
+                        // setAttribute dispatch on every keystroke
+                        // even when the value is unchanged; that
+                        // round-trip kills WebKitGTK's undo stack so
+                        // Ctrl+Z stops working in the composer. With
+                        // `initial_value` the textarea owns its own
+                        // value, the `oninput` below syncs the
+                        // `composer` signal from the DOM, and
+                        // programmatic mutations route through
+                        // `replace_composer_via_js` so they still
+                        // appear in the textarea AND get an undo
+                        // entry.
+                        initial_value: "{composer}",
                         placeholder: if has_cwd && has_session {
                             "Type a message... (Cmd/Ctrl+Enter to send)"
                         } else if !has_session {
@@ -1246,7 +1276,7 @@ pub fn CompanionChat() -> Element {
                                                     );
                                                     next.push_str(&cur[..s.at_byte_offset]);
                                                     next.push_str(&token);
-                                                    composer.set(next);
+                                                    replace_composer_via_js(&next);
                                                     mention_picker.set(None);
                                                     e.prevent_default();
                                                     return;
@@ -1254,6 +1284,66 @@ pub fn CompanionChat() -> Element {
                                             }
                                         }
                                         _ => {}
+                                    }
+                                }
+                                // Ctrl/Cmd+V: WebKitGTK silently drops the
+                                // text payload for native paste into a
+                                // controlled textarea (same blackhole
+                                // Monaco hits — see editor_host.rs:295).
+                                // Route through arboard to fetch the
+                                // payload, then splice it in via
+                                // `document.execCommand('insertText')`.
+                                //
+                                // Why execCommand and NOT `composer.set`:
+                                //   - Splicing the signal directly forces a
+                                //     Dioxus re-render whose new VDOM value
+                                //     differs from the current DOM value.
+                                //     The reconciler then writes
+                                //     `node.value = <new>`, which on big
+                                //     pastes (a long chat-bubble selection)
+                                //     interacts with mid-paste WebKitGTK
+                                //     state and freezes the app.
+                                //   - `execCommand('insertText')` writes
+                                //     into the DOM first and fires `input`.
+                                //     Our existing `oninput` then calls
+                                //     `composer.set(e.value())` — same path
+                                //     as typing — and the reconciler sees
+                                //     VDOM matches DOM, so the value attr
+                                //     update is skipped (per
+                                //     dioxus-interpreter-js/set_attribute.js).
+                                //   - Bonus: execCommand pushes the
+                                //     insertion onto the browser's undo
+                                //     stack so Ctrl+Z reverses the paste.
+                                if (e.modifiers().ctrl() || e.modifiers().meta())
+                                    && !e.modifiers().shift()
+                                    && !e.modifiers().alt()
+                                {
+                                    if let Key::Character(c) = e.key() {
+                                        if c.eq_ignore_ascii_case("v") {
+                                            e.prevent_default();
+                                            e.stop_propagation();
+                                            if let Ok(text) =
+                                                crate::util::clipboard::read_clipboard_text()
+                                            {
+                                                if !text.is_empty() {
+                                                    let escaped = text
+                                                        .replace('\\', "\\\\")
+                                                        .replace('`', "\\`")
+                                                        .replace('$', "\\$");
+                                                    let script = format!(
+                                                        "(function() {{ \
+                                                            const ta = document.querySelector('[data-testid=\"companion-input\"]'); \
+                                                            if (!ta) return; \
+                                                            ta.focus(); \
+                                                            try {{ document.execCommand('insertText', false, `{escaped}`); }} \
+                                                            catch (err) {{ console.warn('operon: paste insertText failed', err); }} \
+                                                        }})();"
+                                                    );
+                                                    let _ = dioxus::document::eval(&script);
+                                                }
+                                            }
+                                            return;
+                                        }
                                     }
                                 }
                                 if e.key() == Key::Enter && (e.modifiers().ctrl() || e.modifiers().meta()) {
@@ -1755,7 +1845,12 @@ fn run_turn(
     if text.is_empty() {
         return;
     }
-    composer.set(String::new());
+    // Clear via the JS bridge so the textarea (uncontrolled) actually
+    // empties AND the clear lands on the browser's undo stack — a
+    // user who hits Send and immediately presses Ctrl+Z gets their
+    // prompt back instead of an empty composer with no recoverable
+    // history.
+    replace_composer_via_js("");
     attached_notes.set(Vec::new());
     transcript
         .write()
@@ -2350,6 +2445,41 @@ pub fn detect_trailing_mention(text: &str) -> Option<(usize, String)> {
     }
     let query = text[i + 1..].to_string();
     Some((i, query))
+}
+
+/// Replace the entire chat composer content via JS, routed through the
+/// browser's native `input` event so the existing `oninput` handler
+/// (and the `composer` signal write inside it) stay the canonical sync
+/// point. Why not just `composer.set(new)`:
+///   - The textarea is uncontrolled (`initial_value`, not `value`) so
+///     writing the signal alone never reaches the DOM.
+///   - Routing through `execCommand('insertText')` pushes the change
+///     onto the browser's undo stack so Ctrl+Z reverses programmatic
+///     splices (mention insert, inbox push, clear-after-send) the same
+///     way it reverses native typing and paste.
+fn replace_composer_via_js(new_text: &str) {
+    let escaped = new_text
+        .replace('\\', "\\\\")
+        .replace('`', "\\`")
+        .replace('$', "\\$");
+    let script = format!(
+        "(function() {{ \
+            const ta = document.querySelector('[data-testid=\"companion-input\"]'); \
+            if (!ta) return; \
+            ta.focus(); \
+            ta.setSelectionRange(0, ta.value.length); \
+            try {{ \
+                if (!document.execCommand('insertText', false, `{escaped}`)) {{ \
+                    ta.value = `{escaped}`; \
+                    ta.dispatchEvent(new Event('input', {{ bubbles: true }})); \
+                }} \
+            }} catch (err) {{ \
+                ta.value = `{escaped}`; \
+                ta.dispatchEvent(new Event('input', {{ bubbles: true }})); \
+            }} \
+        }})();"
+    );
+    let _ = dioxus::document::eval(&script);
 }
 
 /// Filter the notes visible in `scope` by case-insensitive title

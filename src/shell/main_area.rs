@@ -62,22 +62,26 @@ pub fn MainArea() -> Element {
                     });
                     let local_save: Option<crate::local_mode::LocalSaveAction> =
                         try_consume_context();
-                    // `key="{tab_id:?}"` on each branch forces Dioxus to
-                    // unmount the prior editor and mount a fresh
-                    // instance when the active tab changes — without
-                    // it, plugins that initialize state via use_signal
-                    // / use_hook from props.content (e.g. workflow's
-                    // `text` signal at view.rs:66, the Monaco host's
-                    // eval_handle) hang on to the previous tab's
-                    // content because Dioxus diffs the same rsx slot
-                    // as "same component, new props". `display:
-                    // contents` keeps the wrapper out of the box tree
-                    // so child layout (Monaco's absolute-inset, the
-                    // workflow canvas's flex container) is unaffected.
+                    // `key="{tab_id:?}-{mode:?}"` on each branch forces
+                    // Dioxus to unmount the prior editor and mount a
+                    // fresh instance when the active tab OR the editor
+                    // mode changes. Without it, plugins that initialize
+                    // state via use_signal / use_hook from props.content
+                    // (e.g. workflow's `text` signal at view.rs:66, the
+                    // Monaco host's eval_handle) hang on to the previous
+                    // tab's content because Dioxus diffs the same rsx
+                    // slot as "same component, new props". The mode
+                    // suffix also guarantees the artifact's body branch
+                    // (Monaco vs MarkdownView) is rebuilt cleanly on the
+                    // View⇄Edit flip — without it the conditional swap
+                    // sometimes left Monaco unmounted in Edit mode.
+                    // `display: contents` keeps the wrapper out of the
+                    // box tree so child layout (Monaco's absolute-inset,
+                    // the workflow canvas's flex container) is unaffected.
                     match mode {
                         EditorMode::View => rsx! {
                             div {
-                                key: "{tab_id:?}",
+                                key: "{tab_id:?}-{mode:?}",
                                 style: "display: contents;",
                                 {plugin.render(&note_id, &content)}
                             }
@@ -101,7 +105,7 @@ pub fn MainArea() -> Element {
                                     if let Some(action) = local_save {
                                         rsx! {
                                             crate::local_mode::LocalNoteEditor {
-                                                key: "{tab_id:?}",
+                                                key: "{tab_id:?}-{mode:?}",
                                                 tab_id,
                                                 action,
                                             }
@@ -109,7 +113,7 @@ pub fn MainArea() -> Element {
                                     } else {
                                         rsx! {
                                             div {
-                                                key: "{tab_id:?}",
+                                                key: "{tab_id:?}-{mode:?}",
                                                 style: "display: contents;",
                                                 {plugin.render_edit(&note_id, &content, on_change)}
                                             }
@@ -118,7 +122,7 @@ pub fn MainArea() -> Element {
                                 } else {
                                     rsx! {
                                         div {
-                                            key: "{tab_id:?}",
+                                            key: "{tab_id:?}-{mode:?}",
                                             style: "display: contents;",
                                             {plugin.render_edit(&note_id, &content, on_change)}
                                         }
@@ -127,7 +131,7 @@ pub fn MainArea() -> Element {
                             } else {
                                 rsx! {
                                     div {
-                                        key: "{tab_id:?}",
+                                        key: "{tab_id:?}-{mode:?}",
                                         style: "display: contents;",
                                         {plugin.render_edit(&note_id, &content, on_change)}
                                     }
@@ -136,7 +140,7 @@ pub fn MainArea() -> Element {
                         }
                         EditorMode::LivePreview => rsx! {
                             div {
-                                key: "{tab_id:?}",
+                                key: "{tab_id:?}-{mode:?}",
                                 style: "display: contents;",
                                 {plugin.render_live_preview(&note_id, &content, on_change)}
                             }
@@ -151,7 +155,7 @@ pub fn MainArea() -> Element {
                                             div {
                                                 class: "operon-local-split-edit",
                                                 crate::local_mode::LocalNoteEditor {
-                                                    key: "{tab_id:?}",
+                                                    key: "{tab_id:?}-{mode:?}",
                                                     tab_id,
                                                     action,
                                                 }
@@ -165,7 +169,7 @@ pub fn MainArea() -> Element {
                                 } else {
                                     rsx! {
                                         crate::shell::split_view::SplitView {
-                                            key: "{tab_id:?}",
+                                            key: "{tab_id:?}-{mode:?}",
                                             format_id: format_id.clone(),
                                             note_id: note_id.clone(),
                                             content: content.clone(),
@@ -176,7 +180,7 @@ pub fn MainArea() -> Element {
                             } else {
                                 rsx! {
                                     crate::shell::split_view::SplitView {
-                                        key: "{tab_id:?}",
+                                        key: "{tab_id:?}-{mode:?}",
                                         format_id: format_id.clone(),
                                         note_id: note_id.clone(),
                                         content: content.clone(),

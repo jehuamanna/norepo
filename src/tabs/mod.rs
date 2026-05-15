@@ -249,6 +249,17 @@ impl TabManager {
         }
     }
 
+    /// Update the visible title for every tab whose `note_id` matches
+    /// `note_id_str`. Called by the explorer's rename handler so the
+    /// tab strip follows the rename without requiring the user to
+    /// close + reopen the tab. Multiple matches are possible because
+    /// `open_manual_save_new` allows duplicate tabs for the same note.
+    pub fn set_title_for_note(&mut self, note_id_str: &str, title: String) {
+        for t in self.tabs.iter_mut().filter(|t| t.note_id == note_id_str) {
+            t.title = title.clone();
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &Tab> {
         self.tabs.iter()
     }
@@ -564,5 +575,40 @@ mod tests {
         let id = tm.open_manual_save("n1".into(), "markdown".into(), "T".into(), String::new());
         let t = tm.get(id).unwrap();
         assert!(t.manual_save);
+    }
+
+    #[test]
+    fn set_title_for_note_updates_every_matching_tab() {
+        let mut tm = TabManager::new();
+        let a = tm.open_manual_save_new(
+            "n1".into(),
+            "markdown".into(),
+            "Old".into(),
+            String::new(),
+        );
+        let b = tm.open_manual_save_new(
+            "n1".into(),
+            "markdown".into(),
+            "Old".into(),
+            String::new(),
+        );
+        let c = tm.open_manual_save_new(
+            "n2".into(),
+            "markdown".into(),
+            "Other".into(),
+            String::new(),
+        );
+        tm.set_title_for_note("n1", "Renamed".into());
+        assert_eq!(tm.get(a).unwrap().title, "Renamed");
+        assert_eq!(tm.get(b).unwrap().title, "Renamed");
+        assert_eq!(tm.get(c).unwrap().title, "Other");
+    }
+
+    #[test]
+    fn set_title_for_note_unknown_id_is_noop() {
+        let mut tm = TabManager::new();
+        let id = open_md(&mut tm, "n1", "Keep");
+        tm.set_title_for_note("missing", "Nope".into());
+        assert_eq!(tm.get(id).unwrap().title, "Keep");
     }
 }

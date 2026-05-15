@@ -405,6 +405,7 @@ impl ClaudeCodeChatPlugin {
         let mut cmd = tokio::process::Command::new(&self.cfg.claude_bin);
         cmd.current_dir(&cwd)
             .arg("--print")
+            .arg("--verbose")
             .arg("--input-format")
             .arg("stream-json")
             .arg("--output-format")

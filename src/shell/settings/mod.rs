@@ -11,12 +11,10 @@ pub mod claude_defaults;
 pub mod provider_card;
 pub mod providers;
 pub mod service;
-pub mod tool_permissions;
 
 pub use claude_defaults::ClaudeDefaultsSection;
 pub use providers::ProvidersSection;
 pub use service::{ProviderId, SettingsService, VerifyOutcome};
-pub use tool_permissions::ToolPermissionsSection;
 
 /// Dioxus context wrapper so the settings modal can pull a `SettingsService`
 /// without re-building one per render.

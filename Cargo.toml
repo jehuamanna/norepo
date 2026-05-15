@@ -115,6 +115,14 @@ operon-store = { path = "crates/operon-store" }
 notify = "6"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+# Plans-Phase-9-monaco-desktop (rev 15): embed the editor-bridge dist
+# folder into the binary so `bridge://localhost/...` resolves in
+# installed bundles (.deb / .AppImage / .app / .msi) — `dx bundle`
+# doesn't copy arbitrary asset directories alongside the binary, and
+# the previous CARGO_MANIFEST_DIR-relative resolver only worked from
+# the build host. Single-binary deploy keeps the runtime path lookup
+# OS-agnostic.
+include_dir = "0.7"
 # Plans-Phase-1: Local Mode wires the SQLite-backed local_user / local_app_settings
 # repos into the desktop app. rusqlite is bundled and gated on non-wasm targets.
 operon-store = { path = "crates/operon-store" }

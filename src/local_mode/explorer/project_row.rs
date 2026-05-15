@@ -106,6 +106,13 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
     let drop_indicator: Signal<Option<Result<DropPosition, ()>>> = use_signal(|| None);
     let mut drop_indicator_setter = drop_indicator;
     let DragSession(mut drag_session) = use_context();
+    // Per-project Tool Permissions modal — opened from the gear icon
+    // (and the matching context-menu entry) on this row. The signal is
+    // a target id; setting `Some(id)` mounts the modal scoped to that
+    // project.
+    let crate::shell::project_tool_permissions::ProjectToolPermissionsTarget(
+        mut tool_perms_target,
+    ) = use_context();
     // Plans-Phase-8-explorer-undo: panel-scope undo handle for the
     // "Undo last action" menu entry.
     let ExplorerUndoCtx { history, on_undo, on_redo } = use_context::<ExplorerUndoCtx>();
@@ -275,6 +282,12 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
             item.enabled = has_repo;
             item
         },
+        ContextMenuItem::new(
+            "Tool permissions\u{2026}",
+            Callback::new(move |_| {
+                tool_perms_target.set(Some(id));
+            }),
+        ),
         ContextMenuItem::submenu(
             "Add note",
             build_creatable_menu(Callback::new(move |kind| {
@@ -757,6 +770,19 @@ pub fn ProjectRow(props: ProjectRowProps) -> Element {
                             "{sub}"
                         }
                     }
+                }
+                button {
+                    r#type: "button",
+                    class: "opacity-0 group-hover:opacity-100 inline-flex items-center justify-center w-5 h-5 rounded text-xs hover:bg-[var(--operon-border)]",
+                    "data-testid": "project-tool-permissions-icon",
+                    "data-project-id": "{id_str}",
+                    "aria-label": "Tool permissions",
+                    title: "Tool permissions",
+                    onclick: move |evt| {
+                        evt.stop_propagation();
+                        tool_perms_target.set(Some(id));
+                    },
+                    "\u{2699}"
                 }
                 button {
                     r#type: "button",

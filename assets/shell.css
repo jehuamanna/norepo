@@ -65,6 +65,16 @@ html, body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
   background: var(--vscode-editor-background);
   color: var(--vscode-editor-foreground);
+  /* Webview shells (wry/WebKitGTK/WKWebView) treat the document as a
+   * native app surface and suppress text selection by default. Opt the
+   * whole shell back in — `user-select` is inherited, so this propagates
+   * everywhere unless an element opts out (e.g. `.operon-tab`, chips,
+   * `.select-none`). Required for Ctrl+C and right-click → Copy in
+   * chat / transcript / editor preview. */
+  -webkit-user-select: text;
+  -moz-user-select: text;
+  user-select: text;
+  cursor: auto;
 }
 
 #operon-root {
@@ -1509,6 +1519,14 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* Webview defaults (WKWebView / WebKitGTK) suppress text selection on
+   * non-input elements. Opt the transcript in explicitly; `user-select`
+   * is inherited so this propagates to message bubbles, markdown output
+   * and tool-card bodies. Mention chips keep their own `user-select:none`
+   * via more specific rules below. */
+  -webkit-user-select: text;
+  user-select: text;
+  cursor: auto;
 }
 
 .operon-companion-chat-composer {
@@ -2680,12 +2698,21 @@ html, body {
 }
 .operon-artifact-approve,
 .operon-artifact-reject,
-.operon-artifact-mark-dirty {
+.operon-artifact-mark-dirty,
+.operon-artifact-reload {
   font-size: 11px;
   padding: 2px 10px;
   border-radius: 3px;
   background: transparent;
   cursor: pointer;
+}
+.operon-artifact-reload {
+  border: 1px solid var(--vscode-descriptionforeground, currentColor);
+  color: var(--vscode-descriptionforeground, inherit);
+}
+.operon-artifact-reload:hover {
+  background: var(--vscode-descriptionforeground, currentColor);
+  color: var(--vscode-editor-background, #1e1e1e);
 }
 .operon-artifact-approve {
   border: 1px solid var(--operon-accent);

@@ -8,6 +8,21 @@ category = "Productivity"
 short_description = "Operon — local-first notes editor"
 long_description = "Operon-dioxus is a local-first, project-aware notes editor."
 
+# Sidecar binary: ship the `operon-mcp-permission` MCP shim alongside the
+# main binary so tool-call approvals (Bash/Edit/Write) work in installed
+# release builds. Cross-platform mechanism — `dx bundle` looks for a file
+# named `operon-mcp-permission-<target-triple>` at the crate root and
+# copies it next to the main exe inside the package (so the runtime
+# sibling-probe in `resolve_shim_from_exe` finds it on every OS).
+#
+# Build pipeline: `scripts/build-release.sh` runs `cargo build --release
+# --bin operon-mcp-permission`, then renames the output to the expected
+# `-<triple>` filename before invoking `dx bundle`. Layout per OS:
+#   .deb / .AppImage  →  /usr/bin/operon-mcp-permission (sibling of main)
+#   .app / .dmg       →  Operon.app/Contents/MacOS/operon-mcp-permission
+#   .msi / .exe       →  alongside operon-dioxus.exe in the install dir
+external_bin = ["operon-mcp-permission"]
+
 [web.app]
 
 # HTML title tag content

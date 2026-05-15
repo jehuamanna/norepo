@@ -1316,6 +1316,14 @@ pub fn ExplorerPanel() -> Element {
                 // through this signal so a rename re-renders the chips
                 // referencing this note across every open session.
                 *crate::shell::companion_state::NOTE_TITLE_VERSION.write() += 1;
+                // Tabs cache the title at open-time, so a rename
+                // wouldn't surface in the tab strip without an
+                // explicit push. Update every open tab pointing at
+                // this note id.
+                let mut tabs_for_rename = tabs;
+                tabs_for_rename
+                    .write()
+                    .set_title_for_note(&id.to_string(), new_title.clone());
                 renaming_note_setter.set(None);
 
                 // Walk every referrer and rewrite `[[OldTitle]]` / etc to

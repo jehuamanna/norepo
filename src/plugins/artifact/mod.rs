@@ -93,7 +93,11 @@ impl FormatPlugin for ArtifactFormatPlugin {
                 note_id,
                 content,
                 edit: true,
-                on_change: on_change,
+                // Wrap explicitly so the optional-prop coercion can't
+                // silently flip to None — the artifact body gates Monaco
+                // on `on_change.is_some()`, so a coercion slip would
+                // render the read-only MarkdownView in Edit mode.
+                on_change: Some(on_change),
             }
         }
     }

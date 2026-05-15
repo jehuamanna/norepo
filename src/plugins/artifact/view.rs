@@ -74,6 +74,12 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
     // visible content reflects the patched body without a reload.
     let persistence_for_status: Arc<dyn Persistence> = use_context();
     let note_id_for_status = props.note_id.clone();
+    // Tab buffer signal — needed in View mode where `on_change` is
+    // None and a status flip would otherwise wait on the FS watcher
+    // to round-trip the disk write back into the tab. `ArtifactView`
+    // is always mounted inside the LocalShell context, so the
+    // `Signal<TabManager>` is always available.
+    let tabs_for_status: Signal<crate::tabs::TabManager> = use_context();
     let approve = {
         let content = content_for_actions.clone();
         let persistence = persistence_for_status.clone();
@@ -84,6 +90,7 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
             &content,
             ArtifactStatus::Approved,
             on_change,
+            tabs_for_status,
         )
     };
     let reject = {
@@ -96,6 +103,7 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
             &content,
             ArtifactStatus::Rejected,
             on_change,
+            tabs_for_status,
         )
     };
     let mark_dirty = {
@@ -108,6 +116,7 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
             &content,
             ArtifactStatus::Dirty,
             on_change,
+            tabs_for_status,
         )
     };
 
@@ -367,13 +376,12 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                     }
                 }
                 div { class: "operon-artifact-actions",
-                    // Revise ⇄ Done toggle is always visible; the
-                    // button morphs and (in Edit) surfaces a sibling
-                    // Cancel button. Drives the View → Edit and
-                    // Edit → View transitions.
-                    if let Some(uuid) = source_uuid {
-                        ReviseButton { artifact_id: uuid }
-                    }
+                    // Revise ⇄ Done is provided by the shell-level
+                    // `ModeToolbar`'s `RevisionFlowButtons` cluster
+                    // (see `src/shell/mode_toolbar.rs`). The artifact
+                    // header keeps only Approve / Reject / Mark dirty
+                    // so there's exactly one Edit entry point.
+                    //
                     // Approve / Reject / Mark dirty — visible in
                     // BOTH View and Edit modes per the toolbar
                     // redesign. They go through `save_status_change`,
@@ -428,6 +436,12 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                         onclick: mark_dirty,
                         "Mark dirty"
                     }
+                    // Manual reload-from-disk — escape hatch when the
+                    // filesystem watcher misses an external write
+                    // (Claude Code editing a sibling working copy,
+                    // path-resolution gap between vault/UUID and
+                    // .operon/artifacts/<slug>, etc.).
+                    ReloadFromDiskButton { note_id: props.note_id.clone() }
                     // Rerun — only in View mode, only when the
                     // artifact is Dirty and we have source info.
                     // Hidden in Edit so the user isn't tempted to
@@ -770,9 +784,21 @@ fn patch_status(
 /// Persist a status flip immediately and notify the open editor tab.
 /// Saves bypass the SaveScheduler so the new state sticks in
 /// View-mode (no `on_change`) and in Edit-mode manual-save tabs (the
-/// scheduler short-circuits there). The `on_change` notification
-/// keeps the in-memory tab content in sync so the visible body
-/// reflects the patched frontmatter without a reload.
+/// scheduler short-circuits there).
+///
+/// The status change shows up in the UI on three pathways:
+///   1. `on_change` (Edit mode): pushes the new body up through the
+///      shell's tab edit signal so Monaco rebinds against it.
+///   2. `TabManager::reload_content` (both modes): writes the new
+///      body directly into every matching tab buffer. Critical for
+///      View mode — `on_change` is None there, so without this the
+///      visible body stays stuck at the pre-click status until the
+///      tab is reopened or the FS watcher catches up (which it
+///      doesn't in the current layout: `ArtifactPersistence` saves
+///      under `<vault>/.operon/<project>/artifacts/` but watcher #2
+///      tails `<repo>/.operon/artifacts/`).
+///   3. `LOCAL_NOTE_VERSION` bump: refreshes the explorer row's
+///      status pill + any open Memo that derives from the note tree.
 ///
 /// `note_id` is the artifact's UUID-string (the persistence key);
 /// `content` is the current body. The save is fire-and-forget via
@@ -785,11 +811,32 @@ fn save_status_change(
     content: &str,
     next: ArtifactStatus,
     on_change: Option<EventHandler<String>>,
+    mut tabs: Signal<crate::tabs::TabManager>,
 ) {
     let new_body = patch_status_text(content, next);
     if let Some(handler) = on_change {
         handler.call(new_body.clone());
     }
+    // Update every open tab buffer for this note. Belt-and-braces:
+    // `on_change` already routes the new body to the active tab in
+    // Edit mode, but a same-note tab opened in a split or sibling
+    // pane wouldn't see the flip otherwise, and View mode has no
+    // on_change at all.
+    {
+        let mut tabs_w = tabs.write();
+        let matching: Vec<crate::tabs::TabId> = tabs_w
+            .iter()
+            .filter(|t| t.note_id == note_id && t.content != new_body)
+            .map(|t| t.id)
+            .collect();
+        for tid in matching {
+            tabs_w.reload_content(tid, new_body.clone());
+        }
+    }
+    // Refresh explorer rows / status-pill consumers.
+    crate::shell::companion_state::LOCAL_NOTE_VERSION
+        .with_mut(|v| *v = v.saturating_add(1));
+
     let persistence = persistence.clone();
     let note_id = note_id.to_string();
     let body = new_body;
@@ -1411,6 +1458,73 @@ pub fn chat_session_id_for_source(source_note_id: Uuid) -> Uuid {
 
 /// Re-run the producing skill against the parent artifact so this
 /// (Dirty) artifact gets regenerated from current parent content.
+/// Pull the artifact's body from disk and overwrite every open tab
+/// pointing at this note id. Lets the user force-resync when a Claude
+/// Code session (or any external editor) wrote to the file outside
+/// Operon and the filesystem watcher didn't pick it up — typically
+/// because the watcher is bound to a different on-disk path than the
+/// one Claude touched, but useful as a general escape hatch.
+#[derive(Props, Clone, PartialEq)]
+struct ReloadFromDiskButtonProps {
+    note_id: String,
+}
+
+#[component]
+fn ReloadFromDiskButton(props: ReloadFromDiskButtonProps) -> Element {
+    let persistence: Arc<dyn Persistence> = use_context();
+    let tabs: Signal<crate::tabs::TabManager> = use_context();
+    let note_id = props.note_id.clone();
+    rsx! {
+        button {
+            r#type: "button",
+            class: "operon-artifact-reload",
+            "data-testid": "artifact-reload",
+            title: "Reload this artifact from disk. Use after editing the underlying file from Claude Code or another editor.",
+            onclick: move |_| {
+                let pers = persistence.clone();
+                let nid = note_id.clone();
+                let mut tabs_sig = tabs;
+                dioxus::core::spawn_forever(async move {
+                    let bytes = match pers.load(&nid).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "operon::artifact",
+                                "reload-from-disk: load({nid}): {e}"
+                            );
+                            return;
+                        }
+                    };
+                    let body = match String::from_utf8(bytes) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            tracing::warn!(
+                                target: "operon::artifact",
+                                "reload-from-disk: non-utf8 body for {nid}"
+                            );
+                            return;
+                        }
+                    };
+                    let tab_ids: Vec<crate::tabs::TabId> = tabs_sig
+                        .read()
+                        .iter()
+                        .filter(|t| t.note_id == nid)
+                        .map(|t| t.id)
+                        .collect();
+                    if tab_ids.is_empty() {
+                        return;
+                    }
+                    let mut tabs_w = tabs_sig.write();
+                    for tid in tab_ids {
+                        tabs_w.reload_content(tid, body.clone());
+                    }
+                });
+            },
+            "Reload"
+        }
+    }
+}
+
 /// Reuses `spawn_runner` plus the runner-side dedup so the existing
 /// note row is updated in place rather than a duplicate sibling
 /// being created. Visible only when status == Dirty AND the
@@ -1501,528 +1615,6 @@ fn RerunButton(props: RerunButtonProps) -> Element {
             "Re-run"
         }
     }
-}
-
-/// Revise ⇄ Done toggle for artifact notes. The button itself has two
-/// modes (View / Edit) and orchestrates a confirm-dialog flow on the
-/// commit edge:
-///
-/// 1. **View → Revise click:** snapshot the body as `prior_body`,
-///    flip the tab to Edit. Monaco becomes editable.
-/// 2. **Edit → Done click:** open the confirm dialog, kick off a
-///    one-shot Claude call that examines the body diff + existing
-///    revision-history rows and drafts a summary in matching style.
-///    The dialog renders a spinner until Claude returns, then swaps
-///    in an editable textarea pre-filled with the draft. The user
-///    can edit, then click Confirm (commits the row + cascade-dirty
-///    + flips to View) or Cancel (closes the dialog, stays in Edit).
-///
-/// Implementation notes:
-/// - Local state (prior_body, dialog_open, draft, loading) lives
-///   inside this component so closing the dialog with Cancel is a
-///   pure UI operation; nothing else has to know about it.
-/// - The Claude call uses an ephemeral session UUID — bound to the
-///   artifact's project repo as cwd, spawned, consumed, unbound.
-///   No tools, no MCP bridge, no permission shim.
-/// - On Claude failure we still open the dialog with a template
-///   summary so the user can always confirm/edit and proceed.
-#[derive(Props, Clone, PartialEq)]
-struct ReviseButtonProps {
-    artifact_id: Uuid,
-}
-
-#[component]
-fn ReviseButton(props: ReviseButtonProps) -> Element {
-    let LocalNoteRepo(note_repo) = use_context();
-    let LocalProjectRepo(project_repo) = use_context();
-    let persistence: Arc<dyn Persistence> = use_context();
-    let LocalNoteVersion(note_version) = use_context();
-    let mut tabs: Signal<crate::tabs::TabManager> = use_context();
-    let ClaudeCodePluginCtx(claude_plugin) = use_context();
-    let artifact_id = props.artifact_id;
-
-    // Body BEFORE the user clicked Revise. Used by the Claude
-    // prompt to describe the diff; `None` if Revise was never
-    // clicked this mount (defensive — shouldn't happen since the
-    // button is the only path into Edit mode).
-    let mut prior_body: Signal<Option<String>> = use_signal(|| None);
-
-    // Confirm-dialog state.
-    let mut dialog_open: Signal<bool> = use_signal(|| false);
-    let mut draft_summary: Signal<String> = use_signal(String::new);
-    let mut summary_loading: Signal<bool> = use_signal(|| false);
-    let mut summary_error: Signal<Option<String>> = use_signal(|| None);
-
-    // Active tab snapshot: id + mode + content. None when there's no
-    // active tab matching this artifact — render nothing in that case
-    // so the toolbar stays clean.
-    let active_snapshot: Option<(crate::tabs::TabId, crate::editor::EditorMode, String)> = {
-        let snap = tabs.read();
-        snap.active().map(|t| (t.id, t.mode, t.content.clone()))
-    };
-    let Some((tab_id, mode, body_now)) = active_snapshot else {
-        return rsx! {};
-    };
-    let in_edit = matches!(mode, crate::editor::EditorMode::Edit);
-
-    // cwd for the Claude ephemeral session: the artifact's project
-    // repo if we can resolve it, else "." as a harmless fallback (the
-    // one-shot call doesn't use any tools, so cwd is essentially
-    // ignored beyond satisfying the plugin's binding requirement).
-    let repo_path: PathBuf = note_repo
-        .find_project_for_note(artifact_id)
-        .ok()
-        .flatten()
-        .and_then(|pid| project_repo.list().ok().map(|ps| (pid, ps)))
-        .and_then(|(pid, ps)| ps.into_iter().find(|p| p.id == pid))
-        .and_then(|p| p.repo_path)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    // Clone for the two click closures + the Confirm-time row build.
-    // `body_now` is a `String` so each closure that touches it needs
-    // its own copy; we hand them out by clone.
-    let body_for_button = body_now.clone();
-    let repo_path_for_button = repo_path.clone();
-    let claude_plugin_for_button = claude_plugin.clone();
-    let on_button_click = move |_| {
-        if !in_edit {
-            // Revise → Edit. Snapshot the body for the eventual
-            // Done-time Claude prompt; flip the mode.
-            prior_body.set(Some(body_for_button.clone()));
-            tabs.write().set_mode(tab_id, crate::editor::EditorMode::Edit);
-            return;
-        }
-        // Done → open the dialog. Reset state for a fresh round.
-        summary_error.set(None);
-        draft_summary.set(String::new());
-        summary_loading.set(true);
-        dialog_open.set(true);
-
-        // Spawn the Claude one-shot. On finish (success or fall-back)
-        // the dialog's loading state clears and the textarea becomes
-        // editable.
-        let prior = prior_body.read().clone();
-        let new_body = body_for_button.clone();
-        let plugin_for_call = claude_plugin_for_button.clone();
-        let cwd_for_call = repo_path_for_button.clone();
-        let mut draft_sink = draft_summary;
-        let mut loading_sink = summary_loading;
-        let mut error_sink = summary_error;
-        dioxus::core::spawn_forever(async move {
-            match draft_revision_summary(
-                plugin_for_call,
-                cwd_for_call,
-                prior.as_deref(),
-                &new_body,
-            )
-            .await
-            {
-                Ok(text) => {
-                    draft_sink.set(text);
-                }
-                Err(e) => {
-                    // Fallback: keep the dialog usable even when the
-                    // LLM call fails, so the user can still record a
-                    // manual revision summary.
-                    let fallback = crate::plugins::artifact::revision_table::compute_summary(
-                        prior.as_deref(),
-                        Some(new_body.as_str()),
-                    );
-                    draft_sink.set(fallback);
-                    error_sink.set(Some(e));
-                }
-            }
-            loading_sink.set(false);
-        });
-    };
-
-    // Clone persistence + note_repo before each closure that needs
-    // them so the second closure (Revise cancel) doesn't see them
-    // moved out by the first (Confirm). The closures themselves do
-    // `persistence.clone()` again to hand into the spawn tasks they
-    // launch, which is fine — clones of an `Arc` are cheap.
-    let persistence_for_confirm = persistence.clone();
-    let note_repo_for_confirm = note_repo.clone();
-    let on_confirm = move |_| {
-        let persistence = persistence_for_confirm.clone();
-        let note_repo = note_repo_for_confirm.clone();
-        let final_summary = draft_summary.read().trim().to_string();
-        if final_summary.is_empty() {
-            return;
-        }
-        let date = crate::plugins::artifact::revision_table::format_revision_date(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0),
-        );
-        let row = crate::plugins::artifact::revision_table::RevisionRow {
-            revision: crate::plugins::artifact::revision_table::next_revision_number(
-                &body_now,
-            ),
-            date,
-            derived_from: "manual".to_string(),
-            summary: final_summary,
-        };
-        let body_with_row =
-            crate::plugins::artifact::revision_table::append_revision_row(&body_now, row);
-
-        // Optimistic pre-save buffer update so the user sees the new
-        // revision row immediately. Uses `reload_content` (clears
-        // dirty) — we're about to persist, so the buffer matches
-        // disk. `set_content` would leave dirty=true and confuse
-        // downstream save logic.
-        tabs.write()
-            .reload_content(tab_id, body_with_row.clone());
-
-        let note_id_str = artifact_id.to_string();
-        let persistence_for_save = persistence.clone();
-        let note_repo_for_dirty = note_repo.clone();
-        let persistence_for_dirty = persistence.clone();
-        let _ = note_version;
-        let body_for_save = body_with_row.clone();
-        let mut tabs_for_reassert = tabs;
-        let tab_id_for_reassert = tab_id;
-        dioxus::core::spawn_forever(async move {
-            if let Err(e) = persistence_for_save
-                .save(&note_id_str, body_for_save.as_bytes())
-                .await
-            {
-                tracing::warn!(
-                    target: "operon::artifact",
-                    "Done: save({artifact_id}): {e}"
-                );
-            }
-            // Re-assert the buffer AFTER the save. When the sync
-            // `set_mode(View)` below triggers Monaco to unmount, its
-            // teardown fires one last `on_change` with the pre-Confirm
-            // buffer — clobbering our `reload_content` above. By the
-            // time we land here (post-save, post-unmount), Monaco has
-            // had its chance; re-asserting now wins the race so the
-            // View renders the body containing the new row.
-            tabs_for_reassert
-                .write()
-                .reload_content(tab_id_for_reassert, body_for_save.clone());
-            match mark_descendants_dirty(
-                &note_repo_for_dirty,
-                &persistence_for_dirty,
-                artifact_id,
-            )
-            .await
-            {
-                Ok(n) => tracing::info!(
-                    target: "operon::artifact",
-                    "Done: marked {n} descendant(s) of {artifact_id} dirty"
-                ),
-                Err(e) => tracing::warn!(
-                    target: "operon::artifact",
-                    "Done: mark_descendants_dirty({artifact_id}): {e}"
-                ),
-            }
-            crate::shell::companion_state::LOCAL_NOTE_VERSION
-                .with_mut(|v| *v = v.saturating_add(1));
-        });
-
-        // Close dialog, clear scratch state, flip back to View.
-        dialog_open.set(false);
-        prior_body.set(None);
-        draft_summary.set(String::new());
-        summary_error.set(None);
-        tabs.write().set_mode(tab_id, crate::editor::EditorMode::View);
-    };
-
-    let on_dialog_cancel = move |_| {
-        // Dialog Cancel = close the dialog only; the user stays in
-        // Edit so they can keep tweaking the body and click Done
-        // again. The toolbar Cancel below is the one that actually
-        // abandons the revise session.
-        dialog_open.set(false);
-        draft_summary.set(String::new());
-        summary_error.set(None);
-        summary_loading.set(false);
-    };
-
-    // Toolbar Cancel handler — bound only when the Cancel button
-    // renders (Edit mode). Abandons the whole revise session: reverts
-    // the tab buffer + disk to the body snapshotted at Revise click,
-    // closes the dialog if open, and flips the tab back to View.
-    let persistence_for_revise_cancel = persistence.clone();
-    let on_revise_cancel = move |_| {
-        // The pre-Revise snapshot may be absent if Revise was never
-        // clicked this mount (defensive — shouldn't happen). When
-        // absent we still flip back to View without touching disk.
-        let prior = prior_body.read().clone();
-        // Tear down dialog + scratch state up front so the user
-        // doesn't see them flash through View mode.
-        dialog_open.set(false);
-        draft_summary.set(String::new());
-        summary_error.set(None);
-        summary_loading.set(false);
-
-        if let Some(prior) = prior {
-            // Optimistic pre-save buffer update so the user sees the
-            // revert immediately. `reload_content` (not `set_content`)
-            // keeps the dirty flag clean since the buffer matches
-            // what we're about to persist.
-            tabs.write().reload_content(tab_id, prior.clone());
-            let note_id_str = artifact_id.to_string();
-            let pers = persistence_for_revise_cancel.clone();
-            let mut tabs_for_reassert = tabs;
-            let tab_id_for_reassert = tab_id;
-            let prior_for_reassert = prior.clone();
-            dioxus::core::spawn_forever(async move {
-                if let Err(e) = pers.save(&note_id_str, prior.as_bytes()).await {
-                    tracing::warn!(
-                        target: "operon::artifact",
-                        "Revise cancel: revert save({artifact_id}): {e}"
-                    );
-                }
-                // Re-assert after save: Monaco's unmount on the View
-                // flip below fires one last `on_change` with its
-                // internal buffer (the user's mid-revise edits),
-                // which would otherwise clobber the revert. Post-save
-                // we win the race.
-                tabs_for_reassert
-                    .write()
-                    .reload_content(tab_id_for_reassert, prior_for_reassert);
-            });
-        }
-        prior_body.set(None);
-        tabs.write().set_mode(tab_id, crate::editor::EditorMode::View);
-    };
-
-    let label = if in_edit { "Done" } else { "Revise" };
-    let title_attr = if in_edit {
-        "Open the revision-summary dialog: Claude drafts a one-line summary you can edit before committing."
-    } else {
-        "Switch to Edit mode. Click Done when finished to record the revision."
-    };
-
-    rsx! {
-        button {
-            r#type: "button",
-            class: "operon-artifact-revise",
-            "data-testid": "artifact-revise",
-            title: "{title_attr}",
-            onclick: on_button_click,
-            "{label}"
-        }
-        if in_edit {
-            button {
-                r#type: "button",
-                class: "operon-artifact-revise-cancel",
-                "data-testid": "artifact-revise-cancel",
-                title: "Abandon this revise session: discard any in-progress edits and return to View.",
-                onclick: on_revise_cancel,
-                "Cancel"
-            }
-        }
-        if *dialog_open.read() {
-            RevisionConfirmDialog {
-                draft: draft_summary,
-                loading: summary_loading,
-                error: summary_error,
-                on_confirm: EventHandler::new(on_confirm),
-                on_cancel: EventHandler::new(on_dialog_cancel),
-            }
-        }
-    }
-}
-
-#[derive(Props, Clone, PartialEq)]
-struct RevisionConfirmDialogProps {
-    draft: Signal<String>,
-    loading: Signal<bool>,
-    error: Signal<Option<String>>,
-    on_confirm: EventHandler<()>,
-    on_cancel: EventHandler<()>,
-}
-
-#[component]
-fn RevisionConfirmDialog(props: RevisionConfirmDialogProps) -> Element {
-    let mut draft = props.draft;
-    let loading = props.loading;
-    let error = props.error;
-    let confirm_handler = props.on_confirm;
-    let cancel_handler = props.on_cancel;
-
-    let is_loading = *loading.read();
-    let confirm_disabled = is_loading || draft.read().trim().is_empty();
-
-    rsx! {
-        div {
-            class: "operon-revision-dialog-scrim",
-            "data-testid": "artifact-revision-dialog-scrim",
-            onclick: move |_| cancel_handler.call(()),
-        }
-        div {
-            class: "operon-revision-dialog",
-            "data-testid": "artifact-revision-dialog",
-            role: "dialog",
-            "aria-modal": "true",
-            onkeydown: move |evt| {
-                if evt.key().to_string() == "Escape" {
-                    cancel_handler.call(());
-                }
-            },
-            div { class: "operon-revision-dialog-header",
-                h3 { class: "operon-revision-dialog-title", "Record revision" }
-                p { class: "operon-revision-dialog-hint",
-                    "Claude is drafting a summary based on what changed and your previous entries. Review and edit before committing."
-                }
-            }
-            if is_loading {
-                div { class: "operon-revision-dialog-loading",
-                    span { class: "operon-companion-thinking-spinner" }
-                    span { class: "operon-revision-dialog-loading-label",
-                        "Drafting summary\u{2026}"
-                    }
-                }
-            } else {
-                textarea {
-                    class: "operon-revision-dialog-textarea",
-                    "data-testid": "artifact-revision-dialog-textarea",
-                    rows: "4",
-                    value: "{draft}",
-                    placeholder: "Summary of revision\u{2026}",
-                    oninput: move |e| draft.set(e.value()),
-                }
-                if let Some(err) = error.read().clone() {
-                    div { class: "operon-revision-dialog-error",
-                        "Claude draft failed: {err}. Edit the fallback summary above and confirm."
-                    }
-                }
-            }
-            div { class: "operon-revision-dialog-actions",
-                button {
-                    r#type: "button",
-                    class: "operon-revision-dialog-cancel",
-                    "data-testid": "artifact-revision-dialog-cancel",
-                    onclick: move |_| cancel_handler.call(()),
-                    "Cancel"
-                }
-                button {
-                    r#type: "button",
-                    class: "operon-revision-dialog-confirm",
-                    "data-testid": "artifact-revision-dialog-confirm",
-                    disabled: confirm_disabled,
-                    onclick: move |_| confirm_handler.call(()),
-                    "Confirm"
-                }
-            }
-        }
-    }
-}
-
-/// One-shot Claude call: examine the artifact's existing revision
-/// history (parsed from `new_body`) and the diff between `prior` and
-/// `new_body`, then return a single-line revision summary in the
-/// style of the existing entries.
-///
-/// Implementation: binds an ephemeral session on the shared
-/// `ClaudeCodeChatPlugin`, calls `send_rich`, accumulates `Text`
-/// events into a string, and unbinds when the stream finishes. The
-/// session has no MCP bridge attached, so Claude only generates text
-/// — no tool calls, no permissions, no side effects on disk.
-async fn draft_revision_summary(
-    plugin: Arc<operon_plugins_claude_code::ClaudeCodeChatPlugin>,
-    cwd: PathBuf,
-    prior: Option<&str>,
-    new_body: &str,
-) -> Result<String, String> {
-    use futures::StreamExt;
-    use operon_plugins_claude_code::ClaudeCodeEvent;
-
-    let existing_table = crate::plugins::artifact::revision_table::parse_revision_table(new_body);
-    let existing_table_md = render_existing_table_for_prompt(existing_table.as_ref());
-    let prompt = build_summary_prompt(
-        &existing_table_md,
-        prior.unwrap_or("(no prior body)"),
-        new_body,
-    );
-
-    let sid = Uuid::new_v4();
-    plugin.bind_session(sid, cwd);
-    let ct = crate::agent::CancellationToken::new();
-    let mut rx = plugin
-        .send_rich(prompt, sid, ct)
-        .await
-        .map_err(|e| format!("send_rich: {e}"))?;
-
-    let mut accumulated = String::new();
-    let mut had_error: Option<String> = None;
-    while let Some(ev) = rx.next().await {
-        match ev {
-            ClaudeCodeEvent::Text(t) => accumulated.push_str(&t),
-            ClaudeCodeEvent::Done { .. } => break,
-            ClaudeCodeEvent::Error(e) => {
-                had_error = Some(e);
-                break;
-            }
-            _ => {}
-        }
-    }
-    plugin.unbind_session(sid);
-
-    if let Some(e) = had_error {
-        return Err(e);
-    }
-    let cleaned = accumulated.trim().to_string();
-    if cleaned.is_empty() {
-        return Err("empty response".to_string());
-    }
-    // Trim to a single line: collapse any newlines into spaces. Even if
-    // Claude responded with multi-line markdown, the table cell needs a
-    // one-liner.
-    let one_line = cleaned.lines().collect::<Vec<_>>().join(" ").trim().to_string();
-    Ok(one_line)
-}
-
-fn render_existing_table_for_prompt(
-    t: Option<&crate::plugins::artifact::revision_table::RevisionTable>,
-) -> String {
-    let Some(t) = t else {
-        return "(no prior revision entries)".to_string();
-    };
-    if t.rows.is_empty() {
-        return "(no prior revision entries)".to_string();
-    }
-    let mut out = String::new();
-    out.push_str("| Revision | Date | Derived from | Summary |\n");
-    out.push_str("|----------|------|--------------|---------|\n");
-    for r in &t.rows {
-        out.push_str(&format!(
-            "| {} | {} | {} | {} |\n",
-            r.revision, r.date, r.derived_from, r.summary
-        ));
-    }
-    out
-}
-
-fn build_summary_prompt(existing_table_md: &str, prior_body: &str, new_body: &str) -> String {
-    format!(
-        "You are recording a single revision of an artifact note. The author has just edited the body. Write ONE concise sentence describing what changed, matching the style of the existing entries.\n\
-\n\
-# Existing revision entries\n\
-\n\
-{existing_table_md}\n\
-\n\
-# Body BEFORE this revision\n\
-\n\
-```\n\
-{prior_body}\n\
-```\n\
-\n\
-# Body AFTER this revision\n\
-\n\
-```\n\
-{new_body}\n\
-```\n\
-\n\
-# Task\n\
-\n\
-Respond with exactly one short sentence describing what changed in this revision. Match the terse, declarative style of the prior entries (no emoji, no quotes, no preamble). End with a period. Do NOT include the date or revision number — just the summary text.",
-    )
 }
 
 /// Render the user's answer to a clarification artifact into a
