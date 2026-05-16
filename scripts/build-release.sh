@@ -150,6 +150,13 @@ echo "==> Rebuilding editor-bridge dist (Monaco / CodeMirror / Tiptap shim)..."
 # --- build the sidecar binaries ------------------------------------------
 echo "==> Building operon-mcp-permission + operon-posttool-hook (sidecars, release)..."
 cargo build --release --bin operon-mcp-permission --bin operon-posttool-hook
+# operon-mcp lives in a separate package (operon-bridge), so it needs its
+# own -p invocation. It's the stdio MCP stub that lets chat-mode claude
+# reach the in-tree operon-bridge socket — without it shipped, every
+# mcp__operon_notes__* tool fails at startup with "operon-mcp binary not
+# found" (see resolve_operon_mcp_bin in src/local_mode/bridge_runtime.rs).
+echo "==> Building operon-mcp (operon-bridge stdio stub, release)..."
+cargo build --release -p operon-bridge --bin operon-mcp
 
 # Discover host triple so the dx `external_bin` lookup matches.
 triple=$(rustc -vV | awk -F': ' '/^host:/ {print $2}')
@@ -161,7 +168,7 @@ if [[ "$target_os" == windows ]]; then
 fi
 
 declare -a staged_sidecars=()
-for bin in operon-mcp-permission operon-posttool-hook; do
+for bin in operon-mcp-permission operon-posttool-hook operon-mcp; do
   src="target/release/${bin}${shim_ext}"
   dest="${bin}-${triple}${shim_ext}"
   echo "==> Staging ${bin} as ./${dest} for dx external_bin lookup..."

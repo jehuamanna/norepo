@@ -25,7 +25,7 @@ long_description = "Operon-dioxus is a local-first, project-aware notes editor."
 #   .deb / .AppImage  →  /usr/bin/<bin> (sibling of main)
 #   .app / .dmg       →  Operon.app/Contents/MacOS/<bin>
 #   .msi / .exe       →  alongside operon-dioxus.exe in the install dir
-external_bin = ["operon-mcp-permission", "operon-posttool-hook"]
+external_bin = ["operon-mcp-permission", "operon-posttool-hook", "operon-mcp"]
 
 [web.app]
 
