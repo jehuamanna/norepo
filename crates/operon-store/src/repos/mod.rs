@@ -8,6 +8,7 @@ pub mod department;
 pub mod invite;
 pub mod local_note;
 pub mod local_note_link;
+pub mod local_attachment;
 pub mod local_project;
 pub mod local_search;
 pub mod local_settings;
@@ -39,6 +40,9 @@ pub use local_note::{
 };
 pub use local_note_link::{
     LinkRow, LocalNoteLinkRepository, SqliteLocalNoteLinkRepository,
+};
+pub use local_attachment::{
+    LocalAttachment, LocalAttachmentRepository, SqliteLocalAttachmentRepository,
 };
 pub use local_project::{LocalProject, LocalProjectRepository, SqliteLocalProjectRepository};
 pub use local_search::{

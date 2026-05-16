@@ -20,7 +20,7 @@ pub mod panel;
 pub mod server_card;
 pub mod service;
 
-pub use panel::McpSettingsPanel;
+pub use panel::{McpPanelMode, McpSettingsPanel};
 pub use service::{AddArgs, McpDetails, McpEntry, McpService, Scope, Transport};
 
 use std::sync::Arc;

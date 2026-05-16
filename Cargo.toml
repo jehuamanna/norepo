@@ -6,6 +6,7 @@ members = [
     "crates/operon-plugins-anthropic",
     "crates/operon-plugins-claude-code",
     "crates/operon-plugins-mcp",
+    "crates/operon-bridge",
     "crates/operon-plugins-openai",
     "crates/operon-plugins-google",
     "crates/operon-plugins-tools",
@@ -115,6 +116,14 @@ operon-store = { path = "crates/operon-store" }
 notify = "6"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+
+# Bridge: in-tree MCP server that lets Claude Code (PTY-hosted in the
+# companion terminal, or stdio child in chat mode) call back into the
+# GUI process. Unix-only — uses unix-domain sockets. On non-unix
+# desktops the bridge degrades to "absent" and the toolbar feature
+# falls back to the legacy in-process executor path.
+[target.'cfg(all(unix, not(target_arch = "wasm32")))'.dependencies]
+operon-bridge = { path = "crates/operon-bridge" }
 # Plans-Phase-9-monaco-desktop (rev 15): embed the editor-bridge dist
 # folder into the binary so `bridge://localhost/...` resolves in
 # installed bundles (.deb / .AppImage / .app / .msi) — `dx bundle`
@@ -145,6 +154,17 @@ arboard = "3"
 # Encode arboard's RGBA pixel buffer into PNG bytes before attach_blob.
 # Single-format `png` crate is much lighter than the full `image` umbrella.
 png = "0.17"
+# Companion-pane terminal mode: spawn `claude` in a pty so the upstream
+# CLI's TUI (alt-screen, cursor positioning, ANSI colors) renders
+# correctly inside the webview via xterm.js. The `portable-pty` crate
+# wraps the platform-specific PTY APIs (Unix forkpty, Windows ConPTY)
+# behind a uniform interface — same dependency wezterm uses.
+portable-pty = "0.8"
+# Companion-pane terminal mode: PTY bytes ship over the dioxus
+# `eval.send` JSON channel, which can't carry raw binary — base64 is
+# the cheapest binary-safe envelope and is symmetric on the JS side
+# via `atob` / `btoa`.
+base64 = "0.22"
 
 [features]
 default = ["desktop"]

@@ -591,6 +591,11 @@ pub fn ExplorerPanel() -> Element {
 
     let project_repo_for_create = project_repo.clone();
     let mut error_setter_for_create = project_load_error;
+    // Captured by the post-create `spawn` so the default seed-skill
+    // install happens off the click handler's sync path. Cheap to
+    // clone — both repos and persistence are `Arc<dyn ...>`.
+    let note_repo_for_seed_install = note_repo.clone();
+    let persistence_for_seed_install: Arc<dyn Persistence> = use_context();
     let on_add_project = move |_| {
         eprintln!("operon::explorer: on_add_project fired");
         match project_repo_for_create.create("") {
@@ -600,6 +605,56 @@ pub fn ExplorerPanel() -> Element {
                 selected_project.set(Some(p.id));
                 renaming_project_setter.set(Some(p.id));
                 error_setter_for_create.set(None);
+
+                // Default-install the SDLC seed skills (vault-only).
+                // Locked behavior per the project + repo MCP plan:
+                // new projects always come up with the cascade chain
+                // available; user can edit/remove notes after. Skips
+                // the disk materialize path because the project has
+                // no `repo_path` yet (the user binds one separately).
+                let note_repo_owned = note_repo_for_seed_install.clone();
+                let persistence_owned = persistence_for_seed_install.clone();
+                let project_id = p.id;
+                spawn(async move {
+                    let entries: Vec<(String, String)> =
+                        crate::plugins::skill::seed::seed_skill_list()
+                            .map(|s| (s.stem.to_string(), s.body.to_string()))
+                            .collect();
+                    let readme = crate::plugins::skill::seed::seed_readme()
+                        .map(str::to_string);
+                    let skill_iter = entries.iter().map(|(stem, body)| {
+                        crate::plugins::skill::install::SkillSource {
+                            stem: stem.as_str(),
+                            body: body.as_str(),
+                        }
+                    });
+                    match crate::plugins::skill::install::install_skills_into_project(
+                        &note_repo_owned,
+                        &persistence_owned,
+                        project_id,
+                        skill_iter,
+                        readme.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(report) => {
+                            tracing::info!(
+                                target: "operon::explorer",
+                                project = %project_id,
+                                installed = report.installed,
+                                skipped = report.skipped,
+                                "seed-skill default install complete"
+                            );
+                            // Bump so the SKILLS subtree appears immediately.
+                            project_version.with_mut(|v| *v += 1);
+                        }
+                        Err(e) => tracing::warn!(
+                            target: "operon::explorer",
+                            project = %project_id,
+                            "seed-skill default install failed: {e}"
+                        ),
+                    }
+                });
             }
             Err(e) => {
                 let msg = format!("Could not create project: {e}");

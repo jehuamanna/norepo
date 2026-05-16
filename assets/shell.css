@@ -1944,6 +1944,203 @@ html, body {
   flex-direction: column;
   gap: 8px;
 }
+
+/* M4d.4: terminal-mode @-mention picker. Floats above the terminal
+   pane (the pane is `position: relative` via its display-flex
+   container; we pin to its top-left). Backdrop is transparent and
+   only catches outside-clicks; the picker body sits on top. */
+.operon-mention-picker-backdrop {
+  position: absolute;
+  inset: 0;
+  background: transparent;
+  z-index: 10;
+}
+.operon-mention-picker {
+  position: absolute;
+  top: 36px; /* clear the terminal pane's header strip */
+  left: 12px;
+  width: 320px;
+  max-height: 320px;
+  z-index: 11;
+  /* Hardcoded dark surface (NOT theme-bound) so the picker reads
+     consistently in every theme. The terminal pane it floats over
+     can be light or dark; the picker is always its own dark island.
+     If we ever build a light variant we'll gate on a class on the
+     pane, not on theme tokens. */
+  background: #1f1f1f;
+  color: rgba(255, 255, 255, 0.92);
+  border: 1px solid var(--operon-accent);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.operon-mention-picker-input {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  font-size: 12px;
+  /* Same self-contained dark palette as the picker — see the long
+     comment on .operon-mention-picker above for why we don't use
+     theme tokens here. */
+  background: #161616;
+  color: rgba(255, 255, 255, 0.95);
+  border: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.10);
+  outline: none;
+}
+.operon-mention-picker-input::placeholder {
+  color: rgba(255, 255, 255, 0.4);
+}
+.operon-mention-picker-input:focus {
+  outline: 1px solid var(--operon-accent);
+  outline-offset: -1px;
+}
+.operon-mention-picker-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+  overflow-y: auto;
+  flex: 1 1 auto;
+}
+.operon-mention-picker-item {
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* Lock the text color to a light value that contrasts our
+     hardcoded dark picker bg — we can't rely on
+     --vscode-editor-foreground here because some themes set it to
+     a dark color (intended for a light editor bg) which would make
+     items disappear against our dark surface. */
+  color: rgba(255, 255, 255, 0.92);
+}
+/* Hover + keyboard-selection rendering. We do NOT use
+   --vscode-list-hoverbackground because some themes resolve it to a
+   near-white value; combined with our white-ish item text that
+   wipes the row to invisibility (white-on-white). Hardcoded
+   semitransparent overlay on the picker's dark bg is readable in
+   every theme. */
+.operon-mention-picker-item:hover {
+  background: rgba(255, 255, 255, 0.10);
+}
+.operon-mention-picker-item[aria-selected="true"] {
+  background: rgba(255, 255, 255, 0.16);
+  /* Accent stripe so the keyboard-selected row is distinct from a
+     plain hover. */
+  box-shadow: inset 2px 0 0 var(--operon-accent);
+}
+.operon-mention-picker-empty {
+  padding: 8px 12px;
+  font-size: 11px;
+  font-style: italic;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+/* M4c.7: note-edit proposal card. Shares the ask-user shell shape so
+   the two card families read as a family. The diff `<pre>` gets its
+   own monospace + colored-line treatment. */
+.operon-note-proposal {
+  align-self: stretch;
+  flex-shrink: 0;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  background: var(--vscode-editorWidget-background, rgba(127, 127, 127, 0.04));
+  padding: 8px 10px;
+  margin: 6px 0;
+  font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.operon-note-proposal[data-status="pending"] {
+  border-color: var(--operon-accent);
+}
+.operon-note-proposal[data-status="rejected"] {
+  opacity: 0.55;
+}
+.operon-note-proposal[data-status="accepted"] {
+  opacity: 0.7;
+}
+.operon-note-proposal-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.operon-note-proposal-badge {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: var(--operon-accent);
+  color: var(--vscode-editor-background, #fff);
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+.operon-note-proposal[data-status="rejected"] .operon-note-proposal-badge,
+.operon-note-proposal[data-status="accepted"] .operon-note-proposal-badge {
+  background: var(--vscode-descriptionforeground, #888);
+}
+.operon-note-proposal-title {
+  font-weight: 600;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.operon-note-proposal-stats {
+  font-size: 11px;
+  color: var(--vscode-descriptionforeground, #888);
+}
+.operon-note-proposal-diff {
+  margin: 0;
+  padding: 8px 10px;
+  font-family: var(--vscode-editor-font-family, "SF Mono", Menlo, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+  background: var(--vscode-editor-background, #1e1e1e);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  max-height: 280px;
+  overflow: auto;
+  white-space: pre;
+}
+.operon-note-proposal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.operon-note-proposal-accept,
+.operon-note-proposal-reject {
+  font-size: 12px;
+  padding: 3px 12px;
+  border-radius: 4px;
+  border: 1px solid var(--vscode-panel-border);
+  cursor: pointer;
+}
+.operon-note-proposal-accept {
+  background: var(--operon-accent);
+  color: var(--vscode-editor-background, #fff);
+  border-color: var(--operon-accent);
+}
+.operon-note-proposal-accept:hover {
+  filter: brightness(1.1);
+}
+.operon-note-proposal-reject {
+  background: transparent;
+  color: var(--vscode-editor-foreground, inherit);
+}
+.operon-note-proposal-reject:hover {
+  background: var(--vscode-list-hoverbackground, rgba(127, 127, 127, 0.15));
+}
+.operon-note-proposal-resolved {
+  font-size: 11px;
+  color: var(--vscode-descriptionforeground, #888);
+  text-align: right;
+}
 .operon-ask-user-card[data-status="pending"] {
   border-color: var(--operon-accent);
 }
@@ -4372,4 +4569,194 @@ html, body {
   display: flex;
   gap: 6px;
   margin-top: 4px;
+}
+
+/* ============================================================
+ * Inline tool-permission prompt card.
+ * Surfaced by the chat-mode permission_bridge handler when a tool
+ * needs human approval (default policy: every Other-category tool,
+ * including all `mcp__*`). Rendered inline after the transcript.
+ * Component lives in src/shell/permission_prompt.rs.
+ * ============================================================ */
+.operon-permission-prompt {
+  align-self: stretch;
+  padding: 10px 12px;
+  margin: 6px 0;
+  border-radius: 6px;
+  border: 1px solid var(--vscode-panel-border, rgba(127, 127, 127, 0.4));
+  background: var(--vscode-editorWidget-background, rgba(127, 127, 127, 0.06));
+  font-size: 13px;
+  line-height: 1.4;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.operon-permission-prompt-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.operon-permission-prompt-tool {
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  font-weight: 600;
+}
+
+.operon-permission-prompt-category {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 500;
+  background: rgba(127, 127, 127, 0.18);
+}
+
+.operon-permission-cat-readonly { background: rgba(60, 160, 200, 0.22); }
+.operon-permission-cat-fswrite  { background: rgba(220, 165, 70, 0.22); }
+.operon-permission-cat-shell    { background: rgba(220, 110, 110, 0.22); }
+.operon-permission-cat-network  { background: rgba(170, 130, 200, 0.22); }
+.operon-permission-cat-other    { background: rgba(127, 127, 127, 0.22); }
+
+.operon-permission-prompt-cwd {
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  font-size: 11px;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 50%;
+}
+
+.operon-permission-prompt-status {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+}
+
+.operon-permission-prompt-summary {
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: rgba(127, 127, 127, 0.08);
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.operon-permission-prompt-diff summary,
+.operon-permission-prompt-rawinput summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+  user-select: none;
+}
+
+.operon-permission-prompt-diff-body {
+  margin: 6px 0 0;
+  padding: 8px;
+  border-radius: 4px;
+  background: rgba(127, 127, 127, 0.08);
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  font-size: 12px;
+  white-space: pre;
+  overflow-x: auto;
+  max-height: 280px;
+}
+
+.operon-permission-prompt-jsoneditor {
+  width: 100%;
+  margin-top: 6px;
+  padding: 6px;
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  font-size: 12px;
+  background: var(--vscode-input-background, rgba(127, 127, 127, 0.08));
+  color: var(--vscode-input-foreground, inherit);
+  border: 1px solid var(--vscode-input-border, rgba(127, 127, 127, 0.4));
+  border-radius: 4px;
+  resize: vertical;
+  box-sizing: border-box;
+}
+
+.operon-permission-prompt-jsonerror {
+  margin-top: 4px;
+  padding: 4px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  color: var(--vscode-errorForeground, #d04848);
+  background: rgba(208, 72, 72, 0.12);
+}
+
+.operon-permission-prompt-skipform {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: rgba(127, 127, 127, 0.08);
+}
+
+.operon-permission-prompt-skipform label {
+  font-size: 11px;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+}
+
+.operon-permission-prompt-skipinput {
+  width: 100%;
+  padding: 6px;
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  font-size: 12px;
+  background: var(--vscode-input-background, rgba(127, 127, 127, 0.08));
+  color: var(--vscode-input-foreground, inherit);
+  border: 1px solid var(--vscode-input-border, rgba(127, 127, 127, 0.4));
+  border-radius: 4px;
+  resize: vertical;
+  box-sizing: border-box;
+}
+
+.operon-permission-prompt-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.operon-permission-prompt-btn {
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid var(--vscode-button-border, transparent);
+  background: var(--vscode-button-secondaryBackground, rgba(127, 127, 127, 0.18));
+  color: var(--vscode-button-secondaryForeground, inherit);
+  cursor: pointer;
+  transition: background 80ms ease-in-out;
+}
+
+.operon-permission-prompt-btn:hover:not(:disabled) {
+  background: var(--vscode-button-secondaryHoverBackground, rgba(127, 127, 127, 0.28));
+}
+
+.operon-permission-prompt-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.operon-permission-prompt-btn-allow {
+  background: var(--vscode-button-background, #2563eb);
+  color: var(--vscode-button-foreground, #fff);
+}
+.operon-permission-prompt-btn-allow:hover:not(:disabled) {
+  background: var(--vscode-button-hoverBackground, #1d4ed8);
+}
+
+.operon-permission-prompt-btn-deny {
+  color: var(--vscode-errorForeground, #d04848);
+}
+
+.operon-permission-prompt-btn-cancel {
+  margin-left: auto;
 }

@@ -80,17 +80,23 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
         "User skipped this tool; proceed without it.".to_string()
     });
 
-    // Tick the elapsed-time label every 500ms while pending. Drop the
-    // future as soon as we leave Pending so the loop doesn't keep
-    // re-rendering after the decision.
+    // Tick the elapsed-time label every 500ms WHILE PENDING.
+    // Once the decision is in we stop ticking — without the guard the
+    // future kept bumping a signal forever, which made every resolved
+    // card re-render every 500ms and visibly flickered.
     let mut elapsed_ticker = use_signal(|| 0u64);
     use_future(move || async move {
         loop {
+            if !pending {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(500)).await;
             elapsed_ticker.with_mut(|t| *t = t.wrapping_add(1));
         }
     });
-    let _ = elapsed_ticker.read(); // subscribe — value itself is ignored
+    if pending {
+        let _ = elapsed_ticker.read(); // subscribe only while pending
+    }
     let elapsed = SystemTime::now()
         .duration_since(entry.created_at)
         .unwrap_or_default();

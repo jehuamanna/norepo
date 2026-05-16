@@ -168,55 +168,73 @@ fn settings_path(repo_root: &Path) -> PathBuf {
     repo_root.join(".claude").join("settings.local.json")
 }
 
-/// Load the policy for `repo_root`. Missing file or missing key → the
-/// default policy. Corrupted JSON or wrong-shape value → default
-/// policy with a `tracing::warn!` so the user sees something in the
-/// dev console.
-pub fn load(repo_root: &Path) -> AutoApprovePolicy {
-    let path = settings_path(repo_root);
-    let raw = match fs::read_to_string(&path) {
+/// Resolve the global (user-scope) Operon auto-approve settings file:
+/// `~/.claude/settings.json`. Shared with Claude Code's user-scope
+/// settings — Operon only owns the `operonAutoApprove` key inside.
+///
+/// Returns `None` when neither `HOME` nor `USERPROFILE` is set (rare,
+/// but happens in some sandboxed contexts) so callers can fall back
+/// without panicking.
+pub fn global_settings_path() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return Some(PathBuf::from(home).join(".claude").join("settings.json"));
+        }
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        if !profile.is_empty() {
+            return Some(PathBuf::from(profile).join(".claude").join("settings.json"));
+        }
+    }
+    None
+}
+
+/// Read the policy from any settings JSON file (project or global) and
+/// return `Some(policy)` iff the `operonAutoApprove` key is present.
+/// Missing file or absent key → `None` (caller decides what fallback
+/// to use). Corrupted JSON / wrong-shape → `Some(default)` with a
+/// `tracing::warn!` so the user sees something in the dev console.
+fn load_policy_from(path: &Path) -> Option<AutoApprovePolicy> {
+    let raw = match fs::read_to_string(path) {
         Ok(s) if !s.trim().is_empty() => s,
-        _ => return AutoApprovePolicy::default(),
+        _ => return None,
     };
     let root: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
                 target: "operon::permission",
-                "auto_approve::load {} parse failed: {e} — using default policy",
+                "auto_approve parse {} failed: {e} — ignoring file",
                 path.display()
             );
-            return AutoApprovePolicy::default();
+            return Some(AutoApprovePolicy::default());
         }
     };
-    let policy_v = match root.get(KEY) {
-        Some(v) => v.clone(),
-        None => return AutoApprovePolicy::default(),
-    };
+    let policy_v = root.get(KEY)?.clone();
     match serde_json::from_value::<AutoApprovePolicy>(policy_v) {
-        Ok(p) => p,
+        Ok(p) => Some(p),
         Err(e) => {
             tracing::warn!(
                 target: "operon::permission",
-                "auto_approve::load {} policy shape invalid: {e} — using default",
+                "auto_approve shape {} invalid: {e} — using default",
                 path.display()
             );
-            AutoApprovePolicy::default()
+            Some(AutoApprovePolicy::default())
         }
     }
 }
 
-/// Persist `policy` for `repo_root`. Creates `.claude/` and the
-/// settings file if needed. Preserves any pre-existing top-level keys
-/// (notably `permissions`) — only the `operonAutoApprove` slot is
-/// touched.
-pub fn save(repo_root: &Path, policy: AutoApprovePolicy) -> std::io::Result<()> {
-    let dir = repo_root.join(".claude");
-    fs::create_dir_all(&dir)?;
-    let path = settings_path(repo_root);
+/// Write the `operonAutoApprove` key into a settings JSON file (project
+/// or global). Creates the parent directory and the file if needed.
+/// Preserves all sibling top-level keys (notably `permissions` and any
+/// Claude Code user-scope keys like `theme` / `model`).
+fn save_policy_to(path: &Path, policy: AutoApprovePolicy) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
 
     let mut root: Value = if path.exists() {
-        let raw = fs::read_to_string(&path)?;
+        let raw = fs::read_to_string(path)?;
         if raw.trim().is_empty() {
             json!({})
         } else {
@@ -242,7 +260,71 @@ pub fn save(repo_root: &Path, policy: AutoApprovePolicy) -> std::io::Result<()> 
     let pretty = serde_json::to_string_pretty(&root).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::Other, format!("serialize: {e}"))
     })?;
-    fs::write(&path, pretty + "\n")
+    fs::write(path, pretty + "\n")
+}
+
+/// Load the policy for `repo_root`. Missing file or missing key → the
+/// default policy. Corrupted JSON or wrong-shape value → default
+/// policy with a `tracing::warn!` so the user sees something in the
+/// dev console.
+///
+/// This is the *project-only* read — it deliberately does **not** fall
+/// back to the user-scope global file. The per-project Tool Permissions
+/// modal uses this so the toggles reflect what is actually persisted
+/// for the project (not a merged view that would confuse "what am I
+/// editing here?"). Runtime callers that want the effective policy —
+/// project overrides global, global overrides default — should use
+/// [`load_effective`] instead.
+pub fn load(repo_root: &Path) -> AutoApprovePolicy {
+    load_policy_from(&settings_path(repo_root)).unwrap_or_default()
+}
+
+/// Load the *effective* policy for `repo_root`. Resolution order:
+/// 1. `<repo>/.claude/settings.local.json` if it contains an
+///    `operonAutoApprove` key — explicit per-project choice wins.
+/// 2. Else `~/.claude/settings.json` (user-scope global).
+/// 3. Else [`AutoApprovePolicy::default`].
+///
+/// Use this from the runtime (permission-bridge handler, cascade
+/// runner, bash-via-operon dispatch). Use [`load`] from the per-project
+/// settings UI so each tier is editable in isolation.
+pub fn load_effective(repo_root: &Path) -> AutoApprovePolicy {
+    if let Some(p) = load_policy_from(&settings_path(repo_root)) {
+        return p;
+    }
+    load_global()
+}
+
+/// Persist `policy` for `repo_root`. Creates `.claude/` and the
+/// settings file if needed. Preserves any pre-existing top-level keys
+/// (notably `permissions`) — only the `operonAutoApprove` slot is
+/// touched.
+pub fn save(repo_root: &Path, policy: AutoApprovePolicy) -> std::io::Result<()> {
+    save_policy_to(&settings_path(repo_root), policy)
+}
+
+/// Load the user-scope global policy from `~/.claude/settings.json`.
+/// Missing file, absent key, or unresolvable home dir → the default
+/// policy. Used as the project-tier fallback by [`load_effective`] and
+/// read directly by the global Chat Permissions settings UI.
+pub fn load_global() -> AutoApprovePolicy {
+    global_settings_path()
+        .as_deref()
+        .and_then(load_policy_from)
+        .unwrap_or_default()
+}
+
+/// Persist `policy` to the user-scope global settings file. Creates
+/// `~/.claude/` and the file if needed. Returns an error when neither
+/// `HOME` nor `USERPROFILE` is set so the caller can surface it.
+pub fn save_global(policy: AutoApprovePolicy) -> std::io::Result<()> {
+    let path = global_settings_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no HOME or USERPROFILE env var; cannot resolve ~/.claude/settings.json",
+        )
+    })?;
+    save_policy_to(&path, policy)
 }
 
 #[cfg(test)]
@@ -356,5 +438,78 @@ mod tests {
         assert!(!p.allows(ToolCategory::Shell));
         assert!(!p.allows(ToolCategory::Network));
         assert!(!p.allows(ToolCategory::Other));
+    }
+
+    // --- Global-tier (load_policy_from / save_policy_to) ---
+    //
+    // We test the path-based helpers directly so the assertions don't
+    // race against a developer's real `~/.claude/settings.json`. The
+    // `load_global` / `save_global` wrappers are thin shims over these
+    // plus `global_settings_path` — they get exercised in manual UX
+    // tests once HOME is populated.
+
+    #[test]
+    fn save_policy_to_creates_file_and_round_trips() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("nested").join("settings.json");
+        let mut overrides = BTreeMap::new();
+        overrides.insert("Edit".into(), ToolOverride::AlwaysAllow);
+        let policy = AutoApprovePolicy {
+            read_only: false,
+            fs_write: true,
+            shell: true,
+            network: false,
+            other: false,
+            cascade_uses_auto_approve_policy: false,
+            tool_overrides: overrides,
+            bash_via_operon: false,
+        };
+        save_policy_to(&path, policy.clone()).unwrap();
+        // Parent dir auto-created.
+        assert!(path.parent().unwrap().is_dir());
+        // Round-trips through load_policy_from.
+        assert_eq!(load_policy_from(&path), Some(policy));
+    }
+
+    #[test]
+    fn save_policy_to_preserves_sibling_keys() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{ "theme": "dark", "model": "claude-opus-4-7" }"#,
+        )
+        .unwrap();
+        save_policy_to(&path, AutoApprovePolicy::default()).unwrap();
+
+        let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(v["model"], "claude-opus-4-7");
+        assert!(v.get(KEY).is_some(), "operonAutoApprove key written");
+    }
+
+    #[test]
+    fn load_policy_from_returns_none_when_key_absent() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("settings.json");
+        fs::write(&path, r#"{ "theme": "dark" }"#).unwrap();
+        // None signals "no Operon policy here" → caller can fall back.
+        assert!(load_policy_from(&path).is_none());
+    }
+
+    #[test]
+    fn load_effective_uses_project_when_key_present() {
+        // The fallback chain only descends if the project file lacks
+        // the key. With a project policy in place, the global tier
+        // (whatever HOME points at) must NOT be consulted — verified
+        // by setting a non-default project value and asserting it
+        // round-trips even if the developer has a real ~/.claude
+        // policy stored on their machine.
+        let td = TempDir::new().unwrap();
+        let mut policy = AutoApprovePolicy::default();
+        policy.shell = true;
+        policy.bash_via_operon = true;
+        save(td.path(), policy.clone()).unwrap();
+        assert_eq!(load_effective(td.path()), policy);
     }
 }

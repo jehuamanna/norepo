@@ -79,24 +79,269 @@ pub enum TranscriptItem {
 
 /// Resolve the path of the `claude` binary at startup. Tries, in order:
 /// 1. `OPERON_CLAUDE_BIN` env override.
-/// 2. `~/.local/bin/claude` — the standalone installer's standard location.
-///    Uses `is_file()` (not `exists()`-style) so a broken symlink falls
-///    through to the next candidate instead of being returned as-is.
-/// 3. Bare `"claude"` — relies on PATH, which Dioxus desktop spawns
-///    inherit from the parent shell.
+/// 2. Current `PATH` (`which`-style lookup).
+/// 3. Well-known install locations: `~/.local/bin`, `~/.npm-global/bin`,
+///    `~/.bun/bin`, `~/.cargo/bin`, every `~/.nvm/versions/node/*/bin`,
+///    `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`.
+/// 4. The user's login shell (`$SHELL -ilc …`) — the standard trick GUI
+///    launchers use to recover the user's interactive PATH on macOS/Linux.
+///    When launched from a `.desktop` file / Dock icon, the inherited
+///    PATH is stripped and misses `~/.local/bin`, nvm, asdf, brew, etc.
+///    The shell's PATH is *imported into our own process env* so children
+///    `claude` spawns (npx / uvx / node for stdio MCP servers) can find
+///    their tools too — without this, even a located `claude` binary
+///    fails to start MCP servers in GUI-launch mode.
+/// 5. Bare `"claude"` as a final fallback.
 ///
-/// Public so `provide_local_app_signals` can construct the shared
-/// `ClaudeCodeChatPlugin` instance once at App scope.
+/// Cached in a `OnceLock` so the login-shell fallback runs at most once
+/// per process. Public so `provide_local_app_signals` can construct the
+/// shared `ClaudeCodeChatPlugin` instance once at App scope.
 pub fn resolve_claude_bin() -> PathBuf {
+    static CACHED: OnceLock<PathBuf> = OnceLock::new();
+    CACHED.get_or_init(resolve_claude_bin_uncached).clone()
+}
+
+fn resolve_claude_bin_uncached() -> PathBuf {
+    let bin = resolve_claude_bin_inner();
+    write_resolve_diagnostic(&bin);
+    bin
+}
+
+/// Dump the resolution outcome to `$XDG_CACHE_HOME/operon/claude-resolve.log`
+/// (or `~/.cache/operon/...`). GUI launches typically have no console, so
+/// this is how you confirm what PATH the app actually saw — read the file
+/// after starting from the desktop icon.
+fn write_resolve_diagnostic(bin: &Path) {
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")));
+    let Some(cache) = cache else { return; };
+    let dir = cache.join("operon");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let body = format!(
+        "resolved_claude_bin: {}\nis_file: {}\nPATH: {}\nSHELL: {}\nHOME: {}\n",
+        bin.display(),
+        bin.is_file(),
+        std::env::var("PATH").unwrap_or_default(),
+        std::env::var("SHELL").unwrap_or_default(),
+        std::env::var("HOME").unwrap_or_default(),
+    );
+    let _ = std::fs::write(dir.join("claude-resolve.log"), body);
+}
+
+fn resolve_claude_bin_inner() -> PathBuf {
     if let Ok(p) = std::env::var("OPERON_CLAUDE_BIN") {
+        tracing::info!(
+            target: "operon::claude_resolve",
+            bin = %p,
+            "claude bin: OPERON_CLAUDE_BIN override",
+        );
         return PathBuf::from(p);
     }
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
-    let local = home.join(".local/bin/claude");
-    if local.is_file() {
-        return local;
+
+    // GUI launchers (`.desktop` files, macOS Dock, Finder) start the
+    // process with a stripped PATH (Linux: ~`/usr/bin:/bin`; macOS:
+    // whatever `path_helper(8)` + `/etc/paths` produces, which excludes
+    // Homebrew, nvm, asdf, `~/.local/bin`, and the rest of the user's
+    // toolchains). We unconditionally import the user's interactive PATH
+    // from `$SHELL -ilc` so:
+    //   (a) we resolve the *same* `claude` the user runs in their
+    //       terminal — avoids picking up a stale `~/.local/bin/claude`
+    //       that's installed but not actually on PATH (the screenshot
+    //       case);
+    //   (b) when `claude` spawns stdio MCP children (`npx -y …`,
+    //       `uvx …`, `node`), they inherit a PATH where those tools
+    //       are findable.
+    // Skipped when `OPERON_CLAUDE_BIN` is set — explicit override means
+    // the user has already told us exactly what to run.
+    let imported = import_login_shell_path().is_some();
+    if !imported {
+        tracing::warn!(
+            target: "operon::claude_resolve",
+            current_path = %std::env::var("PATH").unwrap_or_default(),
+            "could not import PATH from login shell — MCP children may fail to spawn",
+        );
     }
+
+    if let Some(p) = find_in_path("claude") {
+        tracing::info!(
+            target: "operon::claude_resolve",
+            bin = %p.display(),
+            "claude bin: found on PATH",
+        );
+        return p;
+    }
+    if let Some(p) = probe_known_install_locations("claude") {
+        tracing::info!(
+            target: "operon::claude_resolve",
+            bin = %p.display(),
+            "claude bin: found via well-known location probe",
+        );
+        return p;
+    }
+    if let Some(p) = discover_via_login_shell("claude") {
+        tracing::info!(
+            target: "operon::claude_resolve",
+            bin = %p.display(),
+            "claude bin: resolved via `$SHELL -ilc command -v claude`",
+        );
+        return p;
+    }
+    tracing::warn!(
+        target: "operon::claude_resolve",
+        "claude bin: no candidate found; falling back to bare \"claude\"",
+    );
     PathBuf::from("claude")
+}
+
+/// Run `$SHELL -ilc 'printf %s "$PATH"'` and merge the result into our
+/// own process PATH. Split out from `discover_via_login_shell` so we
+/// can refresh PATH eagerly even when `claude` itself was findable
+/// through a cheaper path — the imported PATH is what makes `npx`,
+/// `uvx`, and `node` findable for stdio MCP children.
+fn import_login_shell_path() -> Option<()> {
+    let shell_path = run_login_shell("printf '%s' \"$PATH\"")?;
+    if shell_path.is_empty() {
+        return None;
+    }
+    let merged = match std::env::var_os("PATH") {
+        Some(existing) => {
+            let mut all: Vec<PathBuf> = std::env::split_paths(&shell_path).collect();
+            for d in std::env::split_paths(&existing) {
+                if !all.contains(&d) {
+                    all.push(d);
+                }
+            }
+            std::env::join_paths(all).ok()
+        }
+        None => Some(std::ffi::OsString::from(&shell_path)),
+    }?;
+    std::env::set_var("PATH", &merged);
+    tracing::info!(
+        target: "operon::claude_resolve",
+        merged_path = %merged.to_string_lossy(),
+        "imported PATH from login shell",
+    );
+    Some(())
+}
+
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if cfg!(windows) {
+            for ext in ["exe", "cmd", "bat"] {
+                let mut c = candidate.clone();
+                c.set_extension(ext);
+                if c.is_file() {
+                    return Some(c);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn probe_known_install_locations(name: &str) -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var("HOME").ok()?);
+    let mut candidates: Vec<PathBuf> = vec![
+        home.join(".local/bin").join(name),
+        home.join(".npm-global/bin").join(name),
+        home.join(".bun/bin").join(name),
+        home.join(".cargo/bin").join(name),
+        PathBuf::from("/opt/homebrew/bin").join(name),
+        PathBuf::from("/usr/local/bin").join(name),
+        PathBuf::from("/usr/bin").join(name),
+    ];
+    let nvm_root = std::env::var("NVM_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home.join(".nvm"));
+    if let Ok(entries) = std::fs::read_dir(nvm_root.join("versions/node")) {
+        for entry in entries.flatten() {
+            candidates.push(entry.path().join("bin").join(name));
+        }
+    }
+    candidates.into_iter().find(|c| c.is_file())
+}
+
+/// Ask the login shell to print where `name` lives (`command -v <name>`).
+/// Used as a last-resort lookup when neither `PATH` nor the well-known
+/// install locations turned up the binary.
+fn discover_via_login_shell(name: &str) -> Option<PathBuf> {
+    let script = format!("command -v {name} 2>/dev/null");
+    let stdout = run_login_shell(&script)?;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(trimmed);
+    if p.is_file() { Some(p) } else { None }
+}
+
+/// Spawn `$SHELL -ilc <script>` and return its stdout. `-i` reads
+/// interactive rc files (`.bashrc`/`.zshrc`); `-l` reads login profile
+/// files; `-c` runs the script. Bounded by a 5s wall-clock timeout so a
+/// slow or misconfigured rc file can't hang app startup. Returns `None`
+/// on `SHELL` unset (e.g., Windows), spawn failure, timeout, or non-zero
+/// exit.
+fn run_login_shell(script: &str) -> Option<String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let shell = std::env::var("SHELL").ok()?;
+    let mut child = std::process::Command::new(&shell)
+        .args(["-ilc", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            tracing::warn!(
+                target: "operon::claude_resolve",
+                shell = %shell,
+                err = %e,
+                "could not spawn login shell",
+            );
+            e
+        })
+        .ok()?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(status)) => {
+                tracing::warn!(
+                    target: "operon::claude_resolve",
+                    shell = %shell,
+                    code = ?status.code(),
+                    "login shell exited non-zero",
+                );
+                return None;
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                tracing::warn!(
+                    target: "operon::claude_resolve",
+                    shell = %shell,
+                    "login shell timed out",
+                );
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => return None,
+        }
+    }
+
+    let mut stdout = String::new();
+    child.stdout.as_mut()?.read_to_string(&mut stdout).ok()?;
+    Some(stdout)
 }
 
 /// Locate the `operon-mcp-permission` shim that claude spawns to bridge
@@ -270,10 +515,6 @@ pub fn CompanionChat() -> Element {
     // Cleared by `flush_pending_thinking` once the run hits a non-Thinking
     // event (or finishes), at which point the merged body is persisted.
     let pending_thinking = use_signal(|| false);
-    // Visibility of the MCP settings modal — opened by the wrench button
-    // in the chat header, closed by clicking the scrim or pressing Esc.
-    let mcp_panel_open: Signal<bool> = use_signal(|| false);
-
     // Hotfix: every context lookup uses `try_consume_context` so a missing
     // provider renders a degraded (but visible) chat surface instead of
     // panicking and bringing down sibling regions of the Shell tree.
@@ -393,7 +634,13 @@ pub fn CompanionChat() -> Element {
     if let Some(mut append) = composer_append {
         let pending = append.peek().clone();
         if let Some(text) = pending {
-            if let Some(cap) = mention_link_regex().captures(&text) {
+            // M4e: iterate ALL `@[title](note:uuid)` captures so a
+            // bulk-send payload (multiple space-separated tokens
+            // in one signal write) materializes into multiple chips.
+            // Single-item payloads still work — the loop just runs
+            // once. Dedupes against `attached_notes` so re-selecting
+            // a note that's already in the tray is a no-op.
+            for cap in mention_link_regex().captures_iter(&text) {
                 if let (Some(title_m), Some(id_m)) = (cap.get(1), cap.get(2)) {
                     if let Ok(uuid) = Uuid::parse_str(id_m.as_str()) {
                         let title = title_m.as_str().to_string();
@@ -928,20 +1175,6 @@ pub fn CompanionChat() -> Element {
                             }
                         }
                     }
-                    button {
-                        r#type: "button",
-                        class: "operon-companion-mcp-button",
-                        "data-testid": "companion-mcp-toggle",
-                        title: "Manage MCP servers",
-                        onclick: {
-                            let mut mcp_panel_open = mcp_panel_open;
-                            move |_| {
-                                let cur = *mcp_panel_open.read();
-                                mcp_panel_open.set(!cur);
-                            }
-                        },
-                        "MCP"
-                    }
                     if session_running {
                         button {
                             class: "operon-companion-chat-stop",
@@ -1032,6 +1265,49 @@ pub fn CompanionChat() -> Element {
                                 .unwrap_or(crate::shell::companion_state::AskUserStatus::Pending);
                             rsx! {
                                 crate::shell::ask_user_question_card::AskUserPromptCard {
+                                    key: "{entry.id}",
+                                    entry: entry.clone(),
+                                    status: status,
+                                }
+                            }
+                        }
+                    }
+                    // M4c.7: inline note-edit proposals from
+                    // `OperonReplaceNoteRangeTool` with confirm:true.
+                    // Same surfacing model as ask_user — the bridge
+                    // tool parks a oneshot, pushes to NOTE_PROPOSALS,
+                    // and waits; the card's Accept/Reject buttons
+                    // resolve the responder via accept_/reject_
+                    // helpers in companion_state.
+                    for entry in crate::shell::companion_state::NOTE_PROPOSALS.read().iter() {
+                        {
+                            let status = crate::shell::companion_state::NOTE_PROPOSAL_DECISIONS
+                                .read()
+                                .get(&entry.id)
+                                .cloned()
+                                .unwrap_or(crate::shell::companion_state::NoteProposalStatus::Pending);
+                            rsx! {
+                                crate::shell::note_proposal_card::NoteProposalCard {
+                                    key: "{entry.id}",
+                                    entry: entry.clone(),
+                                    status: status,
+                                }
+                            }
+                        }
+                    }
+                    // Deletion-confirm cards from `delete_note`. Same
+                    // surfacing pattern as the edit-proposal card
+                    // above — separate GlobalSignal list so deletion
+                    // copy/buttons render distinctly.
+                    for entry in crate::shell::companion_state::NOTE_DELETION_PROPOSALS.read().iter() {
+                        {
+                            let status = crate::shell::companion_state::NOTE_DELETION_DECISIONS
+                                .read()
+                                .get(&entry.id)
+                                .cloned()
+                                .unwrap_or(crate::shell::companion_state::NoteProposalStatus::Pending);
+                            rsx! {
+                                crate::shell::note_deletion_card::NoteDeletionCard {
                                     key: "{entry.id}",
                                     entry: entry.clone(),
                                     status: status,
@@ -1555,9 +1831,6 @@ pub fn CompanionChat() -> Element {
                         },
                         "Send"
                     }
-                }
-                crate::shell::mcp_settings::McpSettingsPanel {
-                    open: mcp_panel_open,
                 }
             }
         }

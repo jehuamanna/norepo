@@ -341,13 +341,78 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
             .map(|c| c.0);
     if let Some(mut append_sig) = composer_append_handle {
         let title_for_chat = title.clone();
-        menu_items.push(ContextMenuItem::new(
-            "Send to chat",
-            Callback::new(move |_| {
-                let token = format!("@[{}](note:{})", title_for_chat, id);
-                append_sig.set(Some(token));
-            }),
-        ));
+        // M4e: bulk variant when 2+ notes are multi-selected. Single
+        // variant unchanged. Both feed the same CompanionComposerAppend
+        // (multi-mention consumer in companion_chat.rs:393-413) and
+        // PENDING_TERMINAL_INJECTION (drained by companion_terminal.rs).
+        if is_bulk {
+            // Snapshot the selected set + the per-project note tables
+            // so the click callback has stable data to walk. Skips
+            // NodeKey::Project entries — sending a whole project as
+            // one mention isn't meaningful (yet).
+            let selected: Vec<Uuid> = multi_selected
+                .read()
+                .iter()
+                .filter_map(|k| match k {
+                    NodeKey::Note(u) => Some(*u),
+                    _ => None,
+                })
+                .collect();
+            let notes_snapshot = notes_by_project_ctx.read().clone();
+            let label = format!("Send {} notes to Claude", selected.len());
+            menu_items.push(ContextMenuItem::new(
+                label,
+                Callback::new(move |_| {
+                    // Resolve each note's current title from the
+                    // memo'd per-project tables. Tokens are space-
+                    // separated so the chat composer's regex finds
+                    // each `@[title](note:uuid)` independently and
+                    // the terminal pane types them in one paste-like
+                    // burst at the prompt.
+                    let mut tokens: Vec<String> = Vec::with_capacity(selected.len());
+                    for note_id in selected.iter() {
+                        let title = notes_snapshot
+                            .values()
+                            .flat_map(|v| v.iter())
+                            .find(|n| n.id == *note_id)
+                            .map(|n| n.title.clone())
+                            .unwrap_or_else(|| note_id.to_string());
+                        tokens.push(format!("@[{title}](note:{note_id})"));
+                    }
+                    if tokens.is_empty() {
+                        return;
+                    }
+                    let joined = tokens.join(" ");
+                    append_sig.set(Some(joined.clone()));
+                    *crate::shell::companion_state::PENDING_TERMINAL_INJECTION.write() =
+                        Some(format!("{joined} "));
+                    let cur = *crate::shell::companion_state::EXPAND_COMPANION_TICK.peek();
+                    *crate::shell::companion_state::EXPAND_COMPANION_TICK.write() =
+                        cur.wrapping_add(1);
+                }),
+            ));
+        } else {
+            menu_items.push(ContextMenuItem::new(
+                "Send to chat",
+                Callback::new(move |_| {
+                    let token = format!("@[{}](note:{})", title_for_chat, id);
+                    append_sig.set(Some(token.clone()));
+                    // Also feed terminal-mode injection so the gesture
+                    // works regardless of which companion surface is
+                    // active (matches M4d.1's toolbar behaviour).
+                    *crate::shell::companion_state::PENDING_TERMINAL_INJECTION.write() =
+                        Some(format!("{token} "));
+                    // Bump the expand tick so a collapsed companion pops
+                    // open; matches the same gesture in
+                    // `mode_toolbar::build_send_to_claude_cluster`. Without
+                    // this the chip lands silently and the user has no
+                    // signal that anything happened.
+                    let cur = *crate::shell::companion_state::EXPAND_COMPANION_TICK.peek();
+                    *crate::shell::companion_state::EXPAND_COMPANION_TICK.write() =
+                        cur.wrapping_add(1);
+                }),
+            ));
+        }
     }
     menu_items.extend([
         ContextMenuItem::new(

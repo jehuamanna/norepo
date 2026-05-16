@@ -372,13 +372,13 @@ fn BindRepoPrompt(props: BindRepoPromptProps) -> Element {
 }
 
 #[derive(Props, Clone, PartialEq)]
-struct OverrideEditorProps {
-    policy: AutoApprovePolicy,
-    on_change: EventHandler<AutoApprovePolicy>,
+pub(crate) struct OverrideEditorProps {
+    pub policy: AutoApprovePolicy,
+    pub on_change: EventHandler<AutoApprovePolicy>,
 }
 
 #[component]
-fn OverrideEditor(props: OverrideEditorProps) -> Element {
+pub(crate) fn OverrideEditor(props: OverrideEditorProps) -> Element {
     let mut new_tool: Signal<String> = use_signal(String::new);
     let mut new_kind: Signal<String> = use_signal(|| "always_prompt".to_string());
 

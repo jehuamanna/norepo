@@ -127,7 +127,13 @@ pub fn Menubar() -> Element {
                     }
                 }
             }
-            div { class: "operon-menubar-right",
+            div {
+                class: "operon-menubar-right",
+                // `position: relative` so the help popover inside
+                // `CompanionModeToggle` can drop down anchored to this
+                // cluster (right: 0; top: 100%;) without measurement JS.
+                style: "position: relative;",
+                CompanionModeToggle {}
                 button {
                     r#type: "button",
                     class: "operon-toggle-btn",
@@ -149,6 +155,208 @@ pub fn Menubar() -> Element {
             }
         }
     }
+}
+
+/// Two-segment toggle that flips the companion pane between the
+/// Operon chat surface and the raw `claude` CLI terminal. Persists to
+/// `local_app_settings` under [`SETTINGS_KEY_COMPANION_MODE`] and
+/// bumps [`COMPANION_MODE_VERSION`] so `CompanionArea` swaps surfaces
+/// in-place. Replaces the old Settings → Companion pane radio.
+///
+/// Web build mounts nothing — the settings repo is desktop-only.
+#[cfg(not(target_arch = "wasm32"))]
+#[component]
+fn CompanionModeToggle() -> Element {
+    use crate::local_mode::desktop::LocalSettingsRepo;
+    use crate::local_mode::{
+        COMPANION_MODE_CHAT, COMPANION_MODE_CLAUDE_CODE,
+        SETTINGS_KEY_COMPANION_MODE,
+    };
+
+    let LocalSettingsRepo(settings_repo) = use_context();
+
+    // Subscribe to the version signal so any other writer (or our own
+    // click below) triggers a re-render of this scope.
+    let _ = crate::shell::companion_state::COMPANION_MODE_VERSION.read();
+    let current_mode = settings_repo
+        .get(SETTINGS_KEY_COMPANION_MODE)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| COMPANION_MODE_CHAT.to_string());
+    let is_chat = current_mode == COMPANION_MODE_CHAT;
+
+    let settings_for_chat = settings_repo.clone();
+    let settings_for_cli = settings_repo.clone();
+
+    // Disclosure state for the inline "?" help popover. Closed on
+    // mount; toggled by the `?` button, the `×` inside the popover,
+    // or Escape while the popover has focus. Outside-click dismissal
+    // is deliberately omitted in this iteration — see plan.
+    let mut help_open: Signal<bool> = use_signal(|| false);
+    let help_is_open = *help_open.read();
+
+    rsx! {
+        div {
+            class: "operon-companion-mode-toggle",
+            role: "group",
+            "aria-label": "Companion mode",
+            "data-mode": if is_chat { "chat" } else { "claude_code" },
+            "data-testid": "menubar-companion-mode-toggle",
+            style: "display: inline-flex; border: 1px solid var(--vscode-panel-border, #444); border-radius: 4px; overflow: hidden; margin-right: 8px; align-self: center; font-size: 11px; line-height: 1;",
+            button {
+                r#type: "button",
+                "data-testid": "menubar-companion-mode-chat",
+                "aria-pressed": if is_chat { "true" } else { "false" },
+                title: "Claude Code Chat — rich Operon chat surface",
+                style: format!(
+                    "padding: 3px 8px; border: none; cursor: pointer; background: {bg}; color: {fg};",
+                    bg = if is_chat {
+                        "var(--vscode-button-background, #0e639c)"
+                    } else {
+                        "transparent"
+                    },
+                    fg = if is_chat {
+                        "var(--vscode-button-foreground, #ffffff)"
+                    } else {
+                        "var(--vscode-foreground, inherit)"
+                    },
+                ),
+                onclick: move |_| {
+                    if is_chat { return; }
+                    if let Err(e) = settings_for_chat.set(
+                        SETTINGS_KEY_COMPANION_MODE,
+                        COMPANION_MODE_CHAT,
+                    ) {
+                        tracing::warn!(
+                            target: "operon::menubar",
+                            "persist companion mode (chat) failed: {e}"
+                        );
+                    }
+                    *crate::shell::companion_state::COMPANION_MODE_VERSION.write() += 1;
+                },
+                "Chat"
+            }
+            button {
+                r#type: "button",
+                "data-testid": "menubar-companion-mode-cli",
+                "aria-pressed": if is_chat { "false" } else { "true" },
+                title: "Claude Code CLI — raw upstream terminal",
+                style: format!(
+                    "padding: 3px 8px; border: none; cursor: pointer; background: {bg}; color: {fg};",
+                    bg = if !is_chat {
+                        "var(--vscode-button-background, #0e639c)"
+                    } else {
+                        "transparent"
+                    },
+                    fg = if !is_chat {
+                        "var(--vscode-button-foreground, #ffffff)"
+                    } else {
+                        "var(--vscode-foreground, inherit)"
+                    },
+                ),
+                onclick: move |_| {
+                    if !is_chat { return; }
+                    if let Err(e) = settings_for_cli.set(
+                        SETTINGS_KEY_COMPANION_MODE,
+                        COMPANION_MODE_CLAUDE_CODE,
+                    ) {
+                        tracing::warn!(
+                            target: "operon::menubar",
+                            "persist companion mode (cli) failed: {e}"
+                        );
+                    }
+                    *crate::shell::companion_state::COMPANION_MODE_VERSION.write() += 1;
+                },
+                "CLI"
+            }
+        }
+        // "?" disclosure — small icon button that opens the help
+        // popover below the menubar-right cluster. Lives outside the
+        // toggle group so its hover/focus styling doesn't get pulled
+        // into the role="group" semantics.
+        button {
+            r#type: "button",
+            "data-testid": "menubar-companion-mode-help",
+            "aria-haspopup": "dialog",
+            "aria-expanded": if help_is_open { "true" } else { "false" },
+            "aria-controls": "operon-companion-mode-help",
+            title: "What's the difference between Chat and CLI?",
+            style: "margin-right: 8px; padding: 0 6px; border: 1px solid var(--vscode-panel-border, #444); border-radius: 4px; background: transparent; color: var(--vscode-descriptionforeground, var(--vscode-foreground, inherit)); cursor: pointer; font-size: 11px; line-height: 1.6; align-self: center;",
+            onclick: move |_| { help_open.set(!help_is_open); },
+            "?"
+        }
+        if help_is_open {
+            div {
+                id: "operon-companion-mode-help",
+                role: "dialog",
+                "aria-label": "Companion mode help",
+                "data-testid": "menubar-companion-mode-help-panel",
+                tabindex: "-1",
+                onkeydown: move |evt| {
+                    if evt.key().to_string() == "Escape" {
+                        help_open.set(false);
+                    }
+                },
+                style: "position: absolute; top: 100%; right: 0; margin-top: 4px; z-index: 50; width: 520px; max-width: calc(100vw - 24px); padding: 12px 14px 14px 14px; background: var(--vscode-editorWidget-background, var(--vscode-panel-background, #1e1e1e)); color: var(--vscode-editorWidget-foreground, var(--vscode-foreground, inherit)); border: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border, #444)); border-radius: 4px; box-shadow: 0 4px 12px rgba(0,0,0,0.25); font-size: 11.5px; line-height: 1.5; text-align: left;",
+                div {
+                    style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;",
+                    div {
+                        style: "font-weight: 600; font-size: 12px;",
+                        "Companion modes"
+                    }
+                    button {
+                        r#type: "button",
+                        autofocus: true,
+                        "aria-label": "Close help",
+                        title: "Close",
+                        style: "border: none; background: transparent; color: inherit; cursor: pointer; font-size: 14px; line-height: 1; padding: 2px 6px; opacity: 0.7;",
+                        onclick: move |_| { help_open.set(false); },
+                        "\u{00d7}"
+                    }
+                }
+                div {
+                    style: "display: flex; gap: 16px; align-items: flex-start;",
+                    div {
+                        style: "flex: 1 1 0; min-width: 0;",
+                        div {
+                            style: "font-weight: 600; margin-bottom: 4px;",
+                            "Chat"
+                        }
+                        ul {
+                            style: "margin: 0; padding-left: 16px;",
+                            li { "Question picker (single / multi-select + free-text \u{201C}Other\u{201D})" }
+                            li { "Permission cards with diff preview + editable JSON" }
+                            li { "\u{201C}Allow always\u{201D} persists in one click" }
+                            li { "Note proposal / deletion cards" }
+                            li { "Auto-approve policy UI (per category + per tool)" }
+                            li { "Thinking deltas shown inline" }
+                        }
+                    }
+                    div {
+                        style: "flex: 1 1 0; min-width: 0;",
+                        div {
+                            style: "font-weight: 600; margin-bottom: 4px;",
+                            "CLI"
+                        }
+                        ul {
+                            style: "margin: 0; padding-left: 16px;",
+                            li { "Raw upstream claude TUI in xterm.js" }
+                            li { "Live Bash stdout / stderr streaming" }
+                            li { "Slash commands (/clear, /compact, /cost)" }
+                            li { "Whatever Anthropic ships next lands here first" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn CompanionModeToggle() -> Element {
+    rsx! {}
 }
 
 #[component]

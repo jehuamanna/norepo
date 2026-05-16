@@ -2,11 +2,19 @@
 //!
 //! Plans-Phase-4 hosts the Companion chat surface here. The actual chat UI lives in
 //! `companion_chat.rs`; this file owns layout/collapse semantics only.
+//!
+//! The user can swap the chat for a raw Claude Code terminal via
+//! Settings → Companion pane. We resolve the persisted choice on every
+//! render (cheap key/value read) and subscribe to
+//! [`COMPANION_MODE_VERSION`] so a toggle in Settings swaps the surface
+//! in-place without a restart.
 
 use dioxus::prelude::*;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::shell::companion_chat::CompanionChat;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::shell::companion_terminal::CompanionClaudeTerminal;
 use crate::shell::layout::LayoutState;
 
 #[component]
@@ -48,12 +56,32 @@ pub fn CompanionArea() -> Element {
     } else {
         #[cfg(not(target_arch = "wasm32"))]
         {
+            // Subscribe so a Settings toggle re-renders this scope; the
+            // returned tick value is unused beyond establishing the
+            // dependency.
+            let _ = crate::shell::companion_state::COMPANION_MODE_VERSION.read();
+            let crate::local_mode::desktop::LocalSettingsRepo(settings_repo) =
+                use_context();
+            let mode = settings_repo
+                .get(crate::local_mode::SETTINGS_KEY_COMPANION_MODE)
+                .ok()
+                .flatten()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    crate::local_mode::COMPANION_MODE_CHAT.to_string()
+                });
+            let is_terminal = mode == crate::local_mode::COMPANION_MODE_CLAUDE_CODE;
             rsx! {
                 section {
                     "data-region": "companion-area",
                     class: "operon-region operon-companion-area",
                     "data-collapsed": "false",
-                    CompanionChat {}
+                    "data-companion-mode": if is_terminal { "claude_code" } else { "chat" },
+                    if is_terminal {
+                        CompanionClaudeTerminal {}
+                    } else {
+                        CompanionChat {}
+                    }
                 }
             }
         }

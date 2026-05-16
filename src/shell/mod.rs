@@ -30,6 +30,8 @@ pub mod companion_chat;
 pub mod companion_settings;
 pub mod companion_state;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod companion_terminal;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod agent_backend_picker;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod permission_persist;
@@ -42,6 +44,8 @@ pub mod project_claude_settings;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod project_tool_permissions;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod global_chat_permissions;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod repo_permissions;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod clarification_prompt;
@@ -49,6 +53,10 @@ pub mod clarification_prompt;
 pub mod settings;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mcp_settings;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod global_mcp_settings;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod project_mcp_settings;
 #[cfg(not(target_arch = "wasm32"))]
 mod session_rail;
 #[cfg(not(target_arch = "wasm32"))]
@@ -66,6 +74,29 @@ pub mod bridge_artifact_executor;
 pub mod ask_user_question_card;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bridge_ask_user_executor;
+// M4b.5: out-of-process counterpart for terminal-mode Claude.
+// Implements `ToolHandler` from `operon-bridge`; registered by
+// `local_mode::bridge_runtime::start_bridge_runtime`. Unix-only.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+pub mod bridge_ask_user_tool;
+// M4c: read-only note tools (operon_get_note, operon_list_notes,
+// operon_search_notes). Same registration site as bridge_ask_user_tool.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+pub mod bridge_note_tools;
+// M4c.7: diff-card UI for the proposed (confirm:true) variant of
+// `replace_note_range`. Renders pending NOTE_PROPOSALS in the
+// companion chat surface, alongside AskUserPromptCard.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod note_proposal_card;
+// Companion-side confirm card for `delete_note`. Same render slot
+// as note_proposal_card but distinct copy and a smaller payload
+// (no diff to display — just title + descendant count).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod note_deletion_card;
+// M4d.4: floating note picker mounted inside the companion terminal
+// pane. Opens when the user types `@` at the claude prompt.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod terminal_mention_picker;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bridge_shell_executor;
 pub mod dropdown;

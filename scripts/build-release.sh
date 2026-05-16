@@ -135,6 +135,18 @@ EOF
   fi
 fi
 
+# --- rebuild the editor-bridge dist before cargo embeds it ---------------
+# `src/main.rs` embeds `assets/editor-bridge/dist/` via `include_dir!`. Running
+# `dx bundle` against a stale dist (or an empty one on a fresh checkout) ships
+# a binary whose `bridge://` handler can't resolve `index.js` / `monaco-*.js`,
+# so the Monaco host stays empty. `build.rs` re-emits `cargo:rerun-if-changed`
+# for every file under dist, so refreshing it here forces cargo to rebuild
+# `main.o` whenever the JS changed.
+echo "==> Rebuilding editor-bridge dist (Monaco / CodeMirror / Tiptap shim)..."
+( cd assets/editor-bridge && \
+    if command -v bun >/dev/null 2>&1; then bun run build; \
+    else npm run build; fi )
+
 # --- build the sidecar binaries ------------------------------------------
 echo "==> Building operon-mcp-permission + operon-posttool-hook (sidecars, release)..."
 cargo build --release --bin operon-mcp-permission --bin operon-posttool-hook

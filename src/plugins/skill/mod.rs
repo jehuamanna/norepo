@@ -14,7 +14,9 @@ use dioxus::prelude::*;
 use crate::plugin::{FormatCaps, FormatPlugin, PluginManifest, PluginSurface};
 
 pub mod frontmatter;
+pub mod install;
 pub mod materialize;
+pub mod seed;
 mod view;
 
 pub struct SkillFormatPlugin {

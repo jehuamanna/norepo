@@ -136,6 +136,10 @@ impl LocalNoteRepository for RelocatingNoteRepo {
         self.inner.set_blob_path(id, path)
     }
 
+    fn count_by_blob_path(&self, path: &str) -> Result<i64, StoreError> {
+        self.inner.count_by_blob_path(path)
+    }
+
     fn rename(&self, id: Uuid, title: &str) -> Result<(), StoreError> {
         let old_dir = self.canonical_dir(id);
         self.inner.rename(id, title)?;

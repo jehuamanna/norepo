@@ -129,6 +129,14 @@ pub static PROJECT_SETTINGS_VERSION: GlobalSignal<u64> = Signal::global(|| 0);
 /// scope) no project row needs its "Inherit (X)" label to refresh.
 pub static GLOBAL_SETTINGS_VERSION: GlobalSignal<u64> = Signal::global(|| 0);
 
+/// Bumped by the global Settings panel's "Companion pane" toggle when
+/// the user flips between the rich Operon chat and the raw Claude Code
+/// terminal. `CompanionArea` subscribes to this so the surface swaps
+/// in-place without restarting the app. `GlobalSignal` so the toggle
+/// (mounted inside the modal scope) and the consumer (mounted in the
+/// workspace scope) can share the value across scope-tree boundaries.
+pub static COMPANION_MODE_VERSION: GlobalSignal<u64> = Signal::global(|| 0);
+
 /// User's app-wide cascade step-mode preference. Toggled via the
 /// View menu's `cascade.toggleStepMode` command. Read by
 /// `workflow::state::effective_step_mode` after the per-graph
@@ -358,6 +366,57 @@ pub struct CompanionComposerInbox(pub Signal<Option<String>>);
 /// Keeps "send-to-chat" non-destructive over the user's draft.
 #[derive(Clone, Copy)]
 pub struct CompanionComposerAppend(pub Signal<Option<String>>);
+
+/// M4d.4: open-state for the floating note picker that the terminal
+/// pane mounts when the user types `@` at the claude prompt. `true`
+/// means render the picker; `false` means hide it. The picker reads
+/// from `LocalNoteRepo` + `LocalProjectRepo` (already in context via
+/// `provide_local_state`) to enumerate notes; on selection it writes
+/// `[Title](note:uuid) ` to `PENDING_TERMINAL_INJECTION` (no leading
+/// `@` because the user already typed the `@` that triggered the
+/// open).
+///
+/// `GlobalSignal` for the same reason as the other picker / inbox
+/// signals here — written from the terminal pane's recv loop
+/// (outside any Dioxus runtime guard until it reaches the picker
+/// component) and read by the picker.
+pub static MENTION_PICKER_OPEN: GlobalSignal<bool> = Signal::global(|| false);
+
+/// Pixel position the picker should anchor to, relative to the
+/// terminal pane's outer container. Set by the xterm bootstrap when
+/// it intercepts `@` — JS computes from `term.buffer.active.cursorX/Y`
+/// + cell dimensions measured off `term.element.getBoundingClientRect()`.
+///
+/// `None` means "fall back to the docked default" (top-left of the
+/// pane) — used when the JS measurement fails (no `term` yet, or
+/// `getBoundingClientRect` returned zero dims during a relayout).
+/// The picker reads this and emits inline `style="top:Ypx; left:Xpx"`
+/// when present.
+pub static MENTION_PICKER_POS: GlobalSignal<Option<(f64, f64)>> =
+    Signal::global(|| None);
+
+/// M4d.1: terminal-mode counterpart to `CompanionComposerAppend`.
+///
+/// When the user clicks "Send to Claude" (or, in future iterations,
+/// drags or pastes a note reference) and the companion is in
+/// terminal mode, the gesture-handler writes a mention token here.
+/// The currently-mounted `ClaudeRepoTerminal` reads the signal on
+/// each render, writes the token (plus a space) into its PTY
+/// writer, and resets to `None`.
+///
+/// Why a `GlobalSignal`: the toolbar lives in the main-area tree,
+/// while the terminal pane lives in the companion-area tree. A
+/// shared context-provided `Signal<Option<String>>` would work too,
+/// but `GlobalSignal` matches the pattern the chat-side append
+/// signal uses for a similar pub-sub flow.
+///
+/// Why a separate signal (not "also write to CompanionComposerAppend"):
+/// chat-mode's append consumer turns the token into a chip in the
+/// composer's attached-notes tray — silent without a tray to mount
+/// into. Terminal mode wants the token actually typed at the
+/// claude prompt so the user can edit or submit it.
+pub static PENDING_TERMINAL_INJECTION: GlobalSignal<Option<String>> =
+    Signal::global(|| None);
 
 /// Snapshot of MCP servers + tools as reported by claude's `system/init`
 /// event on the most recent turn. The MCP settings panel reads this to
@@ -919,6 +978,120 @@ pub fn push_permission_prompt(entry: PermissionPromptEntry) {
     push_permission_prompt_with_status(entry, PermissionStatus::Pending);
 }
 
+// =================================================================
+// Thread-safe UI dispatch
+//
+// The chat-mode permission_bridge handler and the in-process
+// BridgeAskUserExecutor both run on tokio tasks spawned WITHOUT the
+// Dioxus runtime guard (the bridge's `tokio::spawn` accept loop
+// doesn't inherit the per-task guard that `dioxus::prelude::spawn`
+// installs). Writing `PERMISSION_PROMPTS` / `ASK_USER_PROMPTS`
+// directly from those tasks panics with "Must be called from inside
+// a Dioxus runtime", which silently kills the task (the panic is
+// caught by tokio's JoinHandle but the parked oneshot responder is
+// dropped — claude sees a hung MCP call and the user sees a tool
+// stuck on RUNNING with no permission card to click).
+//
+// Fix: a process-global mpsc channel. The Dioxus side installs the
+// drain task at app boot via `init_chat_ui_dispatch`; any thread can
+// `dispatch_push_permission_prompt(...)` / `dispatch_push_ask_user_prompt(...)`
+// without caring about runtime guards. The drain task is spawned
+// from a Dioxus component so it inherits the guard and the writes
+// succeed.
+//
+// Why not the existing `BridgeUiSender` from `local_mode::bridge_runtime`:
+// that channel is tied to the operon-bridge OS thread and only
+// initialized when `provide_bridge_runtime` runs (Local mode only).
+// The chat plugin's permission_bridge runs in every mode and spins
+// up later in the chat lifecycle, so it needs an always-available
+// dispatcher that lives at companion-state scope.
+// =================================================================
+
+/// Variants for the thread-safe chat-UI dispatcher. Each variant maps
+/// 1:1 to a function that needs a Dioxus runtime guard to run safely.
+#[cfg(not(target_arch = "wasm32"))]
+pub enum ChatUiCommand {
+    PushPermissionPrompt(PermissionPromptEntry, PermissionStatus),
+    PushAskUserPrompt(AskUserPromptEntry),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+static CHAT_UI_DISPATCH: std::sync::OnceLock<
+    tokio::sync::mpsc::UnboundedSender<ChatUiCommand>,
+> = std::sync::OnceLock::new();
+
+/// Install the global chat-UI dispatcher. Call once at app boot from
+/// a Dioxus component scope, then spawn `drain_chat_ui_commands` on
+/// the Dioxus runtime so the receiver runs with the runtime guard.
+/// Subsequent calls are silently ignored — the first sender wins.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn init_chat_ui_dispatch() -> tokio::sync::mpsc::UnboundedReceiver<ChatUiCommand> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let _ = CHAT_UI_DISPATCH.set(tx);
+    rx
+}
+
+/// Apply one [`ChatUiCommand`] to the underlying GlobalSignals.
+/// MUST be called from a Dioxus runtime guard (the drain task
+/// satisfies this).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn apply_chat_ui_command(cmd: ChatUiCommand) {
+    match cmd {
+        ChatUiCommand::PushPermissionPrompt(entry, status) => {
+            push_permission_prompt_with_status(entry, status);
+        }
+        ChatUiCommand::PushAskUserPrompt(entry) => {
+            push_ask_user_prompt(entry);
+        }
+    }
+}
+
+/// Thread-safe replacement for direct `push_permission_prompt` calls
+/// from bridge handlers. Falls back to a direct write if the
+/// dispatcher hasn't been initialised yet (which only happens during
+/// early app boot, before any MCP server can connect — defensive).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn dispatch_push_permission_prompt(
+    entry: PermissionPromptEntry,
+    status: PermissionStatus,
+) {
+    if let Some(tx) = CHAT_UI_DISPATCH.get() {
+        match tx.send(ChatUiCommand::PushPermissionPrompt(entry, status)) {
+            Ok(()) => return,
+            Err(tokio::sync::mpsc::error::SendError(cmd)) => {
+                // Drain task gone — fall through to a direct write
+                // using the recovered values.
+                if let ChatUiCommand::PushPermissionPrompt(entry, status) = cmd {
+                    push_permission_prompt_with_status(entry, status);
+                }
+                return;
+            }
+        }
+    }
+    // Dispatcher never initialised — direct write (only safe under a
+    // Dioxus runtime guard; will panic otherwise).
+    push_permission_prompt_with_status(entry, status);
+}
+
+/// Thread-safe replacement for direct `push_ask_user_prompt` calls
+/// from in-process bridge handlers. See [`dispatch_push_permission_prompt`]
+/// for the rationale.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn dispatch_push_ask_user_prompt(entry: AskUserPromptEntry) {
+    if let Some(tx) = CHAT_UI_DISPATCH.get() {
+        match tx.send(ChatUiCommand::PushAskUserPrompt(entry)) {
+            Ok(()) => return,
+            Err(tokio::sync::mpsc::error::SendError(cmd)) => {
+                if let ChatUiCommand::PushAskUserPrompt(entry) = cmd {
+                    push_ask_user_prompt(entry);
+                }
+                return;
+            }
+        }
+    }
+    push_ask_user_prompt(entry);
+}
+
 /// One pending or already-resolved `ask_user` picker rendered inline
 /// in any active companion chat. Mirrors [`PermissionPromptEntry`] but
 /// carries the typed question schema instead of a tool-name + input
@@ -1374,7 +1547,7 @@ pub async fn ensure_session_bridge_with_ctx(
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
             let category = crate::shell::tool_category::of(&req.tool_name);
-            let policy = crate::shell::auto_approve::load(&cwd_for_handler);
+            let policy = crate::shell::auto_approve::load_effective(&cwd_for_handler);
             // Pattern key for per-tool overrides like `Bash(git push *)`
             // — for Bash we synthesise a claude-style rule shape from
             // the input so a single override entry matches all
@@ -1387,7 +1560,7 @@ pub async fn ensure_session_bridge_with_ctx(
             // can see what flowed through.
             if policy.auto_approve_for(&req.tool_name, pattern_key.as_deref(), category) {
                 let _ = respond.send(PermissionDecision::Allow { updated_input: None });
-                push_permission_prompt_with_status(
+                dispatch_push_permission_prompt(
                     PermissionPromptEntry {
                         id,
                         tool_name: req.tool_name,
@@ -1403,16 +1576,19 @@ pub async fn ensure_session_bridge_with_ctx(
                 return;
             }
             park_permission_responder(id.clone(), respond);
-            push_permission_prompt(PermissionPromptEntry {
-                id,
-                tool_name: req.tool_name,
-                input: req.input,
-                source_session: Some(session_id),
-                source_cwd: Some(cwd_for_handler.clone()),
-                category,
-                created_at: std::time::SystemTime::now(),
-                backend_id: "claude-code".to_string(),
-            });
+            dispatch_push_permission_prompt(
+                PermissionPromptEntry {
+                    id,
+                    tool_name: req.tool_name,
+                    input: req.input,
+                    source_session: Some(session_id),
+                    source_cwd: Some(cwd_for_handler.clone()),
+                    category,
+                    created_at: std::time::SystemTime::now(),
+                    backend_id: "claude-code".to_string(),
+                },
+                PermissionStatus::Pending,
+            );
         };
 
         let bridge = PermissionBridge::bind(socket, handler).await?;
@@ -1423,7 +1599,7 @@ pub async fn ensure_session_bridge_with_ctx(
         // then advertises `mcp__operon__operon_bash` in tools/list
         // and routes claude's bash invocations through it
         // (streaming + cancellable).
-        let bash_via_operon = crate::shell::auto_approve::load(&cwd).bash_via_operon;
+        let bash_via_operon = crate::shell::auto_approve::load_effective(&cwd).bash_via_operon;
         if bash_via_operon {
             bridge.set_shell_executor(Some(std::sync::Arc::new(
                 crate::shell::bridge_shell_executor::BridgeShellExecutor::new(),
@@ -1466,6 +1642,287 @@ pub async fn ensure_session_bridge_with_ctx(
     .map(|_| ())
 }
 
+// ============================================================
+// Note-edit proposals (M4c.7 — diff-card confirm flow)
+//
+// Backing state for `OperonReplaceNoteRangeTool` when invoked with
+// `confirm: true`. The tool computes the proposed body, parks a
+// one-shot responder, pushes a `NoteProposalEntry` here, and awaits.
+// The user's Accept/Reject click in the companion chat surface
+// resolves the responder; the tool then either persists the change
+// or returns an error.
+//
+// Same shape as the ask-user infra above (responder map +
+// pending-entry vec + status map). Kept separate so its eviction
+// policy and rendering can evolve independently.
+// ============================================================
+
+#[cfg(not(target_arch = "wasm32"))]
+mod note_proposal_responders {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use tokio::sync::oneshot;
+
+    static MAP: OnceLock<Mutex<HashMap<String, oneshot::Sender<bool>>>> = OnceLock::new();
+
+    fn cell() -> &'static Mutex<HashMap<String, oneshot::Sender<bool>>> {
+        MAP.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub fn insert(id: String, responder: oneshot::Sender<bool>) {
+        if let Ok(mut m) = cell().lock() {
+            m.insert(id, responder);
+        }
+    }
+
+    pub fn take(id: &str) -> Option<oneshot::Sender<bool>> {
+        cell().lock().ok().and_then(|mut m| m.remove(id))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn park_note_proposal_responder(
+    proposal_id: String,
+    responder: tokio::sync::oneshot::Sender<bool>,
+) {
+    note_proposal_responders::insert(proposal_id, responder);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn take_note_proposal_responder(
+    proposal_id: &str,
+) -> Option<tokio::sync::oneshot::Sender<bool>> {
+    note_proposal_responders::take(proposal_id)
+}
+
+/// One pending or already-resolved note-edit proposal. The card
+/// renders the pre-computed `diff_preview` (unified-diff text) so
+/// the user can decide without a round-trip to the model. `old_body`
+/// + `new_body` are kept too in case a future card wants to render
+/// a richer side-by-side or syntax-highlighted diff.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NoteProposalEntry {
+    /// Per-proposal id (UUID v4 string). Distinct from `note_id`
+    /// because a single note can have multiple pending proposals
+    /// queued from sequential tool calls.
+    pub id: String,
+    pub note_id: Uuid,
+    /// Cached at proposal time for the card header. The live title
+    /// could have been renamed in the meantime; the cached value is
+    /// what Claude saw, which is what the user reviewing the diff
+    /// should also see.
+    pub note_title: String,
+    pub old_body: String,
+    pub new_body: String,
+    pub diff_preview: String,
+    pub source_session: Option<Uuid>,
+    pub created_at: std::time::SystemTime,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NoteProposalStatus {
+    Pending,
+    Accepted,
+    Rejected,
+}
+
+/// Reactive status map for proposals. Card buttons read this to
+/// switch between Pending (interactive) and resolved-render modes.
+pub static NOTE_PROPOSAL_DECISIONS: GlobalSignal<HashMap<String, NoteProposalStatus>> =
+    Signal::global(HashMap::new);
+
+/// All proposals seen so far. Same rendering model as
+/// `ASK_USER_PROMPTS`: the active companion chat renders every
+/// pending entry regardless of which session triggered it.
+#[cfg(not(target_arch = "wasm32"))]
+pub static NOTE_PROPOSALS: GlobalSignal<Vec<NoteProposalEntry>> = Signal::global(Vec::new);
+
+/// Soft cap on `NOTE_PROPOSALS`. Edit proposals are paced by user
+/// review, so this cap is more about catching runaway bugs than
+/// throttling normal usage.
+pub const NOTE_PROPOSALS_CAP: usize = 200;
+
+/// Append a proposal and seed its status to Pending. Mirrors
+/// `push_ask_user_prompt` — same FIFO eviction policy that never
+/// drops a Pending entry (it owns a parked responder).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn push_note_proposal(entry: NoteProposalEntry) {
+    NOTE_PROPOSAL_DECISIONS
+        .write()
+        .insert(entry.id.clone(), NoteProposalStatus::Pending);
+    NOTE_PROPOSALS.with_mut(|list| {
+        list.push(entry);
+        if list.len() > NOTE_PROPOSALS_CAP {
+            let decisions = NOTE_PROPOSAL_DECISIONS.read().clone();
+            while list.len() > NOTE_PROPOSALS_CAP {
+                let pos = list.iter().position(|e| {
+                    !matches!(
+                        decisions.get(&e.id).cloned().unwrap_or(NoteProposalStatus::Pending),
+                        NoteProposalStatus::Pending
+                    )
+                });
+                match pos {
+                    Some(i) => {
+                        list.remove(i);
+                    }
+                    None => break,
+                }
+            }
+        }
+    });
+}
+
+/// User clicked Accept on a proposal card. Resolves the responder
+/// with `true` so the tool's await wakes up and persists the change.
+/// Second call for the same id is a no-op (the responder is taken).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn accept_note_proposal(proposal_id: &str) {
+    if let Some(responder) = take_note_proposal_responder(proposal_id) {
+        let _ = responder.send(true);
+        NOTE_PROPOSAL_DECISIONS
+            .write()
+            .insert(proposal_id.to_string(), NoteProposalStatus::Accepted);
+    }
+}
+
+/// User clicked Reject. Resolves with `false`; the tool returns an
+/// error so Claude knows to back off / try a different edit.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn reject_note_proposal(proposal_id: &str) {
+    if let Some(responder) = take_note_proposal_responder(proposal_id) {
+        let _ = responder.send(false);
+        NOTE_PROPOSAL_DECISIONS
+            .write()
+            .insert(proposal_id.to_string(), NoteProposalStatus::Rejected);
+    }
+}
+
+// ============================================================
+// Note-deletion proposals (delete_note confirm card)
+// ============================================================
+//
+// Same shape as the edit-proposal trio above but separate state so
+// the deletion card UI can render distinctly (different copy, no
+// diff preview — just title + descendant count). The responder map
+// lives in its own OnceLock so accept/reject for deletions can't
+// accidentally collide with edit-proposal ids.
+
+#[cfg(not(target_arch = "wasm32"))]
+mod note_deletion_responders {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use tokio::sync::oneshot;
+
+    static MAP: OnceLock<Mutex<HashMap<String, oneshot::Sender<bool>>>> = OnceLock::new();
+
+    fn cell() -> &'static Mutex<HashMap<String, oneshot::Sender<bool>>> {
+        MAP.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub fn insert(id: String, responder: oneshot::Sender<bool>) {
+        if let Ok(mut m) = cell().lock() {
+            m.insert(id, responder);
+        }
+    }
+
+    pub fn take(id: &str) -> Option<oneshot::Sender<bool>> {
+        cell().lock().ok().and_then(|mut m| m.remove(id))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn park_note_deletion_responder(
+    proposal_id: String,
+    responder: tokio::sync::oneshot::Sender<bool>,
+) {
+    note_deletion_responders::insert(proposal_id, responder);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn take_note_deletion_responder(
+    proposal_id: &str,
+) -> Option<tokio::sync::oneshot::Sender<bool>> {
+    note_deletion_responders::take(proposal_id)
+}
+
+/// One pending deletion proposal. Captures just enough for the
+/// confirm card: the note id, its title at proposal time, and how
+/// many descendants would also be removed (`note_repo.delete`
+/// cascades children via the foreign-key constraint).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoteDeletionProposalEntry {
+    pub id: String,
+    pub note_id: Uuid,
+    pub note_title: String,
+    pub descendant_count: usize,
+    pub source_session: Option<Uuid>,
+    pub created_at: std::time::SystemTime,
+}
+
+/// Reactive status map for deletion proposals; same Pending /
+/// Accepted / Rejected vocabulary as edit proposals so the card
+/// component can switch render modes the same way.
+pub static NOTE_DELETION_DECISIONS: GlobalSignal<HashMap<String, NoteProposalStatus>> =
+    Signal::global(HashMap::new);
+
+#[cfg(not(target_arch = "wasm32"))]
+pub static NOTE_DELETION_PROPOSALS: GlobalSignal<Vec<NoteDeletionProposalEntry>> =
+    Signal::global(Vec::new);
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn push_note_deletion_proposal(entry: NoteDeletionProposalEntry) {
+    NOTE_DELETION_DECISIONS
+        .write()
+        .insert(entry.id.clone(), NoteProposalStatus::Pending);
+    NOTE_DELETION_PROPOSALS.with_mut(|list| {
+        list.push(entry);
+        // Reuse the edit-proposal cap; deletions are even rarer.
+        if list.len() > NOTE_PROPOSALS_CAP {
+            let decisions = NOTE_DELETION_DECISIONS.read().clone();
+            while list.len() > NOTE_PROPOSALS_CAP {
+                let pos = list.iter().position(|e| {
+                    !matches!(
+                        decisions
+                            .get(&e.id)
+                            .cloned()
+                            .unwrap_or(NoteProposalStatus::Pending),
+                        NoteProposalStatus::Pending
+                    )
+                });
+                match pos {
+                    Some(i) => {
+                        list.remove(i);
+                    }
+                    None => break,
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn accept_note_deletion(proposal_id: &str) {
+    if let Some(responder) = take_note_deletion_responder(proposal_id) {
+        let _ = responder.send(true);
+        NOTE_DELETION_DECISIONS
+            .write()
+            .insert(proposal_id.to_string(), NoteProposalStatus::Accepted);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn reject_note_deletion(proposal_id: &str) {
+    if let Some(responder) = take_note_deletion_responder(proposal_id) {
+        let _ = responder.send(false);
+        NOTE_DELETION_DECISIONS
+            .write()
+            .insert(proposal_id.to_string(), NoteProposalStatus::Rejected);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1483,6 +1940,29 @@ mod tests {
         }
         let dom = VirtualDom::new(app);
         dom.in_runtime(f);
+    }
+
+    /// Load-bearing documentation for M4c.9 (the
+    /// `BridgeUiCommand` channel). This test asserts the constraint
+    /// that motivated the channel: writing a `GlobalSignal` from a
+    /// thread that never had a Dioxus runtime guard installed
+    /// **panics**, even though `GlobalSignal::write` looks like a
+    /// plain `Mutex`-style API.
+    ///
+    /// If Dioxus ever loosens this requirement, this test will start
+    /// failing — at which point the channel layer in
+    /// `local_mode::bridge_runtime` becomes optional, not required.
+    /// Keep this test green as a guardrail; the channel is an
+    /// implementation cost we only pay because of this constraint.
+    #[test]
+    #[should_panic(expected = "Must be called from inside a Dioxus runtime")]
+    fn global_signal_write_from_thread_without_dioxus_runtime_panics() {
+        // We deliberately do NOT wrap this in `with_runtime` — the
+        // whole point is to probe what happens with no runtime guard.
+        // A bare main-thread write triggers the same panic the
+        // bridge thread would: Dioxus's GlobalSignal write path
+        // calls `Runtime::current().expect(...)` internally.
+        *LOCAL_NOTE_VERSION.write() = LOCAL_NOTE_VERSION.read().saturating_add(1);
     }
 
     #[test]

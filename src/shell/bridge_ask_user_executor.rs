@@ -41,7 +41,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::shell::companion_state::{
-    park_ask_user_responder, push_ask_user_prompt, AskUserPromptEntry,
+    dispatch_push_ask_user_prompt, park_ask_user_responder, AskUserPromptEntry,
 };
 
 pub struct BridgeAskUserExecutor {
@@ -92,7 +92,7 @@ async fn ask_inner(
     let (tx, rx) = oneshot::channel::<Option<Value>>();
     park_ask_user_responder(prompt_id.clone(), tx);
 
-    push_ask_user_prompt(AskUserPromptEntry {
+    dispatch_push_ask_user_prompt(AskUserPromptEntry {
         id: prompt_id.clone(),
         questions: questions.clone(),
         source_session: Some(session_id),

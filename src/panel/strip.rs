@@ -3,6 +3,8 @@
 use dioxus::prelude::*;
 
 use super::{LogsView, PanelManager, PanelTabId, ProblemsView};
+#[cfg(not(target_arch = "wasm32"))]
+use super::TerminalsView;
 use crate::shell::layout::LayoutState;
 
 #[component]
@@ -31,6 +33,14 @@ pub fn PanelStrip() -> Element {
     let body: Element = match active.0 {
         "logs" => rsx! { LogsView {} },
         "problems" => rsx! { ProblemsView {} },
+        #[cfg(not(target_arch = "wasm32"))]
+        "terminal" => rsx! { TerminalsView {} },
+        #[cfg(target_arch = "wasm32")]
+        "terminal" => rsx! {
+            div { class: "operon-panel-empty",
+                "Terminal is only available on the desktop build."
+            }
+        },
         _ => rsx! {
             div { class: "operon-panel-empty",
                 "No content yet for this tab."

@@ -7,6 +7,21 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod desktop;
+// In-tree MCP bridge: lets the PTY-hosted `claude` (and, in M4b.5,
+// chat-mode Claude) call back into the GUI process. Unix-only — uses
+// unix-domain sockets. The module is `#![cfg(all(unix, ...))]` so on
+// Windows the symbol simply isn't there and the consuming code is
+// `#[cfg]`-gated to match.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+pub mod bridge_runtime;
+
+/// Cross-target wasm/Windows no-op so `App` can call
+/// `provide_bridge_runtime()` unconditionally. The real
+/// implementation lives in [`desktop::provide_bridge_runtime`] and
+/// is re-exported through `pub use desktop::*` above on unix-desktop
+/// targets; this stub fills in everywhere else.
+#[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+pub fn provide_bridge_runtime() {}
 #[cfg(not(target_arch = "wasm32"))]
 pub mod editor;
 #[cfg(not(target_arch = "wasm32"))]
@@ -85,3 +100,12 @@ pub const SETTINGS_KEY_CLAUDE_DEFAULT_MODEL: &str = "claude.default_model";
 /// `bypassPermissions`); empty string means "(default)".
 pub const SETTINGS_KEY_CLAUDE_DEFAULT_PERMISSION_MODE: &str =
     "claude.default_permission_mode";
+
+/// Companion-pane surface selection: `chat` (default — the rich Operon
+/// chat UI driven by `ClaudeCodeChatPlugin`) vs `claude_code` (a raw
+/// PTY-backed terminal that runs the `claude` CLI directly so users
+/// see the upstream TUI). Read by `CompanionArea` to decide which
+/// component to mount; written by the global Settings panel toggle.
+pub const SETTINGS_KEY_COMPANION_MODE: &str = "companion.mode";
+pub const COMPANION_MODE_CHAT: &str = "chat";
+pub const COMPANION_MODE_CLAUDE_CODE: &str = "claude_code";

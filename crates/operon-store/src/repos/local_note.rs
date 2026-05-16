@@ -261,6 +261,16 @@ pub trait LocalNoteRepository: Send + Sync {
     /// note's image blob. Pass `None` to clear.
     fn set_blob_path(&self, id: Uuid, path: Option<&str>) -> Result<(), StoreError>;
 
+    /// Count `local_note` rows whose `blob_path` exactly equals
+    /// `path`. Used by the bridge's blob-GC pass after image-note
+    /// deletes — the same content-addressed blob may also be
+    /// referenced from `local_attachments`, so both repos contribute
+    /// to the refcount. Required (not default) so any wrapper
+    /// (notably `RelocatingNoteRepo`) is forced to forward — a
+    /// default returning 0 would silently cause false-positive
+    /// blob deletions when wrappers forgot to override.
+    fn count_by_blob_path(&self, path: &str) -> Result<i64, StoreError>;
+
     fn rename(&self, id: Uuid, title: &str) -> Result<(), StoreError>;
     fn delete(&self, id: Uuid) -> Result<(), StoreError>;
     fn touch_updated(&self, id: Uuid) -> Result<(), StoreError>;
@@ -705,6 +715,16 @@ impl LocalNoteRepository for SqliteLocalNoteRepository {
             return Err(StoreError::NotFound);
         }
         Ok(())
+    }
+
+    fn count_by_blob_path(&self, path: &str) -> Result<i64, StoreError> {
+        let conn = self.store.conn()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM local_note WHERE blob_path = ?1",
+            params![path],
+            |row| row.get(0),
+        )?;
+        Ok(count)
     }
 
     fn delete(&self, id: Uuid) -> Result<(), StoreError> {

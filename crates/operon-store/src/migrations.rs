@@ -108,6 +108,15 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "021_local_note_kind_ce",
         include_str!("../migrations/021_local_note_kind_ce.sql"),
     ),
+    // Version 22 deliberately skipped — the removed `local_note_revision`
+    // dev migration owned that slot at one point; any local DB recording
+    // version 22 from that prior branch must not silently re-run new SQL
+    // under the same number. See the comment on `migrate_up`.
+    (
+        23,
+        "023_local_attachments",
+        include_str!("../migrations/023_local_attachments.sql"),
+    ),
 ];
 
 fn ensure_migrations_table(conn: &Connection) -> Result<(), StoreError> {
@@ -196,6 +205,7 @@ pub fn migrate_down_all(conn: &mut Connection) -> Result<(), StoreError> {
         "chat_session",
         "local_app_settings",
         "local_tree_state",
+        "local_attachments",
         "local_note_link",
         "local_note",
         "local_project",

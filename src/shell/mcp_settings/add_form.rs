@@ -12,6 +12,18 @@ use crate::shell::permission_persist::{append_allow_rule, mcp_wildcard_rule};
 #[derive(Props, Clone, PartialEq)]
 pub struct AddFormProps {
     pub initial_scope: Scope,
+    /// When true, the scope picker is hidden and writes are pinned to
+    /// `initial_scope`. Used by the scope-locked panel modes (Global /
+    /// Project) so the user can't accidentally write to a different
+    /// tier than the panel claims to manage.
+    #[props(default = false)]
+    pub lock_scope: bool,
+    /// Working directory passed to `claude mcp add`. When `None`, falls
+    /// back to the active repo path from context. Project-scope writes
+    /// MUST set this to the project's repo so `.mcp.json` lands in the
+    /// right place; global writes leave it `None`.
+    #[props(default)]
+    pub cwd_override: Option<std::path::PathBuf>,
     /// Fired when the form closes. `Some(msg)` → reload + toast; `None`
     /// → cancelled.
     pub on_done: EventHandler<Option<String>>,
@@ -31,6 +43,20 @@ enum InputMode {
 pub fn AddForm(props: AddFormProps) -> Element {
     let McpServiceCtx(service) = use_context();
     let ActiveRepoPath(active_repo) = use_context();
+    let cwd_override = props.cwd_override.clone();
+    let lock_scope = props.lock_scope;
+    // Resolve `cwd` once per render: an explicit override (the panel
+    // is scope-locked to a specific project) wins, else fall through
+    // to the active repo from chat context for legacy callers.
+    let resolve_cwd = {
+        let cwd_override = cwd_override.clone();
+        let active_repo = active_repo;
+        move || -> Option<std::path::PathBuf> {
+            cwd_override
+                .clone()
+                .or_else(|| active_repo.read().clone())
+        }
+    };
 
     let mut mode: Signal<InputMode> = use_signal(|| InputMode::Form);
     let mut scope: Signal<Scope> = use_signal(|| props.initial_scope);
@@ -97,7 +123,7 @@ pub fn AddForm(props: AddFormProps) -> Element {
                     let service = service.clone();
                     let on_done = on_done;
                     let saved_name = args.name.clone();
-                    let cwd = active_repo.read().clone();
+                    let cwd = resolve_cwd();
                     let allow_after_add = *auto_allow.read();
                     submitting.set(true);
                     spawn(async move {
@@ -150,7 +176,7 @@ pub fn AddForm(props: AddFormProps) -> Element {
                     };
                     let service = service.clone();
                     let on_done = on_done;
-                    let cwd = active_repo.read().clone();
+                    let cwd = resolve_cwd();
                     let chosen_scope = *scope.read();
                     let allow_after_add = *auto_allow.read();
                     submitting.set(true);
@@ -260,21 +286,23 @@ pub fn AddForm(props: AddFormProps) -> Element {
                     "JSON file"
                 }
             }
-            div { class: "operon-mcp-form-row",
-                label { class: "operon-modal-label", "Scope" }
-                select {
-                    class: "operon-modal-input",
-                    "data-testid": "mcp-add-scope",
-                    onchange: move |e| {
-                        scope.set(match e.value().as_str() {
-                            "user" => Scope::User,
-                            "project" => Scope::Project,
-                            _ => Scope::Local,
-                        });
-                    },
-                    option { value: "local", selected: matches!(*scope.read(), Scope::Local), "{Scope::Local.label()}" }
-                    option { value: "user", selected: matches!(*scope.read(), Scope::User), "{Scope::User.label()}" }
-                    option { value: "project", selected: matches!(*scope.read(), Scope::Project), "{Scope::Project.label()}" }
+            if !lock_scope {
+                div { class: "operon-mcp-form-row",
+                    label { class: "operon-modal-label", "Scope" }
+                    select {
+                        class: "operon-modal-input",
+                        "data-testid": "mcp-add-scope",
+                        onchange: move |e| {
+                            scope.set(match e.value().as_str() {
+                                "user" => Scope::User,
+                                "project" => Scope::Project,
+                                _ => Scope::Local,
+                            });
+                        },
+                        option { value: "local", selected: matches!(*scope.read(), Scope::Local), "{Scope::Local.label()}" }
+                        option { value: "user", selected: matches!(*scope.read(), Scope::User), "{Scope::User.label()}" }
+                        option { value: "project", selected: matches!(*scope.read(), Scope::Project), "{Scope::Project.label()}" }
+                    }
                 }
             }
             if !is_json {

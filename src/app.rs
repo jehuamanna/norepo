@@ -15,7 +15,7 @@ use crate::local_mode::VaultDirPicker;
 use crate::local_mode::StartupChooser;
 use crate::log::LogBuffer;
 use crate::log_info;
-use crate::panel::PanelManager;
+use crate::panel::{PanelManager, TerminalsManager};
 use crate::persistence::{MemoryPersistence, Persistence};
 use crate::plugin::{register_builtins, PluginContext, PluginRegistry};
 use crate::rbag::state::{AppState, Mode};
@@ -151,6 +151,69 @@ pub fn App() -> Element {
         )
     });
 
+    // App-scope target for the per-project MCP servers modal. Set to
+    // Some(project_id) by the project row's context-menu entry; cleared
+    // by the modal's close paths. Desktop-only because configuration is
+    // written into `<repo>/.mcp.json` via the `claude mcp` CLI.
+    #[cfg(not(target_arch = "wasm32"))]
+    let project_mcp_settings_target: Signal<Option<uuid::Uuid>> = use_signal(|| None);
+    #[cfg(not(target_arch = "wasm32"))]
+    use_context_provider(|| {
+        crate::shell::project_mcp_settings::ProjectMcpSettingsTarget(
+            project_mcp_settings_target,
+        )
+    });
+
+    // App-scope visibility for the global (user-scope) MCP servers
+    // modal. Flipped by the Settings dialog button.
+    #[cfg(not(target_arch = "wasm32"))]
+    let global_mcp_settings_open: Signal<bool> = use_signal(|| false);
+    #[cfg(not(target_arch = "wasm32"))]
+    use_context_provider(|| {
+        crate::shell::global_mcp_settings::GlobalMcpSettingsOpen(global_mcp_settings_open)
+    });
+
+    // App-scope visibility for the global Chat Permissions modal.
+    // Flipped by the Settings dialog button. Desktop-only because the
+    // policy is persisted to `~/.claude/settings.json` on the local
+    // filesystem.
+    #[cfg(not(target_arch = "wasm32"))]
+    let global_chat_permissions_open: Signal<bool> = use_signal(|| false);
+    #[cfg(not(target_arch = "wasm32"))]
+    use_context_provider(|| {
+        crate::shell::global_chat_permissions::GlobalChatPermissionsOpen(
+            global_chat_permissions_open,
+        )
+    });
+
+    // App-scope MCP service. Has to live up here (not inside
+    // `Workspace`) because the `GlobalMcpSettingsPanelHost` and
+    // `ProjectMcpSettingsPanelHost` are siblings of `Workspace` in
+    // the App rsx — same comment as `AboutDialog` for "modal floats
+    // above StartupChooser AND Workspace alike." The panels' inner
+    // `McpSettingsPanel` reads `McpServiceCtx` via `use_context`,
+    // which would panic if the provider lived only in Workspace.
+    #[cfg(not(target_arch = "wasm32"))]
+    use_context_provider(|| {
+        let claude_bin = crate::shell::companion_chat::resolve_claude_bin();
+        crate::shell::mcp_settings::McpServiceCtx(std::sync::Arc::new(
+            crate::shell::mcp_settings::McpService::new(claude_bin),
+        ))
+    });
+
+    // App-scope `ActiveRepoPath`. Same reason as `McpServiceCtx`
+    // above — the `AddForm` and `ServerCard` rendered by the
+    // sibling MCP panel hosts read it via `use_context()`. The
+    // signal is mutated from inside `Workspace` (its `use_effect`
+    // mirrors the explorer's selected project), but the *cell* is
+    // created here so both subtrees see the same one.
+    #[cfg(not(target_arch = "wasm32"))]
+    let active_repo_path: Signal<Option<std::path::PathBuf>> = use_signal(|| None);
+    #[cfg(not(target_arch = "wasm32"))]
+    use_context_provider(|| {
+        crate::shell::companion_state::ActiveRepoPath(active_repo_path)
+    });
+
     // App-scope visibility for the queued-permissions drawer. Toggled
     // by the activity-bar badge; component overlays the app shell.
     #[cfg(not(target_arch = "wasm32"))]
@@ -246,6 +309,11 @@ pub fn App() -> Element {
 
     let panel: Signal<PanelManager> = use_signal(PanelManager::new);
     use_context_provider(|| panel);
+
+    // Terminal panel tabs. Cross-platform descriptor list; the PTY
+    // side is native-only and reads this from context.
+    let terminals: Signal<TerminalsManager> = use_signal(TerminalsManager::new);
+    use_context_provider(|| terminals);
 
     let layout: Signal<LayoutState> = use_signal(LayoutState::load_or_default);
     use_context_provider(|| layout);
@@ -364,6 +432,9 @@ pub fn App() -> Element {
         RepoPermissionsPanelHost {}
         ProjectClaudeSettingsPanelHost {}
         ProjectToolPermissionsPanelHost {}
+        GlobalChatPermissionsPanelHost {}
+        GlobalMcpSettingsPanelHost {}
+        ProjectMcpSettingsPanelHost {}
         PermissionDrawerHost {}
     }
 }
@@ -406,6 +477,48 @@ fn ProjectToolPermissionsPanelHost() -> Element {
     #[cfg(not(target_arch = "wasm32"))]
     {
         rsx! { crate::shell::project_tool_permissions::ProjectToolPermissionsPanel {} }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        rsx! {}
+    }
+}
+
+/// Global Chat Permissions modal host. Desktop-only because the policy
+/// is persisted to `~/.claude/settings.json` on the local filesystem.
+#[component]
+fn GlobalChatPermissionsPanelHost() -> Element {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        rsx! { crate::shell::global_chat_permissions::GlobalChatPermissionsPanel {} }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        rsx! {}
+    }
+}
+
+/// Global (user-scope) MCP servers modal host. Desktop-only because
+/// the underlying `claude mcp` CLI is unavailable in the wasm sandbox.
+#[component]
+fn GlobalMcpSettingsPanelHost() -> Element {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        rsx! { crate::shell::global_mcp_settings::GlobalMcpSettingsPanel {} }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        rsx! {}
+    }
+}
+
+/// Per-project MCP servers modal host. Desktop-only — project-scope
+/// configuration writes to `<repo>/.mcp.json` on disk.
+#[component]
+fn ProjectMcpSettingsPanelHost() -> Element {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        rsx! { crate::shell::project_mcp_settings::ProjectMcpSettingsPanel {} }
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -482,6 +595,32 @@ fn Workspace() -> Element {
     let scheduler = SaveScheduler::new(persistence.clone());
     use_context_provider(|| persistence);
     use_context_provider(|| scheduler);
+
+    // Chat-UI dispatcher: route GlobalSignal mutations from non-
+    // Dioxus tokio tasks (the permission_bridge handler closure, the
+    // in-process ask_user executor) through a single drain task that
+    // runs under the Dioxus runtime guard. Without this, those tasks
+    // panic on `PERMISSION_PROMPTS.write()` / `ASK_USER_PROMPTS.write()`
+    // and the parked responders silently leak — the user sees a
+    // tool stuck on RUNNING with no permission card to click.
+    // See `companion_state::ChatUiCommand` for the contract.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let rx = crate::shell::companion_state::init_chat_ui_dispatch();
+        use_hook(move || {
+            let mut rx = rx;
+            dioxus::prelude::spawn(async move {
+                while let Some(cmd) = rx.recv().await {
+                    crate::shell::companion_state::apply_chat_ui_command(cmd);
+                }
+            });
+        });
+    }
+
+    // M4c.0: bring up the in-tree MCP bridge. Must be after the
+    // persistence provider above — bridge tools (operon_get_note
+    // etc.) read note bodies through it.
+    crate::local_mode::provide_bridge_runtime();
 
     use_context_provider(|| {
         let mut registry = PluginRegistry::new();

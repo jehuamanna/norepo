@@ -1,0 +1,32 @@
+[package]
+name = "operon-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Operon bridge server + operon-mcp stdio stub. Lets Claude Code (running in the companion terminal or chat) call back into the Operon GUI process over a unix-domain socket."
+
+[lib]
+path = "src/lib.rs"
+
+# operon-mcp: the stdio MCP stub that Claude spawns. Reads
+# OPERON_BRIDGE_SOCK + OPERON_BRIDGE_TOKEN from env, opens the socket,
+# performs the hello handshake, then pipes stdio frames ↔ socket
+# frames so Claude (which only speaks stdio MCP) can reach the
+# in-process server we host in the GUI.
+[[bin]]
+name = "operon-mcp"
+path = "src/bin/operon_mcp.rs"
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(unix)'.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "fs"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "net", "sync", "time", "fs", "signal"] }
+tempfile = "3"

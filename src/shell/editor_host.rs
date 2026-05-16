@@ -258,6 +258,21 @@ pub fn MonacoEditorHost(
                         }});
                         window.__operon_monaco_handles = window.__operon_monaco_handles || {{}};
                         window.__operon_monaco_handles['{host_id}'] = handle;
+                        // M4d-selection: track the currently-focused
+                        // editor so the "Send selection" toolbar
+                        // button knows which handle to snapshot. We
+                        // listen at the host element level + use
+                        // capture phase so we catch focus regardless
+                        // of which inner element (textarea,
+                        // viewlines, etc.) Monaco actually focuses.
+                        // Also set on initial mount — first paint
+                        // counts as "active" until the user clicks
+                        // elsewhere.
+                        const markActive = () => {{
+                            window.__operon_active_monaco_id = '{host_id}';
+                        }};
+                        try {{ target.addEventListener('focusin', markActive, true); }} catch (_) {{}}
+                        markActive();
                         // Suppress change events fired by programmatic
                         // setContent so Rust doesn't see its own write
                         // bounce back as user input.
@@ -543,6 +558,13 @@ pub fn MonacoEditorHost(
                                     window.removeEventListener("keydown", onKey, true);
                                     handle.dispose();
                                     delete window.__operon_monaco_handles['{host_id}'];
+                                    // M4d-selection: clear the
+                                    // active-id pointer if we owned
+                                    // it, so the toolbar doesn't try
+                                    // to snapshot a freed handle.
+                                    if (window.__operon_active_monaco_id === '{host_id}') {{
+                                        window.__operon_active_monaco_id = null;
+                                    }}
                                     return;
                             }}
                         }}

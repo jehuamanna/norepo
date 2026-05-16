@@ -76,6 +76,15 @@ pub(crate) struct PluginState {
     /// the flag and let claude pick its own default. Set from the
     /// companion toolbar's permission picker.
     pub permission_mode: Option<String>,
+    /// Extra MCP server entries merged into the per-spawn
+    /// `.mcp.json` alongside the permission_bridge's `operon` entry.
+    /// Shape: `{"<server_name>": {<server_config>}, ...}` — same
+    /// nested-map shape as `.mcp.json`'s `mcpServers` field. Set by
+    /// the GUI via [`ClaudeCodeChatPlugin::set_extra_mcp_servers`]
+    /// to surface tools from the in-tree operon-bridge (note CRUD,
+    /// etc.) in chat-mode claude. `None` = legacy behaviour
+    /// (permission_bridge only).
+    pub extra_mcp_servers: Option<serde_json::Value>,
 }
 
 #[derive(Clone)]
@@ -228,6 +237,21 @@ impl ClaudeCodeChatPlugin {
 
     /// Override the model id forwarded as `--model` on subsequent turns.
     /// Pass `None` to fall back to the `ClaudeCodeConfig.model` default.
+    /// Inject extra MCP server entries (e.g. operon-bridge's
+    /// `operon_notes`) into the chat-mode spawn's `.mcp.json`. The
+    /// value must be a JSON object whose keys are server names and
+    /// whose values are MCP server configs — same shape as the
+    /// `mcpServers` field of `.mcp.json`. Pass `None` to clear.
+    ///
+    /// Called once at app boot from
+    /// `local_mode::desktop::provide_local_app_signals` after the
+    /// bridge runtime is up; per-spawn merging happens in
+    /// `spawn_turn` below.
+    pub fn set_extra_mcp_servers(&self, extra: Option<serde_json::Value>) {
+        let mut s = self.state.lock().expect("plugin state mutex poisoned");
+        s.extra_mcp_servers = extra;
+    }
+
     pub fn set_default_model(&self, model: Option<String>) {
         let mut s = self.state.lock().expect("plugin state mutex poisoned");
         s.default_model = model;
@@ -492,15 +516,62 @@ impl ClaudeCodeChatPlugin {
         // questions instead, which is fine but loses the picker UX.
         // Kept as a single short paragraph so it's cheap to pay the
         // cache cost on every turn.
-        cmd.arg("--append-system-prompt").arg(
-            "When you want to ask the user a clarifying question with structured options, \
+        //
+        // When the GUI has wired the operon-bridge into chat mode
+        // via `set_extra_mcp_servers`, also list the note tools so
+        // the model proactively reaches for them instead of asking
+        // the user to enumerate / create notes manually. We detect
+        // this by inspecting `extra_mcp_servers` — same source the
+        // mcp-config merge above reads.
+        let extra_has_notes = {
+            let s = self.state.lock().expect("plugin state mutex poisoned");
+            s.extra_mcp_servers
+                .as_ref()
+                .and_then(|v| v.as_object())
+                .map(|m| m.contains_key("operon_notes"))
+                .unwrap_or(false)
+        };
+        let base_prompt = "When you want to ask the user a clarifying question with structured options, \
              call the `mcp__operon__ask_user` MCP tool. Its input schema mirrors the built-in \
              AskUserQuestion verbatim (a `questions` array of \
              `{question, header, multiSelect, options:[{label, description}]}`), and the \
              response will be `{questions, answers}` where `answers` maps each question to \
              the chosen option label (string for single-select, array for multiSelect). \
-             The built-in AskUserQuestion is disabled in this environment — do not call it.",
-        );
+             The built-in AskUserQuestion is disabled in this environment — do not call it.";
+        let notes_prompt = if extra_has_notes {
+            "\n\nOperon notes (the user's vault) are exposed via `mcp__operon_notes__*` tools: \
+             `list_projects`, `get_note`, `list_notes`, `list_recent_notes`, `search_notes`, \
+             `crawl_note_graph`, `create_note`, `append_note`, `replace_note_range`, \
+             `rename_note`, `delete_note`, `reorder_note`, `move_note`, `open_note`, \
+             `get_vault_info`, `create_image_note`, `attach_image_to_note`, \
+             `list_attachments`, `delete_attachment`. Note bodies referenced in this turn via \
+             `@[Title](note:<uuid>)` mentions are already inlined below as \
+             `--- referenced note ---` blocks — you do NOT need to call `get_note` for those. \
+             \
+             Usage hints: \
+             - Call `list_projects` FIRST when the user mentions a project by name — every \
+               other tool that takes `project_id` needs one of these ids. \
+             - Use `search_notes` with `in_content: true` when titles alone wouldn't find a \
+               match (e.g. \"find where I wrote about X\"); default title-only is cheaper. \
+             - Use `list_recent_notes` for \"what did I work on recently / yesterday / this week\". \
+             - Use `crawl_note_graph` (with `direction: out|in|both`) for tree-shaped questions \
+               like \"everything connected to this note\" — ONE call with cycle detection \
+               instead of looping `get_note` + `search_notes` per link. \
+             - `delete_note` ALWAYS shows a confirmation card to the user — it's blocking; \
+               just call it and wait. \
+             - When the user pastes a screenshot: pick `create_image_note` (standalone vault \
+               entry) or `attach_image_to_note` (pinned to an existing note as a sidecar). \
+               Pass the bytes base64-encoded as `image_base64` along with `mime_type` \
+               (image/png etc.). Both return an `embed_markdown` field you can paste into \
+               another note's body via `replace_note_range`. Practical size limit is ~600 KB \
+               pre-base64. Use `list_attachments` to see what's pinned to a note; \
+               `delete_attachment` to drop one. \
+             - `open_note` focuses a note tab in the editor so the user can see what you're \
+               talking about — useful after edits."
+        } else {
+            ""
+        };
+        cmd.arg("--append-system-prompt").arg(format!("{base_prompt}{notes_prompt}"));
 
         // Wire the inline-permission-prompt MCP tool when a session has
         // a `PermissionBridge` attached AND the runtime knows where the
@@ -530,33 +601,83 @@ impl ClaudeCodeChatPlugin {
                  --bin operon-mcp-permission` or set OPERON_MCP_PERMISSION_BIN."
             );
         }
+        // Build the per-spawn `mcpServers` map. Two sources contribute:
+        //
+        // 1. When `bridge_active`, the permission_bridge's `operon` entry
+        //    (shim binary + socket) is added; we also tag the spawn with
+        //    `--permission-prompt-tool` so claude routes gated tool calls
+        //    through the bridge.
+        // 2. The extras the GUI set via `set_extra_mcp_servers` — most
+        //    importantly the in-tree `operon_notes` server that fronts
+        //    every `mcp__operon_notes__*` tool (create_note, list_notes,
+        //    search_notes, …). These are independent of the permission
+        //    bridge: in `bypassPermissions` mode, or when the shim binary
+        //    is missing, the bridge entry is skipped but the extras still
+        //    need to ship — otherwise chat-mode claude can't see any of
+        //    the operon note tools and silently falls back to plain Bash.
+        let extras_snapshot = {
+            let s = self.state.lock().expect("plugin state mutex poisoned");
+            s.extra_mcp_servers.clone()
+        };
+        let mut servers_map = serde_json::Map::new();
         if bridge_active {
-            // Both checked above — unwraps are infallible here.
             let shim = self.cfg.shim_bin.as_ref().expect("shim_bin");
             let socket = bridge.as_ref().expect("bridge").socket_path().to_path_buf();
+            if let Some(bridge_servers) = build_mcp_config(shim, &socket)
+                .get("mcpServers")
+                .and_then(|v| v.as_object())
+            {
+                for (k, v) in bridge_servers {
+                    servers_map.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        if let Some(extra_obj) = extras_snapshot.as_ref().and_then(|v| v.as_object()) {
+            for (k, v) in extra_obj {
+                servers_map.insert(k.clone(), v.clone());
+            }
+        }
+        if !servers_map.is_empty() {
             match tempfile::Builder::new()
                 .prefix("operon-mcp-")
                 .suffix(".json")
                 .tempfile()
             {
                 Ok(mut f) => {
-                    let cfg_json = build_mcp_config(shim, &socket).to_string();
+                    let server_names: Vec<String> = servers_map.keys().cloned().collect();
+                    let cfg_value = serde_json::json!({
+                        "mcpServers": serde_json::Value::Object(servers_map),
+                    });
+                    let cfg_json = cfg_value.to_string();
                     use std::io::Write;
                     if let Err(e) = f.write_all(cfg_json.as_bytes()) {
                         tracing::warn!(
                             target: "operon::permission",
-                            "write mcp config tempfile: {e}; skipping prompt-tool wiring"
+                            "write mcp config tempfile: {e}; skipping mcp-config wiring"
                         );
                     } else {
+                        tracing::info!(
+                            target: "operon::claude_spawn",
+                            config = %f.path().display(),
+                            servers = ?server_names,
+                            bridge_active,
+                            "wrote per-spawn mcp config"
+                        );
+                        tracing::debug!(
+                            target: "operon::claude_spawn",
+                            "mcp config body: {cfg_json}"
+                        );
                         cmd.arg("--mcp-config").arg(f.path());
-                        cmd.arg("--permission-prompt-tool")
-                            .arg(permission_prompt_tool_arg());
+                        if bridge_active {
+                            cmd.arg("--permission-prompt-tool")
+                                .arg(permission_prompt_tool_arg());
+                        }
                         mcp_config_keepalive = Some(f);
                     }
                 }
                 Err(e) => tracing::warn!(
                     target: "operon::permission",
-                    "create mcp config tempfile: {e}; skipping prompt-tool wiring"
+                    "create mcp config tempfile: {e}; skipping mcp-config wiring"
                 ),
             }
         }

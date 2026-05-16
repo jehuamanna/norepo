@@ -11,6 +11,12 @@ use crate::shell::mcp_settings::{McpDetails, McpEntry, McpServiceCtx, Scope};
 #[derive(Props, Clone, PartialEq)]
 pub struct ServerCardProps {
     pub entry: McpEntry,
+    /// Working directory for `claude mcp get`/`remove`. When `None`,
+    /// falls back to the active repo from context (legacy callers).
+    /// Project-scope panels MUST set this to the project's repo so
+    /// `mcp get` resolves the right `.mcp.json`.
+    #[props(default)]
+    pub cwd_override: Option<std::path::PathBuf>,
     /// Live MCP server roster reported by the most recent
     /// `system/init`. Empty if the chat session hasn't started yet.
     pub live_servers: Vec<McpServerStatus>,
@@ -28,6 +34,16 @@ pub struct ServerCardProps {
 pub fn ServerCard(props: ServerCardProps) -> Element {
     let McpServiceCtx(service) = use_context();
     let ActiveRepoPath(active_repo) = use_context();
+    let cwd_override = props.cwd_override.clone();
+    let resolve_cwd = {
+        let cwd_override = cwd_override.clone();
+        let active_repo = active_repo;
+        move || -> Option<std::path::PathBuf> {
+            cwd_override
+                .clone()
+                .or_else(|| active_repo.read().clone())
+        }
+    };
     let mut details: Signal<DetailState> = use_signal(|| DetailState::Hidden);
     let mut tools_open: Signal<bool> = use_signal(|| false);
     let confirm_remove: Signal<bool> = use_signal(|| false);
@@ -59,8 +75,8 @@ pub fn ServerCard(props: ServerCardProps) -> Element {
     let (dot_class, status_label) = compute_indicator(&entry, live_status.as_ref());
 
     // Scope chip + directory hint. For Local/Project the directory is
-    // the cwd that owns the config (active repo); User is global.
-    let cwd_for_scope = active_repo.read().clone();
+    // the cwd that owns the config; User is global.
+    let cwd_for_scope = resolve_cwd();
     let (scope_chip_class, scope_chip_label, scope_dir): (&'static str, String, Option<String>) =
         match entry.scope {
             Some(Scope::User) => (
@@ -98,6 +114,7 @@ pub fn ServerCard(props: ServerCardProps) -> Element {
     let toggle_details = {
         let service = service.clone();
         let name = entry_for_load.name.clone();
+        let resolve_cwd = resolve_cwd.clone();
         move |_| {
             let cur = details.read().clone();
             match cur {
@@ -105,7 +122,7 @@ pub fn ServerCard(props: ServerCardProps) -> Element {
                     details.set(DetailState::Loading);
                     let service = service.clone();
                     let name = name.clone();
-                    let cwd = active_repo.read().clone();
+                    let cwd = resolve_cwd();
                     spawn(async move {
                         match service.get(&name, cwd.as_deref()).await {
                             Ok(d) => details.set(DetailState::Shown(d)),
@@ -136,10 +153,11 @@ pub fn ServerCard(props: ServerCardProps) -> Element {
         let service = service.clone();
         let name = entry_for_remove.name.clone();
         let on_changed = props.on_changed;
+        let resolve_cwd = resolve_cwd.clone();
         move |_| {
             let service = service.clone();
             let name = name.clone();
-            let cwd = active_repo.read().clone();
+            let cwd = resolve_cwd();
             removing.set(true);
             remove_err.set(None);
             spawn(async move {

@@ -116,6 +116,65 @@ pub fn write_image(
     })
 }
 
+/// Refcount-based GC: for each `candidate_relative_paths`, check
+/// both `local_note(blob_path)` and `local_attachments(blob_path)`;
+/// when both return 0 the blob on disk is orphaned and gets
+/// unlinked. Returns the number of files actually removed.
+///
+/// Intended call site: the bridge's `delete_attachment` and
+/// `delete_note` tools after the SQL deletes commit. Candidate
+/// paths are whatever blob_paths the deleted rows referenced
+/// (snapshotted before the delete since the rows themselves are
+/// then gone).
+///
+/// Eager because the alternative — a background sweep at app
+/// startup — leaks disk between launches. The cost is O(candidates)
+/// SELECT COUNTs per delete, which is bounded and small in
+/// practice (one attachment delete → one path; one note delete →
+/// the subtree's blob_path set).
+///
+/// Errors during individual unlinks are logged and skipped, not
+/// returned — a permission glitch on one blob shouldn't undo the
+/// whole tool's SQL delete. The function returns Ok with the count
+/// of successfully removed files.
+pub fn gc_unreferenced_blobs(
+    vault: &VaultRoot,
+    candidate_relative_paths: &[String],
+    note_count_by_blob: &dyn Fn(&str) -> i64,
+    attachment_count_by_blob: &dyn Fn(&str) -> i64,
+) -> usize {
+    let mut deleted = 0usize;
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for rel in candidate_relative_paths {
+        if !seen.insert(rel.as_str()) {
+            continue; // dedupe within the same call
+        }
+        let n_refs = note_count_by_blob(rel);
+        let a_refs = attachment_count_by_blob(rel);
+        if n_refs > 0 || a_refs > 0 {
+            continue;
+        }
+        let abs = vault.path().join(rel);
+        if !abs.exists() {
+            // Already gone (e.g. user removed it out-of-band); not
+            // a failure. Don't count it as deleted-by-us.
+            continue;
+        }
+        match fs::remove_file(&abs) {
+            Ok(()) => deleted += 1,
+            Err(e) => {
+                tracing::warn!(
+                    target: "operon::images",
+                    error = %e,
+                    path = %abs.display(),
+                    "gc_unreferenced_blobs: failed to unlink orphaned blob",
+                );
+            }
+        }
+    }
+    deleted
+}
+
 /// Read bytes back for a given relative blob path.
 pub fn read_image(vault: &VaultRoot, relative: &Path) -> Result<Vec<u8>, ImageErr> {
     let abs = vault.path().join(relative);

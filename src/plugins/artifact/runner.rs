@@ -640,7 +640,7 @@ pub async fn run_skill_on_source_with_revision_notes(
     //    watchdog in `cascade.rs` keeps a hung cascade from running
     //    forever waiting on a missed approval.
     let cascade_honors_policy =
-        crate::shell::auto_approve::load(&repo_path).cascade_uses_auto_approve_policy;
+        crate::shell::auto_approve::load_effective(&repo_path).cascade_uses_auto_approve_policy;
     if !cascade_honors_policy {
         plugin.set_session_permission_mode(chat_session_id, Some("acceptEdits".into()));
     } else {

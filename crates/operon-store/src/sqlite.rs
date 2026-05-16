@@ -59,6 +59,12 @@ fn pragmas(conn: &mut Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // With pool size > 1 in local mode, two transactions can race for
+    // the writer lock. Without busy_timeout, the loser gets SQLITE_BUSY
+    // immediately and the caller has to retry. 5 s is enough to ride
+    // out the normal cases (a tab autosave + a bridge tool overlap, an
+    // FTS rebuild) without papering over a real deadlock.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     Ok(())
 }
 
@@ -72,7 +78,15 @@ impl Store {
         .with_init(|c| pragmas(c));
 
         let pool_size = match (cfg.mode, &cfg.path) {
-            (StoreMode::Local, _) => 1,
+            // Local mode used to be 1 conn — fine when only the GUI
+            // thread reached for the DB. The in-tree MCP bridge runs on
+            // its own OS thread (and dispatches each tool call onto
+            // tokio's blocking pool), so a single-conn pool now serializes
+            // every bridge call behind whatever the GUI is doing and vice
+            // versa. WAL allows N readers + 1 writer concurrently, so
+            // bumping to 4 lets the bridge and the GUI make progress in
+            // parallel without changing the writer-exclusivity contract.
+            (StoreMode::Local, _) => 4,
             (_, StorePath::Memory) => 1,
             (StoreMode::NonLocal, _) => 8,
         };

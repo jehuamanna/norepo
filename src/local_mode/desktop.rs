@@ -12,8 +12,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use dioxus::prelude::*;
 use operon_store::repos::{
-    LocalNoteLinkRepository, LocalNoteRepository, LocalProjectRepository, LocalSearchRepository,
-    LocalSettingsRepository, LocalTreeStateRepository, LocalUserRepository, NoteKind,
+    LocalAttachmentRepository, LocalNoteLinkRepository, LocalNoteRepository,
+    LocalProjectRepository, LocalSearchRepository, LocalSettingsRepository,
+    LocalTreeStateRepository, LocalUserRepository, NoteKind, SqliteLocalAttachmentRepository,
     SqliteLocalNoteLinkRepository, SqliteLocalNoteRepository, SqliteLocalProjectRepository,
     SqliteLocalSearchRepository, SqliteLocalSettingsRepository, SqliteLocalTreeStateRepository,
     SqliteLocalUserRepository,
@@ -78,6 +79,8 @@ pub fn LocalStateProvider(children: Element) -> Element {
     > = Arc::new(operon_store::repos::SqliteChatMessageRepository::new(
         store.clone(),
     ));
+    let attachment_repo: Arc<dyn LocalAttachmentRepository> =
+        Arc::new(SqliteLocalAttachmentRepository::new(store.clone()));
     let search_repo: Arc<dyn LocalSearchRepository> =
         Arc::new(SqliteLocalSearchRepository::new(store));
     use_context_provider(|| LocalUserRepo(user_repo));
@@ -86,6 +89,7 @@ pub fn LocalStateProvider(children: Element) -> Element {
     use_context_provider(|| LocalNoteRepo(note_repo));
     use_context_provider(|| LocalTreeStateRepo(tree_repo));
     use_context_provider(|| LocalNoteLinkRepo(link_repo));
+    use_context_provider(|| LocalAttachmentRepo(attachment_repo));
     use_context_provider(|| ExplorerSearchRepo(search_repo));
     use_context_provider(|| crate::shell::companion_state::ChatSessionRepo(chat_session_repo));
     use_context_provider(|| crate::shell::companion_state::ChatMessageRepo(chat_message_repo));
@@ -113,6 +117,17 @@ pub struct LocalTreeStateRepo(pub Arc<dyn LocalTreeStateRepository>);
 /// rebuild and rename propagation read/write through this.
 #[derive(Clone)]
 pub struct LocalNoteLinkRepo(pub Arc<dyn LocalNoteLinkRepository>);
+
+/// Per-note attachment metadata repo. Image notes use it indirectly
+/// (their blob lives at `<vault>/.operon/images/<sha>.<ext>` via
+/// content-addressing); attachments proper — files/screenshots
+/// pinned to an existing note — round-trip through this repo.
+/// Bridge MCP tools `list_attachments` / `delete_attachment` /
+/// `attach_image_to_note` consume it. Backed by `local_attachments`
+/// (FK'd to `local_note(id)`), distinct from the cloud `attachments`
+/// table that the multi-tenant code path uses.
+#[derive(Clone)]
+pub struct LocalAttachmentRepo(pub Arc<dyn LocalAttachmentRepository>);
 
 /// App-scope signal: gear → settings panel toggle. Lives at App scope so the
 /// ActivityBar gear (rendered inside Cloud `Shell`) and the overlay can share it.
@@ -175,6 +190,8 @@ pub fn provide_local_state() {
     > = Arc::new(operon_store::repos::SqliteChatMessageRepository::new(
         store.clone(),
     ));
+    let attachment_repo: Arc<dyn LocalAttachmentRepository> =
+        Arc::new(SqliteLocalAttachmentRepository::new(store.clone()));
     let search_repo: Arc<dyn LocalSearchRepository> =
         Arc::new(SqliteLocalSearchRepository::new(store));
     use_context_provider(|| LocalUserRepo(user_repo));
@@ -183,10 +200,150 @@ pub fn provide_local_state() {
     use_context_provider(|| LocalNoteRepo(note_repo));
     use_context_provider(|| LocalTreeStateRepo(tree_repo));
     use_context_provider(|| LocalNoteLinkRepo(link_repo));
+    use_context_provider(|| LocalAttachmentRepo(attachment_repo));
     use_context_provider(|| ExplorerSearchRepo(search_repo));
     use_context_provider(|| crate::shell::companion_state::ChatSessionRepo(chat_session_repo));
     use_context_provider(|| crate::shell::companion_state::ChatMessageRepo(chat_message_repo));
 }
+
+/// Bring up the in-tree MCP bridge once at app start and publish its
+/// handle via [`crate::local_mode::bridge_runtime::BridgeContext`].
+/// Must be called AFTER both [`provide_local_state`] (for the note +
+/// project repos) and `App`'s `provide_persistence` (registers the
+/// persistence layer); `App` invokes this right after the persistence
+/// `use_context_provider`.
+///
+/// `use_hook` makes it run exactly once per render-scope. Drop on
+/// app shutdown signals the bridge thread to unlink its socket.
+///
+/// Failures are non-fatal: log and skip context registration so the
+/// GUI still boots. Tool-using surfaces (companion_terminal env
+/// injection, future chat-mode tools) are guarded on
+/// `try_consume_context::<BridgeContext>()`.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+pub fn provide_bridge_runtime() {
+    use crate::local_mode::bridge_runtime::{
+        apply_bridge_ui_command, make_ui_channel, start_bridge_runtime, BridgeContext,
+        BridgeRepos,
+    };
+
+    // Pull every dependency out of context BEFORE the use_hook
+    // closure so the closure captures plain Arcs by move and we
+    // never re-fetch on subsequent renders (use_hook caches its
+    // result). LocalNoteRepo + Persistence are required (missing one
+    // is a programmer error in app boot order); LocalProjectRepo is
+    // optional.
+    let note_repo: Arc<dyn LocalNoteRepository> =
+        try_consume_context::<LocalNoteRepo>()
+            .map(|c| c.0)
+            .expect(
+                "provide_bridge_runtime: LocalNoteRepo missing — call \
+                 provide_local_state() first",
+            );
+    let persistence: Arc<dyn crate::persistence::Persistence> = use_context();
+    let project_repo: Option<Arc<dyn LocalProjectRepository>> =
+        try_consume_context::<LocalProjectRepo>().map(|c| c.0);
+    // LocalNoteLinkRepo is registered by `provide_local_state` (same
+    // place LocalNoteRepo lives) and consumed elsewhere already (the
+    // backlinks pane, the editor's save pipeline). Required for the
+    // `crawl_note_graph` MCP tool — every real boot path has it.
+    let link_repo: Arc<dyn LocalNoteLinkRepository> =
+        try_consume_context::<LocalNoteLinkRepo>()
+            .map(|c| c.0)
+            .expect(
+                "provide_bridge_runtime: LocalNoteLinkRepo missing — call \
+                 provide_local_state() first",
+            );
+    // Both registered by `provide_local_state` / `LocalStateProvider`.
+    // Attachment repo is required by the image + attachment tools;
+    // search repo is required when `search_notes` is called with
+    // `in_content: true`.
+    let attachment_repo: Arc<dyn LocalAttachmentRepository> =
+        try_consume_context::<LocalAttachmentRepo>()
+            .map(|c| c.0)
+            .expect(
+                "provide_bridge_runtime: LocalAttachmentRepo missing — call \
+                 provide_local_state() first",
+            );
+    let search_repo: Arc<dyn LocalSearchRepository> =
+        try_consume_context::<crate::local_mode::explorer::ExplorerSearchRepo>()
+            .map(|c| c.0)
+            .expect(
+                "provide_bridge_runtime: ExplorerSearchRepo missing — call \
+                 provide_local_state() first",
+            );
+    // Snapshot the vault root at bridge-startup time. The
+    // CurrentVaultRoot signal is the live source of truth; vault
+    // rebinds require a GUI restart in practice, so taking a one-
+    // time snapshot is fine and saves us a Signal::peek per image
+    // tool call. `None` is benign — the image tools and
+    // get_vault_info return helpful errors when it's absent.
+    let vault_root_snapshot: Option<crate::local_mode::vault::VaultRoot> =
+        try_consume_context::<CurrentVaultRoot>()
+            .and_then(|CurrentVaultRoot(sig)| sig.peek().clone());
+
+    // M4c.9: create the UI-command channel here so the sender can
+    // live in every tool's `BridgeRepos` and the receiver can be
+    // drained on the Dioxus side (which has the runtime guard
+    // GlobalSignal writes require). Bridge tools post commands
+    // instead of touching GlobalSignals directly — proved necessary
+    // by the `global_signal_write_from_thread_without_dioxus_runtime`
+    // test in `companion_state::tests`.
+    let (ui, ui_rx) = make_ui_channel();
+
+    let repos = BridgeRepos {
+        note_repo,
+        persistence,
+        project_repo,
+        link_repo,
+        attachment_repo,
+        search_repo,
+        vault_root: vault_root_snapshot,
+        ui,
+    };
+
+    let bridge: Option<Arc<crate::local_mode::bridge_runtime::BridgeRuntime>> =
+        use_hook(move || match start_bridge_runtime(repos) {
+            Ok(rt) => Some(Arc::new(rt)),
+            Err(e) => {
+                tracing::error!(
+                    target: "operon::bridge",
+                    error = %e,
+                    "bridge startup failed; companion bridge features disabled"
+                );
+                None
+            }
+        });
+    if let Some(rt) = bridge {
+        use_context_provider(move || BridgeContext(rt.clone()));
+
+        // Drain task. `use_hook` runs the closure exactly once per
+        // scope; we kick off the drainer via `dioxus::prelude::spawn`
+        // so it inherits the Dioxus runtime guard — which is exactly
+        // what makes `apply_bridge_ui_command` legal (it writes
+        // GlobalSignals). The task lives until the receiver yields
+        // None (= every sender dropped, which happens at app
+        // shutdown when the bridge thread and tools tear down).
+        use_hook(move || {
+            let mut rx = ui_rx;
+            spawn(async move {
+                while let Some(cmd) = rx.recv().await {
+                    apply_bridge_ui_command(cmd);
+                }
+                tracing::info!(
+                    target: "operon::bridge",
+                    "UI command drain task exiting (all senders dropped)"
+                );
+            });
+        });
+    }
+}
+
+// Non-unix-desktop and wasm fallback lives in `local_mode/mod.rs`
+// (a sibling `pub fn provide_bridge_runtime() {}`); since `mod.rs`
+// only defines it under `cfg(not(all(unix, ...)))` and we only
+// define the real one under `cfg(all(unix, ...))`, there's no
+// duplicate symbol.
 
 fn open_local_store() -> Store {
     let path = default_store_path();
@@ -225,6 +382,72 @@ fn default_store_path() -> std::path::PathBuf {
         return std::path::PathBuf::from(home).join("AppData/Local/operon/local.sqlite");
     }
     std::env::temp_dir().join("operon/local.sqlite")
+}
+
+/// "Chat permissions (global)" row inside the SettingsPanel modal. The
+/// button toggles the
+/// [`crate::shell::global_chat_permissions::GlobalChatPermissionsOpen`]
+/// signal, which mounts a separate modal layered above this one. Same
+/// shape as `GlobalMcpSettingsSection` for visual consistency.
+#[component]
+fn GlobalChatPermissionsSection() -> Element {
+    let crate::shell::global_chat_permissions::GlobalChatPermissionsOpen(mut open) =
+        use_context();
+    rsx! {
+        div {
+            style: "margin-top: 1rem;",
+            "data-testid": "settings-global-chat-permissions",
+            h3 {
+                style: "margin: 0 0 0.5rem 0; font-size: 0.95em;",
+                "Chat permissions (global)"
+            }
+            p {
+                class: "operon-modal-help",
+                style: "font-size: 0.8em; color: var(--operon-fg-muted, #666); margin: 0 0 0.5rem 0;",
+                "Tool-permission defaults applied to every chat. Per-project overrides \
+                 live on the project row's right-click menu (Tool permissions\u{2026})."
+            }
+            button {
+                r#type: "button",
+                class: "operon-modal-button",
+                "data-testid": "settings-global-chat-permissions-open",
+                onclick: move |_| open.set(true),
+                "Manage global chat permissions\u{2026}"
+            }
+        }
+    }
+}
+
+/// "Global MCP servers" row inside the SettingsPanel modal. The
+/// button toggles the [`crate::shell::global_mcp_settings::GlobalMcpSettingsOpen`]
+/// signal, which mounts a separate modal layered above this one.
+#[component]
+fn GlobalMcpSettingsSection() -> Element {
+    let crate::shell::global_mcp_settings::GlobalMcpSettingsOpen(mut open) =
+        use_context();
+    rsx! {
+        div {
+            style: "margin-top: 1rem;",
+            "data-testid": "settings-global-mcp",
+            h3 {
+                style: "margin: 0 0 0.5rem 0; font-size: 0.95em;",
+                "MCP servers (global)"
+            }
+            p {
+                class: "operon-modal-help",
+                style: "font-size: 0.8em; color: var(--operon-fg-muted, #666); margin: 0 0 0.5rem 0;",
+                "Manage user-scope MCP servers — available to every project. \
+                 Project-scope servers live on the project row's right-click menu."
+            }
+            button {
+                r#type: "button",
+                class: "operon-modal-button",
+                "data-testid": "settings-global-mcp-open",
+                onclick: move |_| open.set(true),
+                "Manage global MCP servers\u{2026}"
+            }
+        }
+    }
 }
 
 #[component]
@@ -317,11 +540,23 @@ pub fn SettingsPanel(open: Signal<bool>, username: Signal<String>) -> Element {
                 crate::shell::settings::ProvidersSection {}
                 // Global Claude defaults — bottom tier of the
                 // three-tier hierarchy (chat → project → global).
-                // Per-project tool-permissions auto-approve toggles
-                // live on the project row itself (gear icon + context
-                // menu → Tool permissions…) — they're per-repo and
-                // belong on the project, not in global Settings.
                 crate::shell::settings::ClaudeDefaultsSection {}
+                // Global chat permissions — user-scope fallback for
+                // the per-category auto-approve toggles. Per-project
+                // permissions (project row → Tool permissions…) win
+                // when set; this fills in the default for any project
+                // that hasn't been configured explicitly.
+                GlobalChatPermissionsSection {}
+                // Companion mode (Chat vs CLI) moved out of Settings —
+                // it now lives as a two-segment toggle in the menubar
+                // top-right next to the panel/companion show/hide
+                // buttons, since it's a frequent flip rather than a
+                // configure-once preference.
+                // Global MCP servers — opens the user-scope MCP
+                // panel as a sibling modal. Project-scope MCP lives
+                // on the project row context menu so it can be
+                // scoped to the right repo.
+                GlobalMcpSettingsSection {}
                 div {
                     class: "operon-modal-actions",
                     button {
@@ -1246,12 +1481,14 @@ pub fn provide_local_app_signals() {
     }
     let selected_project: Signal<Option<Uuid>> = use_signal(|| None);
     use_context_provider(|| SelectedProject(selected_project));
-    // M1-companion-claude-code: expose the active project's repo_path as a
-    // shared signal so the companion-pane Claude session can rebind its cwd.
-    let active_repo_path: Signal<Option<std::path::PathBuf>> = use_signal(|| None);
-    use_context_provider(|| {
-        crate::shell::companion_state::ActiveRepoPath(active_repo_path)
-    });
+    // M1-companion-claude-code: the cell is now created and
+    // provided in `app.rs::App` so the sibling MCP-settings hosts
+    // can see it. We just consume the shared signal here; the
+    // explorer-sync `use_effect` further down still writes to it.
+    let active_repo_path: Signal<Option<std::path::PathBuf>> = {
+        let crate::shell::companion_state::ActiveRepoPath(sig) = use_context();
+        sig
+    };
     // M1.5a-multi-session: companion-pane scope tab + currently-open chat
     // session. Default scope: Vault (companion can chat against the vault
     // even before any project is selected). The session rail flips this
@@ -1324,6 +1561,35 @@ pub fn provide_local_app_signals() {
             }
         });
     }
+    // Chat-mode bridge access: when the in-tree operon-bridge came
+    // up cleanly at boot, inject its server entry so chat-mode claude
+    // sees the same `mcp__operon_notes__*` tools terminal-mode does.
+    // Uses a fresh use_hook so we don't re-set on every render.
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    {
+        let claude_plugin = claude_plugin.clone();
+        let bridge_ctx =
+            try_consume_context::<crate::local_mode::bridge_runtime::BridgeContext>();
+        use_hook(move || {
+            let Some(ctx) = bridge_ctx else { return };
+            let Some((name, entry)) = ctx.0.chat_mode_mcp_entry() else {
+                tracing::warn!(
+                    target: "operon::bridge",
+                    "bridge alive but operon-mcp binary unresolvable; \
+                     chat-mode will not see bridge tools"
+                );
+                return;
+            };
+            // Wrap as `{ "<name>": <entry> }` — same shape the
+            // chat plugin merges into mcpServers at spawn.
+            let extra = serde_json::json!({ name: entry });
+            claude_plugin.set_extra_mcp_servers(Some(extra));
+            tracing::info!(
+                target: "operon::bridge",
+                "wired operon-bridge into chat-mode mcp config as `{name}`"
+            );
+        });
+    }
     use_context_provider(|| {
         crate::shell::companion_state::ClaudeCodePluginCtx(claude_plugin.clone())
     });
@@ -1344,16 +1610,10 @@ pub fn provide_local_app_signals() {
     use_context_provider(|| {
         crate::shell::settings::SettingsServiceCtx(settings_service.clone())
     });
-    // MCP settings service — wraps the `claude mcp ...` CLI. The cwd is
-    // initialised to None and re-resolved per call against the active
-    // repo path; we don't bake it in here because the panel is shared
-    // across project switches.
-    use_context_provider(|| {
-        let claude_bin = crate::shell::companion_chat::resolve_claude_bin();
-        crate::shell::mcp_settings::McpServiceCtx(std::sync::Arc::new(
-            crate::shell::mcp_settings::McpService::new(claude_bin),
-        ))
-    });
+    // MCP settings service is now provided at App scope (see
+    // `app.rs::App`) so the sibling `GlobalMcpSettingsPanelHost` /
+    // `ProjectMcpSettingsPanelHost` modals can read it — they
+    // mount above Workspace in the App rsx, not under it.
     let selected_note: Signal<Option<Uuid>> = use_signal(|| None);
     use_context_provider(|| SelectedNote(selected_note));
     // Plans-Phase-4-multiselect-aria: parallel multi-selection set.
