@@ -596,37 +596,43 @@ async fn reload_open_tabs_from_disk(
         let is_artifact = matches!(kind, Some(NoteKind::Artifact));
 
         if is_artifact {
-            // PostToolUse hook is wired up: it owns the revision-row
-            // append and ships Claude's actual explanation as the
-            // summary. We just sync the tab buffer to disk here so
-            // the user sees the new content immediately; the hook's
-            // subsequent save lands the row a moment later.
+            // PostToolUse hook is wired up: it owns disk-read, table
+            // rewrite, tab reload, and the version bump. Pre-reloading
+            // the tab here would race with the hook's prior-body check
+            // and swallow the canonical `claude` row, so just bail.
             if crate::local_mode::reload_socket::is_bound() {
-                let mut tabs_sig = tabs;
-                let mut tabs_w = tabs_sig.write();
-                tabs_w.reload_content(tid, body);
-                updated_any = true;
                 continue;
             }
-            // Hook unavailable — keep the original behaviour: build
-            // a `claude` revision row from the disk-vs-tab diff and
-            // stitch it into the body BEFORE writing back. Order of
-            // operations: append → set tab content → save. By the
-            // time `persistence.save` re-fires the notify watcher,
-            // `tab.content` already equals `body_with_row`, so the
-            // next pass sees prior == disk and short-circuits.
+            // Hook unavailable — build a `claude` revision row from
+            // the disk-vs-tab diff and stitch it into the body BEFORE
+            // writing back. Strip any table Claude wrote into `body`
+            // first (it'll often carry a parroted `manual entry` row),
+            // then rebuild from prior_body's rows + the new claude row.
+            // Order of operations: rebuild → set tab content → save.
+            // By the time `persistence.save` re-fires the notify
+            // watcher, `tab.content` already equals `body_with_row`,
+            // so the next pass sees prior == disk and short-circuits.
             let summary = revision_table::compute_summary(
                 prior_body.as_deref(),
                 Some(body.as_str()),
             );
-            let date = revision_table::format_revision_date(now_unix_ms());
+            let body_clean = revision_table::strip_revision_section(&body);
+            let mut accumulated = body_clean;
+            let prior_rows = prior_body
+                .as_deref()
+                .and_then(revision_table::parse_revision_table)
+                .map(|t| t.rows)
+                .unwrap_or_default();
+            for row in prior_rows {
+                accumulated = revision_table::append_revision_row(&accumulated, row);
+            }
             let row = revision_table::RevisionRow {
-                revision: revision_table::next_revision_number(&body),
-                date,
+                revision: revision_table::next_revision_number(&accumulated),
+                date: revision_table::format_revision_date(now_unix_ms()),
                 derived_from: "claude".to_string(),
                 summary,
             };
-            let body_with_row = revision_table::append_revision_row(&body, row);
+            let body_with_row = revision_table::append_revision_row(&accumulated, row);
             let mut tabs_sig = tabs;
             {
                 let mut tabs_w = tabs_sig.write();
@@ -738,23 +744,31 @@ async fn reload_open_tab_by_path(
         let is_artifact = matches!(kind, Some(NoteKind::Artifact));
 
         if is_artifact {
-            // Skip if disk + tab + (no new summary) all agree —
-            // re-saves with no real change would otherwise stack a
-            // row per identical write.
-            if prior_body.as_deref() == Some(body.as_str()) && summary.is_none() {
-                return;
-            }
+            // Rebuild the revision table from the prior body's rows
+            // plus one new canonical `claude` row. Discarding whatever
+            // table Claude wrote into `body` is the only way to be
+            // sure we don't carry forward a `manual entry` row the
+            // model parroted from the explorer scaffold.
             let summary_text = summary.unwrap_or_else(|| {
                 revision_table::compute_summary(prior_body.as_deref(), Some(body.as_str()))
             });
-            let date = revision_table::format_revision_date(now_unix_ms());
-            let row = revision_table::RevisionRow {
-                revision: revision_table::next_revision_number(&body),
-                date,
+            let body_clean = revision_table::strip_revision_section(&body);
+            let mut accumulated = body_clean;
+            let prior_rows = prior_body
+                .as_deref()
+                .and_then(revision_table::parse_revision_table)
+                .map(|t| t.rows)
+                .unwrap_or_default();
+            for row in prior_rows {
+                accumulated = revision_table::append_revision_row(&accumulated, row);
+            }
+            let new_row = revision_table::RevisionRow {
+                revision: revision_table::next_revision_number(&accumulated),
+                date: revision_table::format_revision_date(now_unix_ms()),
                 derived_from: "claude".to_string(),
                 summary: summary_text,
             };
-            let body_with_row = revision_table::append_revision_row(&body, row);
+            let body_with_row = revision_table::append_revision_row(&accumulated, new_row);
             let mut tabs_sig = tabs;
             {
                 let mut tabs_w = tabs_sig.write();
@@ -1495,6 +1509,7 @@ pub fn provide_local_app_signals() {
     let note_repo_for_links_resolver = note_repo_for_links.clone();
     let tabs_for_links = tabs;
     let scheduler_for_links = scheduler.clone();
+    let persistence_for_links = persistence.clone();
     let mut selected_note_for_links_setter = selected_note_for_links;
     let wikilink_resolver = use_hook(move || {
         Callback::new(move |target: String| {
@@ -1535,12 +1550,12 @@ pub fn provide_local_app_signals() {
                                 .map(|n| (n.title, n.kind))
                         })
                         .unwrap_or_else(|| (target.clone(), NoteKind::Markdown));
-                    super::editor::open_local_note_tab(
+                    super::editor::load_and_open_local_note_tab(
                         tabs_for_links,
                         scheduler_for_links.clone(),
+                        persistence_for_links.clone(),
                         note_id,
                         title,
-                        String::new(),
                         kind,
                     );
                     selected_note_for_links_setter.set(Some(note_id));
@@ -1560,6 +1575,7 @@ pub fn provide_local_app_signals() {
     let project_repo_for_note_link = project_repo.clone();
     let tabs_for_note_link = tabs;
     let scheduler_for_note_link = scheduler.clone();
+    let persistence_for_note_link = persistence.clone();
     let mut selected_note_for_note_link_setter = selected_note_for_links;
     let mut reveal_request_for_note_link = reveal_note_request;
     let note_link_resolver = use_hook(move || {
@@ -1568,12 +1584,12 @@ pub fn provide_local_app_signals() {
             for p in &snap_projects {
                 if let Ok(notes) = note_repo_for_note_link.list_for_project(p.id) {
                     if let Some(note) = notes.into_iter().find(|n| n.id == note_id) {
-                        super::editor::open_local_note_tab(
+                        super::editor::load_and_open_local_note_tab(
                             tabs_for_note_link,
                             scheduler_for_note_link.clone(),
+                            persistence_for_note_link.clone(),
                             note_id,
                             note.title,
-                            String::new(),
                             note.kind,
                         );
                         selected_note_for_note_link_setter.set(Some(note_id));

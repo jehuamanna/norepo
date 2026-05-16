@@ -2632,11 +2632,24 @@ pub fn ExplorerPanel() -> Element {
     // Per-Artifact-note frontmatter cache. One sync `block_on` load
     // per Artifact populates both the SDLC kind (drives the role chip
     // + title/caret tint) and the status (drives the right-aligned
-    // status dot). Re-runs whenever `notes_by_project` changes.
-    // Synchronous reads are fine at local-mode scale; for hundreds of
-    // artifacts we'd move this to an async cache.
+    // status dot + the row's combined Approve/Reject icon).
+    //
+    // Re-runs whenever `note_version` bumps. Subscribing to
+    // `note_version` directly (instead of relying on
+    // `notes_by_project.read()`) is load-bearing: an Approve / Reject
+    // / Mark-dirty rewrites the body's frontmatter but leaves the
+    // SQLite note row (id, title, parent_id, kind) untouched, so
+    // `notes_by_project`'s Memo short-circuits on PartialEq and
+    // doesn't propagate. Without this explicit subscription, the
+    // row's `artifact_status` prop stayed stuck at the pre-click
+    // value — the icon kept saying "Approve" on an already-approved
+    // row.
+    //
+    // Synchronous reads are fine at local-mode scale; for hundreds
+    // of artifacts we'd move this to an async cache.
     let persistence_for_kinds = persistence.clone();
     let artifact_meta: Memo<HashMap<Uuid, role::ArtifactMeta>> = use_memo(move || {
+        let _ = note_version.read();
         let mut map = HashMap::new();
         let snapshot = notes_by_project.read();
         for (_, list) in snapshot.iter() {

@@ -27,7 +27,9 @@ pub fn McpSettingsPanel(open: Signal<bool>) -> Element {
     let ActiveRepoPath(active_repo) = use_context();
     let AgentBackendCtx(backend_signal) = use_context();
     let mut servers: Signal<LoadState> = use_signal(|| LoadState::Idle);
-    let mut show_add: Signal<bool> = use_signal(|| false);
+    // Add form is expanded by default so adding a server is one of the
+    // first affordances the user sees; collapse toggle is on the header.
+    let mut show_add: Signal<bool> = use_signal(|| true);
     let mut info_msg: Signal<Option<String>> = use_signal(|| None);
     let default_scope_signal: Signal<Scope> =
         use_signal(|| pick_default_scope(active_repo.read().clone()));
@@ -42,7 +44,7 @@ pub fn McpSettingsPanel(open: Signal<bool>) -> Element {
             let cwd = active_repo.read().clone();
             servers.set(LoadState::Loading);
             spawn(async move {
-                match service.list(cwd.as_deref()).await {
+                match service.list_enriched(cwd.as_deref()).await {
                     Ok(v) => servers.set(LoadState::Loaded(v)),
                     Err(e) => servers.set(LoadState::Error(e)),
                 }
@@ -62,7 +64,6 @@ pub fn McpSettingsPanel(open: Signal<bool>) -> Element {
 
     let mut close = move || {
         open.set(false);
-        show_add.set(false);
         info_msg.set(None);
     };
 
@@ -92,7 +93,7 @@ pub fn McpSettingsPanel(open: Signal<bool>) -> Element {
             let cwd = active_repo.read().clone();
             servers.set(LoadState::Loading);
             spawn(async move {
-                let next = match service.list(cwd.as_deref()).await {
+                let next = match service.list_enriched(cwd.as_deref()).await {
                     Ok(v) => LoadState::Loaded(v),
                     Err(e) => LoadState::Error(e),
                 };
@@ -166,59 +167,28 @@ pub fn McpSettingsPanel(open: Signal<bool>) -> Element {
                 if let Some(msg) = info_msg.read().clone() {
                     p { class: "operon-modal-info", "{msg}" }
                 }
-                div { class: "operon-mcp-list",
-                    {
-                        let live_servers = live_servers.clone();
-                        let live_tools = live_tools.clone();
-                        let live_is_current = live_is_current;
-                        match &*servers.read() {
-                            LoadState::Idle => rsx! { p { class: "operon-modal-help", "" } },
-                            LoadState::Loading => rsx! {
-                                p { class: "operon-modal-help", "Loading…" }
-                            },
-                            LoadState::Error(e) => rsx! {
-                                p { class: "operon-modal-error", "{e}" }
-                            },
-                            LoadState::Loaded(v) if v.is_empty() => rsx! {
-                                p { class: "operon-modal-help",
-                                    "No MCP servers configured. Add one below."
-                                }
-                            },
-                            LoadState::Loaded(v) => {
-                                let entries = v.clone();
-                                rsx! {
-                                    for entry in entries {
-                                        ServerCard {
-                                            key: "{entry.name}",
-                                            entry: entry.clone(),
-                                            live_servers: live_servers.clone(),
-                                            live_tools: live_tools.clone(),
-                                            live_is_current,
-                                            on_changed: {
-                                                let mut reload = reload.clone();
-                                                let mut info_msg = info_msg;
-                                                EventHandler::new(move |msg: String| {
-                                                    info_msg.set(Some(msg));
-                                                    reload();
-                                                })
-                                            },
-                                        }
-                                    }
-                                }
-                            }
+                // Add form on top — collapsible via the chevron toggle.
+                div { class: "operon-mcp-add-section",
+                    button {
+                        r#type: "button",
+                        class: "operon-mcp-add-toggle",
+                        "data-testid": "mcp-add-toggle",
+                        onclick: move |_| {
+                            let cur = *show_add.read();
+                            show_add.set(!cur);
+                        },
+                        {
+                            let arrow = if *show_add.read() { "▾" } else { "▸" };
+                            format!("{arrow} Add MCP server")
                         }
                     }
-                }
-                div { class: "operon-mcp-footer",
                     if *show_add.read() {
                         AddForm {
                             initial_scope: *default_scope_signal.read(),
                             on_done: {
                                 let mut reload = reload.clone();
                                 let mut info_msg = info_msg;
-                                let mut show_add = show_add;
                                 EventHandler::new(move |msg: Option<String>| {
-                                    show_add.set(false);
                                     if let Some(m) = msg {
                                         info_msg.set(Some(m));
                                         reload();
@@ -226,13 +196,56 @@ pub fn McpSettingsPanel(open: Signal<bool>) -> Element {
                                 })
                             },
                         }
-                    } else {
-                        button {
-                            r#type: "button",
-                            class: "operon-modal-button operon-modal-button-primary",
-                            "data-testid": "mcp-add-toggle",
-                            onclick: move |_| show_add.set(true),
-                            "Add MCP server"
+                    }
+                }
+                // Server listing below the form — scrollable region so a
+                // long list (multiple figma sessions, etc.) doesn't push
+                // the add form off-screen.
+                h3 { class: "operon-modal-section operon-mcp-list-heading",
+                    "Configured servers"
+                }
+                div { class: "operon-mcp-list-scroll",
+                    div { class: "operon-mcp-list",
+                        {
+                            let live_servers = live_servers.clone();
+                            let live_tools = live_tools.clone();
+                            let live_is_current = live_is_current;
+                            match &*servers.read() {
+                                LoadState::Idle => rsx! { p { class: "operon-modal-help", "" } },
+                                LoadState::Loading => rsx! {
+                                    p { class: "operon-modal-help", "Loading…" }
+                                },
+                                LoadState::Error(e) => rsx! {
+                                    p { class: "operon-modal-error", "{e}" }
+                                },
+                                LoadState::Loaded(v) if v.is_empty() => rsx! {
+                                    p { class: "operon-modal-help",
+                                        "No MCP servers configured. Add one above."
+                                    }
+                                },
+                                LoadState::Loaded(v) => {
+                                    let entries = v.clone();
+                                    rsx! {
+                                        for entry in entries {
+                                            ServerCard {
+                                                key: "{entry.name}",
+                                                entry: entry.clone(),
+                                                live_servers: live_servers.clone(),
+                                                live_tools: live_tools.clone(),
+                                                live_is_current,
+                                                on_changed: {
+                                                    let mut reload = reload.clone();
+                                                    let mut info_msg = info_msg;
+                                                    EventHandler::new(move |msg: String| {
+                                                        info_msg.set(Some(msg));
+                                                        reload();
+                                                    })
+                                                },
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

@@ -388,6 +388,78 @@ pub fn open_local_note_tab(
     id
 }
 
+/// Same contract as [`open_local_note_tab`], but loads the note body from
+/// `persistence` first when no tab exists yet for `note_uuid`. The
+/// explorer click path does this inline; in-prose link clicks
+/// (`[[Title]]` wikilinks, `[text](operon://note/<uuid>)` markdown
+/// links, TOC entries, …) used to pass `String::new()` and a fresh tab
+/// would mount empty — visually indistinguishable from a brand-new
+/// note replacing whatever the user was just reading.
+pub fn load_and_open_local_note_tab(
+    tabs: Signal<TabManager>,
+    save_scheduler: SaveScheduler,
+    persistence: Arc<dyn Persistence>,
+    note_uuid: Uuid,
+    title: String,
+    kind: operon_store::repos::NoteKind,
+) -> TabId {
+    let note_id_str = note_uuid.to_string();
+    // Fast path: an existing tab already holds in-memory content. Skip
+    // the persistence load and let `open_local_note_tab` activate it.
+    let has_existing = tabs.read().iter().any(|t| t.note_id == note_id_str);
+    if has_existing {
+        return open_local_note_tab(
+            tabs,
+            save_scheduler,
+            note_uuid,
+            title,
+            String::new(),
+            kind,
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let initial_content = match futures::executor::block_on(persistence.load(&note_id_str)) {
+        Ok(bytes) => String::from_utf8(bytes).unwrap_or_default(),
+        Err(crate::persistence::PersistError::NotFound) => String::new(),
+        Err(e) => {
+            eprintln!("operon: in-prose link load error note={note_id_str}: {e:?}");
+            String::new()
+        }
+    };
+    #[cfg(target_arch = "wasm32")]
+    let initial_content = String::new();
+
+    let new_tab_id = open_local_note_tab(
+        tabs,
+        save_scheduler.clone(),
+        note_uuid,
+        title,
+        initial_content,
+        kind,
+    );
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let pers = persistence.clone();
+        let mut tabs_handle = tabs;
+        let id_str = note_id_str.clone();
+        spawn(async move {
+            match pers.load(&id_str).await {
+                Ok(bytes) => {
+                    if let Ok(content) = String::from_utf8(bytes) {
+                        tabs_handle.write().set_content(new_tab_id, content);
+                    }
+                }
+                Err(crate::persistence::PersistError::NotFound) => {}
+                Err(e) => eprintln!("operon: in-prose link load error note={id_str}: {e:?}"),
+            }
+        });
+    }
+
+    new_tab_id
+}
+
 /// Image-note dispatch: returns the image viewer when the note has an
 /// attached blob, an empty-state pane (with a file-picker button) when
 /// the row exists but `blob_path` is `None`, or `None` when the note

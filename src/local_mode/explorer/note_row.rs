@@ -1241,6 +1241,9 @@ pub fn NoteRow(props: NoteRowProps) -> Element {
                                             } else {
                                                 on_select.call(id_for_actions);
                                                 on_set_mode.call((id_for_actions, EditorMode::View));
+                                                if let Some(kind) = props.artifact_kind.clone() {
+                                                    spawn_row_cascade(id_for_actions, kind);
+                                                }
                                             }
                                         },
                                         if is_cascading {
@@ -1508,6 +1511,66 @@ fn ForbiddenIndicator() -> Element {
             "data-testid": "drop-indicator-forbidden",
         }
     }
+}
+
+/// Kick off a cascade rooted on `note_id` from the explorer row's
+/// inline ▶ Play icon. Mirrors the header `CascadePlayButton`'s onclick
+/// (view.rs:2025-2061) so the row affordance and the in-view header
+/// button do the same job. The cascade itself flips active chat scope
+/// and session via `spawn_cascade`, so the user lands in the new
+/// `Cascade: <seed>` rail entry as soon as the run starts.
+///
+/// The dep-blocked check the header performs (unmet upstream
+/// approvals → button disabled) is omitted here — adding it would
+/// require an async `use_resource` at row scope. The cascade still
+/// surfaces unmet-dep failures via the Problems panel.
+fn spawn_row_cascade(
+    note_id: Uuid,
+    kind: crate::plugins::artifact::frontmatter::ArtifactKind,
+) {
+    use crate::plugins::artifact::cascade::RunMode;
+    use crate::plugins::artifact::frontmatter::ArtifactKind;
+
+    // Pick the slice of the SDLC chain to run, keyed off the clicked
+    // artifact's kind. Matches `primary_play_mode` at view.rs:255-274.
+    let run_mode = match kind {
+        ArtifactKind::MasterRequirement => RunMode::Full,
+        ArtifactKind::Task => RunMode::TaskPlanOnly,
+        ArtifactKind::ImplementationPlan => RunMode::PlanExecuteAndTest,
+        ArtifactKind::Implementation => RunMode::ImplementationRetest,
+        _ => return,
+    };
+
+    let crate::local_mode::desktop::LocalNoteRepo(note_repo) = use_context();
+    let crate::local_mode::desktop::LocalProjectRepo(project_repo) = use_context();
+    let persistence: std::sync::Arc<dyn crate::persistence::Persistence> = use_context();
+    let crate::shell::companion_state::ClaudeCodePluginCtx(plugin) = use_context();
+    let crate::shell::companion_state::ChatSessionRepo(chat_session_repo) = use_context();
+    let crate::shell::companion_state::ChatMessageRepo(chat_message_repo) = use_context();
+    let crate::local_mode::explorer::LocalNoteVersion(mut note_version) = use_context();
+    let crate::shell::companion_state::ChatSessionVersion(mut chat_session_version) =
+        use_context();
+    let crate::shell::companion_state::ActiveChatSession(mut active_session) = use_context();
+    let crate::shell::companion_state::ActiveChatScope(mut active_scope) = use_context();
+    let crate::local_mode::desktop::CurrentVaultRoot(vault_signal) = use_context();
+    let vault_snapshot = vault_signal.read().clone();
+
+    crate::plugins::artifact::view::spawn_cascade(
+        note_id,
+        note_repo,
+        project_repo,
+        persistence,
+        plugin,
+        chat_session_repo,
+        chat_message_repo,
+        vault_snapshot,
+        &mut note_version,
+        &mut chat_session_version,
+        &mut active_session,
+        &mut active_scope,
+        None,
+        run_mode,
+    );
 }
 
 /// Load an artifact's body via the in-scope persistence context,

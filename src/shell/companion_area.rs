@@ -11,7 +11,29 @@ use crate::shell::layout::LayoutState;
 
 #[component]
 pub fn CompanionArea() -> Element {
-    let layout: Signal<LayoutState> = use_context();
+    let mut layout: Signal<LayoutState> = use_context();
+
+    // Auto-uncollapse when a cascade run requests it (Play on an
+    // artifact bumps `EXPAND_COMPANION_TICK` so the user sees live
+    // thinking / tool_use rows instead of an empty chrome). Tracking
+    // the previously-seen tick locally — initialised from the current
+    // global value — keeps initial mount from clobbering a
+    // deliberately-collapsed panel.
+    let mut seen_expand_tick = use_signal(|| {
+        *crate::shell::companion_state::EXPAND_COMPANION_TICK.peek()
+    });
+    use_effect(move || {
+        let cur = *crate::shell::companion_state::EXPAND_COMPANION_TICK.read();
+        if cur != *seen_expand_tick.peek() {
+            seen_expand_tick.set(cur);
+            layout.with_mut(|s| {
+                if s.companion_collapsed {
+                    s.companion_collapsed = false;
+                }
+            });
+        }
+    });
+
     let collapsed = layout.read().companion_collapsed;
 
     if collapsed {

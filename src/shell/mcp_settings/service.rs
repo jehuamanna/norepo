@@ -147,6 +147,13 @@ pub struct McpEntry {
     /// Whether the status reads as connected. Drives the green-vs-red dot
     /// when only `mcp list` is available.
     pub connected: bool,
+    /// Parsed scope, populated by `list_enriched` (via `mcp get`). `None`
+    /// when only `mcp list` was called or when the scope label couldn't
+    /// be classified.
+    pub scope: Option<Scope>,
+    /// Verbatim "Scope:" label from `mcp get`, kept for display when the
+    /// classification falls through.
+    pub scope_label: Option<String>,
 }
 
 /// Detailed view from `claude mcp get <name>`.
@@ -182,6 +189,39 @@ impl McpService {
         Ok(parse_list(&out.stdout))
     }
 
+    /// Same as `list` but enriches each entry with `scope` / `scope_label`
+    /// by fanning out `claude mcp get <name>` calls in parallel. Failures
+    /// to enrich an individual entry are non-fatal — the original row is
+    /// kept without scope info.
+    pub async fn list_enriched(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Vec<McpEntry>, String> {
+        let base = self.list(cwd).await?;
+        if base.is_empty() {
+            return Ok(base);
+        }
+        let cwd_owned: Option<std::path::PathBuf> = cwd.map(|c| c.to_path_buf());
+        let mut handles = Vec::with_capacity(base.len());
+        for entry in &base {
+            let svc = self.clone();
+            let name = entry.name.clone();
+            let cwd_opt = cwd_owned.clone();
+            handles.push(tokio::spawn(async move {
+                svc.get(&name, cwd_opt.as_deref()).await.ok()
+            }));
+        }
+        let mut out = Vec::with_capacity(base.len());
+        for (mut entry, handle) in base.into_iter().zip(handles.into_iter()) {
+            if let Ok(Some(d)) = handle.await {
+                entry.scope = classify_scope(&d.scope_label);
+                entry.scope_label = Some(d.scope_label);
+            }
+            out.push(entry);
+        }
+        Ok(out)
+    }
+
     /// `claude mcp get <name>` → parsed details.
     pub async fn get(
         &self,
@@ -204,6 +244,22 @@ impl McpService {
         argv.extend(args.argv());
         let argv_ref: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         self.run(&argv_ref, cwd).await.map(|_| ())
+    }
+
+    /// `claude mcp add-json -s <scope> <name> <jsonString>`. Used by the
+    /// JSON-import flow in the add form. `json_string` is the raw config
+    /// claude expects (`{"command":..., "args":[...], ...}` or
+    /// `{"type":"http","url":...}` — same shape as `.mcp.json` values).
+    pub async fn add_json(
+        &self,
+        name: &str,
+        scope: Scope,
+        json_string: &str,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<(), String> {
+        let argv: Vec<&str> =
+            vec!["mcp", "add-json", "-s", scope.as_arg(), name, json_string];
+        self.run(&argv, cwd).await.map(|_| ())
     }
 
     /// `claude mcp remove [-s scope] <name>`.
@@ -344,6 +400,8 @@ pub(crate) fn parse_list(stdout: &str) -> Vec<McpEntry> {
             command_or_url: command_or_url.to_string(),
             status: status_text,
             connected,
+            scope: None,
+            scope_label: None,
         });
     }
     out
@@ -423,6 +481,24 @@ where
         if let Some((k, v)) = line.split_once(sep) {
             out.push((k.trim().to_string(), v.trim().to_string()));
         }
+    }
+}
+
+/// Map a raw "Scope:" label from `mcp get` back to a typed `Scope`. The
+/// labels claude emits look like:
+///   - "Local config (private to you in this project)"
+///   - "User config"
+///   - "Project config (.mcp.json, shared with team)"
+pub(crate) fn classify_scope(label: &str) -> Option<Scope> {
+    let lower = label.to_ascii_lowercase();
+    if lower.starts_with("local") {
+        Some(Scope::Local)
+    } else if lower.starts_with("user") {
+        Some(Scope::User)
+    } else if lower.starts_with("project") {
+        Some(Scope::Project)
+    } else {
+        None
     }
 }
 
@@ -593,6 +669,21 @@ mod tests {
             d.headers,
             vec![("Authorization".into(), "Bearer abc".into())]
         );
+    }
+
+    #[test]
+    fn classify_scope_matches_labels_claude_emits() {
+        assert_eq!(
+            classify_scope("Local config (private to you in this project)"),
+            Some(Scope::Local)
+        );
+        assert_eq!(classify_scope("User config"), Some(Scope::User));
+        assert_eq!(
+            classify_scope("Project config (.mcp.json, shared with team)"),
+            Some(Scope::Project)
+        );
+        assert_eq!(classify_scope(""), None);
+        assert_eq!(classify_scope("Mystery"), None);
     }
 
     #[test]

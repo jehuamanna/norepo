@@ -63,6 +63,10 @@ pub mod permission_drawer;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bridge_artifact_executor;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod ask_user_question_card;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod bridge_ask_user_executor;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod bridge_shell_executor;
 pub mod dropdown;
 pub mod editor_host;
@@ -448,21 +452,42 @@ fn install_global_shortcuts(
                     // (chat transcript, markdown preview, tool cards).
                     // Same workaround Monaco uses (editor_host.rs:343):
                     // grab the live selection JS-side and ship it to
-                    // Rust, which writes via arboard. We do NOT
-                    // preventDefault — when focus is in an editable
-                    // surface the native path / Monaco bridge owns it
-                    // and we early-return.
+                    // Rust, which writes via arboard.
+                    //
+                    // We classify by *selection container*, not
+                    // `document.activeElement`. Common chat flow:
+                    // user clicks in the composer textarea (so focus
+                    // is there) then drags to select text in the
+                    // transcript above. activeElement is still the
+                    // textarea, but the page selection lives in the
+                    // transcript. The old `activeElement`-based check
+                    // bailed out in that case and the textarea's
+                    // empty native copy won — net effect: nothing
+                    // landed on the clipboard.
                     if (!shift && (key === 'c' || key === 'C')) {
-                        var ae = document.activeElement;
-                        var inEditable = false;
-                        if (ae) {
-                            var tag = (ae.tagName || '').toUpperCase();
-                            inEditable = tag === 'INPUT' || tag === 'TEXTAREA' || ae.isContentEditable;
-                        }
-                        if (!inEditable) {
-                            var sel = window.getSelection ? window.getSelection().toString() : '';
-                            if (sel) {
-                                try { dioxus.send({type: 'shortcut', action: 'clipboard.copy', text: sel}); } catch (err) {}
+                        var sel = window.getSelection ? window.getSelection() : null;
+                        var selText = sel ? sel.toString() : '';
+                        if (selText) {
+                            var selInEditable = false;
+                            if (sel.rangeCount > 0) {
+                                try {
+                                    var node = sel.getRangeAt(0).commonAncestorContainer;
+                                    while (node) {
+                                        if (node.nodeType === 1) {
+                                            var tag = (node.tagName || '').toUpperCase();
+                                            if (tag === 'INPUT' || tag === 'TEXTAREA' || node.isContentEditable) {
+                                                selInEditable = true;
+                                                break;
+                                            }
+                                        }
+                                        node = node.parentNode;
+                                    }
+                                } catch (err) {}
+                            }
+                            if (!selInEditable) {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                try { dioxus.send({type: 'shortcut', action: 'clipboard.copy', text: selText}); } catch (err) {}
                             }
                         }
                         return;

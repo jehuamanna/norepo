@@ -15,7 +15,24 @@ use dioxus::prelude::*;
 use operon_core::agent_event::AgentBackend;
 use serde_json::Value;
 
-use crate::shell::companion_state::{ActiveChatSession, AgentBackendCtx, TOOL_STREAM_OUTPUT};
+use crate::shell::companion_state::{
+    ActiveChatSession, AgentBackendCtx, MCP_LIVE_STATUS, TOOL_STREAM_OUTPUT,
+};
+
+/// Elapsed wall-clock threshold at which a pending tool gets a
+/// "Cancel turn" affordance. Short enough that a stalled MCP call
+/// (figma, etc.) gives the user an escape hatch quickly; long enough
+/// that healthy multi-second tool calls don't surface the button.
+const STUCK_TOOL_THRESHOLD: Duration = Duration::from_secs(30);
+
+/// Parse `mcp__<server>__<tool>` and return `<server>`. Used by the
+/// pending tool card to surface the MCP server's live health when a
+/// call hangs ("figma: needs-auth") — answers "is this server even
+/// authenticated?" without leaving the chat.
+fn mcp_server_name(tool: &str) -> Option<&str> {
+    let rest = tool.strip_prefix("mcp__")?;
+    rest.split_once("__").map(|(server, _)| server)
+}
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct ToolResultBody {
@@ -48,6 +65,27 @@ pub fn ToolCard(props: ToolCardProps) -> Element {
         "operon-tool-card-status-ok"
     };
 
+    // For pending MCP tool calls, surface the *current* server health
+    // next to the running badge — only when the server is in a non-OK
+    // state, so healthy calls aren't cluttered. Read inside `pending`
+    // so completed cards don't drag along a now-stale status.
+    let mcp_pill: Option<(String, String)> = if pending {
+        mcp_server_name(&props.name).and_then(|server| {
+            let status = MCP_LIVE_STATUS
+                .read()
+                .mcp_servers
+                .iter()
+                .find(|s| s.name == server)
+                .map(|s| s.status.clone());
+            match status {
+                Some(s) if s != "connected" => Some((server.to_string(), s)),
+                _ => None,
+            }
+        })
+    } else {
+        None
+    };
+
     rsx! {
         details {
             class: "operon-tool-card",
@@ -60,6 +98,14 @@ pub fn ToolCard(props: ToolCardProps) -> Element {
                 span { class: "operon-tool-card-icon", "{icon}" }
                 span { class: "operon-tool-card-name", "{props.name}" }
                 span { class: "operon-tool-card-arg truncate", "{summary}" }
+                if let Some((server, status)) = mcp_pill.as_ref() {
+                    span {
+                        class: "operon-tool-card-mcp-status",
+                        "data-mcp-status": "{status}",
+                        "data-testid": "tool-card-mcp-status",
+                        "{server}: {status}"
+                    }
+                }
                 span { class: "operon-tool-card-status {status_class}",
                     if pending {
                         "running\u{2026}"
@@ -122,18 +168,11 @@ fn PendingToolFooter(props: PendingToolFooterProps) -> Element {
     let elapsed = started_at
         .and_then(|t| SystemTime::now().duration_since(t).ok())
         .unwrap_or_default();
-    // `started_at` is populated by the first `ToolChunk` event. The
-    // runtime backend streams chunks; claude-code does not. Without an
-    // anchor `elapsed` stays at zero and the `< 1s` branch of
-    // `format_elapsed` would say "starting…" forever — misleading when
-    // the call is actually hung. Distinguish the two: with an anchor
-    // show the timer; without one show a static "(running…)" so
-    // hangs are visible.
-    let elapsed_label = if started_at.is_some() {
-        format_elapsed(elapsed)
-    } else {
-        "(running\u{2026})".to_string()
-    };
+    // `started_at` is now populated when the `ToolUse` event arrives
+    // (via `mark_tool_started`), regardless of backend. claude-code
+    // tools — which never emit `ToolChunk` — still get a timer.
+    let elapsed_label = format_elapsed(elapsed);
+    let stuck = elapsed >= STUCK_TOOL_THRESHOLD;
 
     let backend_id = active_backend
         .as_ref()
@@ -163,6 +202,26 @@ fn PendingToolFooter(props: PendingToolFooterProps) -> Element {
         });
     };
 
+    // Cancel turn: only path to recovery for claude-code (which can't
+    // kill an individual MCP request) and a useful escape on runtime
+    // too. Wired to the existing `cancel_session_run` helper — the
+    // stream drainer's cancellation arm then kills the subprocess
+    // and the `Error`-driven `flush_orphan_tools` stamps this card
+    // with an error result so it stops spinning.
+    let cancel_turn_click = move |_| {
+        let Some(ActiveChatSession(sess_sig)) = active_session_ctx else {
+            return;
+        };
+        let Some(session) = *sess_sig.read() else {
+            return;
+        };
+        let ok = crate::shell::companion_state::cancel_session_run(session);
+        tracing::info!(
+            target: "operon::tool",
+            "cancel_session_run({session}) -> {ok}"
+        );
+    };
+
     rsx! {
         div {
             class: "operon-tool-card-pending-footer",
@@ -189,6 +248,16 @@ fn PendingToolFooter(props: PendingToolFooterProps) -> Element {
                         title: "Cancel this tool call (runtime backend)",
                         onclick: cancel_click,
                         "Cancel"
+                    }
+                }
+                if stuck {
+                    button {
+                        r#type: "button",
+                        class: "operon-tool-card-cancel-turn",
+                        "data-testid": "tool-cancel-turn-btn",
+                        title: "Cancel the entire turn (kills the in-flight subprocess)",
+                        onclick: cancel_turn_click,
+                        "Cancel turn"
                     }
                 }
             }

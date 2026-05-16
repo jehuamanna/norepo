@@ -17,7 +17,8 @@ use crate::local_mode::desktop::{LocalNoteRepo, LocalProjectRepo};
 use crate::local_mode::explorer::{LocalNoteVersion, SelectedNote, SelectedProject};
 use crate::local_mode::ui::InlineRename;
 use crate::shell::companion_state::{
-    ActiveChatScope, ActiveChatSession, ChatSessionRepo, ChatSessionVersion,
+    cancel_session_run, ActiveChatScope, ActiveChatSession, ChatSessionRepo, ChatSessionVersion,
+    CHAT_RUN_CANCEL,
 };
 
 #[component]
@@ -286,6 +287,14 @@ pub fn SessionRail() -> Element {
                         let sid = s.id;
                         let is_active = active_now == Some(sid);
                         let in_rename = *renaming_session.read() == Some(sid);
+                        // Subscribe to CHAT_RUN_CANCEL so this row
+                        // re-renders when its session starts / stops a
+                        // turn. `is_running` drives both the running
+                        // pulse dot AND the inline ⏹ Stop button. The
+                        // button targets `sid` specifically — clicking
+                        // it cancels only this session's subprocess, so
+                        // a second chat that's also mid-run keeps going.
+                        let is_running = CHAT_RUN_CANCEL.read().contains_key(&sid);
                         let label = s.label.clone();
                         let session_repo_for_row = session_repo.clone();
                         let session_repo_for_rename = session_repo.clone();
@@ -342,6 +351,10 @@ pub fn SessionRail() -> Element {
                             }
                             version_for_delete.with_mut(|v| *v += 1);
                         });
+                        let on_stop = Callback::new(move |evt: Event<MouseData>| {
+                            evt.stop_propagation();
+                            cancel_session_run(sid);
+                        });
                         rsx! {
                             li {
                                 key: "{sid}",
@@ -353,8 +366,17 @@ pub fn SessionRail() -> Element {
                                 "data-testid": "companion-rail-item",
                                 "data-session-id": "{sid}",
                                 "data-active": if is_active { "true" } else { "false" },
+                                "data-running": if is_running { "true" } else { "false" },
                                 onclick: on_select,
                                 ondoubleclick: on_dblclick,
+                                if is_running {
+                                    span {
+                                        class: "operon-companion-rail-item-running",
+                                        "data-testid": "companion-rail-item-running",
+                                        title: "Claude is working on this chat",
+                                        "\u{25CF}"
+                                    }
+                                }
                                 if in_rename {
                                     InlineRename {
                                         initial: label.clone(),
@@ -366,6 +388,16 @@ pub fn SessionRail() -> Element {
                                         class: "operon-companion-rail-item-label truncate",
                                         title: "{label}",
                                         "{label}"
+                                    }
+                                }
+                                if is_running {
+                                    button {
+                                        r#type: "button",
+                                        class: "operon-companion-rail-item-stop",
+                                        "data-testid": "companion-rail-item-stop",
+                                        title: "Stop this chat — terminates only this session's claude process.",
+                                        onclick: on_stop,
+                                        "\u{25A0}"
                                     }
                                 }
                                 button {

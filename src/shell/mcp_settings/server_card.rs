@@ -6,7 +6,7 @@ use dioxus::prelude::*;
 use operon_core::agent_event::McpServerStatus;
 
 use crate::shell::companion_state::ActiveRepoPath;
-use crate::shell::mcp_settings::{McpDetails, McpEntry, McpServiceCtx};
+use crate::shell::mcp_settings::{McpDetails, McpEntry, McpServiceCtx, Scope};
 
 #[derive(Props, Clone, PartialEq)]
 pub struct ServerCardProps {
@@ -57,6 +57,43 @@ pub fn ServerCard(props: ServerCardProps) -> Element {
     };
 
     let (dot_class, status_label) = compute_indicator(&entry, live_status.as_ref());
+
+    // Scope chip + directory hint. For Local/Project the directory is
+    // the cwd that owns the config (active repo); User is global.
+    let cwd_for_scope = active_repo.read().clone();
+    let (scope_chip_class, scope_chip_label, scope_dir): (&'static str, String, Option<String>) =
+        match entry.scope {
+            Some(Scope::User) => (
+                "operon-mcp-scope-chip operon-mcp-scope-user",
+                "User · global".to_string(),
+                None,
+            ),
+            Some(Scope::Project) => (
+                "operon-mcp-scope-chip operon-mcp-scope-project",
+                "Project".to_string(),
+                cwd_for_scope.as_ref().map(|p| p.display().to_string()),
+            ),
+            Some(Scope::Local) => (
+                "operon-mcp-scope-chip operon-mcp-scope-local",
+                "Local".to_string(),
+                cwd_for_scope.as_ref().map(|p| p.display().to_string()),
+            ),
+            None => (
+                "operon-mcp-scope-chip operon-mcp-scope-unknown",
+                entry
+                    .scope_label
+                    .clone()
+                    .unwrap_or_else(|| "Scope ?".to_string()),
+                None,
+            ),
+        };
+    let scope_dir_basename = scope_dir.as_ref().map(|p| {
+        std::path::Path::new(p)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(p.as_str())
+            .to_string()
+    });
 
     let toggle_details = {
         let service = service.clone();
@@ -135,6 +172,16 @@ pub fn ServerCard(props: ServerCardProps) -> Element {
                     ""
                 }
                 span { class: "operon-mcp-server-name", "{entry.name}" }
+                span {
+                    class: "{scope_chip_class}",
+                    title: {
+                        match scope_dir.as_ref() {
+                            Some(p) => format!("Scope: {scope_chip_label}\nDirectory: {p}"),
+                            None => format!("Scope: {scope_chip_label}"),
+                        }
+                    },
+                    "{scope_chip_label}"
+                }
                 span { class: "operon-mcp-status-text", "{status_label}" }
                 div { class: "operon-mcp-card-actions",
                     button {
@@ -178,6 +225,15 @@ pub fn ServerCard(props: ServerCardProps) -> Element {
             }
             p { class: "operon-mcp-server-meta",
                 "{entry.command_or_url}"
+            }
+            if let Some(dir_path) = scope_dir.as_ref() {
+                p { class: "operon-mcp-server-dir", title: "{dir_path}",
+                    span { class: "operon-mcp-server-dir-icon", "📁 " }
+                    span { class: "operon-mcp-server-dir-name",
+                        "{scope_dir_basename.clone().unwrap_or_else(|| dir_path.clone())}"
+                    }
+                    span { class: "operon-mcp-server-dir-path", " — {dir_path}" }
+                }
             }
             if let Some(err) = remove_err.read().clone() {
                 p { class: "operon-modal-error", "{err}" }

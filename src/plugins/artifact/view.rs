@@ -2770,6 +2770,13 @@ pub fn spawn_cascade(
     let scope = operon_store::repos::ChatScope::Project(project_id);
     active_scope.set(scope);
     active_session.set(Some(cascade_session_id));
+    // Ensure the companion panel is visible. The user can't follow
+    // Claude's thinking / tool_use rows if the panel is collapsed,
+    // and the cascade switches the active session out from under
+    // them — bumping the tick lets `CompanionArea` un-collapse on
+    // the same tick the session changes.
+    crate::shell::companion_state::EXPAND_COMPANION_TICK
+        .with_mut(|v| *v = v.saturating_add(1));
     plugin.bind_session(cascade_session_id, repo_path.clone());
 
     // Cancellation handle — Stop button on the clicked artifact reads

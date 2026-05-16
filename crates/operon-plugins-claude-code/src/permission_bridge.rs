@@ -105,6 +105,14 @@ pub const SHELL_TOOL_NAME: &str = "operon_bash";
 /// mtime-scan after the run" handshake and the heuristic re-parenting
 /// it required.
 pub const CREATE_ARTIFACT_TOOL_NAME: &str = "create_artifact";
+/// Custom replacement for the harness-owned `AskUserQuestion` built-in.
+/// The harness intercepts AskUserQuestion tool_results in non-TUI mode
+/// (rewriting them to `is_error: true` or auto-synthesising empty
+/// answers), so the only way to ship interactive answers back to the
+/// model is to expose our own MCP tool with the same input shape.
+/// Advertised in `tools/list` when an [`AskUserExecutor`] is set via
+/// [`PermissionBridge::set_ask_user_executor`].
+pub const ASK_USER_TOOL_NAME: &str = "ask_user";
 
 /// Host-supplied shell executor wired in via [`PermissionBridge::with_shell_executor`].
 /// When set, the bridge advertises [`SHELL_TOOL_NAME`] in its `tools/list`
@@ -146,6 +154,22 @@ pub trait ArtifactExecutor: Send + Sync + 'static {
     ) -> futures::future::LocalBoxFuture<'a, OperonResult<Value>>;
 }
 
+/// Host-supplied executor for the custom `ask_user` MCP tool.
+/// When set, the bridge advertises [`ASK_USER_TOOL_NAME`] in
+/// `tools/list` and routes `tools/call ask_user` invocations to
+/// `ask`. The executor surfaces an interactive picker UI, awaits the
+/// user's selection(s), and returns a JSON payload that gets handed
+/// to Claude verbatim as the MCP tool result. The expected shape
+/// mirrors the built-in AskUserQuestion's internal response:
+/// `{ "questions": [...as-supplied...], "answers": { <question text>: <selected label or array> } }`.
+///
+/// Uses `BoxFuture` (Send) — unlike `ArtifactExecutor`, this path
+/// doesn't touch the wasm-bound `Persistence` futures, so it can run
+/// directly on the connection task without `spawn_blocking`.
+pub trait AskUserExecutor: Send + Sync + 'static {
+    fn ask<'a>(&'a self, args: Value) -> futures::future::BoxFuture<'a, OperonResult<Value>>;
+}
+
 use operon_core::error::OperonResult;
 
 /// Live per-session permission server. Drop it to revoke the binding
@@ -164,6 +188,10 @@ pub struct PermissionBridge {
     /// not advertise `create_artifact` in `tools/list`. Set via
     /// [`PermissionBridge::set_artifact_executor`].
     artifact_executor: Arc<std::sync::Mutex<Option<Arc<dyn ArtifactExecutor>>>>,
+    /// Host-installed ask-user executor. `None` means the bridge does
+    /// not advertise `ask_user` in `tools/list`. Set via
+    /// [`PermissionBridge::set_ask_user_executor`].
+    ask_user_executor: Arc<std::sync::Mutex<Option<Arc<dyn AskUserExecutor>>>>,
 }
 
 impl PermissionBridge {
@@ -190,8 +218,11 @@ impl PermissionBridge {
             Arc::new(std::sync::Mutex::new(None));
         let artifact_executor: Arc<std::sync::Mutex<Option<Arc<dyn ArtifactExecutor>>>> =
             Arc::new(std::sync::Mutex::new(None));
+        let ask_user_executor: Arc<std::sync::Mutex<Option<Arc<dyn AskUserExecutor>>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let shell_for_accept = shell_executor.clone();
         let artifact_for_accept = artifact_executor.clone();
+        let ask_user_for_accept = ask_user_executor.clone();
         let accept_task = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -199,7 +230,8 @@ impl PermissionBridge {
                         let h = handler.clone();
                         let s = shell_for_accept.clone();
                         let a = artifact_for_accept.clone();
-                        tokio::spawn(handle_connection(stream, h, s, a));
+                        let q = ask_user_for_accept.clone();
+                        tokio::spawn(handle_connection(stream, h, s, a, q));
                     }
                     Err(e) => {
                         tracing::warn!(target: "operon::permission", "accept: {e}");
@@ -215,6 +247,7 @@ impl PermissionBridge {
             accept_task: Some(accept_task),
             shell_executor,
             artifact_executor,
+            ask_user_executor,
         })
     }
 
@@ -243,6 +276,15 @@ impl PermissionBridge {
             *s = executor;
         }
     }
+
+    /// Install an ask-user executor. Once set, the bridge advertises
+    /// `ask_user` in subsequent `tools/list` responses and routes calls
+    /// through `executor`. Pass `None` to detach.
+    pub fn set_ask_user_executor(&self, executor: Option<Arc<dyn AskUserExecutor>>) {
+        if let Ok(mut s) = self.ask_user_executor.lock() {
+            *s = executor;
+        }
+    }
 }
 
 impl Drop for PermissionBridge {
@@ -262,6 +304,7 @@ async fn handle_connection<H: PermissionHandler>(
     handler: Arc<H>,
     shell: Arc<std::sync::Mutex<Option<Arc<dyn ShellExecutor>>>>,
     artifact: Arc<std::sync::Mutex<Option<Arc<dyn ArtifactExecutor>>>>,
+    ask_user: Arc<std::sync::Mutex<Option<Arc<dyn AskUserExecutor>>>>,
 ) {
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half).lines();
@@ -364,6 +407,46 @@ async fn handle_connection<H: PermissionHandler>(
                                 "body":      { "type": "string", "description": "Markdown body. Operon ensures the YAML frontmatter declares `artifact_kind` and `parent` consistent with the typed arguments above." }
                             },
                             "required": ["kind", "parent_id", "title", "body"]
+                        }
+                    }));
+                }
+                let ask_user_active = ask_user
+                    .lock()
+                    .ok()
+                    .map(|g| g.is_some())
+                    .unwrap_or(false);
+                if ask_user_active {
+                    tools.push(serde_json::json!({
+                        "name": ASK_USER_TOOL_NAME,
+                        "description": "Ask the user a clarifying question with structured options. Use this whenever you would normally use the built-in AskUserQuestion tool — that one is disabled here, so this is the only way to surface a picker. Input shape mirrors AskUserQuestion exactly. The response will be `{questions, answers}` where `answers` maps each question text to the chosen option label (string for single-select, array for multiSelect).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "questions": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "question":    { "type": "string", "description": "The complete question. Should end with a question mark." },
+                                            "header":      { "type": "string", "description": "Very short label (max ~12 chars)." },
+                                            "multiSelect": { "type": "boolean", "description": "If true, allow multiple selections. Defaults to false." },
+                                            "options": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "label":       { "type": "string" },
+                                                        "description": { "type": "string" }
+                                                    },
+                                                    "required": ["label", "description"]
+                                                }
+                                            }
+                                        },
+                                        "required": ["question", "header", "options"]
+                                    }
+                                }
+                            },
+                            "required": ["questions"]
                         }
                     }));
                 }
@@ -494,6 +577,52 @@ async fn handle_connection<H: PermissionHandler>(
                         id,
                         -32601,
                         "create_artifact advertised but no executor installed".to_string(),
+                    );
+                    send(&writer, resp).await;
+                    continue;
+                }
+                if name == ASK_USER_TOOL_NAME {
+                    let executor = ask_user
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.as_ref().cloned());
+                    if let Some(exec) = executor {
+                        let args = params
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        let writer = writer.clone();
+                        tokio::spawn(async move {
+                            let result = exec.ask(args).await;
+                            let resp = match result {
+                                Ok(v) => json_rpc_result(
+                                    id,
+                                    serde_json::json!({
+                                        "content": [{
+                                            "type": "text",
+                                            "text": v.to_string(),
+                                        }]
+                                    }),
+                                ),
+                                Err(e) => json_rpc_result(
+                                    id,
+                                    serde_json::json!({
+                                        "content": [{
+                                            "type": "text",
+                                            "text": format!("{{\"error\":\"{}\"}}", e),
+                                        }],
+                                        "isError": true,
+                                    }),
+                                ),
+                            };
+                            send(&writer, resp).await;
+                        });
+                        continue;
+                    }
+                    let resp = json_rpc_error(
+                        id,
+                        -32601,
+                        "ask_user advertised but no executor installed".to_string(),
                     );
                     send(&writer, resp).await;
                     continue;
@@ -1002,5 +1131,131 @@ mod tests {
             permission_prompt_tool_arg(),
             format!("mcp__{MCP_SERVER_NAME}__{PERMISSION_TOOL_NAME}")
         );
+    }
+
+    // ===== ask_user tool surface =====
+
+    /// Test ask-user executor: records the question payload it
+    /// received and returns a canned answers map.
+    struct TestAskUserExecutor {
+        captured: Arc<StdMutex<Vec<Value>>>,
+        result: Value,
+    }
+
+    impl AskUserExecutor for TestAskUserExecutor {
+        fn ask<'a>(
+            &'a self,
+            args: Value,
+        ) -> futures::future::BoxFuture<'a, operon_core::error::OperonResult<Value>> {
+            let captured = self.captured.clone();
+            let result = self.result.clone();
+            Box::pin(async move {
+                captured.lock().unwrap().push(args);
+                Ok(result)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_list_advertises_ask_user_when_executor_installed() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("perm.sock");
+        let bridge = PermissionBridge::bind(sock.clone(), allow_all())
+            .await
+            .unwrap();
+        bridge.set_ask_user_executor(Some(Arc::new(TestAskUserExecutor {
+            captured: Arc::new(StdMutex::new(Vec::new())),
+            result: serde_json::json!({"questions": [], "answers": {}}),
+        })));
+
+        let mut stream = UnixStream::connect(&sock).await.unwrap();
+        let resp = rpc(
+            &mut stream,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/list",
+                "params": {}
+            }),
+        )
+        .await;
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&PERMISSION_TOOL_NAME));
+        assert!(names.contains(&ASK_USER_TOOL_NAME));
+    }
+
+    #[tokio::test]
+    async fn tools_call_ask_user_routes_to_executor() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("perm.sock");
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let bridge = PermissionBridge::bind(sock.clone(), allow_all())
+            .await
+            .unwrap();
+        bridge.set_ask_user_executor(Some(Arc::new(TestAskUserExecutor {
+            captured: captured.clone(),
+            result: serde_json::json!({
+                "questions": [{
+                    "question": "Pick one?",
+                    "header": "Pick",
+                    "options": [{"label": "a", "description": "alpha"}]
+                }],
+                "answers": { "Pick one?": "a" },
+            }),
+        })));
+
+        let mut stream = UnixStream::connect(&sock).await.unwrap();
+        let resp = rpc(
+            &mut stream,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {
+                    "name": ASK_USER_TOOL_NAME,
+                    "arguments": {
+                        "questions": [{
+                            "question": "Pick one?",
+                            "header": "Pick",
+                            "options": [{"label": "a", "description": "alpha"}]
+                        }]
+                    }
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(resp["id"], 11);
+        let payload_text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(payload_text).unwrap();
+        assert_eq!(payload["answers"]["Pick one?"], "a");
+
+        let cap = captured.lock().unwrap();
+        assert_eq!(cap.len(), 1);
+        assert_eq!(cap[0]["questions"][0]["question"], "Pick one?");
+    }
+
+    #[tokio::test]
+    async fn tools_call_ask_user_without_executor_returns_error() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("perm.sock");
+        let _bridge = PermissionBridge::bind(sock.clone(), allow_all())
+            .await
+            .unwrap();
+
+        let mut stream = UnixStream::connect(&sock).await.unwrap();
+        let resp = rpc(
+            &mut stream,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "tools/call",
+                "params": { "name": ASK_USER_TOOL_NAME, "arguments": { "questions": [] } }
+            }),
+        )
+        .await;
+        assert_eq!(resp["id"], 12);
+        assert_eq!(resp["error"]["code"], -32601);
     }
 }

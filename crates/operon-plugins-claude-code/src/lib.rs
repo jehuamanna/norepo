@@ -23,9 +23,10 @@ pub mod stream;
 pub use event::ClaudeCodeEvent;
 #[cfg(not(target_arch = "wasm32"))]
 pub use permission_bridge::{
-    build_mcp_config, permission_prompt_tool_arg, ArtifactExecutor, PermissionBridge,
-    PermissionDecision, PermissionHandler, PermissionRequest, ShellExecutor,
-    CREATE_ARTIFACT_TOOL_NAME, MCP_SERVER_NAME, PERMISSION_TOOL_NAME, SHELL_TOOL_NAME,
+    build_mcp_config, permission_prompt_tool_arg, ArtifactExecutor, AskUserExecutor,
+    PermissionBridge, PermissionDecision, PermissionHandler, PermissionRequest, ShellExecutor,
+    ASK_USER_TOOL_NAME, CREATE_ARTIFACT_TOOL_NAME, MCP_SERVER_NAME, PERMISSION_TOOL_NAME,
+    SHELL_TOOL_NAME,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use plugin::{ClaudeCodeChatPlugin, ClaudeCodeConfig};

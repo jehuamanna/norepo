@@ -4901,6 +4901,7 @@ async fn run_one_node(
         &upstream,
         &graph_for_hash,
         transcript_sink,
+        Some(repo_path),
     )
     .await
     .map_err(|e| format!("{e}"))?;

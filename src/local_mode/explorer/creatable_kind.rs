@@ -80,14 +80,14 @@ impl CreatableKind {
 /// "Required body sections" block in `seed-skills-updated/0{2..9}-*.md`.
 ///
 /// The `## Revision history` table is seeded with row 1 dated `<today>`
-/// (`current_iso_date`) and `Derived from = manual entry` so re-runs of
+/// (`current_iso_date`) and `Derived from = manual` so re-runs of
 /// downstream skills can extend it without losing provenance.
 pub fn scaffold_body(kind: &ArtifactKind) -> String {
     let today = current_iso_date();
     let history = format!(
         "| Revision | Date       | Derived from | Summary                              |\n\
          |----------|------------|--------------|--------------------------------------|\n\
-         | 1        | {today}    | manual entry | Manually created via Operon explorer. |\n"
+         | 1        | {today}    | manual       | Manually created via Operon explorer. |\n"
     );
     let frontmatter = format!("---\nartifact_kind: {}\n---\n\n", kind.as_str());
 
@@ -390,9 +390,12 @@ mod tests {
             body.contains(&today),
             "scaffold should stamp today's date ({today}) into the revision history"
         );
-        assert!(
-            body.contains("manual entry"),
-            "scaffold's revision row should mark `Derived from = manual entry`"
+        let parsed = crate::plugins::artifact::revision_table::parse_revision_table(&body)
+            .expect("scaffold body contains a parseable revision table");
+        assert_eq!(parsed.rows.len(), 1);
+        assert_eq!(
+            parsed.rows[0].derived_from, "manual",
+            "scaffold's revision row should mark `Derived from = manual`"
         );
     }
 

@@ -271,9 +271,10 @@ pub async fn run_skill_on_source_with_revision_notes(
     //     finds the tool absent halts immediately rather than
     //     producing degraded output. Belt-and-suspenders with the
     //     general MCP health gate at the top of this function.
-    if let Some(msg) =
-        crate::shell::companion_state::mcp_skill_requirements_gate_error(&contract.requires_mcp)
-    {
+    if let Some(msg) = crate::shell::companion_state::mcp_skill_requirements_gate_error(
+        &contract.requires_mcp,
+        Some(&repo_path),
+    ) {
         return Err(RunnerError::Gated(msg));
     }
 

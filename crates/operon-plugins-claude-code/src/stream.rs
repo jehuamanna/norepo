@@ -121,6 +121,7 @@ pub(crate) fn parse_line(
         "user" => parse_user_blocks(&v),
         "result" => parse_result(&v, state, operon_session),
         "system" => parse_system(&v),
+        "stream_event" => parse_stream_event(&v),
         "error" => {
             let msg = v
                 .get("error")
@@ -136,6 +137,44 @@ pub(crate) fn parse_line(
         // rate_limit_event / unknown — drop silently
         _ => Vec::new(),
     }
+}
+
+/// Parse a `stream_event` envelope — emitted only when claude was spawned
+/// with `--include-partial-messages`. The envelope's `event` field carries
+/// a raw Anthropic SSE event (`content_block_start`, `content_block_delta`,
+/// `content_block_stop`, `message_*`); we surface only the `thinking_delta`
+/// deltas so the chat UI can stream extended-thinking content live.
+///
+/// Text deltas are intentionally NOT surfaced here: the non-partial
+/// `assistant` envelope already arrives at end-of-turn with the full text,
+/// and the chat layer collates Text deltas by appending — emitting both
+/// the partials and the final block would double the rendered text.
+/// Thinking is the inverse: claude-code v2.1.8+ strips `thinking` blocks
+/// from the non-partial envelope, so partial deltas are the only signal.
+fn parse_stream_event(v: &serde_json::Value) -> Vec<ClaudeCodeEvent> {
+    let event = match v.get("event") {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+    let ev_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    if ev_type != "content_block_delta" {
+        return Vec::new();
+    }
+    let delta = match event.get("delta") {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    if delta.get("type").and_then(|t| t.as_str()) != Some("thinking_delta") {
+        return Vec::new();
+    }
+    let text = delta
+        .get("thinking")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    if text.is_empty() {
+        return Vec::new();
+    }
+    vec![ClaudeCodeEvent::Thinking(text.to_string())]
 }
 
 /// Parse a claude `system` envelope. Only the `init` subtype carries the
@@ -409,6 +448,52 @@ mod tests {
             ClaudeCodeEvent::Thinking(t) => assert_eq!(t, "hmm let me think"),
             other => panic!("expected Thinking, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_stream_event_thinking_delta() {
+        // claude --include-partial-messages emits one of these per chunk
+        // of extended thinking. The chat layer coalesces successive
+        // deltas into a single Thinking block, so partial chunks must
+        // make it through parse_line without being dropped.
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"weighing options"}}}"#;
+        let sid = Uuid::new_v4();
+        let state = fresh_state_with_binding(sid);
+        let events = parse_line(line, &state, sid);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ClaudeCodeEvent::Thinking(t) => assert_eq!(t, "weighing options"),
+            other => panic!("expected Thinking, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_event_text_delta_is_dropped() {
+        // Text deltas inside `stream_event` envelopes are intentionally
+        // ignored; the full assistant text arrives in a non-partial
+        // `assistant` envelope and emitting both would double-render.
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}}"#;
+        let sid = Uuid::new_v4();
+        let state = fresh_state_with_binding(sid);
+        assert!(parse_line(line, &state, sid).is_empty());
+    }
+
+    #[test]
+    fn stream_event_non_delta_subtypes_are_dropped() {
+        let sid = Uuid::new_v4();
+        let state = fresh_state_with_binding(sid);
+        assert!(parse_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_start"}}"#,
+            &state,
+            sid,
+        )
+        .is_empty());
+        assert!(parse_line(
+            r#"{"type":"stream_event","event":{"type":"message_stop"}}"#,
+            &state,
+            sid,
+        )
+        .is_empty());
     }
 
     #[test]

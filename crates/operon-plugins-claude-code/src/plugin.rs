@@ -410,6 +410,13 @@ impl ClaudeCodeChatPlugin {
             .arg("stream-json")
             .arg("--output-format")
             .arg("stream-json")
+            // Surface extended-thinking as it streams. Claude Code v2.1.8+
+            // suppresses `thinking` content blocks from default stream-json
+            // output (regression vs 2.1.7); the only way to see them now is
+            // the `stream_event` envelope this flag enables. Without it the
+            // companion would render assistant text only, with no visible
+            // reasoning trace.
+            .arg("--include-partial-messages")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -452,14 +459,48 @@ impl ClaudeCodeChatPlugin {
             bridge.is_some(),
             bash_via_operon,
         );
-        // Phase 6 bash-via-operon: claude's built-in Bash is barred
-        // for this session so the model has to call
-        // `mcp__operon__operon_bash` (advertised by the bridge when
-        // its shell executor is installed). Streams stdout/stderr
-        // live into the chat UI and supports per-tool Cancel.
+        // Compose the `--disallowedTools` argument as a single
+        // comma-separated value. Claude's CLI accepts the flag at
+        // most once — passing it multiple times silently keeps only
+        // the last invocation, so two separate `.arg("--disallowedTools")`
+        // calls would let one of the entries through (regression that
+        // caused Bash and/or AskUserQuestion to not actually be blocked
+        // depending on order).
+        //
+        // AskUserQuestion is always disabled because the harness
+        // intercepts its tool_result frames in non-TUI mode (rewrites
+        // host responses to is_error=true, or auto-synthesises empty
+        // answers), which hangs the chat surface — see the 2026-05-15
+        // spike findings. The custom `mcp__operon__ask_user` MCP tool
+        // (advertised by the bridge, executor lives in
+        // `operon-dioxus::shell::bridge_ask_user_executor`) replaces
+        // it and surfaces a real picker.
+        //
+        // Bash is additionally disabled under bash_via_operon (Phase
+        // 6): forces the model to call `mcp__operon__operon_bash`
+        // instead, which streams stdout/stderr live into the chat UI
+        // and supports per-tool Cancel.
+        let mut disallowed: Vec<&str> = vec!["AskUserQuestion"];
         if bash_via_operon {
-            cmd.arg("--disallowedTools").arg("Bash");
+            disallowed.push("Bash");
         }
+        cmd.arg("--disallowedTools").arg(disallowed.join(","));
+        // Steer the model to the replacement tool. Without this hint
+        // Claude knows about the harness's AskUserQuestion from its
+        // training but won't necessarily reach for the unfamiliar
+        // `mcp__operon__ask_user` — it'll fall back to plain-text
+        // questions instead, which is fine but loses the picker UX.
+        // Kept as a single short paragraph so it's cheap to pay the
+        // cache cost on every turn.
+        cmd.arg("--append-system-prompt").arg(
+            "When you want to ask the user a clarifying question with structured options, \
+             call the `mcp__operon__ask_user` MCP tool. Its input schema mirrors the built-in \
+             AskUserQuestion verbatim (a `questions` array of \
+             `{question, header, multiSelect, options:[{label, description}]}`), and the \
+             response will be `{questions, answers}` where `answers` maps each question to \
+             the chosen option label (string for single-select, array for multiSelect). \
+             The built-in AskUserQuestion is disabled in this environment — do not call it.",
+        );
 
         // Wire the inline-permission-prompt MCP tool when a session has
         // a `PermissionBridge` attached AND the runtime knows where the

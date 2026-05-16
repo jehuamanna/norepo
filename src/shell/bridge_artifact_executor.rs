@@ -38,6 +38,7 @@ use crate::persistence::Persistence;
 use crate::plugins::artifact::frontmatter::{
     parse as parse_artifact_fm, rewrite as rewrite_artifact_fm, ArtifactKind, ArtifactStatus,
 };
+use crate::plugins::artifact::revision_table;
 
 pub struct BridgeArtifactExecutor {
     note_repo: Arc<dyn LocalNoteRepository>,
@@ -116,9 +117,10 @@ async fn create_inner(
         .map_err(|e| err(format!("create note: {e}")))?;
 
     let normalized_body = normalize_body(&body, &kind);
+    let seeded_body = seed_revision_history(&normalized_body, &title);
 
     persistence
-        .save(&note.id.to_string(), normalized_body.as_bytes())
+        .save(&note.id.to_string(), seeded_body.as_bytes())
         .await
         .map_err(|e| err(format!("save body: {e:?}")))?;
 
@@ -140,6 +142,27 @@ fn require_string(args: &Value, key: &str) -> OperonResult<String> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| err(format!("missing string arg `{key}`")))
+}
+
+/// Strip whatever revision-history table the caller put in `body` and
+/// seed a canonical row 1 with `derived_from = "claude"`. The model
+/// often copies the explorer-scaffold pattern (which uses `manual
+/// entry`) into the body it provides, which would misattribute the
+/// creation. Owning this column from the host side guarantees correct
+/// provenance regardless of what the model wrote.
+fn seed_revision_history(body: &str, title: &str) -> String {
+    let stripped = revision_table::strip_revision_section(body);
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let row = revision_table::RevisionRow {
+        revision: 1,
+        date: revision_table::format_revision_date(unix_ms),
+        derived_from: "claude".to_string(),
+        summary: format!("Created '{title}' via Claude Code."),
+    };
+    revision_table::append_revision_row(&stripped, row)
 }
 
 /// Normalize the caller-supplied body so its YAML frontmatter declares
@@ -194,5 +217,37 @@ mod tests {
         let v = json!({ "title": "hello" });
         let s = require_string(&v, "title").unwrap();
         assert_eq!(s, "hello");
+    }
+
+    #[test]
+    fn seed_revision_history_replaces_model_supplied_manual_row() {
+        // The model often parrots the explorer scaffold's `manual entry`
+        // row into bodies it generates for `create_artifact`. The seed
+        // pass must drop that and stamp a single `claude` row 1.
+        let body = "---\nartifact_kind: epic\n---\n\n# Epic: Memory Match\n\n\
+                    ## Revision history\n\n\
+                    | Revision | Date | Derived from | Summary |\n\
+                    |-|-|-|-|\n\
+                    | 1 | 2026-05-15 | manual entry | Manually created via Operon explorer. |\n";
+        let out = super::seed_revision_history(body, "Memory Match");
+        let parsed = crate::plugins::artifact::revision_table::parse_revision_table(&out)
+            .expect("seeded body has a revision table");
+        assert_eq!(parsed.rows.len(), 1, "exactly one row after seeding");
+        assert_eq!(parsed.rows[0].derived_from, "claude");
+        assert!(
+            !out.contains("manual entry"),
+            "model's `manual entry` row must be discarded; got:\n{out}"
+        );
+        assert!(parsed.rows[0].summary.contains("Memory Match"));
+    }
+
+    #[test]
+    fn seed_revision_history_adds_row_when_body_has_no_table() {
+        let body = "---\nartifact_kind: epic\n---\n\n# Epic: \n\n## Outcome\n\n";
+        let out = super::seed_revision_history(body, "Untitled");
+        let parsed = crate::plugins::artifact::revision_table::parse_revision_table(&out)
+            .expect("seeded body has a revision table");
+        assert_eq!(parsed.rows.len(), 1);
+        assert_eq!(parsed.rows[0].derived_from, "claude");
     }
 }

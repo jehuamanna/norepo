@@ -131,6 +131,11 @@ pub async fn run_node(
     upstream_outputs: &[(NodeId, String)],
     graph_for_hash: &WorkflowGraph,
     transcript_sink: Option<CascadeTranscriptSink>,
+    // Repo root the claude subprocess is bound to. Used by the
+    // MCP-requirement gate as a fallback when the live `system/init`
+    // snapshot is empty — lets `.mcp.json`-declared servers satisfy
+    // `requires_mcp` on a cold cascade run.
+    repo_path: Option<&std::path::Path>,
 ) -> Result<RunArtifact, ExecError> {
     if skill_body.trim().is_empty() {
         return Err(ExecError::NoSkillBody(node.skill_note_id));
@@ -143,15 +148,17 @@ pub async fn run_node(
     // Per-skill MCP requirement gate. Parse just enough of the skill
     // contract to read `requires_mcp` and refuse to fire when any
     // declared server/tool is missing from the latest `system/init`
-    // inventory.
+    // inventory (with `.mcp.json` / `~/.claude.json` as the cold-start
+    // fallback).
     {
         use crate::plugins::skill::frontmatter::{contract as parse_skill_contract, split as split_skill};
         let (fm_lines, _) = split_skill(skill_body);
         let lines = fm_lines.unwrap_or_default();
         let contract = parse_skill_contract(&lines);
-        if let Some(msg) =
-            crate::shell::companion_state::mcp_skill_requirements_gate_error(&contract.requires_mcp)
-        {
+        if let Some(msg) = crate::shell::companion_state::mcp_skill_requirements_gate_error(
+            &contract.requires_mcp,
+            repo_path,
+        ) {
             return Err(ExecError::Plugin(msg));
         }
     }

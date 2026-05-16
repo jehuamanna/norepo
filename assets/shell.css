@@ -77,6 +77,31 @@ html, body {
   cursor: auto;
 }
 
+/* Make every label, chip, badge, tab, glyph, disclosure, and inline
+ * control text selectable so the user can copy any text in the app.
+ * Individual selectors below set `user-select: none` for affordance
+ * reasons (tabs feel button-like, chips behave like one-shot tokens);
+ * `!important` overrides them all on user request. The canvas
+ * background re-asserts `user-select: none !important` (with inline
+ * style of equal importance) so drag-to-pan still works. */
+*,
+*::before,
+*::after {
+  -webkit-user-select: text !important;
+  -moz-user-select: text !important;
+  user-select: text !important;
+}
+.operon-canvas-view {
+  -webkit-user-select: none !important;
+  -moz-user-select: none !important;
+  user-select: none !important;
+}
+.operon-canvas-view .operon-canvas-node {
+  -webkit-user-select: text !important;
+  -moz-user-select: text !important;
+  user-select: text !important;
+}
+
 #operon-root {
   height: 100vh;
   width: 100vw;
@@ -1488,6 +1513,41 @@ html, body {
   color: var(--vscode-errorforeground, #f48771);
 }
 
+/* Live indicator + per-row stop button for a chat session that has a
+   `claude` turn in flight. Both subscribe to CHAT_RUN_CANCEL and
+   appear only while the session id is in the map. The stop button
+   sits to the left of the delete button (which is still hover-only)
+   so the user can terminate a background run without first
+   navigating to that chat. */
+.operon-companion-rail-item-running {
+  flex: 0 0 auto;
+  color: var(--vscode-charts-green, #4ec9b0);
+  font-size: 8px;
+  line-height: 1;
+  margin-right: 4px;
+  animation: operon-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes operon-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+.operon-companion-rail-item-stop {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  color: var(--vscode-errorforeground, #f48771);
+  cursor: pointer;
+  padding: 0 4px;
+  font-size: 10px;
+  opacity: 0.85;
+}
+
+.operon-companion-rail-item-stop:hover {
+  opacity: 1;
+}
+
 .operon-companion-rail-empty {
   padding: 12px;
   font-size: 11px;
@@ -1670,6 +1730,20 @@ html, body {
   border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
   border-radius: 4px;
   cursor: pointer;
+}
+
+/* Red accent so the header Stop button reads as a destructive
+   action — terminates only the *active* session's claude turn. The
+   per-row Stop in the rail (`operon-companion-rail-item-stop`)
+   handles non-active running sessions. */
+.operon-companion-chat-stop {
+  background: transparent;
+  color: var(--vscode-errorforeground, #f48771);
+  border-color: var(--vscode-errorforeground, #f48771);
+}
+
+.operon-companion-chat-stop:hover {
+  background: rgba(244, 135, 113, 0.12);
 }
 
 .operon-companion-toolbar-label {
@@ -1856,6 +1930,135 @@ html, body {
   font-style: italic;
 }
 
+/* ------------ Ask-user picker card (custom mcp__operon__ask_user tool) ------------ */
+.operon-ask-user-card {
+  align-self: stretch;
+  flex-shrink: 0;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  background: var(--vscode-editorWidget-background, rgba(127, 127, 127, 0.04));
+  padding: 8px 10px;
+  margin: 6px 0;
+  font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.operon-ask-user-card[data-status="pending"] {
+  border-color: var(--operon-accent);
+}
+.operon-ask-user-card[data-status="cancelled"] {
+  opacity: 0.6;
+}
+.operon-ask-user-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.operon-ask-user-chip {
+  font-weight: 600;
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--vscode-badge-background, rgba(127, 127, 127, 0.18));
+  color: var(--vscode-badge-foreground, inherit);
+}
+.operon-ask-user-status {
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+  font-style: italic;
+}
+.operon-ask-user-question {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.operon-ask-user-question-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.operon-ask-user-question-chip {
+  font-weight: 600;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--vscode-badge-background, rgba(127, 127, 127, 0.18));
+}
+.operon-ask-user-question-text {
+  flex: 1 1 auto;
+  font-weight: 500;
+}
+.operon-ask-user-options {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-left: 6px;
+}
+.operon-ask-user-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 3px;
+}
+.operon-ask-user-option:hover {
+  background: var(--vscode-list-hoverBackground, rgba(127, 127, 127, 0.08));
+}
+.operon-ask-user-option-desc {
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+}
+.operon-ask-user-other input {
+  width: 100%;
+  margin-top: 4px;
+  padding: 2px 4px;
+  font-size: 12px;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  border-radius: 3px;
+}
+.operon-ask-user-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.operon-ask-user-submit {
+  padding: 4px 12px;
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  border: 1px solid var(--vscode-button-border, transparent);
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.operon-ask-user-submit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.operon-ask-user-submit:not(:disabled):hover {
+  background: var(--vscode-button-hoverBackground, var(--vscode-button-background));
+}
+.operon-ask-user-cancel {
+  padding: 4px 12px;
+  background: transparent;
+  color: var(--vscode-foreground);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.operon-ask-user-cancel:hover {
+  background: var(--vscode-list-hoverBackground, rgba(127, 127, 127, 0.08));
+}
+.operon-ask-user-resolved-pick {
+  padding: 2px 6px;
+  font-style: italic;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+}
+
 /* ------------ Tool-use card (collapsible, per-tool body) ------------ */
 .operon-tool-card {
   align-self: stretch;
@@ -1915,6 +2118,35 @@ html, body {
   background: var(--vscode-errorforeground, #f48771);
   color: var(--vscode-button-foreground, white);
 }
+/* MCP server health badge — only rendered for pending mcp__* tool
+ * cards when the matching MCP server status is *not* `connected`.
+ * Surfaces a stalled / mis-authed server inline so the user sees
+ * "figma: needs-auth" without leaving the chat. */
+.operon-tool-card-mcp-status {
+  flex: 0 0 auto;
+  font-size: 10px;
+  letter-spacing: 0.3px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--vscode-input-background, rgba(255, 255, 255, 0.05));
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+  border: 1px solid var(--vscode-panel-border);
+  font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+}
+.operon-tool-card-mcp-status[data-mcp-status="needs-auth"],
+.operon-tool-card-mcp-status[data-mcp-status="auth"] {
+  background: var(--vscode-statusbaritem-warningbackground, #cc8a00);
+  color: var(--vscode-statusbaritem-warningforeground, #fff);
+  border-color: transparent;
+}
+.operon-tool-card-mcp-status[data-mcp-status="failed"],
+.operon-tool-card-mcp-status[data-mcp-status="not connected"],
+.operon-tool-card-mcp-status[data-mcp-status="disconnected"],
+.operon-tool-card-mcp-status[data-mcp-status="error"] {
+  background: var(--vscode-errorforeground, #f48771);
+  color: var(--vscode-button-foreground, white);
+  border-color: transparent;
+}
 .operon-tool-card-body {
   padding: 6px 8px;
   border-top: 1px solid var(--vscode-panel-border);
@@ -1939,6 +2171,47 @@ html, body {
   overflow-x: auto;
   font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
   font-size: 11px;
+}
+.operon-tool-card-pending-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.operon-tool-card-pending-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.operon-tool-card-elapsed {
+  flex: 1 1 auto;
+  font-size: 11px;
+  color: var(--vscode-descriptionforeground, var(--vscode-editor-foreground));
+  font-style: italic;
+}
+.operon-tool-card-cancel-btn,
+.operon-tool-card-cancel-turn {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  background: transparent;
+  color: var(--vscode-editor-foreground);
+  border: 1px solid var(--vscode-panel-border);
+}
+.operon-tool-card-cancel-btn:hover {
+  background: var(--vscode-list-hoverBackground, rgba(255, 255, 255, 0.05));
+}
+/* Cancel turn is the heavier action — only appears after 30s, kills
+ * the whole subprocess. Amber border distinguishes it from the
+ * runtime-only per-tool Cancel sitting next to it. */
+.operon-tool-card-cancel-turn {
+  border-color: var(--vscode-statusbaritem-warningbackground, #cc8a00);
+  color: var(--vscode-statusbaritem-warningbackground, #cc8a00);
+}
+.operon-tool-card-cancel-turn:hover {
+  background: var(--vscode-statusbaritem-warningbackground, #cc8a00);
+  color: var(--vscode-statusbaritem-warningforeground, #fff);
 }
 .operon-tool-card-result-pending {
   font-style: italic;
@@ -3748,14 +4021,19 @@ html, body {
      one line. */
   min-width: 32rem;
   max-width: min(40rem, 92vw);
-  max-height: 80vh;
-  overflow: auto;
+  max-height: 86vh;
+  /* Card is a flex column so the header + add form pin to the top
+     and the server list scrolls independently below. */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 .operon-mcp-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  flex: 0 0 auto;
 }
 .operon-mcp-header-actions {
   display: flex;
@@ -3937,4 +4215,161 @@ html, body {
 }
 .operon-mcp-kv-val {
   flex: 1 1 auto;
+}
+
+/* Scope chip on each server row — tells the user which config the
+   entry lives in (User-global vs. Project/.mcp.json vs. Local). The
+   directory is shown on its own line under the command. */
+.operon-mcp-scope-chip {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 6px;
+  border-radius: 10px;
+  border: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-badge-background, rgba(255, 255, 255, 0.06));
+  color: var(--vscode-badge-foreground, currentColor);
+  flex: 0 0 auto;
+  white-space: nowrap;
+  cursor: help;
+}
+.operon-mcp-scope-user {
+  border-color: rgba(120, 170, 255, 0.45);
+  background: rgba(120, 170, 255, 0.12);
+}
+.operon-mcp-scope-project {
+  border-color: rgba(126, 179, 106, 0.5);
+  background: rgba(126, 179, 106, 0.14);
+}
+.operon-mcp-scope-local {
+  border-color: rgba(217, 154, 60, 0.5);
+  background: rgba(217, 154, 60, 0.14);
+}
+.operon-mcp-scope-unknown {
+  opacity: 0.7;
+}
+.operon-mcp-server-dir {
+  font-size: 11px;
+  opacity: 0.7;
+  margin: 2px 0 0 16px;
+  font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, monospace);
+  display: flex;
+  align-items: baseline;
+  gap: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.operon-mcp-server-dir-icon {
+  flex: 0 0 auto;
+}
+.operon-mcp-server-dir-name {
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+.operon-mcp-server-dir-path {
+  opacity: 0.6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* Two-section layout inside the modal card: form on top, list below.
+   The list lives inside an explicitly-scrollable region so the
+   add-form stays visible when many servers are configured. */
+.operon-mcp-add-section {
+  flex: 0 0 auto;
+  margin-bottom: 10px;
+}
+.operon-mcp-add-toggle {
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  padding: 4px 0;
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+}
+.operon-mcp-add-toggle:hover {
+  opacity: 0.9;
+  text-decoration: underline;
+}
+.operon-mcp-list-heading {
+  flex: 0 0 auto;
+  margin: 6px 0 4px 0;
+}
+.operon-mcp-list-scroll {
+  flex: 1 1 auto;
+  min-height: 6rem;
+  overflow-y: auto;
+  /* A visible right-side rail signals the region scrolls. */
+  border-top: 1px solid var(--vscode-panel-border);
+  padding: 6px 4px 6px 0;
+  margin-right: -4px;
+}
+.operon-mcp-list-scroll::-webkit-scrollbar {
+  width: 10px;
+}
+.operon-mcp-list-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.operon-mcp-list-scroll::-webkit-scrollbar-thumb {
+  background: var(
+    --vscode-scrollbarSlider-background,
+    rgba(121, 121, 121, 0.4)
+  );
+  border-radius: 5px;
+}
+.operon-mcp-list-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(
+    --vscode-scrollbarSlider-hoverBackground,
+    rgba(121, 121, 121, 0.6)
+  );
+}
+
+/* Form / JSON mode tabs at the top of the add form. */
+.operon-mcp-mode-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+.operon-mcp-mode-tab {
+  font: inherit;
+  font-size: 12px;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 4px 10px;
+  cursor: pointer;
+  opacity: 0.75;
+}
+.operon-mcp-mode-tab:hover {
+  opacity: 1;
+}
+.operon-mcp-mode-tab-active {
+  opacity: 1;
+  border-bottom-color: var(--vscode-focusborder, #0078d4);
+}
+.operon-mcp-json-textarea {
+  font-family: var(
+    --vscode-editor-font-family,
+    ui-monospace,
+    SFMono-Regular,
+    monospace
+  );
+  font-size: 11.5px;
+  resize: vertical;
+  min-height: 8rem;
+  width: 100%;
+}
+.operon-mcp-json-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
 }

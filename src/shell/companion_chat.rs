@@ -37,10 +37,11 @@ use crate::local_mode::desktop::{CurrentVaultRoot, LocalProjectRepo};
 use crate::local_mode::explorer::LocalProjectVersion;
 use crate::plugins::markdown::MarkdownView;
 use crate::shell::companion_state::{
-    take_permission_responder, ActiveChatScope, ActiveChatSession, ActiveRepoPath, ChatMessage,
-    ChatMessageKind, ArtifactRunState, ChatMessageRepo, ChatScope, ChatSessionRepo,
-    CompanionComposerInbox, PermissionStatus, ARTIFACT_RUN_STATE, CHAT_MESSAGE_VERSION,
-    INPROGRESS_ASSISTANT, PERMISSION_DECISIONS, PERMISSION_PROMPTS,
+    cancel_session_run, take_permission_responder, ActiveChatScope, ActiveChatSession,
+    ActiveRepoPath, ArtifactRunState, ChatMessage, ChatMessageKind, ChatMessageRepo, ChatScope,
+    ChatSessionRepo, CompanionComposerInbox, PermissionStatus, ARTIFACT_RUN_STATE,
+    CHAT_MESSAGE_VERSION, CHAT_RUN_CANCEL, INPROGRESS_ASSISTANT, PERMISSION_DECISIONS,
+    PERMISSION_PROMPTS,
 };
 use crate::shell::session_rail::SessionRail;
 use crate::shell::splitter::RailSplitter;
@@ -249,8 +250,12 @@ pub fn CompanionChat() -> Element {
     // the chip's *displayed* title is re-resolved live through
     // `NoteTitleResolver` so renames update inline.
     let mut attached_notes = use_signal::<Vec<(Uuid, String)>>(Vec::new);
-    let in_flight = use_signal(|| false);
-    let active_ct = use_signal::<Option<CancellationToken>>(|| None);
+    // Per-session in-flight state lives in `CHAT_RUN_CANCEL` (a
+    // GlobalSignal<HashMap<Uuid, CancellationToken>> in
+    // `companion_state`). The header / rail / composer all derive
+    // "is the active session running?" from that map by id, so two
+    // chats can stream in parallel and each has its own Stop button
+    // that only cancels its own subprocess.
     let usage_total = use_signal::<Usage>(Usage::default);
     // Tracks whether the tail-end AssistantText in `transcript` has been
     // persisted to chat_message yet. Set true on each Text delta; cleared
@@ -258,6 +263,13 @@ pub fn CompanionChat() -> Element {
     // on Done (or before any non-text event) to coalesce streaming deltas
     // into one row per assistant block instead of a write per delta.
     let pending_assistant = use_signal(|| false);
+    // Same idea for streaming extended-thinking deltas. claude-code's
+    // `--include-partial-messages` mode emits one `thinking_delta` per
+    // small chunk; without coalescing, every chunk would push a fresh
+    // collapsible block AND a chat_message row, flooding both UI and DB.
+    // Cleared by `flush_pending_thinking` once the run hits a non-Thinking
+    // event (or finishes), at which point the merged body is persisted.
+    let pending_thinking = use_signal(|| false);
     // Visibility of the MCP settings modal — opened by the wrench button
     // in the chat header, closed by clicking the scrim or pressing Esc.
     let mcp_panel_open: Signal<bool> = use_signal(|| false);
@@ -446,7 +458,23 @@ pub fn CompanionChat() -> Element {
                     .and_then(|projects| projects.into_iter().find(|p| p.id == pid))
                     .and_then(|p| p.repo_path)
             }),
-            ChatScope::Vault => vault_root.read().as_ref().map(|v| v.path.clone()),
+            // Global chat: cwd is `$HOME` so claude has a sensible
+            // working directory for filesystem-wide commands ("read
+            // /etc/hosts", "edit ~/.zshrc", search any path…) without
+            // being trapped inside the vault subtree. The vault is
+            // still pinned via `--add-dir` below so global chat can
+            // still reach @-mentioned notes and operon artifacts.
+            //
+            // Falls back to the vault path when `$HOME` is unset
+            // (rare — typically only headless test envs), and then to
+            // `/` so `has_cwd` is true regardless. Without this
+            // fallback the Send button stays disabled on systems
+            // without a configured vault, which presents as "global
+            // chat does nothing — no request or response is shown."
+            ChatScope::Vault => std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| vault_root.read().as_ref().map(|v| v.path.clone()))
+                .or_else(|| Some(std::path::PathBuf::from("/"))),
         }
     });
 
@@ -468,6 +496,7 @@ pub fn CompanionChat() -> Element {
         // before it so both consumers get their own owned/copied value.
         let project_repo_for_extras = project_repo_for_extras.clone();
         let project_version_for_extras = project_version_for_extras;
+        let scope_for_extras = scope_signal;
         use_effect(move || {
             if let Some(v) = project_version_for_extras.as_ref() {
                 let _ = v.read();
@@ -477,6 +506,7 @@ pub fn CompanionChat() -> Element {
             let sid = *session.read();
             let cwd = cwd.read().clone();
             let vault_root = vault_for_effect;
+            let scope_now_for_extras = *scope_for_extras.read();
             match (sid, cwd) {
                 (Some(sid), Some(cwd)) => {
                     let cwd_for_bind = cwd.clone();
@@ -547,6 +577,7 @@ pub fn CompanionChat() -> Element {
                         // from operon's own metadata.
                         let mut extra_dirs: Vec<PathBuf> = Vec::new();
                         if let Some(v) = vault_root.read().as_ref() {
+                            extra_dirs.push(v.path.clone());
                             extra_dirs.push(v.notes_dir());
                             if let Some(prepo) = project_repo_for_extras.as_ref() {
                                 if let Ok(projects) = prepo.list() {
@@ -555,6 +586,20 @@ pub fn CompanionChat() -> Element {
                                     }
                                 }
                             }
+                        }
+                        // Global chat: grant complete filesystem
+                        // access via `--add-dir /` so claude's tools
+                        // (Read / Edit / Write / Glob / Grep) can
+                        // reach any path the user could touch from
+                        // their shell. Permission prompts still gate
+                        // mutations — the rule just stops claude
+                        // from refusing the path outright as "not in
+                        // an allowed directory." Project-scoped chat
+                        // stays narrow (only the repo + bound vault
+                        // subdirs) so production-code sessions don't
+                        // accidentally roam into `/etc` or `$HOME`.
+                        if matches!(scope_now_for_extras, ChatScope::Vault) {
+                            extra_dirs.push(PathBuf::from("/"));
                         }
                         if !extra_dirs.is_empty() {
                             tracing::info!(
@@ -601,17 +646,35 @@ pub fn CompanionChat() -> Element {
         let mut transcript_setter = transcript;
         let mut usage_setter = usage_total;
         let mut pending_setter = pending_assistant;
+        let mut pending_thinking_setter = pending_thinking;
         let repo = message_repo.clone();
         use_effect(move || {
             let sid = *session.read();
             usage_setter.set(Usage::default());
             pending_setter.set(false);
+            pending_thinking_setter.set(false);
             match sid {
                 Some(id) => match repo.list(id) {
                     Ok(rows) => {
                         let restored: Vec<TranscriptItem> =
                             rows.iter().filter_map(transcript_item_from_message).collect();
                         transcript_setter.set(restored);
+                        // Retro-cleanup: if this session was stranded
+                        // mid-turn by a prior app kill, persisted
+                        // tool_call rows still have `result: null` and
+                        // their cards would render RUNNING\u{2026}
+                        // forever. Stamp them errored — but ONLY when
+                        // no live run currently owns the session
+                        // (otherwise we'd kill the in-flight tool of
+                        // a turn the user is just switching back to).
+                        if !crate::shell::companion_state::is_session_running(id) {
+                            flush_orphan_tools(
+                                &mut transcript_setter,
+                                id,
+                                &repo,
+                                "(no result \u{2014} session reloaded)",
+                            );
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -705,6 +768,15 @@ pub fn CompanionChat() -> Element {
     let active_session = *session_signal.read();
     let has_session = active_session.is_some();
     let has_cwd = cwd_for_scope.read().is_some();
+    // Read CHAT_RUN_CANCEL so the component re-renders when any turn
+    // starts / stops. `session_running` is what the header + composer
+    // gate on — true iff the *active* session has an in-flight turn.
+    // A run on a different session id leaves this `false`, so the
+    // composer stays enabled and the user can fire a parallel turn.
+    let session_running = match active_session {
+        Some(sid) => CHAT_RUN_CANCEL.read().contains_key(&sid),
+        None => false,
+    };
     let scope_now = *scope_signal.read();
     let scope_is_project = matches!(scope_now, ChatScope::Project(_));
     let banner = if !has_cwd {
@@ -757,11 +829,10 @@ pub fn CompanionChat() -> Element {
                             let current = AgentBackendKind::parse(&current_id)
                                 .unwrap_or(AgentBackendKind::ClaudeCode);
                             let mut active_backend_setter = active_backend;
-                            let in_flight_read = *in_flight.read();
                             rsx! {
                                 AgentBackendPicker {
                                     current,
-                                    enabled: !in_flight_read,
+                                    enabled: !session_running,
                                     on_change: move |kind: AgentBackendKind| {
                                         active_backend_setter.set(backends.pick(kind));
                                     },
@@ -871,13 +942,14 @@ pub fn CompanionChat() -> Element {
                         },
                         "MCP"
                     }
-                    if *in_flight.read() {
+                    if session_running {
                         button {
                             class: "operon-companion-chat-stop",
                             "data-testid": "companion-stop",
+                            title: "Stop this chat — terminates only this session's claude process.",
                             onclick: move |_| {
-                                if let Some(ct) = active_ct.read().as_ref() {
-                                    ct.cancel();
+                                if let Some(sid) = active_session {
+                                    cancel_session_run(sid);
                                 }
                             },
                             "Stop"
@@ -942,6 +1014,31 @@ pub fn CompanionChat() -> Element {
                             }
                         }
                     }
+                    // Inline ask_user pickers — the custom MCP tool
+                    // that replaces the harness-owned AskUserQuestion
+                    // built-in (which is disabled in this backend
+                    // because its tool_result frames are intercepted
+                    // by the harness in non-TUI mode). The bridge
+                    // executor pushes entries onto `ASK_USER_PROMPTS`
+                    // and parks a oneshot responder per id; the
+                    // card's Submit button resolves the responder
+                    // via `submit_ask_user_answers`.
+                    for entry in crate::shell::companion_state::ASK_USER_PROMPTS.read().iter() {
+                        {
+                            let status = crate::shell::companion_state::ASK_USER_DECISIONS
+                                .read()
+                                .get(&entry.id)
+                                .cloned()
+                                .unwrap_or(crate::shell::companion_state::AskUserStatus::Pending);
+                            rsx! {
+                                crate::shell::ask_user_question_card::AskUserPromptCard {
+                                    key: "{entry.id}",
+                                    entry: entry.clone(),
+                                    status: status,
+                                }
+                            }
+                        }
+                    }
                     // Streaming surface (Phase G): live letter-by-
                     // letter Claude text + "Claude is thinking…"
                     // loader. Both subscribe to GlobalSignals so
@@ -955,12 +1052,13 @@ pub fn CompanionChat() -> Element {
                             })
                             .filter(|s| !s.is_empty());
                         // `is_running` catches artifact/cascade runs.
-                        // `in_flight` catches plain chat turns submitted
-                        // from the composer (Cmd/Ctrl+Enter or Send), which
+                        // `session_running` (derived from CHAT_RUN_CANCEL
+                        // above) catches plain chat turns submitted from
+                        // the composer (Cmd/Ctrl+Enter or Send), which
                         // never touch ARTIFACT_RUN_STATE. Both should
                         // surface the same "Claude is thinking…" loader so
                         // the user has feedback while the turn is pending.
-                        let is_running = *in_flight.read()
+                        let is_running = session_running
                             || sid_now
                                 .map(|id| {
                                     matches!(
@@ -1357,26 +1455,45 @@ pub fn CompanionChat() -> Element {
                                         if c.eq_ignore_ascii_case("v") {
                                             e.prevent_default();
                                             e.stop_propagation();
-                                            if let Ok(text) =
-                                                crate::util::clipboard::read_clipboard_text()
-                                            {
-                                                if !text.is_empty() {
-                                                    let escaped = text
-                                                        .replace('\\', "\\\\")
-                                                        .replace('`', "\\`")
-                                                        .replace('$', "\\$");
-                                                    let script = format!(
-                                                        "(function() {{ \
-                                                            const ta = document.querySelector('[data-testid=\"companion-input\"]'); \
-                                                            if (!ta) return; \
-                                                            ta.focus(); \
-                                                            try {{ document.execCommand('insertText', false, `{escaped}`); }} \
-                                                            catch (err) {{ console.warn('operon: paste insertText failed', err); }} \
-                                                        }})();"
-                                                    );
-                                                    let _ = dioxus::document::eval(&script);
+                                            // Defer the arboard read to a
+                                            // blocking task so the UI thread
+                                            // doesn't stall while X11/Wayland
+                                            // negotiates clipboard ownership
+                                            // (multi-second hang on some
+                                            // setups, especially when the
+                                            // clipboard owner is a remote /
+                                            // sandboxed app). prevent_default
+                                            // already ran synchronously, so
+                                            // the native paste is suppressed
+                                            // before we yield.
+                                            spawn(async move {
+                                                let text =
+                                                    match tokio::task::spawn_blocking(|| {
+                                                        crate::util::clipboard::read_clipboard_text()
+                                                    })
+                                                    .await
+                                                    {
+                                                        Ok(Ok(t)) => t,
+                                                        _ => return,
+                                                    };
+                                                if text.is_empty() {
+                                                    return;
                                                 }
-                                            }
+                                                let escaped = text
+                                                    .replace('\\', "\\\\")
+                                                    .replace('`', "\\`")
+                                                    .replace('$', "\\$");
+                                                let script = format!(
+                                                    "(function() {{ \
+                                                        const ta = document.querySelector('[data-testid=\"companion-input\"]'); \
+                                                        if (!ta) return; \
+                                                        ta.focus(); \
+                                                        try {{ document.execCommand('insertText', false, `{escaped}`); }} \
+                                                        catch (err) {{ console.warn('operon: paste insertText failed', err); }} \
+                                                    }})();"
+                                                );
+                                                let _ = dioxus::document::eval(&script);
+                                            });
                                             return;
                                         }
                                     }
@@ -1392,11 +1509,13 @@ pub fn CompanionChat() -> Element {
                                         run_turn(
                                             active_backend, sid, transcript, composer,
                                             attached_notes,
-                                            in_flight, active_ct, usage_total,
-                                            pending_assistant, repo.clone(), srepo.clone(),
+                                            usage_total,
+                                            pending_assistant, pending_thinking,
+                                            repo.clone(), srepo.clone(),
                                             session_version, handshake,
                                             kd_note_repo.clone(), kd_persistence.clone(),
                                             scope_now, vault_notes_now,
+                                            session_signal,
                                         );
                                     }
                                 }
@@ -1406,7 +1525,7 @@ pub fn CompanionChat() -> Element {
                     button {
                         class: "operon-companion-chat-send",
                         "data-testid": "companion-send",
-                        disabled: *in_flight.read() || !has_cwd || !has_session,
+                        disabled: session_running || !has_cwd || !has_session,
                         onclick: {
                             let repo = message_repo.clone();
                             let srepo = session_repo.clone();
@@ -1423,11 +1542,13 @@ pub fn CompanionChat() -> Element {
                                     run_turn(
                                         active_backend, sid, transcript, composer,
                                         attached_notes,
-                                        in_flight, active_ct, usage_total,
-                                        pending_assistant, repo.clone(), srepo.clone(),
+                                        usage_total,
+                                        pending_assistant, pending_thinking,
+                                        repo.clone(), srepo.clone(),
                                         session_version, handshake,
                                         send_note_repo.clone(), send_persistence.clone(),
                                         scope_now, vault_notes_now,
+                                        session_signal,
                                     );
                                 }
                             }
@@ -1476,13 +1597,24 @@ fn render_item(
                 pre { class: "operon-companion-thinking-body", "{t}" }
             }
         },
-        TranscriptItem::ToolCall { id, name, input, result } => rsx! {
-            ToolCard {
-                key: "{key}",
-                id: id.clone(),
-                name: name.clone(),
-                input: input.clone(),
-                result: result.clone(),
+        TranscriptItem::ToolCall { id, name, input, result } => {
+            // The custom `mcp__operon__ask_user` MCP tool has its own
+            // interactive surface (the `AskUserPromptCard` rendered
+            // from `ASK_USER_PROMPTS` below the transcript). The
+            // generic JSON-dump tool card adds nothing here and just
+            // shows ugly raw `questions=[…]` text while the user is
+            // looking for somewhere to click — suppress it.
+            if name == "mcp__operon__ask_user" {
+                return rsx! {};
+            }
+            rsx! {
+                ToolCard {
+                    key: "{key}",
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                    result: result.clone(),
+                }
             }
         },
         TranscriptItem::System(t) => rsx! {
@@ -1830,10 +1962,9 @@ fn run_turn(
     mut transcript: Signal<Vec<TranscriptItem>>,
     mut composer: Signal<String>,
     mut attached_notes: Signal<Vec<(Uuid, String)>>,
-    mut in_flight: Signal<bool>,
-    mut active_ct: Signal<Option<CancellationToken>>,
     mut usage_total: Signal<Usage>,
     mut pending_assistant: Signal<bool>,
+    mut pending_thinking: Signal<bool>,
     repo: Arc<dyn crate::shell::companion_state::ChatMessageRepository>,
     session_repo: Arc<dyn crate::shell::companion_state::ChatSessionRepository>,
     mut session_version: Signal<u64>,
@@ -1856,8 +1987,18 @@ fn run_turn(
     persistence: Option<Arc<dyn crate::persistence::Persistence>>,
     scope: ChatScope,
     vault_notes_dir: Option<PathBuf>,
+    // Active-session signal used by `apply_event` to gate in-memory
+    // transcript writes. When this turn's `chat_session` doesn't
+    // match the currently-viewed session, apply_event still persists
+    // to SQLite but skips the in-memory transcript mutations so the
+    // user's visible chat isn't corrupted by a parallel run.
+    active_session: Signal<Option<Uuid>>,
 ) {
-    if *in_flight.read() {
+    // Per-session re-entrancy guard. Two Sends on the *same* session
+    // can't double-fire (the second one short-circuits here), but a
+    // Send on a *different* session id is allowed — each gets its own
+    // CancellationToken in `CHAT_RUN_CANCEL` and its own subprocess.
+    if CHAT_RUN_CANCEL.read().contains_key(&chat_session) {
         return;
     }
     let body = composer.read().trim().to_string();
@@ -1902,9 +2043,13 @@ fn run_turn(
     // still the default "New chat". Manual renames in the rail set the
     // label to anything else and disable this path automatically.
     auto_rename_if_default(&session_repo, chat_session, &text, &mut session_version);
-    in_flight.set(true);
+    // Register the turn's CancellationToken in the global map so the
+    // header Stop button + rail per-row Stop can find it by session id.
+    // Removed in every terminal arm of the spawned drainer (early
+    // error, end-of-stream, cancelled) so the entry's presence is an
+    // accurate "running" flag.
     let ct = CancellationToken::new();
-    active_ct.set(Some(ct.clone()));
+    CHAT_RUN_CANCEL.write().insert(chat_session, ct.clone());
 
     let backend_arc: Arc<dyn AgentBackend> = backend.read().clone();
     let repo_for_task = repo.clone();
@@ -1945,48 +2090,293 @@ fn run_turn(
             Ok(rx) => rx,
             Err(e) => {
                 let msg = format!("error: {e}");
-                transcript
-                    .write()
-                    .push(TranscriptItem::System(msg.clone()));
+                let is_viewed = *active_session.peek() == Some(chat_session);
+                if is_viewed {
+                    transcript
+                        .write()
+                        .push(TranscriptItem::System(msg.clone()));
+                }
                 let _ = repo_for_task.append(
                     chat_session,
                     ChatMessageKind::System,
                     None,
                     &serde_json::json!({ "text": msg }),
                 );
-                in_flight.set(false);
-                active_ct.set(None);
+                CHAT_RUN_CANCEL.write().remove(&chat_session);
                 return;
             }
         };
+        // Per-task buffer for assistant text deltas when this run's
+        // session isn't currently viewed. Active runs accumulate text
+        // in the in-memory `transcript` Signal (so the user sees the
+        // letter-by-letter stream); background runs accumulate here
+        // and we persist a single Assistant row whenever a non-text
+        // event arrives or the loop exits. Either way SQLite gets the
+        // same `chat_message` row at the end.
+        let mut bg_assistant_text = String::new();
+        // Sibling buffer to `bg_assistant_text` for streaming
+        // `thinking_delta` chunks while this run's session isn't viewed.
+        // Persisted as a single Thinking row on the next non-Thinking
+        // event or when the loop exits.
+        let mut bg_thinking_text = String::new();
         while let Some(ev) = rx.recv().await {
-            apply_event(
-                &mut transcript,
-                &mut usage_total,
-                &mut pending_assistant,
-                chat_session,
-                &repo_for_task,
-                ev,
-            );
+            let is_viewed = *active_session.peek() == Some(chat_session);
+            if is_viewed {
+                // Drop any buffered background text — the user just
+                // switched to this session, and the next `Text` delta
+                // will land in the transcript Signal directly. The
+                // partial buffer didn't get persisted yet, but any
+                // text already in `bg_assistant_text` is lost from
+                // SQLite's perspective. Persist before clearing to
+                // keep the transcript whole.
+                if !bg_thinking_text.is_empty() {
+                    persist_thinking_text(
+                        &repo_for_task,
+                        chat_session,
+                        std::mem::take(&mut bg_thinking_text),
+                    );
+                }
+                if !bg_assistant_text.is_empty() {
+                    persist_assistant_text(
+                        &repo_for_task,
+                        chat_session,
+                        std::mem::take(&mut bg_assistant_text),
+                    );
+                }
+                apply_event(
+                    &mut transcript,
+                    &mut usage_total,
+                    &mut pending_assistant,
+                    &mut pending_thinking,
+                    chat_session,
+                    &repo_for_task,
+                    ev,
+                );
+            } else {
+                apply_event_background(
+                    chat_session,
+                    &repo_for_task,
+                    ev,
+                    &mut bg_assistant_text,
+                    &mut bg_thinking_text,
+                );
+            }
         }
         // Whatever the loop ended with, make sure any in-progress
-        // assistant text gets a row before we go quiet.
-        flush_pending_assistant(&mut transcript, &mut pending_assistant, chat_session, &repo_for_task);
-        in_flight.set(false);
-        active_ct.set(None);
+        // assistant text gets a row before we go quiet — for both
+        // the active and the background path.
+        let is_viewed = *active_session.peek() == Some(chat_session);
+        if is_viewed {
+            flush_pending_thinking(
+                &mut transcript, &mut pending_thinking, chat_session, &repo_for_task,
+            );
+            flush_pending_assistant(
+                &mut transcript, &mut pending_assistant, chat_session, &repo_for_task,
+            );
+        } else {
+            if !bg_thinking_text.is_empty() {
+                persist_thinking_text(&repo_for_task, chat_session, bg_thinking_text);
+            }
+            if !bg_assistant_text.is_empty() {
+                persist_assistant_text(&repo_for_task, chat_session, bg_assistant_text);
+            }
+        }
+        CHAT_RUN_CANCEL.write().remove(&chat_session);
     });
+}
+
+/// SQLite-only sibling of `apply_event` for runs whose session id
+/// isn't currently viewed. Mutates no Signal so it can't corrupt the
+/// in-memory transcript of whatever the user *is* looking at.
+/// Bumps `CHAT_MESSAGE_VERSION` after each persisted row so the 500ms
+/// poll picks the rows up when the user does switch back.
+fn apply_event_background(
+    chat_session: Uuid,
+    repo: &Arc<dyn crate::shell::companion_state::ChatMessageRepository>,
+    ev: AgentEvent,
+    bg_text: &mut String,
+    bg_thinking: &mut String,
+) {
+    use crate::shell::companion_state::CHAT_MESSAGE_VERSION;
+    match ev {
+        AgentEvent::Text(t) => {
+            // A non-thinking event always closes any pending thinking
+            // buffer (so the run's order is preserved in chat_message).
+            if !bg_thinking.is_empty() {
+                persist_thinking_text(repo, chat_session, std::mem::take(bg_thinking));
+                CHAT_MESSAGE_VERSION.with_mut(|v| *v += 1);
+            }
+            bg_text.push_str(&t);
+            // Don't bump the version on every delta — text rows aren't
+            // persisted until the run hits a non-text event or ends.
+        }
+        AgentEvent::Thinking(t) => {
+            if !bg_text.is_empty() {
+                persist_assistant_text(repo, chat_session, std::mem::take(bg_text));
+                CHAT_MESSAGE_VERSION.with_mut(|v| *v += 1);
+            }
+            // Coalesce streaming `thinking_delta` chunks into a single
+            // buffer; persist when the run hits a non-Thinking event or
+            // ends. Mirrors the bg_text path so each thinking block ends
+            // up as one chat_message row, not one per delta.
+            bg_thinking.push_str(&t);
+        }
+        AgentEvent::ToolUse { id, name, input } => {
+            if !bg_thinking.is_empty() {
+                persist_thinking_text(repo, chat_session, std::mem::take(bg_thinking));
+            }
+            if !bg_text.is_empty() {
+                persist_assistant_text(repo, chat_session, std::mem::take(bg_text));
+            }
+            crate::shell::companion_state::mark_tool_started(&id);
+            let body = serde_json::json!({
+                "id": id,
+                "name": name,
+                "input": input,
+                "result": serde_json::Value::Null,
+            });
+            if let Err(e) = repo.append(chat_session, ChatMessageKind::ToolCall, Some(&id), &body)
+            {
+                tracing::warn!(target: "operon::companion", "persist bg tool_use: {e}");
+            }
+            CHAT_MESSAGE_VERSION.with_mut(|v| *v += 1);
+        }
+        AgentEvent::ToolChunk { .. } => {
+            // Live streaming bytes — runtime backend only. Same as
+            // foreground path, deliberately not persisted; the final
+            // ToolResult is the audited body.
+        }
+        AgentEvent::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => {
+            crate::shell::companion_state::mark_tool_stream_complete(&tool_use_id);
+            let body = serde_json::json!({
+                "id": tool_use_id,
+                "name": "",
+                "input": serde_json::Value::Null,
+                "result": { "content": content, "is_error": is_error },
+            });
+            if let Err(e) = repo.update_tool_result(chat_session, &tool_use_id, &body) {
+                tracing::warn!(target: "operon::companion", "patch bg tool_result: {e}");
+            }
+            CHAT_MESSAGE_VERSION.with_mut(|v| *v += 1);
+        }
+        AgentEvent::Done { .. } => {
+            if !bg_thinking.is_empty() {
+                persist_thinking_text(repo, chat_session, std::mem::take(bg_thinking));
+                CHAT_MESSAGE_VERSION.with_mut(|v| *v += 1);
+            }
+            if !bg_text.is_empty() {
+                persist_assistant_text(repo, chat_session, std::mem::take(bg_text));
+                CHAT_MESSAGE_VERSION.with_mut(|v| *v += 1);
+            }
+        }
+        AgentEvent::Error(msg) => {
+            if !bg_thinking.is_empty() {
+                persist_thinking_text(repo, chat_session, std::mem::take(bg_thinking));
+            }
+            if !bg_text.is_empty() {
+                persist_assistant_text(repo, chat_session, std::mem::take(bg_text));
+            }
+            let line = format!("error: {msg}");
+            if let Err(e) = repo.append(
+                chat_session,
+                ChatMessageKind::System,
+                None,
+                &serde_json::json!({ "text": line }),
+            ) {
+                tracing::warn!(target: "operon::companion", "persist bg error: {e}");
+            }
+            CHAT_MESSAGE_VERSION.with_mut(|v| *v += 1);
+        }
+        AgentEvent::SessionInit { mcp_servers, tools } => {
+            // Mirror to the global so the MCP panel stays accurate
+            // even when the user is viewing a different session.
+            *crate::shell::companion_state::MCP_LIVE_STATUS.write() =
+                crate::shell::companion_state::McpLiveStatus {
+                    mcp_servers,
+                    tools,
+                    session: Some(chat_session),
+                };
+        }
+        AgentEvent::PermissionRequest { .. } => {
+            // Permission asks need user input — without UI rendering
+            // for background sessions, the request would deadlock the
+            // run (the runtime gate blocks until a decision comes
+            // back). Forward to the foreground path: push onto the
+            // global PERMISSION_PROMPTS signal so the inline card
+            // surfaces on whichever session is viewed; the user
+            // either approves there or has to switch back. This
+            // matches the existing foreground-runtime behavior of
+            // routing through `PERMISSION_PROMPTS` without
+            // duplicating the dispatch logic.
+            //
+            // The full handler lives in foreground `apply_event`
+            // (case `AgentEvent::PermissionRequest`). The simplest
+            // path is to recursively delegate to it via a tiny
+            // wrapper, but apply_event needs the transcript +
+            // pending_assistant signals which we don't have here.
+            // For now, drop background permission asks with a warn —
+            // the user will see the run stall and switching back
+            // gives them the inline card on the next event. M3
+            // follow-up: extract the PermissionRequest branch into
+            // a Signal-free helper that both paths can call.
+            tracing::warn!(
+                target: "operon::companion",
+                "background session {chat_session} got a permission ask; \
+                 switch to the session to approve."
+            );
+        }
+    }
+}
+
+fn persist_assistant_text(
+    repo: &Arc<dyn crate::shell::companion_state::ChatMessageRepository>,
+    chat_session: Uuid,
+    body: String,
+) {
+    if let Err(e) = repo.append(
+        chat_session,
+        ChatMessageKind::Assistant,
+        None,
+        &serde_json::json!({ "body": body }),
+    ) {
+        tracing::warn!(target: "operon::companion", "persist bg assistant: {e}");
+    }
+}
+
+fn persist_thinking_text(
+    repo: &Arc<dyn crate::shell::companion_state::ChatMessageRepository>,
+    chat_session: Uuid,
+    body: String,
+) {
+    if let Err(e) = repo.append(
+        chat_session,
+        ChatMessageKind::Thinking,
+        None,
+        &serde_json::json!({ "text": body }),
+    ) {
+        tracing::warn!(target: "operon::companion", "persist thinking: {e}");
+    }
 }
 
 fn apply_event(
     transcript: &mut Signal<Vec<TranscriptItem>>,
     usage_total: &mut Signal<Usage>,
     pending_assistant: &mut Signal<bool>,
+    pending_thinking: &mut Signal<bool>,
     chat_session: Uuid,
     repo: &Arc<dyn crate::shell::companion_state::ChatMessageRepository>,
     ev: AgentEvent,
 ) {
     match ev {
         AgentEvent::Text(t) => {
+            // Text closes any in-flight thinking block — flush it so the
+            // collapsible row is persisted before the assistant reply
+            // starts rendering after it.
+            flush_pending_thinking(transcript, pending_thinking, chat_session, repo);
             let mut tx = transcript.write();
             if let Some(TranscriptItem::AssistantText(body)) = tx.last_mut() {
                 body.push_str(&t);
@@ -1999,18 +2389,24 @@ fn apply_event(
             // Any prior assistant block is now "complete" — flush before
             // we shift the tail of the transcript away from it.
             flush_pending_assistant(transcript, pending_assistant, chat_session, repo);
-            transcript.write().push(TranscriptItem::Thinking(t.clone()));
-            if let Err(e) = repo.append(
-                chat_session,
-                ChatMessageKind::Thinking,
-                None,
-                &serde_json::json!({ "text": t }),
-            ) {
-                tracing::warn!(target: "operon::companion", "persist thinking: {e}");
+            // Coalesce streaming `thinking_delta` chunks. Append to the
+            // trailing Thinking block when one is already in flight;
+            // otherwise start a new one. Persistence happens at the next
+            // boundary via `flush_pending_thinking` so each block ends
+            // up as a single chat_message row, not one per delta.
+            let mut tx = transcript.write();
+            if let Some(TranscriptItem::Thinking(body)) = tx.last_mut() {
+                body.push_str(&t);
+            } else {
+                tx.push(TranscriptItem::Thinking(t));
             }
+            drop(tx);
+            pending_thinking.set(true);
         }
         AgentEvent::ToolUse { id, name, input } => {
+            flush_pending_thinking(transcript, pending_thinking, chat_session, repo);
             flush_pending_assistant(transcript, pending_assistant, chat_session, repo);
+            crate::shell::companion_state::mark_tool_started(&id);
             transcript.write().push(TranscriptItem::ToolCall {
                 id: id.clone(),
                 name: name.clone(),
@@ -2090,7 +2486,14 @@ fn apply_event(
             }
         }
         AgentEvent::Done { stop_reason: _, usage } => {
+            flush_pending_thinking(transcript, pending_thinking, chat_session, repo);
             flush_pending_assistant(transcript, pending_assistant, chat_session, repo);
+            flush_orphan_tools(
+                transcript,
+                chat_session,
+                repo,
+                "(no result — turn ended)",
+            );
             if let Some(u) = usage {
                 let mut total = usage_total.write();
                 total.prompt += u.prompt;
@@ -2099,7 +2502,14 @@ fn apply_event(
             }
         }
         AgentEvent::Error(msg) => {
+            flush_pending_thinking(transcript, pending_thinking, chat_session, repo);
             flush_pending_assistant(transcript, pending_assistant, chat_session, repo);
+            flush_orphan_tools(
+                transcript,
+                chat_session,
+                repo,
+                &format!("(no result — {msg})"),
+            );
             let line = format!("error: {msg}");
             transcript.write().push(TranscriptItem::System(line.clone()));
             if let Err(e) = repo.append(
@@ -2137,6 +2547,7 @@ fn apply_event(
             // signal so the inline prompt UI renders in either case.
             // Step 5 wires the inline `PermissionPrompt` component to
             // resolve this back through the runtime's `PermissionGate`.
+            flush_pending_thinking(transcript, pending_thinking, chat_session, repo);
             flush_pending_assistant(transcript, pending_assistant, chat_session, repo);
             let category = crate::shell::tool_category::of(&kind);
             let entry = crate::shell::companion_state::PermissionPromptEntry {
@@ -2153,6 +2564,63 @@ fn apply_event(
             tracing::debug!(
                 target: "operon::permission",
                 "runtime permission request: id={id} title={title}"
+            );
+        }
+    }
+}
+
+/// Stamp every still-pending tool card with a synthetic error result so
+/// it stops rendering as "RUNNING…". Called when the turn ends (`Done`
+/// or `Error`) — by that point any tool whose `tool_result` block never
+/// arrived is stranded: the SDK won't send it later, and without a
+/// fallback the card spins forever. We mark both the in-memory
+/// transcript (so the UI flips immediately) and the persisted row (so
+/// switching away and back doesn't reset the card to pending).
+fn flush_orphan_tools(
+    transcript: &mut Signal<Vec<TranscriptItem>>,
+    chat_session: Uuid,
+    repo: &Arc<dyn crate::shell::companion_state::ChatMessageRepository>,
+    reason: &str,
+) {
+    let orphans: Vec<(String, String, Value)> = {
+        let tx = transcript.read();
+        tx.iter()
+            .filter_map(|item| match item {
+                TranscriptItem::ToolCall { id, name, input, result: None } => {
+                    Some((id.clone(), name.clone(), input.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    if orphans.is_empty() {
+        return;
+    }
+    {
+        let mut tx = transcript.write();
+        for item in tx.iter_mut() {
+            if let TranscriptItem::ToolCall { id, result, .. } = item {
+                if result.is_none() && orphans.iter().any(|(oid, _, _)| oid == id) {
+                    *result = Some(ToolResultBody {
+                        content: reason.to_string(),
+                        is_error: true,
+                    });
+                    crate::shell::companion_state::mark_tool_stream_complete(id);
+                }
+            }
+        }
+    }
+    for (id, name, input) in orphans {
+        let body = serde_json::json!({
+            "id": id,
+            "name": name,
+            "input": input,
+            "result": { "content": reason, "is_error": true },
+        });
+        if let Err(e) = repo.update_tool_result(chat_session, &id, &body) {
+            tracing::warn!(
+                target: "operon::companion",
+                "patch orphan tool_result {id}: {e}"
             );
         }
     }
@@ -2184,6 +2652,40 @@ fn flush_pending_assistant(
             &serde_json::json!({ "body": body }),
         ) {
             tracing::warn!(target: "operon::companion", "persist assistant: {e}");
+        }
+    }
+    pending.set(false);
+}
+
+/// Sibling of `flush_pending_assistant` for the coalesced
+/// `TranscriptItem::Thinking` at the tail of the transcript. Persists
+/// the merged delta body as a single Thinking row at the next boundary
+/// event so the chat_message table doesn't get one row per
+/// `thinking_delta` chunk.
+fn flush_pending_thinking(
+    transcript: &mut Signal<Vec<TranscriptItem>>,
+    pending: &mut Signal<bool>,
+    chat_session: Uuid,
+    repo: &Arc<dyn crate::shell::companion_state::ChatMessageRepository>,
+) {
+    if !*pending.read() {
+        return;
+    }
+    let body_to_persist: Option<String> = {
+        let tx = transcript.read();
+        tx.iter().rev().find_map(|item| match item {
+            TranscriptItem::Thinking(b) => Some(b.clone()),
+            _ => None,
+        })
+    };
+    if let Some(body) = body_to_persist {
+        if let Err(e) = repo.append(
+            chat_session,
+            ChatMessageKind::Thinking,
+            None,
+            &serde_json::json!({ "text": body }),
+        ) {
+            tracing::warn!(target: "operon::companion", "persist thinking: {e}");
         }
     }
     pending.set(false);

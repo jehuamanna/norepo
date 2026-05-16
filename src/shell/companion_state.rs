@@ -102,6 +102,17 @@ pub static NOTE_TITLE_VERSION: GlobalSignal<u64> = Signal::global(|| 0);
 /// not values.
 pub static SAVE_REQUEST_TICK: GlobalSignal<u64> = Signal::global(|| 0);
 
+/// Bumped by `spawn_cascade` when Play is hit on an artifact so the
+/// companion panel un-collapses (if the user had it tucked away)
+/// before the cascade's session starts streaming thinking / tool_use
+/// rows. `CompanionArea` subscribes via `use_effect`, tracks the
+/// last-seen tick locally, and forces `companion_collapsed = false`
+/// on each transition. `GlobalSignal` over context-bound signal for
+/// the same reason as `CHAT_MESSAGE_VERSION` — `spawn_cascade` runs
+/// off the virtual root scope and would silently drop writes to a
+/// hook-bound signal.
+pub static EXPAND_COMPANION_TICK: GlobalSignal<u64> = Signal::global(|| 0);
+
 /// Bumped by the per-project Claude settings picker every time it writes
 /// to `local_project.default_model` / `default_permission_mode`. The
 /// chat-header picker's `picker_persisted` memo subscribes so the
@@ -236,6 +247,58 @@ pub static CASCADE_CANCEL: GlobalSignal<HashMap<Uuid, tokio_util::sync::Cancella
 pub static CASCADE_RUNNING_SESSIONS: GlobalSignal<HashSet<Uuid>> =
     Signal::global(HashSet::new);
 
+/// Per-chat-session cancellation tokens for in-flight `claude` turns,
+/// keyed on `chat_session_id`. Inserted by `run_turn` at the start of
+/// every turn; removed in the spawned drainer's terminal arms.
+///
+/// Two roles:
+/// - **"Is this session running?"** — entry presence == in flight. The
+///   header's Send button + backend / model / permission pickers gate
+///   on `is_session_running(active_session)`; the Stop button is only
+///   rendered when an entry exists.
+/// - **"Stop this session's run"** — clicking Stop (either the header
+///   button on the active tab or the per-row ⏹ in the rail) clones the
+///   token out of the map and calls `.cancel()`. The drainer's
+///   `tokio::select!` on `ct.cancelled()` (see `stream::drive_stream`)
+///   kills the spawned `claude` subprocess and emits a final Error
+///   event so `flush_pending_assistant` writes any partial assistant
+///   row before the loop exits.
+///
+/// `GlobalSignal<HashMap<Uuid, _>>` rather than a per-component
+/// `Signal`: the drainer is spawned via `spawn` (root-scope task) so
+/// writes from there to a `Signal` owned by `CompanionChat`'s scope
+/// would emit the `__copy_value_hoisted` warning. Same pattern as
+/// `CASCADE_CANCEL` above.
+///
+/// Sessions are mutually exclusive on *themselves* (a session can't
+/// double-fire) but parallel across distinct session ids — clicking
+/// Send on chat A while chat B is mid-run is allowed and gives each
+/// its own subprocess that the user can terminate independently.
+pub static CHAT_RUN_CANCEL: GlobalSignal<HashMap<Uuid, tokio_util::sync::CancellationToken>> =
+    Signal::global(HashMap::new);
+
+/// `true` iff `chat_session` currently has a `claude` turn in flight.
+/// Cheap read for UI gating (header Send button, rail row indicator,
+/// backend picker enable) without exposing the token itself.
+pub fn is_session_running(chat_session: Uuid) -> bool {
+    CHAT_RUN_CANCEL.read().contains_key(&chat_session)
+}
+
+/// Cancel the in-flight turn for `chat_session`, if any. Returns
+/// `true` when a token was found and signalled. The drainer's
+/// `ct.cancelled()` arm kills the spawned subprocess and the
+/// terminal arm clears the map entry.
+pub fn cancel_session_run(chat_session: Uuid) -> bool {
+    let token = CHAT_RUN_CANCEL.read().get(&chat_session).cloned();
+    match token {
+        Some(ct) => {
+            ct.cancel();
+            true
+        }
+        None => false,
+    }
+}
+
 /// Per-workflow-note version counter that the cascade graph writer
 /// bumps after every successful `flush()` to disk. The workflow
 /// canvas subscribes by note id: when its entry changes, it re-loads
@@ -368,11 +431,21 @@ pub fn mcp_health_gate_error() -> Option<String> {
 /// — the `mcp__<server>__<tool>` tool name carries the substring
 /// either way.
 ///
+/// When the live snapshot is empty or doesn't satisfy a requirement,
+/// the gate falls back to the **static** MCP config on disk (parsed
+/// from `<cwd>/.mcp.json` for project scope and `~/.claude.json` for
+/// user + local scopes). This is what lets a cold cascade run pick up
+/// servers declared in `.mcp.json` even before the first chat turn
+/// has produced a `system/init` event.
+///
 /// The gate is unconditional: every entry must be satisfied for the
 /// skill to fire. If a skill can run productively without an MCP
 /// tool, the skill author should simply omit that entry from
 /// `requires_mcp` — not declare it and hope the runtime is lenient.
-pub fn mcp_skill_requirements_gate_error(requirements: &[String]) -> Option<String> {
+pub fn mcp_skill_requirements_gate_error(
+    requirements: &[String],
+    cwd: Option<&std::path::Path>,
+) -> Option<String> {
     if requirements.is_empty() {
         return None;
     }
@@ -384,12 +457,22 @@ pub fn mcp_skill_requirements_gate_error(requirements: &[String]) -> Option<Stri
         .map(|s| s.name.to_lowercase())
         .collect();
     let tools_lc: Vec<String> = snap.tools.iter().map(|t| t.to_lowercase()).collect();
+    // Read static config on demand and cache for the duration of this
+    // call. Cheap (small JSON files) and skipped entirely when the
+    // live snapshot already covers all requirements.
+    let mut static_names: Option<Vec<String>> = None;
     let missing: Vec<String> = requirements
         .iter()
         .filter(|req| {
             let needle = req.to_lowercase();
-            !connected_servers.iter().any(|s| s.contains(&needle))
-                && !tools_lc.iter().any(|t| t.contains(&needle))
+            if connected_servers.iter().any(|s| s.contains(&needle))
+                || tools_lc.iter().any(|t| t.contains(&needle))
+            {
+                return false;
+            }
+            let names = static_names
+                .get_or_insert_with(|| static_mcp_server_names(cwd));
+            !names.iter().any(|n| n.contains(&needle))
         })
         .cloned()
         .collect();
@@ -402,6 +485,66 @@ pub fn mcp_skill_requirements_gate_error(requirements: &[String]) -> Option<Stri
             missing.join(", ")
         ))
     }
+}
+
+/// Read the union of MCP server names declared in static config files:
+/// `<cwd>/.mcp.json` (project scope), and `~/.claude.json` for both
+/// user-scope (`mcpServers` at root) and local-scope (project-local
+/// `mcpServers` keyed by absolute path).
+///
+/// Returns lowercased names. Missing / malformed files are silently
+/// ignored — the gate falls back to a (possibly empty) list rather
+/// than failing the run on a config-parse glitch.
+pub(crate) fn static_mcp_server_names(cwd: Option<&std::path::Path>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
+    // 1. Project-scope .mcp.json in cwd.
+    if let Some(dir) = cwd {
+        let p = dir.join(".mcp.json");
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(servers) = v.get("mcpServers").and_then(|x| x.as_object()) {
+                    for k in servers.keys() {
+                        out.push(k.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. User-scope (and per-project local) entries in ~/.claude.json.
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        let p = home.join(".claude.json");
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                // User scope: top-level "mcpServers".
+                if let Some(servers) = v.get("mcpServers").and_then(|x| x.as_object()) {
+                    for k in servers.keys() {
+                        out.push(k.to_ascii_lowercase());
+                    }
+                }
+                // Local scope: projects.<abs-path>.mcpServers, keyed by
+                // the cwd we were given.
+                if let Some(dir) = cwd {
+                    let key = dir.display().to_string();
+                    if let Some(servers) = v
+                        .get("projects")
+                        .and_then(|x| x.get(&key))
+                        .and_then(|x| x.get("mcpServers"))
+                        .and_then(|x| x.as_object())
+                    {
+                        for k in servers.keys() {
+                            out.push(k.to_ascii_lowercase());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Live activity for the currently-executing tool call on a workflow
@@ -668,6 +811,58 @@ pub fn take_permission_responder(
     permission_responders::take(prompt_id)
 }
 
+/// Per-prompt responders for the custom `ask_user` MCP tool. The bridge
+/// executor parks an `Option<Value>` sender keyed by the prompt id;
+/// the picker's Submit click takes the sender and resolves it with the
+/// answers map (`{ <question>: <label or array> }`). `None` means the
+/// user cancelled — the executor surfaces that as a tool_use_error.
+///
+/// Kept structurally identical to [`permission_responders`] so the
+/// same lifecycle guarantees apply (double-click is a no-op,
+/// dropped-sender → executor error).
+#[cfg(not(target_arch = "wasm32"))]
+mod ask_user_responders {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use tokio::sync::oneshot;
+
+    static MAP: OnceLock<Mutex<HashMap<String, oneshot::Sender<Option<serde_json::Value>>>>> =
+        OnceLock::new();
+
+    fn cell() -> &'static Mutex<HashMap<String, oneshot::Sender<Option<serde_json::Value>>>> {
+        MAP.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub fn insert(id: String, responder: oneshot::Sender<Option<serde_json::Value>>) {
+        if let Ok(mut m) = cell().lock() {
+            m.insert(id, responder);
+        }
+    }
+
+    pub fn take(id: &str) -> Option<oneshot::Sender<Option<serde_json::Value>>> {
+        cell().lock().ok().and_then(|mut m| m.remove(id))
+    }
+}
+
+/// Park an ask-user responder under `prompt_id`. The executor calls
+/// this immediately before pushing an [`AskUserPromptEntry`].
+#[cfg(not(target_arch = "wasm32"))]
+pub fn park_ask_user_responder(
+    prompt_id: String,
+    responder: tokio::sync::oneshot::Sender<Option<serde_json::Value>>,
+) {
+    ask_user_responders::insert(prompt_id, responder);
+}
+
+/// Take a parked ask-user responder. Used by the picker's Submit/Cancel
+/// handlers (Submit sends `Some(answers)`, Cancel sends `None`).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn take_ask_user_responder(
+    prompt_id: &str,
+) -> Option<tokio::sync::oneshot::Sender<Option<serde_json::Value>>> {
+    ask_user_responders::take(prompt_id)
+}
+
 /// One pending or already-resolved permission prompt rendered inline
 /// in any active companion chat. Kept around after resolution so the
 /// user has an audit trail of what was permitted.
@@ -722,6 +917,123 @@ pub const PERMISSION_PROMPTS_CAP: usize = 500;
 #[cfg(not(target_arch = "wasm32"))]
 pub fn push_permission_prompt(entry: PermissionPromptEntry) {
     push_permission_prompt_with_status(entry, PermissionStatus::Pending);
+}
+
+/// One pending or already-resolved `ask_user` picker rendered inline
+/// in any active companion chat. Mirrors [`PermissionPromptEntry`] but
+/// carries the typed question schema instead of a tool-name + input
+/// blob.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AskUserPromptEntry {
+    pub id: String,
+    /// Verbatim `questions` array from the MCP `ask_user` input. The
+    /// picker iterates this to render headers/options; the executor
+    /// echoes it back to Claude as part of the response payload so
+    /// the model sees `{questions, answers}` matching the harness's
+    /// built-in shape.
+    pub questions: serde_json::Value,
+    pub source_session: Option<Uuid>,
+    pub source_cwd: Option<PathBuf>,
+    pub created_at: std::time::SystemTime,
+}
+
+/// UI status of an `ask_user` prompt. Picker buttons transition
+/// `Pending` to `Answered` (submitted) or `Cancelled` (dismissed).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AskUserStatus {
+    Pending,
+    Answered,
+    Cancelled,
+}
+
+/// Reactive map of prompt-id → current ask-user status. Picker
+/// re-renders on click without needing per-entry signals.
+pub static ASK_USER_DECISIONS: GlobalSignal<HashMap<String, AskUserStatus>> =
+    Signal::global(HashMap::new);
+
+/// Global list of all `ask_user` prompts seen so far. Same rendering
+/// model as `PERMISSION_PROMPTS` — the active companion chat reads
+/// this regardless of which session triggered the prompt.
+pub static ASK_USER_PROMPTS: GlobalSignal<Vec<AskUserPromptEntry>> = Signal::global(Vec::new);
+
+/// Soft cap on `ASK_USER_PROMPTS`. Pickers are rare compared to
+/// permission prompts, but keep a cap so a misbehaving Claude that
+/// loops on `ask_user` can't grow the vec unbounded.
+pub const ASK_USER_PROMPTS_CAP: usize = 200;
+
+/// Captures the snapshot the picker shows after the user has
+/// answered, so the resolved card can display *what was chosen*
+/// rather than going inert. Keyed by prompt id.
+pub static ASK_USER_RESOLVED_ANSWERS: GlobalSignal<HashMap<String, serde_json::Value>> =
+    Signal::global(HashMap::new);
+
+/// Append a new ask-user prompt and seed its status to `Pending`.
+/// Called by [`crate::shell::bridge_ask_user_executor::BridgeAskUserExecutor`]
+/// after parking the responder.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn push_ask_user_prompt(entry: AskUserPromptEntry) {
+    ASK_USER_DECISIONS
+        .write()
+        .insert(entry.id.clone(), AskUserStatus::Pending);
+    ASK_USER_PROMPTS.with_mut(|list| {
+        list.push(entry);
+        // FIFO evict resolved entries (Answered/Cancelled) until back
+        // under the cap. Pending entries are never dropped — they
+        // own a parked responder.
+        if list.len() > ASK_USER_PROMPTS_CAP {
+            let decisions = ASK_USER_DECISIONS.read().clone();
+            while list.len() > ASK_USER_PROMPTS_CAP {
+                let pos = list.iter().position(|e| {
+                    !matches!(
+                        decisions.get(&e.id).cloned().unwrap_or(AskUserStatus::Pending),
+                        AskUserStatus::Pending
+                    )
+                });
+                match pos {
+                    Some(i) => {
+                        list.remove(i);
+                    }
+                    None => break,
+                }
+            }
+        }
+    });
+}
+
+/// Submit an answers map for the picker `prompt_id`. Resolves the
+/// parked responder (executor returns to Claude) and flips the
+/// status to `Answered`. Second call for the same id is a no-op —
+/// matching the `take`-style consumption in
+/// [`take_permission_responder`].
+///
+/// `answers` is the picker's selection: `{ "<question text>": "<label>" }`
+/// for single-select, `"<question text>": ["a","b"]` for multiSelect.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn submit_ask_user_answers(prompt_id: &str, answers: serde_json::Value) {
+    if let Some(responder) = take_ask_user_responder(prompt_id) {
+        ASK_USER_RESOLVED_ANSWERS
+            .write()
+            .insert(prompt_id.to_string(), answers.clone());
+        let _ = responder.send(Some(answers));
+        ASK_USER_DECISIONS
+            .write()
+            .insert(prompt_id.to_string(), AskUserStatus::Answered);
+    }
+}
+
+/// Cancel an `ask_user` picker. Resolves the parked responder with
+/// `None`, which the executor turns into an error result so Claude
+/// surfaces the cancellation in its next turn.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn cancel_ask_user_prompt(prompt_id: &str) {
+    if let Some(responder) = take_ask_user_responder(prompt_id) {
+        let _ = responder.send(None);
+        ASK_USER_DECISIONS
+            .write()
+            .insert(prompt_id.to_string(), AskUserStatus::Cancelled);
+    }
 }
 
 /// FIFO-evict resolved entries until the vec is back under the cap.
@@ -904,6 +1216,23 @@ pub fn append_tool_chunk(tool_use_id: &str, kind: &str, bytes: &[u8]) {
                 cut += 1;
             }
             target.drain(..cut);
+        }
+    });
+}
+
+/// Record the start time for `tool_use_id` if it isn't already set.
+/// Idempotent: callers (the `ToolUse` event arm in both apply paths)
+/// fire this when the card is first rendered; later `ToolChunk`
+/// arrivals via `append_tool_chunk` see an already-populated
+/// `started_at` and leave it alone. Without this, claude-code tools
+/// — which never emit `ToolChunk` — would never get a timestamp and
+/// the elapsed timer in `PendingToolFooter` would stay frozen.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn mark_tool_started(tool_use_id: &str) {
+    TOOL_STREAM_OUTPUT.with_mut(|m| {
+        let entry = m.entry(tool_use_id.to_string()).or_default();
+        if entry.started_at.is_none() {
+            entry.started_at = Some(std::time::SystemTime::now());
         }
     });
 }
@@ -1114,10 +1443,201 @@ pub async fn ensure_session_bridge_with_ctx(
                 ),
             )));
         }
+        // Replace the harness-owned built-in AskUserQuestion: the
+        // harness intercepts tool_result frames for that tool in
+        // non-TUI mode (synthesising empty answers), so the only
+        // working channel for structured questions is a custom MCP
+        // tool whose result the harness passes through verbatim.
+        // The matching `--disallowedTools AskUserQuestion` flag in
+        // `spawn_turn` keeps Claude from falling back to the broken
+        // built-in. Always installed — no policy gate, because the
+        // built-in is broken in all configurations of this backend.
+        bridge.set_ask_user_executor(Some(std::sync::Arc::new(
+            crate::shell::bridge_ask_user_executor::BridgeAskUserExecutor::new(
+                session_id,
+                cwd.clone(),
+            ),
+        )));
         plugin.set_session_bash_via_operon(session_id, bash_via_operon);
         plugin.set_session_bridge(session_id, Some(std::sync::Arc::new(bridge)));
         Ok::<(), std::io::Error>(())
     })
     .await
     .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dioxus::prelude::*;
+    use tokio_util::sync::CancellationToken;
+
+    // GlobalSignal reads/writes require a Dioxus runtime to be
+    // active. `VirtualDom::new` is the only public way to construct
+    // one. The dom isn't progressed — we just need its runtime guard
+    // installed for the body. Each test takes a snapshot/restore of
+    // the global so siblings don't see each other's mutations.
+    fn with_runtime<F: FnOnce()>(f: F) {
+        fn app() -> Element {
+            rsx! { "" }
+        }
+        let dom = VirtualDom::new(app);
+        dom.in_runtime(f);
+    }
+
+    #[test]
+    fn is_session_running_reflects_map_membership() {
+        with_runtime(|| {
+            let a = Uuid::new_v4();
+            let b = Uuid::new_v4();
+            let prior = CHAT_RUN_CANCEL.read().clone();
+            CHAT_RUN_CANCEL.write().clear();
+
+            assert!(!is_session_running(a));
+            CHAT_RUN_CANCEL.write().insert(a, CancellationToken::new());
+            assert!(is_session_running(a));
+            assert!(!is_session_running(b));
+
+            *CHAT_RUN_CANCEL.write() = prior;
+        });
+    }
+
+    #[test]
+    fn cancel_session_run_signals_only_target_token() {
+        with_runtime(|| {
+            let a = Uuid::new_v4();
+            let b = Uuid::new_v4();
+            let prior = CHAT_RUN_CANCEL.read().clone();
+            CHAT_RUN_CANCEL.write().clear();
+
+            let ct_a = CancellationToken::new();
+            let ct_b = CancellationToken::new();
+            CHAT_RUN_CANCEL.write().insert(a, ct_a.clone());
+            CHAT_RUN_CANCEL.write().insert(b, ct_b.clone());
+
+            assert!(cancel_session_run(a));
+            assert!(ct_a.is_cancelled(), "target session's CT must be cancelled");
+            assert!(
+                !ct_b.is_cancelled(),
+                "sibling session's CT must NOT be cancelled — parallel sessions terminate independently"
+            );
+
+            CHAT_RUN_CANCEL.write().remove(&a);
+            CHAT_RUN_CANCEL.write().remove(&b);
+            *CHAT_RUN_CANCEL.write() = prior;
+        });
+    }
+
+    #[test]
+    fn cancel_session_run_returns_false_when_no_entry() {
+        with_runtime(|| {
+            let a = Uuid::new_v4();
+            let prior = CHAT_RUN_CANCEL.read().clone();
+            CHAT_RUN_CANCEL.write().clear();
+
+            assert!(!cancel_session_run(a));
+
+            *CHAT_RUN_CANCEL.write() = prior;
+        });
+    }
+
+    #[test]
+    fn static_mcp_server_names_reads_project_mcp_json() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mcp_path = tmp.path().join(".mcp.json");
+        std::fs::write(
+            &mcp_path,
+            r#"{
+                "mcpServers": {
+                    "figma": {"command": "npx", "args": []},
+                    "Sentry": {"type": "http", "url": "x"}
+                }
+            }"#,
+        )
+        .expect("write");
+
+        let names = static_mcp_server_names(Some(tmp.path()));
+        assert!(names.iter().any(|n| n == "figma"));
+        assert!(names.iter().any(|n| n == "sentry"));
+    }
+
+    #[test]
+    fn static_mcp_server_names_handles_missing_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // No .mcp.json in tmp; result should not panic and should not
+        // include any project-scoped names (user-scope ~/.claude.json
+        // may still contribute, so we only assert non-panic + that
+        // bogus names aren't fabricated).
+        let names = static_mcp_server_names(Some(tmp.path()));
+        assert!(!names.iter().any(|n| n == "figma_should_not_exist"));
+    }
+
+    #[test]
+    fn requirements_gate_passes_when_static_mcp_json_has_server() {
+        with_runtime(|| {
+            // Empty live snapshot (cold-cascade scenario).
+            let prior = MCP_LIVE_STATUS.read().clone();
+            *MCP_LIVE_STATUS.write() = McpLiveStatus::default();
+
+            let tmp = tempfile::tempdir().expect("tempdir");
+            std::fs::write(
+                tmp.path().join(".mcp.json"),
+                r#"{"mcpServers":{"figma":{"command":"npx"}}}"#,
+            )
+            .expect("write");
+
+            // requires_mcp: ["figma"] — gate should pass via static cfg
+            // even though MCP_LIVE_STATUS is empty.
+            let reqs = vec!["figma".to_string()];
+            let result = mcp_skill_requirements_gate_error(&reqs, Some(tmp.path()));
+            assert!(result.is_none(), "expected None, got {result:?}");
+
+            *MCP_LIVE_STATUS.write() = prior;
+        });
+    }
+
+    #[test]
+    fn requirements_gate_blocks_when_static_mcp_json_missing_server() {
+        with_runtime(|| {
+            let prior = MCP_LIVE_STATUS.read().clone();
+            *MCP_LIVE_STATUS.write() = McpLiveStatus::default();
+
+            // Isolate from the developer's real ~/.claude.json — that
+            // file may legitimately contain "figma" from prior CLI use
+            // and would make this test pass spuriously.
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let fake_home = tempfile::tempdir().expect("home tmpdir");
+            let prior_home = std::env::var_os("HOME");
+            // SAFETY (single-threaded test runner segment): we restore
+            // HOME below; concurrent tests in the same process won't
+            // observe this because cargo test runs each #[test] on its
+            // own thread but env vars are process-global — see the
+            // matching restore.
+            unsafe {
+                std::env::set_var("HOME", fake_home.path());
+            }
+
+            // .mcp.json exists but doesn't declare figma.
+            std::fs::write(
+                tmp.path().join(".mcp.json"),
+                r#"{"mcpServers":{"sentry":{"type":"http","url":"x"}}}"#,
+            )
+            .expect("write");
+
+            let reqs = vec!["figma".to_string()];
+            let result = mcp_skill_requirements_gate_error(&reqs, Some(tmp.path()));
+
+            // Restore env BEFORE assert so a panic still cleans up.
+            match prior_home {
+                Some(v) => unsafe { std::env::set_var("HOME", v) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+            *MCP_LIVE_STATUS.write() = prior;
+
+            assert!(
+                result.as_ref().map(|m| m.contains("figma")).unwrap_or(false),
+                "expected figma to be flagged missing, got {result:?}"
+            );
+        });
+    }
 }
