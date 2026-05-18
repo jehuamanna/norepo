@@ -87,3 +87,9 @@ just test-all           # all four, fail-fast
 Set `OPERON_E2E_BASE_URL` to point Playwright at an already-running dev
 server (skips the embedded `dx serve` boot).
 
+
+## License
+
+Operon is licensed under the [Apache License, Version 2.0](LICENSE).
+
+Copyright 2026 Jehu Amanna and contributors. See [NOTICE](NOTICE) for attribution requirements.
