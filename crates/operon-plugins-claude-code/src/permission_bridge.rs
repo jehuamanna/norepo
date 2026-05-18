@@ -26,9 +26,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::Value;
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::oneshot;
+#[cfg(unix)]
+use tokio::sync::Mutex;
+#[cfg(unix)]
 use tokio::task::JoinHandle;
 
 /// One pending permission request emitted to the host. The host arranges
@@ -175,25 +180,48 @@ use operon_core::error::OperonResult;
 /// Live per-session permission server. Drop it to revoke the binding
 /// (any pending JSON-RPC requests then resolve to deny via the handler
 /// channel close path) and unlink the socket file.
+///
+/// Only functional on Unix (uses Unix domain sockets). On Windows the
+/// struct is a stub that always returns `Unsupported` from `bind()`.
+#[cfg(unix)]
 pub struct PermissionBridge {
     socket_path: PathBuf,
     accept_task: Option<JoinHandle<()>>,
-    /// Host-installed shell executor. `None` means the bridge does
-    /// not advertise `operon_bash` in `tools/list`. Wired by
-    /// [`PermissionBridge::with_shell_executor`] before the bind
-    /// — adding it after is supported but the new tool isn't visible
-    /// to claude until the next session restart.
     shell_executor: Arc<std::sync::Mutex<Option<Arc<dyn ShellExecutor>>>>,
-    /// Host-installed artifact executor. `None` means the bridge does
-    /// not advertise `create_artifact` in `tools/list`. Set via
-    /// [`PermissionBridge::set_artifact_executor`].
     artifact_executor: Arc<std::sync::Mutex<Option<Arc<dyn ArtifactExecutor>>>>,
-    /// Host-installed ask-user executor. `None` means the bridge does
-    /// not advertise `ask_user` in `tools/list`. Set via
-    /// [`PermissionBridge::set_ask_user_executor`].
     ask_user_executor: Arc<std::sync::Mutex<Option<Arc<dyn AskUserExecutor>>>>,
 }
 
+/// Stub for non-Unix platforms (Windows). The permission bridge is
+/// unsupported — `bind()` always returns an error.
+#[cfg(not(unix))]
+pub struct PermissionBridge {
+    socket_path: PathBuf,
+}
+
+#[cfg(not(unix))]
+impl PermissionBridge {
+    /// Unix domain sockets are not available on this platform.
+    pub async fn bind<H: PermissionHandler>(
+        socket_path: PathBuf,
+        _handler: H,
+    ) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "PermissionBridge requires Unix domain sockets (not available on Windows)",
+        ))
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    pub fn set_shell_executor(&self, _executor: Option<Arc<dyn ShellExecutor>>) {}
+    pub fn set_artifact_executor(&self, _executor: Option<Arc<dyn ArtifactExecutor>>) {}
+    pub fn set_ask_user_executor(&self, _executor: Option<Arc<dyn AskUserExecutor>>) {}
+}
+
+#[cfg(unix)]
 impl PermissionBridge {
     /// Bind a Unix socket at `socket_path` and start accepting MCP
     /// JSON-RPC connections. The bridge keeps running until dropped.
@@ -287,6 +315,7 @@ impl PermissionBridge {
     }
 }
 
+#[cfg(unix)]
 impl Drop for PermissionBridge {
     fn drop(&mut self) {
         if let Some(h) = self.accept_task.take() {
@@ -299,6 +328,7 @@ impl Drop for PermissionBridge {
     }
 }
 
+#[cfg(unix)]
 async fn handle_connection<H: PermissionHandler>(
     stream: UnixStream,
     handler: Arc<H>,
@@ -684,6 +714,7 @@ async fn handle_connection<H: PermissionHandler>(
     }
 }
 
+#[cfg(unix)]
 fn json_rpc_result(id: Option<Value>, result: Value) -> Value {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -692,6 +723,7 @@ fn json_rpc_result(id: Option<Value>, result: Value) -> Value {
     })
 }
 
+#[cfg(unix)]
 fn json_rpc_error(id: Option<Value>, code: i64, message: String) -> Value {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -700,6 +732,7 @@ fn json_rpc_error(id: Option<Value>, code: i64, message: String) -> Value {
     })
 }
 
+#[cfg(unix)]
 fn decision_to_payload(decision: &PermissionDecision) -> Value {
     match decision {
         PermissionDecision::Allow { updated_input } => serde_json::json!({
@@ -717,6 +750,7 @@ fn decision_to_payload(decision: &PermissionDecision) -> Value {
     }
 }
 
+#[cfg(unix)]
 async fn send(writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>, msg: Value) {
     let mut guard = writer.lock().await;
     let line = format!("{msg}\n");
@@ -751,7 +785,7 @@ pub fn permission_prompt_tool_arg() -> String {
     format!("mcp__{MCP_SERVER_NAME}__{PERMISSION_TOOL_NAME}")
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;

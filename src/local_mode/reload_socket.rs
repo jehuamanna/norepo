@@ -17,8 +17,11 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+#[cfg(unix)]
 use serde_json::Value;
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
@@ -108,6 +111,7 @@ pub async fn take_receiver() -> Option<UnboundedReceiver<ReloadEvent>> {
     slot.lock().await.take()
 }
 
+#[cfg(unix)]
 fn socket_path() -> PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -116,6 +120,7 @@ fn socket_path() -> PathBuf {
     dir.join(format!("operon-reload-{pid}.sock"))
 }
 
+#[cfg(unix)]
 fn bind_listener(tx: UnboundedSender<ReloadEvent>) -> std::io::Result<PathBuf> {
     let path = socket_path();
     // Unlink any leftover from a previous run at this exact pid (rare
@@ -170,4 +175,12 @@ fn bind_listener(tx: UnboundedSender<ReloadEvent>) -> std::io::Result<PathBuf> {
         }
     });
     Ok(path)
+}
+
+#[cfg(not(unix))]
+fn bind_listener(_tx: UnboundedSender<ReloadEvent>) -> std::io::Result<PathBuf> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "reload socket requires Unix domain sockets (not available on Windows)",
+    ))
 }

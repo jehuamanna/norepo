@@ -20,7 +20,7 @@ use operon_store::repos::{
     SqliteLocalUserRepository,
 };
 use operon_store::vfs;
-use operon_store::{Store, StoreConfig};
+use operon_store::{Store as OpStore, StoreConfig};
 use uuid::Uuid;
 
 use super::editor::{install_save_action, LocalSaveAction};
@@ -345,7 +345,7 @@ pub fn provide_bridge_runtime() {
 // define the real one under `cfg(all(unix, ...))`, there's no
 // duplicate symbol.
 
-fn open_local_store() -> Store {
+fn open_local_store() -> OpStore {
     let path = default_store_path();
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -361,7 +361,7 @@ fn open_local_store() -> Store {
     // vault.root.path, …). Persistence-by-RAM was indistinguishable from
     // a fresh install on every restart. Now we panic loudly with the
     // underlying error so the failure mode is at least debuggable.
-    match Store::open(StoreConfig::local(&path)) {
+    match OpStore::open(StoreConfig::local(&path)) {
         Ok(store) => store,
         Err(e) => panic!(
             "operon: failed to open local store at {path:?}: {e}\n\

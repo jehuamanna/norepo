@@ -1036,6 +1036,7 @@ mod tests {
         assert!(plugin.state.lock().unwrap().bindings.get(&sid).is_none());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn set_session_bridge_attaches_and_clears() {
         use crate::permission_bridge::{PermissionBridge, PermissionDecision, PermissionRequest};
@@ -1079,6 +1080,7 @@ mod tests {
             .is_none());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bind_session_with_new_cwd_preserves_bridge() {
         use crate::permission_bridge::{PermissionBridge, PermissionDecision, PermissionRequest};
