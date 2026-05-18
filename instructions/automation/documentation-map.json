@@ -1,0 +1,60 @@
+{
+  "_generated": "2026-05-14",
+  "_tool": "structure-scanner.js",
+  "crates": {
+    "operon-agent-cli": ["setup-guide.md", "build-guide.md", "architecture.md"],
+    "operon-api-server": ["api-reference.md", "deployment-guide.md", "architecture.md"],
+    "operon-auth": ["security-guidelines.md", "api-reference.md", "architecture.md"],
+    "operon-core": ["architecture.md", "how-it-works.md", "coding-guidelines.md"],
+    "operon-export": ["how-it-works.md", "api-reference.md"],
+    "operon-notes": ["how-it-works.md", "architecture.md"],
+    "operon-plugins-anthropic": ["tech-stack.md", "how-it-works.md"],
+    "operon-plugins-claude-code": ["tech-stack.md", "architecture.md"],
+    "operon-plugins-google": ["tech-stack.md", "how-it-works.md"],
+    "operon-plugins-lsp": ["tech-stack.md", "architecture.md"],
+    "operon-plugins-mcp": ["how-it-works.md", "architecture.md"],
+    "operon-plugins-openai": ["tech-stack.md", "how-it-works.md"],
+    "operon-plugins-tools": ["architecture.md", "how-it-works.md"],
+    "operon-store": ["database-schema.md", "architecture.md"]
+  },
+  "src_modules": {
+    "agent": ["architecture.md", "how-it-works.md"],
+    "commands": ["how-it-works.md", "folder-structure.md"],
+    "editor": ["architecture.md", "how-it-works.md"],
+    "local_mode": ["how-it-works.md", "folder-structure.md"],
+    "persistence": ["architecture.md", "how-it-works.md"],
+    "plugin": ["architecture.md", "how-it-works.md"],
+    "shell": ["architecture.md", "folder-structure.md"],
+    "tabs": ["how-it-works.md"],
+    "theme": ["how-it-works.md"]
+  },
+  "test_files": {
+    "integration": [
+      "agent_runtime.rs",
+      "agent_mcp.rs",
+      "agent_runtime_permission.rs",
+      "markdown.rs",
+      "theme_registry.rs",
+      "vault.rs",
+      "plugin_registry.rs",
+      "shell_state.rs",
+      "menubar.rs",
+      "theme_palettes.rs",
+      "no_pictographs.rs"
+    ],
+    "e2e": [
+      "smoke.spec.ts",
+      "theme-picker.spec.ts",
+      "sidebar-collapse.spec.ts",
+      "note-create.spec.ts",
+      "multi-select.spec.ts",
+      "image-notes.spec.ts",
+      "explorer-dnd.spec.ts",
+      "explorer-undo.spec.ts",
+      "wikilinks.spec.ts",
+      "editor-auto-focus.spec.ts",
+      "explorer-context-menu-submenu.spec.ts",
+      "mode-toolbar.spec.ts"
+    ]
+  }
+}

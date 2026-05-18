@@ -7,12 +7,22 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
+#[cfg(not(unix))]
+fn main() -> ExitCode {
+    eprintln!("operon-mcp-permission: Unix domain sockets are not supported on this platform");
+    ExitCode::from(1)
+}
+
+#[cfg(unix)]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let socket = match parse_socket_arg() {
@@ -80,6 +90,7 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+#[cfg(unix)]
 fn parse_socket_arg() -> Result<PathBuf, String> {
     let mut args = std::env::args().skip(1);
     let mut socket: Option<PathBuf> = None;
