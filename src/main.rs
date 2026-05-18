@@ -130,6 +130,24 @@ fn bridge_protocol_handler(
 }
 
 fn main() {
+    // Multi-call dispatch: when invoked with `--operon-mcp`, behave
+    // as the stdio MCP stub Claude spawns to reach the in-process
+    // bridge. This collapses the deploy to a single executable so
+    // `dx bundle` doesn't need to ship a separate sidecar (the
+    // sibling-probe in `resolve_operon_mcp_bin` resolves to
+    // `current_exe()` + this flag). Must run before tracing/webview
+    // init — anything printed to stdout would corrupt MCP framing.
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    {
+        if std::env::args().skip(1).any(|a| a == "--operon-mcp") {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("operon-mcp tokio runtime");
+            std::process::exit(rt.block_on(operon_bridge::run_stub()));
+        }
+    }
+
     operon_dioxus::agent::tracing_init::init(None);
 
     #[cfg(feature = "desktop")]

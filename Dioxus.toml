@@ -17,6 +17,12 @@ long_description = "Operon-dioxus is a local-first, project-aware notes editor."
 #   this after every Write/Edit/MultiEdit so Operon can reload the matching
 #   open tab from disk over a Unix socket (more reliable than inotify).
 #
+# operon-mcp is NOT listed here — its stub is built into the main binary
+# and dispatched via `--operon-mcp` (see `main()` in src/main.rs and
+# `resolve_operon_mcp_bin` in src/local_mode/bridge_runtime.rs). Single-
+# binary deploy avoids the "sidecar missing from bundle" failure mode that
+# previously broke chat-mode's operon_notes MCP server.
+#
 # Cross-platform mechanism — `dx bundle` looks for a file named
 # `<bin>-<target-triple>` at the crate root and copies it next to the main
 # exe. Build pipeline: `scripts/build-release.sh` runs
@@ -25,7 +31,7 @@ long_description = "Operon-dioxus is a local-first, project-aware notes editor."
 #   .deb / .AppImage  →  /usr/bin/<bin> (sibling of main)
 #   .app / .dmg       →  Operon.app/Contents/MacOS/<bin>
 #   .msi / .exe       →  alongside operon-dioxus.exe in the install dir
-external_bin = ["operon-mcp-permission", "operon-posttool-hook", "operon-mcp"]
+external_bin = ["operon-mcp-permission", "operon-posttool-hook"]
 
 [web.app]
 

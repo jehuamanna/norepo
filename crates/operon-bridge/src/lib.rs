@@ -51,9 +51,11 @@
 
 pub mod protocol;
 pub mod server;
+pub mod stub;
 
 pub use protocol::{Frame, FrameError};
 pub use server::{Server, ServerHandle, ToolHandler, ToolHandlerError};
+pub use stub::run_stub;
 
 use thiserror::Error;
 

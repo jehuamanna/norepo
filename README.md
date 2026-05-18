@@ -90,6 +90,6 @@ server (skips the embedded `dx serve` boot).
 
 ## License
 
-Operon is licensed under the [Apache License, Version 2.0](LICENSE).
+Operon is licensed under the [GNU Affero General Public License v3.0 or later](LICENSE).
 
 Copyright 2026 Jehu Amanna and contributors. See [NOTICE](NOTICE) for attribution requirements.

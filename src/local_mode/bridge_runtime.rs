@@ -547,13 +547,14 @@ pub const BRIDGE_SERVER_NAME: &str = "operon_notes";
 /// or env-block construction.
 pub fn server_entry_value(
     mcp_bin: &Path,
+    mcp_args: &[String],
     sock_path: &Path,
     token: &str,
 ) -> serde_json::Value {
     serde_json::json!({
         "type": "stdio",
         "command": mcp_bin.to_string_lossy(),
-        "args": [],
+        "args": mcp_args,
         "env": {
             "OPERON_BRIDGE_SOCK": sock_path.to_string_lossy(),
             "OPERON_BRIDGE_TOKEN": token,
@@ -569,10 +570,10 @@ impl BridgeRuntime {
     /// can't be resolved; chat-mode degrades to its existing
     /// in-process tools only.
     pub fn chat_mode_mcp_entry(&self) -> Option<(&'static str, serde_json::Value)> {
-        let mcp_bin = resolve_operon_mcp_bin().ok()?;
+        let (mcp_bin, mcp_args) = resolve_operon_mcp_bin().ok()?;
         Some((
             BRIDGE_SERVER_NAME,
-            server_entry_value(&mcp_bin, &self.sock_path, &self.token),
+            server_entry_value(&mcp_bin, &mcp_args, &self.sock_path, &self.token),
         ))
     }
 }
@@ -587,7 +588,7 @@ impl BridgeRuntime {
 /// `$TMPDIR`) so a crash leaves at most two files behind, both keyed
 /// by pid so a restart claims fresh names.
 fn write_mcp_config(sock_path: &Path, token: &str) -> Result<PathBuf, String> {
-    let mcp_bin = resolve_operon_mcp_bin()?;
+    let (mcp_bin, mcp_args) = resolve_operon_mcp_bin()?;
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
@@ -602,7 +603,7 @@ fn write_mcp_config(sock_path: &Path, token: &str) -> Result<PathBuf, String> {
     // loads both (see `ClaudeCodeChatPlugin::set_extra_mcp_servers`).
     let config = serde_json::json!({
         "mcpServers": {
-            BRIDGE_SERVER_NAME: server_entry_value(&mcp_bin, sock_path, token)
+            BRIDGE_SERVER_NAME: server_entry_value(&mcp_bin, &mcp_args, sock_path, token)
         }
     });
     let body = serde_json::to_string_pretty(&config)
@@ -611,21 +612,22 @@ fn write_mcp_config(sock_path: &Path, token: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Locate the `operon-mcp` stub binary. Resolution order:
-/// 1. `OPERON_MCP_BIN` env var — explicit override for development.
-/// 2. Sibling of the current exe (`<exe-dir>/operon-mcp`). Production
-///    bundles drop both binaries in the same directory.
-/// 3. `target/debug/operon-mcp` relative to the workspace root, for
-///    `cargo run` and `dx serve` flows where the GUI binary is the
-///    main crate but the bridge stub is a sibling crate's bin
-///    target.
+/// Locate the `operon-mcp` stub and the args needed to invoke it.
+/// Resolution order:
+/// 1. `OPERON_MCP_BIN` env var — explicit override that points at a
+///    standalone `operon-mcp` binary (legacy / dev escape hatch). No
+///    extra args.
+/// 2. The running `operon-dioxus` executable itself, invoked with
+///    `--operon-mcp` so `main()` dispatches into the embedded stub.
+///    This is the production path: the release bundle ships a single
+///    binary and the stub is "inbuilt" rather than a sidecar.
 ///
-/// Returns the first candidate that exists and is executable.
-fn resolve_operon_mcp_bin() -> Result<PathBuf, String> {
+/// Returns `(path, args)`.
+fn resolve_operon_mcp_bin() -> Result<(PathBuf, Vec<String>), String> {
     if let Some(explicit) = std::env::var_os("OPERON_MCP_BIN") {
         let p = PathBuf::from(explicit);
         if p.exists() {
-            return Ok(p);
+            return Ok((p, Vec::new()));
         }
         return Err(format!(
             "OPERON_MCP_BIN set to {} but the file does not exist",
@@ -633,39 +635,9 @@ fn resolve_operon_mcp_bin() -> Result<PathBuf, String> {
         ));
     }
 
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            // Direct sibling: covers production bundles where the
-            // installer drops both binaries in the same dir.
-            let candidate = parent.join("operon-mcp");
-            if candidate.exists() {
-                return Ok(candidate);
-            }
-            // `dx serve` and `cargo run` shuffle the GUI binary into
-            // various subdirs under `target/` (`target/dx/.../debug/
-            // web/server/desktop/...`, `target/debug/operon-dioxus`).
-            // Walk up looking for either a sibling binary or a
-            // `debug/`/`release/` subdir that cargo's standard layout
-            // produces. We try `debug/` first so a dev rebuild
-            // without `--release` wins over a stale release artifact.
-            for ancestor in parent.ancestors().take(10) {
-                for sub in ["", "debug", "release"] {
-                    let candidate = if sub.is_empty() {
-                        ancestor.join("operon-mcp")
-                    } else {
-                        ancestor.join(sub).join("operon-mcp")
-                    };
-                    if candidate.exists() {
-                        return Ok(candidate);
-                    }
-                }
-            }
-        }
-    }
-
-    Err("operon-mcp binary not found — run `cargo build -p operon-bridge \
-         --bin operon-mcp` first, or set OPERON_MCP_BIN to its path"
-        .into())
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("current_exe: {e}"))?;
+    Ok((exe, vec!["--operon-mcp".to_string()]))
 }
 
 fn pick_socket_path() -> PathBuf {
