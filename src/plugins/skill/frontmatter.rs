@@ -119,9 +119,9 @@ pub fn field<'a>(lines: &'a [&'a str], key: &str) -> Option<&'a str> {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SkillContract {
     /// Artifact kind the skill expects as input. Strings here mirror
-    /// `ArtifactKind` ("epic", "feature", "story", "task",
-    /// "requirements", …); kept as a free string so a skill can
-    /// declare a custom kind without forcing a code change.
+    /// `ArtifactKind` ("epic", "story", "task", "requirements", …);
+    /// kept as a free string so a skill can declare a custom kind
+    /// without forcing a code change.
     pub input_kind: Option<String>,
     /// Artifact kind the skill produces.
     pub output_kind: Option<String>,
@@ -149,7 +149,7 @@ pub struct SkillContract {
     /// matches this kind. Complement of `aggregate` (which descends).
     /// Used by skills that need design context produced upstream —
     /// e.g. an SDE skill on a Task pulling the parent Story's LLD plan
-    /// and the grandparent Feature's HLD plan into its prompt.
+    /// and the grandparent Epic's HLD plan into its prompt.
     pub inherit: Option<String>,
     /// Cascade checkpoint: when `true`, the cascade orchestrator does
     /// NOT auto-approve this skill's produced artifacts, so the chain
@@ -441,14 +441,14 @@ mod tests {
         let lines = vec![
             "skill_name: ba-decompose-epic",
             "input_kind: epic",
-            "output_kind: feature",
+            "output_kind: story",
             "output_count: many",
             "gate: auto",
             "persona: BA",
         ];
         let c = contract(&lines);
         assert_eq!(c.input_kind.as_deref(), Some("epic"));
-        assert_eq!(c.output_kind.as_deref(), Some("feature"));
+        assert_eq!(c.output_kind.as_deref(), Some("story"));
         assert_eq!(c.output_count, SkillOutputCount::Many);
         assert_eq!(c.gate, SkillGate::Auto);
         assert_eq!(c.persona.as_deref(), Some("BA"));

@@ -503,7 +503,7 @@ pub async fn run_skill_on_source_with_revision_notes(
     //     `artifact_kind` matches the declared `inherit:` kind. Lets a
     //     skill pull design context produced upstream — e.g. an SDE
     //     skill on a Task pulls the parent Story's LLD plan and the
-    //     grandparent Feature's HLD plan into its prompt. Empty when
+    //     grandparent Epic's HLD plan into its prompt. Empty when
     //     the contract doesn't declare `inherit:` or no matching
     //     ancestors-sibling artifacts exist.
     let inherited: Vec<(String, String)> =
@@ -697,7 +697,7 @@ pub async fn run_skill_on_source_with_revision_notes(
         // Streaming artifact import: as soon as Claude calls `Write`
         // for a path under the per-source `artifacts_dir`, land that
         // single file in the explorer immediately. Lets the user
-        // watch Features / Tasks pop in one-by-one for `output_count:
+        // watch Stories / Tasks pop in one-by-one for `output_count:
         // many` skills instead of seeing nothing for the whole run
         // and then 5 artifacts at the end. The end-of-run scan +
         // import remains a safety net (idempotent dedup at
@@ -1373,7 +1373,7 @@ pub async fn import_produced_artifacts(
     // Inline-clarification invariant (skills 02–09): a clarification
     // `.mdx` file emitted mid-run carries `artifact_kind:
     // clarification`, which never equals the producing skill's
-    // `contract.output_kind` (epic / feature / story / task /
+    // `contract.output_kind` (epic / story / task /
     // architecture / …). `is_normalizer_contract` therefore returns
     // `false` and the clarification falls through to the child-
     // creating branch below — exactly what we want, since the
@@ -1397,7 +1397,7 @@ pub async fn import_produced_artifacts(
     // master_requirement under the phase, matching the BA chain's
     // conceptual structure (peer artifacts of the discovery phase,
     // not sub-elements of the requirement document). Deeper levels
-    // (epic → feature → story → task) keep today's source-parented
+    // (epic → story → task) keep today's source-parented
     // placement.
     let all_notes = note_repo.list_for_project(project_id).unwrap_or_default();
     let target_parent_id = resolve_target_parent(
@@ -2253,7 +2253,7 @@ mod tests {
         contract.output_kind = Some("implementation".into());
         contract.inherit = Some("plan".into());
         let inherited = vec![
-            ("plan-hld-feature-auth".into(), "HLD plan body".into()),
+            ("plan-hld-epic-auth".into(), "HLD plan body".into()),
             ("plan-lld-story-login".into(), "LLD plan body".into()),
         ];
         let prompt = build_prompt(
@@ -2276,7 +2276,7 @@ mod tests {
         assert!(prompt.contains(
             "inherited plan artifacts from ancestor chain (2 total)"
         ));
-        assert!(prompt.contains("--- artifact: plan-hld-feature-auth ---"));
+        assert!(prompt.contains("--- artifact: plan-hld-epic-auth ---"));
         assert!(prompt.contains("HLD plan body"));
         assert!(prompt.contains("--- artifact: plan-lld-story-login ---"));
         assert!(prompt.contains("LLD plan body"));
@@ -2427,7 +2427,7 @@ mod tests {
     fn is_normalizer_contract_rejects_mismatched_kinds() {
         let mut c = crate::plugins::skill::frontmatter::SkillContract::default();
         c.input_kind = Some("epic".into());
-        c.output_kind = Some("feature".into());
+        c.output_kind = Some("story".into());
         c.output_count = crate::plugins::skill::frontmatter::SkillOutputCount::One;
         assert!(!is_normalizer_contract(&c));
     }
@@ -2525,7 +2525,7 @@ mod tests {
         // Stamp this normalizer rather than preserve a stale link.
         let producer_id = Uuid::new_v4();
         let normalizer_id = Uuid::new_v4();
-        let producer = make_producer_contract("master_requirement", "feature");
+        let producer = make_producer_contract("master_requirement", "story");
         let resolved = decide_normalizer_source_skill_id(
             Some(producer_id),
             normalizer_id,

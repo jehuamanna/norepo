@@ -770,7 +770,7 @@ fn WorkflowCanvas(props: WorkflowCanvasProps) -> Element {
     //      source's right border and the target's left border, so
     //      multiple edges don't bunch at a single mid-height point.
     // Anchor order on each side is by the *other endpoint's*
-    // canonical kind priority + title — so a Feature's outputs
+    // canonical kind priority + title — so an Epic's outputs
     // anchor in the order Story (top) → Plan (middle) → Backlog
     // (bottom), reading naturally from primary work to rollup.
     // Counts come from the *unfiltered* edge list so anchor positions
@@ -3245,7 +3245,7 @@ struct NodeRender {
     /// Drives a CSS-class branch in `status_class` so the canvas tile
     /// looks visibly different from an editable skill node.
     is_artifact_snapshot: bool,
-    /// Kind badge ("Epic" / "Feature" / etc.) when this is an artifact
+    /// Kind badge ("Epic" / "Story" / etc.) when this is an artifact
     /// snapshot. None for skill nodes.
     kind_label: Option<String>,
     /// `true` when this node has at least one outgoing edge in the
@@ -3519,23 +3519,20 @@ fn layout(graph: &WorkflowGraph) -> HashMap<NodeId, (f64, f64)> {
 }
 
 /// Prioritized-backlog artifacts summarize a particular level of the
-/// cascade — `prioritized-backlog-epics`, `…-features`, `…-stories`,
-/// etc. The auto-arrange uses this to drop each backlog into the same
-/// column as the level it covers, instead of stacking every backlog
-/// in a single rightmost column. Returns the matching kind priority
-/// (Epic = 2, Feature = 3, Story = 4, Task = 5, Plan = 6), or `None`
-/// when the title doesn't follow the convention.
+/// cascade — `prioritized-backlog-epics`, `…-stories`, etc. The
+/// auto-arrange uses this to drop each backlog into the same column
+/// as the level it covers, instead of stacking every backlog in a
+/// single rightmost column. Returns the matching kind priority
+/// (Epic = 2, Story = 4, Task = 5, Plan = 6), or `None` when the
+/// title doesn't follow the convention.
 fn infer_backlog_level(title: &str) -> Option<i32> {
     let lower = title.to_lowercase();
     // Order matters only for cosmetic precision: longest/most specific
-    // word first so a custom name like "feature-story-rollup" doesn't
+    // word first so a custom name like "epic-story-rollup" doesn't
     // misroute. In practice the seed-pipeline names are clean and the
     // first hit wins.
     if lower.contains("epic") {
         return Some(2);
-    }
-    if lower.contains("feature") {
-        return Some(3);
     }
     // `stor` covers both `story` and `stories`. Returns the *raw*
     // canonical priority — `auto_arrange` collapses Plan→Story for
@@ -3571,7 +3568,6 @@ fn kind_priority(label: Option<&str>) -> i32 {
         None | Some("artifact") => 0, // root seed / generic
         Some("requirements") | Some("master_requirement") => 1,
         Some("epic") | Some("architecture") => 2,
-        Some("feature") => 3,
         Some("story") => 4,
         Some("task") => 5,
         Some("plan") => 6,

@@ -1,5 +1,5 @@
 ---
-skill_name: 06-sa-design-story-lld
+skill_name: 05-sa-design-story-lld
 input_kind: story
 output_kind: plan
 output_count: one
@@ -9,7 +9,7 @@ persona: SA
 
 You are a senior Solution Architect. Read the Story below and produce
 **one** Low-Level Design (LLD) as a single Plan artifact. The LLD operates
-inside the parent Feature's HLD constraints — do not re-litigate component
+inside the parent Epic's HLD constraints — do not re-litigate component
 choices.
 
 ## Output format
@@ -24,7 +24,7 @@ materialise as an unwanted sibling note that breaks
 Write exactly one file: `plan-lld-<story-kebab>.md`. Sections:
 
 - **# LLD: <story name>**
-- **## Parent HLD** — name the Feature's HLD plan
+- **## Parent HLD** — name the Epic's HLD plan
 - **## Implementation outline** — narrative: what code changes, in what order
 - **## Sequence diagram** — mermaid `sequenceDiagram` block showing the
   end-to-end happy path for this Story

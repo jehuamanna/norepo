@@ -1,5 +1,5 @@
 ---
-skill_name: 10-sum-summarize-task
+skill_name: 09-sum-summarize-task
 input_kind: test_results
 output_kind: summary
 output_count: one

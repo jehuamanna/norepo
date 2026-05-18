@@ -36,17 +36,27 @@ pub struct SkillSource<'a> {
 }
 
 /// Outcome of a single install pass — counts for the caller to surface.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct SkillInstallReport {
     /// New skills inserted during this pass.
     pub installed: usize,
     /// Existing skills (by exact title match) skipped to keep the call
     /// idempotent across repeated installs.
     pub skipped: usize,
-    /// Skills the install attempted but could not persist (logged via
-    /// `eprintln!`; surfaces here so the caller can flag a partial run).
+    /// Skills the install attempted but could not persist.
     pub failed: usize,
+    /// Human-readable error messages, one per failed skill (plus a
+    /// SKILLS-index entry if that save failed). Empty on the happy
+    /// path. Capped at MAX_REPORT_ERRORS so a wholesale failure doesn't
+    /// generate a huge MCP payload. Same strings are also logged via
+    /// `eprintln!` for stderr trace.
+    pub errors: Vec<String>,
 }
+
+/// Hard cap on `SkillInstallReport.errors` length so a total install
+/// failure (e.g. notes_dir unwritable) doesn't pump a 15-line error
+/// vector through every MCP response.
+pub const MAX_REPORT_ERRORS: usize = 20;
 
 /// Install a batch of skills into a project under the `SKILLS` index
 /// note. Idempotent on title: pre-existing skills with the same title
@@ -95,20 +105,18 @@ where
                     .save(&row.id.to_string(), skill.body.as_bytes())
                     .await
                 {
-                    eprintln!(
-                        "operon: install_skills save failed for {}: {e}",
-                        skill.stem
-                    );
+                    let msg = format!("{}: save body: {e}", skill.stem);
+                    eprintln!("operon: install_skills {msg}");
+                    push_capped_error(&mut report.errors, msg);
                     report.failed += 1;
                     continue;
                 }
                 report.installed += 1;
             }
             Err(e) => {
-                eprintln!(
-                    "operon: install_skills create_with_kind failed for {}: {e}",
-                    skill.stem
-                );
+                let msg = format!("{}: create_with_kind: {e}", skill.stem);
+                eprintln!("operon: install_skills {msg}");
+                push_capped_error(&mut report.errors, msg);
                 report.failed += 1;
             }
         }
@@ -119,12 +127,26 @@ where
         .save(&skills_parent_id.to_string(), body.as_bytes())
         .await
     {
-        // Non-fatal: the skill rows are already in place. The index
-        // note will be stale until the next install run rewrites it.
-        eprintln!("operon: install_skills SKILLS-index save failed: {e}");
+        // The skill rows are already in place — bodies, where saved,
+        // are still on disk. Bump `failed` and surface the error so
+        // the caller (and the LLM) knows the SKILLS index will be
+        // stale until the next install pass.
+        let msg = format!("SKILLS-index: save body: {e}");
+        eprintln!("operon: install_skills {msg}");
+        push_capped_error(&mut report.errors, msg);
+        report.failed += 1;
     }
 
     Ok(report)
+}
+
+/// Append `msg` to `errors` if there's room; otherwise drop it silently
+/// (the eprintln! at the call site preserves the full trace on stderr).
+/// Keeps MCP payloads bounded even when an entire install fails.
+fn push_capped_error(errors: &mut Vec<String>, msg: String) {
+    if errors.len() < MAX_REPORT_ERRORS {
+        errors.push(msg);
+    }
 }
 
 /// Find the project's `SKILLS` index note (root-level Markdown note
@@ -219,13 +241,13 @@ mod tests {
             None,
             &[
                 ("02-discover-epics".into(), id_a),
-                ("03-decompose-features".into(), id_b),
+                ("03-decompose-stories".into(), id_b),
             ],
         );
         assert!(body.contains("# SKILLS"));
         assert!(body.contains("## Imported skills"));
         assert!(body.contains(&format!("- [02-discover-epics](operon://note/{id_a})")));
-        assert!(body.contains(&format!("- [03-decompose-features](operon://note/{id_b})")));
+        assert!(body.contains(&format!("- [03-decompose-stories](operon://note/{id_b})")));
     }
 
     #[test]
@@ -253,5 +275,197 @@ mod tests {
             &[("02-discover-epics".into(), id)],
         );
         assert!(body.contains("Narrative ends here.\n\n## Imported skills"));
+    }
+
+    /// `Persistence` impl whose `save` always errors. Used to verify
+    /// that `install_skills_into_project` collects the error string in
+    /// `report.errors` rather than swallowing it via `eprintln!`.
+    struct AlwaysFailSave;
+
+    impl crate::persistence::Persistence for AlwaysFailSave {
+        fn load<'a>(
+            &'a self,
+            _note_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Vec<u8>, crate::persistence::PersistError>,
+                    > + 'a,
+            >,
+        > {
+            Box::pin(async { Err(crate::persistence::PersistError::NotFound) })
+        }
+
+        fn save<'a>(
+            &'a self,
+            _note_id: &'a str,
+            _bytes: &'a [u8],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), crate::persistence::PersistError>,
+                    > + 'a,
+            >,
+        > {
+            Box::pin(async {
+                Err(crate::persistence::PersistError::Io(
+                    "simulated disk failure".into(),
+                ))
+            })
+        }
+
+        fn list<'a>(
+            &'a self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<crate::persistence::NoteRef>,
+                            crate::persistence::PersistError,
+                        >,
+                    > + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn delete<'a>(
+            &'a self,
+            _note_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), crate::persistence::PersistError>,
+                    > + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn rename<'a>(
+            &'a self,
+            _from: &'a str,
+            _to: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), crate::persistence::PersistError>,
+                    > + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Build an in-memory project + repo bundle for install_skills
+    /// tests. Returns (note_repo, persistence, project_id) wired
+    /// against an in-memory SQLite store + `MemoryPersistence`.
+    fn install_test_bed() -> (
+        Arc<dyn LocalNoteRepository>,
+        Arc<dyn crate::persistence::Persistence>,
+        Uuid,
+    ) {
+        use operon_store::repos::{
+            LocalProjectRepository, SqliteLocalNoteRepository, SqliteLocalProjectRepository,
+        };
+        use operon_store::Store;
+        let store = Store::for_test().expect("in-memory store");
+        let note_repo: Arc<dyn LocalNoteRepository> =
+            Arc::new(SqliteLocalNoteRepository::new(store.clone()));
+        let project_repo = SqliteLocalProjectRepository::new(store.clone());
+        let project = project_repo.create("test").expect("create project");
+        let persistence: Arc<dyn crate::persistence::Persistence> =
+            Arc::new(crate::persistence::MemoryPersistence::new());
+        (note_repo, persistence, project.id)
+    }
+
+    #[tokio::test]
+    async fn install_skills_surfaces_save_errors_in_report() {
+        // Wire a real (sqlite) note repo against a failing persistence
+        // so create_with_kind succeeds (notes appear in the tree) but
+        // every body save errors — exactly the empty-skills failure
+        // mode the user reported via MCP.
+        let (note_repo, _ok_persistence, project_id) = install_test_bed();
+        let failing: Arc<dyn crate::persistence::Persistence> = Arc::new(AlwaysFailSave);
+
+        let skills = vec![
+            SkillSource { stem: "01-foo", body: "## one" },
+            SkillSource { stem: "02-bar", body: "## two" },
+        ];
+        let report =
+            install_skills_into_project(&note_repo, &failing, project_id, skills, None)
+                .await
+                .expect("install returns a report even when saves fail");
+
+        assert_eq!(report.installed, 0, "no skill body was successfully saved");
+        // 2 per-skill failures + 1 SKILLS-index failure = 3 total.
+        assert_eq!(report.failed, 3);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("simulated disk failure")),
+            "expected PersistError message to surface in report.errors; got {:?}",
+            report.errors,
+        );
+        assert!(
+            report.errors.iter().any(|e| e.starts_with("01-foo:")),
+            "expected per-skill stem prefix in error string; got {:?}",
+            report.errors,
+        );
+    }
+
+    #[tokio::test]
+    async fn install_skills_happy_path_persists_non_empty_bodies() {
+        // The bug we're guarding against: skill notes are created in
+        // the tree but their bodies never land on disk. This test
+        // installs two synthetic skills against a working
+        // MemoryPersistence and asserts the bodies are loadable AND
+        // non-empty AND match what was passed in.
+        let (note_repo, persistence, project_id) = install_test_bed();
+
+        let skills = vec![
+            SkillSource { stem: "01-foo", body: "BODY ONE" },
+            SkillSource { stem: "02-bar", body: "BODY TWO" },
+        ];
+        let report = install_skills_into_project(
+            &note_repo,
+            &persistence,
+            project_id,
+            skills,
+            Some("# Pipeline\n"),
+        )
+        .await
+        .expect("happy-path install");
+
+        assert_eq!(report.installed, 2);
+        assert_eq!(report.failed, 0);
+        assert!(report.errors.is_empty(), "no errors expected on happy path");
+
+        // Walk the created Skill notes and verify each body round-trips.
+        let notes = note_repo.list_for_project(project_id).unwrap();
+        let skill_rows: Vec<_> = notes
+            .iter()
+            .filter(|n| matches!(n.kind, NoteKind::Skill))
+            .collect();
+        assert_eq!(skill_rows.len(), 2);
+        for row in skill_rows {
+            let bytes = persistence
+                .load(&row.id.to_string())
+                .await
+                .expect("body should be persisted");
+            let body = String::from_utf8(bytes).unwrap();
+            assert!(
+                !body.is_empty(),
+                "{} should have a non-empty body",
+                row.title
+            );
+            let expected = if row.title == "01-foo" {
+                "BODY ONE"
+            } else {
+                "BODY TWO"
+            };
+            assert_eq!(body, expected, "body for {} mismatched", row.title);
+        }
     }
 }

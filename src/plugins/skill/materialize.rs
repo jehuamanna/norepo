@@ -275,7 +275,7 @@ mod tests {
             description: keep this\n\
             skill_name: ba-decompose-epic\n\
             input_kind: epic\n\
-            output_kind: feature\n\
+            output_kind: story\n\
             ---\n\nbody";
         let out = to_claude_compat(body, "ba-decompose-epic");
         assert!(out.contains("name: ba-decompose-epic"));
@@ -290,7 +290,7 @@ mod tests {
         let body = "---\n\
             skill_name: ba-decompose-epic\n\
             input_kind: epic\n\
-            output_kind: feature\n\
+            output_kind: story\n\
             output_count: many\n\
             persona: BA\n\
             ---\n\nbody";
@@ -302,7 +302,7 @@ mod tests {
         // Persona, kinds, and many/fan-out plurality all surface.
         assert!(desc_line.contains("BA"), "{desc_line}");
         assert!(desc_line.contains("epic"), "{desc_line}");
-        assert!(desc_line.contains("feature"), "{desc_line}");
+        assert!(desc_line.contains("story"), "{desc_line}");
         assert!(desc_line.contains("multiple"), "{desc_line}");
     }
 
@@ -341,7 +341,7 @@ mod tests {
     fn compat_quotes_description_with_colons_or_hashes() {
         // Synthesized description contains "skill:" — must be quoted so
         // Claude's YAML parser doesn't read it as a nested mapping.
-        let body = "---\npersona: BA\ninput_kind: epic\noutput_kind: feature\n---\n\nbody";
+        let body = "---\npersona: BA\ninput_kind: epic\noutput_kind: story\n---\n\nbody";
         let out = to_claude_compat(body, "x");
         let desc_line = out.lines().find(|l| l.starts_with("description:")).unwrap();
         // After `description:` the value must be wrapped in double quotes.

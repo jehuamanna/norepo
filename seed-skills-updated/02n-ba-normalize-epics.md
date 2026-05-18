@@ -38,7 +38,7 @@ body and `source_skill_id` (refreshed to this normalizer) change.
    `www.figma.com`), gather them into a `## Design references`
    section as a bullet list with whatever per-URL notes the human
    wrote. Do NOT call the Figma MCP here — fetching is the next
-   decomposition skill's job (`03-ba-decompose-features`). If the
+   decomposition skill's job (`03-ba-decompose-stories`). If the
    input has no Figma URLs, omit `## Design references`.
 5. Add a `## Revision history` row noting `"Normalized by
    02n-ba-normalize-epics on <today>"`.

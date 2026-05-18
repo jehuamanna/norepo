@@ -63,8 +63,8 @@ pub fn compose(project_name: &str, entries: &[ArtifactEntry]) -> String {
          This project uses the Operon SDLC pipeline. Every artifact is a\n\
          markdown note whose YAML frontmatter declares an `artifact_kind`\n\
          and links to a typed parent through Operon's note tree. Operon\n\
-         enforces the parent-kind contract: a `feature` artifact must\n\
-         descend from an `epic`, a `story` from a `feature`, and so on.\n\
+         enforces the parent-kind contract: a `story` artifact must\n\
+         descend from an `epic`, a `task` from a `story`, and so on.\n\
          \n\
          Skills live in `.claude/skills/` and declare `input_kind` /\n\
          `output_kind` in their YAML frontmatter so each skill applies\n\
@@ -78,12 +78,11 @@ pub fn compose(project_name: &str, entries: &[ArtifactEntry]) -> String {
          | 1 | `requirements` | Decomposed needs derived from a master_requirement |\n\
          | 1 | `epic` | Large feature area derived from a master_requirement |\n\
          | 1 | `architecture` | Technical architecture; sibling to epics |\n\
-         | 2 | `feature` | Discrete capability decomposed from an epic |\n\
-         | 3 | `story` | User-facing story under a feature |\n\
-         | 4 | `task` | Implementation unit under a story |\n\
-         | 5 | `plan` / `implementation_plan` | Implementation plan for a task |\n\
-         | 6 | `implementation` | Code change produced from a plan |\n\
-         | 6 | `test_cases` / `test_results` / `summary` | Verification and rollup |\n\
+         | 2 | `story` | User-facing story under an epic |\n\
+         | 3 | `task` | Implementation unit under a story |\n\
+         | 4 | `plan` / `implementation_plan` | Implementation plan for a task |\n\
+         | 5 | `implementation` | Code change produced from a plan |\n\
+         | 5 | `test_cases` / `test_results` / `summary` | Verification and rollup |\n\
          \n",
     );
 
@@ -146,7 +145,6 @@ fn canonical_kind_order() -> &'static [&'static str] {
         "epic",
         "architecture",
         "architecture_review",
-        "feature",
         "story",
         "task",
         "plan",
@@ -251,7 +249,7 @@ mod tests {
     #[test]
     fn compose_groups_entries_by_kind_in_waterfall_order() {
         let entries = vec![
-            entry("Feature A", ArtifactKind::Feature),
+            entry("Task 1", ArtifactKind::Task),
             entry("Root", ArtifactKind::MasterRequirement),
             entry("Epic X", ArtifactKind::Epic),
             entry("Story 1", ArtifactKind::Story),
@@ -261,9 +259,9 @@ mod tests {
         // bare kind names — those appear earlier in the taxonomy table.
         let root = out.find("**master_requirement**").unwrap();
         let epic = out.find("**epic**").unwrap();
-        let feature = out.find("**feature**").unwrap();
         let story = out.find("**story**").unwrap();
-        assert!(root < epic && epic < feature && feature < story);
+        let task = out.find("**task**").unwrap();
+        assert!(root < epic && epic < story && story < task);
     }
 
     #[test]
@@ -320,7 +318,7 @@ mod tests {
         assert!(out.contains("Kind taxonomy"));
         assert!(out.contains("master_requirement"));
         assert!(out.contains("epic"));
-        assert!(out.contains("feature"));
+        assert!(out.contains("story"));
         assert!(out.contains("task"));
     }
 }

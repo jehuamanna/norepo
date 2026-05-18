@@ -1,5 +1,5 @@
 ---
-skill_name: 09-tst-run-tests
+skill_name: 08-tst-run-tests
 input_kind: test_cases
 output_kind: test_results
 output_count: one
@@ -29,7 +29,7 @@ real test command — capture real signal.
 - Do **NOT** edit the test code to make it pass. If a test is broken
   (assertion typo, wrong import path), report it under
   `## Failing tests` with the message "test code error" so the
-  reviewer routes it back to `08-tst-write-tests`.
+  reviewer routes it back to `07-tst-write-tests`.
 - If the test command itself fails to even start (missing dependency,
   wrong path), record that under `## Outcome` as `ERROR` with the
   exit code and the stderr excerpt.

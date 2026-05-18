@@ -3082,9 +3082,31 @@ impl ToolHandler for OperonCreateProjectTool {
             .send(crate::local_mode::bridge_runtime::BridgeUiCommand::BumpNoteVersion);
 
         let mut payload = project_to_json(&final_row);
+        // Total install failure (project created but every seed save
+        // errored): return Err so the LLM sees a clear failure signal
+        // instead of a silent zero-skill project. Include the project
+        // id + first error so the LLM can either retry, surface a fix-
+        // it message to the user, or delete the orphan project.
+        if let Some(rep) = install_report.as_ref() {
+            if rep.installed == 0 && rep.failed > 0 {
+                let first = rep
+                    .errors
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("(no error message captured)");
+                return Err(ToolHandlerError::new(format!(
+                    "create_project: seed-skill install failed for all {} skills (project_id={project_id}; \
+                     re-run mcp__operon__install_seed_skills after fixing the underlying issue). \
+                     First error: {first}",
+                    rep.failed,
+                )));
+            }
+        }
         if let Some(rep) = install_report {
             payload["seed_skills_installed"] = json!(rep.installed);
             payload["seed_skills_skipped"] = json!(rep.skipped);
+            payload["seed_skills_failed"] = json!(rep.failed);
+            payload["seed_skills_errors"] = json!(rep.errors);
         } else {
             payload["seed_skills_installed"] = Value::Null;
         }
@@ -3471,6 +3493,23 @@ impl ToolHandler for OperonInstallSeedSkillsTool {
         let report = install_seed_skills_vault(note_repo.clone(), persistence.clone(), project_id)
             .await?;
 
+        // Total install failure (every skill save errored): bail with
+        // an error so the LLM sees a clear failure signal and can
+        // surface the underlying cause to the user. Includes the first
+        // error string for diagnostic context.
+        if report.installed == 0 && report.failed > 0 {
+            let first = report
+                .errors
+                .first()
+                .map(String::as_str)
+                .unwrap_or("(no error message captured)");
+            return Err(ToolHandlerError::new(format!(
+                "install_seed_skills: failed for all {} skills (project_id={project_id}). \
+                 First error: {first}",
+                report.failed,
+            )));
+        }
+
         // Disk materialize when asked. We walk every Skill note (not
         // just the newly-installed ones) so a re-run with
         // `materialize_to_disk=true` after an earlier vault-only run
@@ -3490,6 +3529,7 @@ impl ToolHandler for OperonInstallSeedSkillsTool {
             "skills_installed": report.installed,
             "skills_skipped": report.skipped,
             "skills_failed": report.failed,
+            "skills_errors": report.errors,
         });
         if let Some(files) = materialized_files {
             payload["skills_materialized"] = json!(files.len());
@@ -3876,7 +3916,7 @@ mod tests {
                 "project_id": project.id.to_string(),
                 "title": "Custom",
                 "kind": "artifact",
-                "artifact_kind": "feature",
+                "artifact_kind": "story",
                 "body": "## Custom outline\n\nfreeform notes",
             }))
             .await
@@ -3893,7 +3933,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             body,
-            "---\nartifact_kind: feature\n---\n\n## Custom outline\n\nfreeform notes"
+            "---\nartifact_kind: story\n---\n\n## Custom outline\n\nfreeform notes"
         );
     }
 
@@ -4002,16 +4042,45 @@ mod tests {
             installed >= 10,
             "expected the cascade chain, got {installed} installed"
         );
+        // Happy-path install must report zero failures with no error
+        // strings — the empty-skills bug surfaces here when this isn't
+        // true.
+        assert_eq!(payload["seed_skills_failed"].as_u64().unwrap(), 0);
+        assert!(
+            payload["seed_skills_errors"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(false),
+            "expected empty seed_skills_errors; got {}",
+            payload["seed_skills_errors"]
+        );
 
         // SKILLS index + Skill children should now live in the project.
         let id = Uuid::parse_str(payload["id"].as_str().unwrap()).unwrap();
         let notes = repos.note_repo.list_for_project(id).unwrap();
         assert!(notes.iter().any(|n| n.title == "SKILLS"));
-        let skill_count = notes
+        let skill_rows: Vec<_> = notes
             .iter()
             .filter(|n| matches!(n.kind, operon_store::repos::NoteKind::Skill))
-            .count();
-        assert_eq!(skill_count as u64, installed);
+            .collect();
+        assert_eq!(skill_rows.len() as u64, installed);
+
+        // Critical: every Skill note must have a NON-EMPTY body
+        // persisted. The empty-skills bug the MCP create_project path
+        // had been silently producing was an install where the rows
+        // existed but persistence.save had failed for the bodies.
+        for row in skill_rows {
+            let bytes = repos
+                .persistence
+                .load(&row.id.to_string())
+                .await
+                .unwrap_or_else(|e| panic!("body for {} must load: {e}", row.title));
+            assert!(
+                !bytes.is_empty(),
+                "{} installed but body is empty",
+                row.title
+            );
+        }
     }
 
     #[tokio::test]
@@ -4274,7 +4343,7 @@ mod tests {
                 "project_id": project.id.to_string(),
                 "title": "Power",
                 "kind": "artifact",
-                "artifact_kind": "feature",
+                "artifact_kind": "story",
                 "body": custom_body,
             }))
             .await

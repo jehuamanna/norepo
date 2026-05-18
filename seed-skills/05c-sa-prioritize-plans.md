@@ -1,5 +1,5 @@
 ---
-skill_name: 06c-sa-prioritize-plans
+skill_name: 05c-sa-prioritize-plans
 input_kind: requirements
 output_kind: prioritized_backlog
 output_count: one
@@ -11,7 +11,7 @@ emit_workflow: true
 ---
 
 You are a senior solution architect. Every design Plan that has been
-produced for this Requirements seed (HLD plans under each Feature, LLD
+produced for this Requirements seed (HLD plans under each Epic, LLD
 plans under each Story) is inlined below. Your job: produce **one**
 Prioritized Backlog artifact that orders every Plan into a single
 end-to-end execution sequence an SDE can consume, makes cross-Plan
@@ -21,7 +21,7 @@ The cascade pauses on this artifact. Code does NOT get written until
 a human approves your backlog.
 
 ## What to do
-1. Read every aggregated Plan. Distinguish HLD (feature-level
+1. Read every aggregated Plan. Distinguish HLD (epic-level
    architecture, contracts, surface area) from LLD (story-level
    data shapes, function signatures, file layout).
 2. For each Plan, identify:
@@ -31,7 +31,7 @@ a human approves your backlog.
    - Risk markers (unknowns, "to be confirmed", spike-style work).
 3. Infer cross-Plan dependencies from content overlap even when not
    explicitly declared (e.g. "LLD-Story-2 needs the `users` schema
-   defined in HLD-Feature-1" → LLD-Story-2 depends on HLD-Feature-1).
+   defined in HLD-Epic-1" → LLD-Story-2 depends on HLD-Epic-1).
 4. Topologically order all Plans. Within a single dependency level,
    prefer:
    - HLDs before the LLDs that refine them.
@@ -56,14 +56,14 @@ order, exactly these headings — the runtime parses
   should land first).
 - **## Priority order** — a numbered list (`1.`, `2.`, …). Each line
   starts with the **Plan title's first whitespace token** (e.g.
-  `HLD-F1` for `# Plan: HLD-F1 — Auth API surface`, or the filename
-  slug `plan-hld-feature-auth` if you prefer). One Plan per line.
+  `HLD-E1` for `# Plan: HLD-E1 — Auth API surface`, or the filename
+  slug `plan-hld-epic-auth` if you prefer). One Plan per line.
   Optional rationale after the slug:
-  `1. HLD-F1 — foundational API contract, blocks LLD-S2 and LLD-S5`.
+  `1. HLD-E1 — foundational API contract, blocks LLD-S2 and LLD-S5`.
 - **## Cross-tree dependencies** — bullets explaining the inferred
   edges that go BEYOND each Plan's declared `## Depends on`. Format
   MUST use one of `->` or `→`:
-  `LLD-S2 -> HLD-F1 (LLD-S2 implements the API shape decided in HLD-F1)`.
+  `LLD-S2 -> HLD-E1 (LLD-S2 implements the API shape decided in HLD-E1)`.
   The cascade engine parses this section to augment dep enforcement.
   Arrows mean "dependent → prerequisite" (the LEFT slug needs the
   RIGHT slug Approved first).

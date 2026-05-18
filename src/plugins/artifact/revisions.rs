@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn no_details_returns_only_current() {
-        let body = "# Feature: foo\n\n## Outcome\nSomething.";
+        let body = "# Story: foo\n\n## Outcome\nSomething.";
         let revs = parse_revisions(body);
         assert_eq!(revs.len(), 1);
         assert_eq!(revs[0].label, "Current");
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn one_details_block_yields_current_plus_revision() {
-        let body = r#"# Feature: foo (rev 2)
+        let body = r#"# Story: foo (rev 2)
 
 ## Outcome
 Updated outcome.
@@ -211,7 +211,7 @@ Updated outcome.
 <details>
 <summary>Revision 1 (2026-05-09)</summary>
 
-# Feature: foo
+# Story: foo
 
 ## Outcome
 Original outcome.

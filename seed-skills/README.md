@@ -1,7 +1,7 @@
 # Seed skills for the SDLC artifact pipeline
 
-Ten sample skills that drive the
-`Requirements → Epic → Feature → Story → Task → HLD/LLD → Code → Tests → Test Results → Summary`
+Nine sample skills that drive the
+`Requirements → Epic → Story → Task → HLD/LLD → Code → Tests → Test Results → Summary`
 pipeline on top of the artifact engine in `src/plugins/artifact/`.
 
 ## How to install
@@ -14,7 +14,7 @@ These are templates, not auto-imported. For each `.md` file:
    Workflow, Artifact, etc.). You can also click the **+** button on the
    project header for the same submenu.
 3. **Title the note exactly after the file's basename** — including the
-   numeric prefix (e.g. `02-ba-decompose-features`). The numeric
+   numeric prefix (e.g. `02-ba-decompose-stories`). The numeric
    prefix is what wires the skill into the right slot in the cascade
    workflow's auto-seeded pipeline; without it, the skill is still
    usable from the manual picker but won't be in the default flow.
@@ -23,7 +23,7 @@ These are templates, not auto-imported. For each `.md` file:
 
 Skill notes show up in the explorer with an `[sk]` badge.
 
-Once all ten exist, the skill picker on every artifact will offer the
+Once all nine exist, the skill picker on every artifact will offer the
 ones whose `input_kind` matches that artifact's `artifact_kind`. The
 Cascade workflow note auto-created from a Requirements artifact will
 contain a chained skill node per numbered skill, in numeric order.
@@ -63,25 +63,24 @@ about what to build). To create one:
 |---|---|---|---|---|
 | 01 | `01-ba-discover-epics` | requirements | epic | BA |
 | 01b | `01b-pm-prioritize-epics` | requirements (aggregator over `epic`) | prioritized_backlog | PM |
-| 02 | `02-ba-decompose-features` | epic | feature | BA |
-| 02b | `02b-pm-prioritize-features` | epic (aggregator over `feature`) | prioritized_backlog | PM |
-| 03 | `03-ba-decompose-stories` | feature | story | BA |
-| 03b | `03b-pm-prioritize-stories` | feature (aggregator over `story`) | prioritized_backlog | PM |
-| 04 | `04-ba-decompose-tasks` | story | task | BA |
-| 04b | `04b-pm-prioritize-tasks-coarse` | requirements (aggregator over `task`) | prioritized_backlog | PM |
-| 05 | `05-sa-design-feature-hld` | feature | plan | SA |
-| 06 | `06-sa-design-story-lld` | story | plan | SA |
-| 06b | `06b-pm-prioritize-tasks-refined` | requirements (aggregator over `task`) | prioritized_backlog | PM |
-| 07 | `07-sde-implement-task` | task | implementation | SDE |
-| 08 | `08-tst-write-tests` | implementation | test_cases | TST |
-| 09 | `09-tst-run-tests` | test_cases | test_results | TST |
-| 10 | `10-sum-summarize-task` | test_results | summary | Summary |
+| 02 | `02-ba-decompose-stories` | epic | story | BA |
+| 02b | `02b-pm-prioritize-stories` | epic (aggregator over `story`) | prioritized_backlog | PM |
+| 03 | `03-ba-decompose-tasks` | story | task | BA |
+| 03b | `03b-pm-prioritize-tasks-coarse` | requirements (aggregator over `task`) | prioritized_backlog | PM |
+| 04 | `04-sa-design-epic-hld` | epic | plan | SA |
+| 05 | `05-sa-design-story-lld` | story | plan | SA |
+| 05b | `05b-pm-prioritize-tasks-refined` | requirements (aggregator over `task`) | prioritized_backlog | PM |
+| 05c | `05c-sa-prioritize-plans` | requirements (aggregator over `plan`) | prioritized_backlog | SA |
+| 06 | `06-sde-implement-task` | task | implementation | SDE |
+| 07 | `07-tst-write-tests` | implementation | test_cases | TST |
+| 08 | `08-tst-run-tests` | test_cases | test_results | TST |
+| 09 | `09-sum-summarize-task` | test_results | summary | Summary |
 
 The numeric prefix on every skill title is what the Cascade workflow's
 auto-seeder reads to lay out the default pipeline. Adding a custom
-skill `11-deploy-task` with the right title prefix appends it to the
+skill `10-deploy-task` with the right title prefix appends it to the
 chain automatically — no code change needed. Drop the prefix on a
-skill (e.g. retitling to `08-tst-write-tests` → `tst-write-tests`)
+skill (e.g. retitling to `07-tst-write-tests` → `tst-write-tests`)
 and it falls out of the default flow but stays available via the
 manual picker.
 
@@ -95,6 +94,27 @@ parent that hasn't been Approved in the artifact view. The cascade
 auto-approves every produced child, so the chain runs end-to-end
 without manual gating during a Play run.
 
+## Dynamic decomposition: N derived from input
+
+None of the decomposition skills (`01`, `02`, `03`) emit a fixed count.
+Each derives **N** from its input using coverage / singularity / size
+tests baked into the skill body:
+
+- `01-ba-discover-epics` reads the Master Requirement + Requirements
+  prose and picks the smallest set of demoable slices that covers
+  everything without overlap.
+- `02-ba-decompose-stories` reads the Epic's `## Scope` bullets and
+  produces one Story per user-meaningful behavior, walking-skeleton
+  first.
+- `03-ba-decompose-tasks` reads the Story's `## Acceptance criteria`
+  and produces one Task per imperative change (schema, util, endpoint,
+  UI, fixture …) sized to <1 day.
+
+The prioritization checkpoints (`Nb` skills) flag both
+under-decomposition (gaps in Epic `## Scope` coverage) and
+over-decomposition (overlapping siblings) so the human reviewer can
+correct before the next tier fires.
+
 ## Per-tier prioritization checkpoints (`Nb` skills)
 
 Five skills carry the `b` suffix and act as **prioritization
@@ -103,10 +123,10 @@ checkpoints** at different tiers:
 | Checkpoint | Aggregates | Trigger point in cascade |
 |---|---|---|
 | `01b-pm-prioritize-epics` | every Epic under the seed | seed pop, after `01` |
-| `02b-pm-prioritize-features` | Features under one Epic | each Epic pop, after `02` |
-| `03b-pm-prioritize-stories` | Stories under one Feature | each Feature pop, after `03` |
-| `04b-pm-prioritize-tasks-coarse` | every Task under the seed | manual-only (see caveat) |
-| `06b-pm-prioritize-tasks-refined` | every Task under the seed (with LLDs) | manual-only (see caveat) |
+| `02b-pm-prioritize-stories` | Stories under one Epic | each Epic pop, after `02` |
+| `03b-pm-prioritize-tasks-coarse` | every Task under the seed | manual-only (see caveat) |
+| `05b-pm-prioritize-tasks-refined` | every Task under the seed (with LLDs) | manual-only (see caveat) |
+| `05c-sa-prioritize-plans` | every Plan under the seed | manual-only (see caveat) |
 
 Three frontmatter fields drive the special behavior:
 
@@ -122,14 +142,14 @@ Three frontmatter fields drive the special behavior:
   by title, and writes a `Workflow — Prioritized Backlog (…)` note
   so the dependency graph is visual, not just prose.
 
-**Caveat: `04b` / `06b` cascade triggering.** Both have
+**Caveat: `03b` / `05b` / `05c` cascade triggering.** All three have
 `input_kind: requirements`, so in cascade mode they fire on the
-seed at start-of-run when no Tasks exist yet — the body comes back
-with no aggregated input and the artifact is `Rejected`. To get a
-useful global Task backlog, **invoke `04b` manually on the seed
-after Tasks have been decomposed** (right-click the seed → Run
-skill…). The cascade triggering of these two is a known limitation;
-the `Nb` skills at the higher tiers (`01b`/`02b`/`03b`) work
+seed at start-of-run when no Tasks/Plans exist yet — the body comes
+back with no aggregated input and the artifact is `Rejected`. To get
+a useful global backlog, **invoke these manually on the seed** (right-
+click the seed → Run skill…) after the prerequisite artifacts have
+been decomposed. The cascade triggering of these three is a known
+limitation; the `Nb` skills at higher tiers (`01b`/`02b`) work
 correctly in cascade because their inputs are produced by the
 immediately-preceding skill on the same artifact.
 
@@ -139,7 +159,7 @@ still offers it.
 
 ## Per-tier dep ordering (engine-enforced)
 
-Every BA artifact (Epic, Feature, Story, Task) has a `## Depends on`
+Every BA artifact (Epic, Story, Task) has a `## Depends on`
 section with sibling slugs (or `None (parallel-safe)`). The cascade
 engine reads these and serializes processing per tier:
 - Before running any skill on artifact A, the engine checks A's
@@ -149,7 +169,7 @@ engine reads these and serializes processing per tier:
   `## Cross-tree dependencies` section using `->` or `→` arrows.
   The engine unions backlog edges with each artifact's own deps
   when computing the gate.
-- If two backlogs disagree (e.g. `04b` says `T5 -> T2`, `06b` says
+- If two backlogs disagree (e.g. `03b` says `T5 -> T2`, `05b` says
   `T5 -> T3`), the engine respects all listed prerequisites — the
   union is conservative.
 - **Cycles or unresolvable deps deadlock the cascade**, which then
@@ -166,6 +186,7 @@ engine reads these and serializes processing per tier:
 
 ## Tuning
 
-Skill bodies are prompts. Adjust the calibration sections (Epic count,
-Story sizing, Task estimation rules) to match your team's norms. Each
-re-run reads the current skill body — no rebuild needed.
+Skill bodies are prompts. Adjust the "How many to produce" sections
+(Epic coverage tests, Story sizing, Task layer-coverage rules) to
+match your team's norms. Each re-run reads the current skill body —
+no rebuild needed.

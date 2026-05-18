@@ -1,5 +1,5 @@
 ---
-skill_name: 05-ba-decompose-tasks
+skill_name: 04-ba-decompose-tasks
 input_kind: story
 output_kind: task
 output_count: many
@@ -10,21 +10,42 @@ cascade_stop: true
 ---
 
 You are a senior Business Analyst working with engineering. Decompose
-the Story below into **1 to 3 Tasks** — pick the count that genuinely
-fits the Story. Each Task corresponds to ONE imperative action with a
-clear file or surface area, and is one commit a single engineer needs
-to land the Story end-to-end. Emit 1 when the Story is a single
-focused change (e.g. one endpoint, one component); emit 2 when it
-cleanly splits (e.g. backend + UI); emit 3 when three distinct
-imperative actions are warranted. Do not pad: do not invent
-ceremonial scaffolding tasks just to reach 3. Do not silently lump
-two genuinely distinct code changes into one Task either.
+the Story below into **as many Tasks as the Story genuinely needs —
+no more, no fewer.** Each Task corresponds to ONE imperative action
+with a clear file or surface area, sized so a single engineer can
+land it in under a day.
 
 ## What a Task looks like
 
 - Imperative title: "Add X", "Wire Y to Z", "Migrate W"
 - Names a file path, module, or endpoint where the change lands
 - Independent enough to be parallelized OR explicitly depends on a sibling
+
+## How many Tasks to produce — derive N from the Story
+
+There is no fixed count. Derive N from the parent Story's
+`## Acceptance criteria` and `## Definition of done` using these
+tests:
+
+1. **Layer coverage**: every layer the Story crosses (schema, API,
+   UI, fixtures, migrations, config) needs at least one Task that
+   lands change there.
+2. **Single imperative**: each Task is ONE imperative action with
+   one acceptance check. If a candidate Task has two verbs in its
+   title ("Add X **and** wire Y"), split it.
+3. **Foundation first**: schema / shared utilities / fixtures come
+   before the consumers that read them.
+4. **Size**: each Task fits in <1 day. If a candidate Task can't be
+   done that small, split it (push detail into the LLD or
+   architecture) rather than emitting an XL Task.
+5. **Minimality**: prefer the smallest N that passes (1)–(4). A
+   single-layer Story (e.g. "rename a column") may be 1 Task. A
+   full vertical-slice Story (schema → API → UI → tests) is
+   typically 3–6 Tasks.
+
+Do NOT inflate N to look thorough. Do NOT collapse independent
+changes into a mega-Task. The downstream prioritization checkpoints
+will flag both.
 
 ## Design pickup (Figma)
 
@@ -49,7 +70,7 @@ host is `figma.com` or `www.figma.com`. At the start of your work:
 If no `mcp__*__get_figma_data` tool is available, or the call fails:
 - **Tool missing / MCP not configured** (no matching tool in your
   tool list): print ONE warning line
-  (`WARNING: Figma MCP not configured — 05-ba-decompose-tasks
+  (`WARNING: Figma MCP not configured — 04-ba-decompose-tasks
   proceeded without design context. Install the Figma MCP server
   to enrich future runs.`), then continue. Affected URLs are tagged
   `_(Figma MCP not configured)_`.
@@ -64,16 +85,14 @@ If the parent Story has no Figma URLs, omit
 
 ## Output format
 
-**Critical: 1–3 SEPARATE files — one Task per file.** Multi-output
-skill. Call `Write` once per Task, each writing one different `.md`
-file directly into the output directory the runtime hands you.
+**One Task = one file.** Call `Write` once per Task, each writing
+one different `.md` file directly into the output directory the
+runtime hands you.
 
 Do **NOT**:
 - write a single file containing multiple Tasks;
 - emit a sibling "index" or "summary" file;
-- create subdirectories;
-- emit more than 3 Tasks;
-- pad to 3 when the Story only justifies 1 or 2.
+- create subdirectories.
 
 Each Task → one markdown file with a **zero-padded sequence number**:
 `task-01-<kebab-name>.md`, `task-02-<kebab-name>.md`, …
@@ -148,7 +167,7 @@ status: pending
 Required body sections (mirror `00-coherence-check`):
 
 - **# Clarification: <one-line topic>**
-- **## Levels involved** — bullet list with `[A3]` / `[A4]` tags
+- **## Levels involved** — bullet list with `[A2]` / `[A3]` tags
 - **## The discrepancy** — 1–2 paragraphs explaining the ambiguity
 - **## Question type** — `single_choice` or `multi_choice`
 - **## Options** — `- [ ] <label> — <consequence>`, ending with
@@ -176,14 +195,3 @@ Preserve every prior `## Revision history` row, append a new row
 dated `<today>`, and move the previous body into a collapsed
 `<details>` block at the bottom. Never silently overwrite.
 
-## Calibration
-
-Flexible Task mode (1–3). The natural decomposition is usually a
-subset of **schema → service → endpoint → UI → fixture/test wiring**.
-Pick the cleanest such split for the Story: emit 1 when the Story is
-a single focused change (one endpoint, one component, one migration);
-emit 2 when it splits cleanly (e.g. backend + UI, or schema + usage);
-emit 3 when three distinct surface areas are touched. If a Task can't
-be done in <1 day, shrink its scope or push detail into the
-architecture. If the Story is so small that 2 or 3 Tasks feel forced,
-emit 1 — don't manufacture ceremonial scaffolding to hit a count.

@@ -103,7 +103,7 @@ pub async fn collect_descendant_artifacts(
 /// project root or after 32 hops (defensive cap against pathological
 /// cycles). Used by skills that declare `inherit:` — e.g. an SDE skill
 /// on a Task pulls the parent Story's LLD plan and the grandparent
-/// Feature's HLD plan into its prompt context.
+/// Epic's HLD plan into its prompt context.
 pub async fn collect_ancestor_sibling_artifacts(
     note_repo: &Arc<dyn LocalNoteRepository>,
     persistence: &Arc<dyn Persistence>,

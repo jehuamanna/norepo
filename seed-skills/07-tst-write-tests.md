@@ -1,5 +1,5 @@
 ---
-skill_name: 08-tst-write-tests
+skill_name: 07-tst-write-tests
 input_kind: implementation
 output_kind: test_cases
 output_count: one
@@ -42,7 +42,7 @@ asks for one.
 once** for the artifact described below — the Test Cases note. The
 test source code itself lives **inside** that single artifact (in
 fenced code blocks under `## Test code`); do not write a separate
-artifact-dir file per test. The next stage (`09-tst-run-tests`)
+artifact-dir file per test. The next stage (`08-tst-run-tests`)
 materialises those fenced blocks onto disk under their target paths.
 Stray artifact-dir Writes here would break `artifact_kind: test_cases`
 matching downstream.

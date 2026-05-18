@@ -1,6 +1,6 @@
 //! SDLC seed skills, embedded into the binary at compile time.
 //!
-//! The 15 skill files plus README under `seed-skills-updated/` ship
+//! The 13 skill files plus README under `seed-skills-updated/` ship
 //! with every operon build via `include_dir!`. The `install_seed_skills`
 //! MCP tool and the explorer "+" project flow both pull from here, so
 //! a shipped binary can populate a new project with the cascade chain

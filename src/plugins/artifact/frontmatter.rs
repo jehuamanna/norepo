@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! ---
-//! artifact_kind: epic           # epic | feature | story | task | plan | implementation_plan | implementation | test_cases | summary | requirements
+//! artifact_kind: epic           # epic | story | task | plan | implementation_plan | implementation | test_cases | summary | requirements
 //! status: pending               # pending | approved | rejected | dirty | running | error
 //! source_artifact_id: <uuid>    # the artifact this was derived from (root artifacts have None)
 //! source_skill_id: <uuid>       # the skill that produced this
@@ -47,7 +47,6 @@ pub enum ArtifactKind {
     /// created when a non-Artifact note is used as the cascade entry.
     Requirements,
     Epic,
-    Feature,
     Story,
     Task,
     Plan,
@@ -91,7 +90,6 @@ impl ArtifactKind {
             Self::MasterRequirement => "master_requirement",
             Self::Requirements => "requirements",
             Self::Epic => "epic",
-            Self::Feature => "feature",
             Self::Story => "story",
             Self::Task => "task",
             Self::Plan => "plan",
@@ -113,7 +111,6 @@ impl ArtifactKind {
             "master_requirement" => Self::MasterRequirement,
             "requirements" => Self::Requirements,
             "epic" => Self::Epic,
-            "feature" => Self::Feature,
             "story" => Self::Story,
             "task" => Self::Task,
             "plan" => Self::Plan,
@@ -135,7 +132,6 @@ impl ArtifactKind {
             Self::MasterRequirement => "Master Requirement".into(),
             Self::Requirements => "Requirements".into(),
             Self::Epic => "Epic".into(),
-            Self::Feature => "Feature".into(),
             Self::Story => "Story".into(),
             Self::Task => "Task".into(),
             Self::Plan => "Plan".into(),
@@ -486,7 +482,7 @@ mod tests {
 
     #[test]
     fn parse_defaults_status_to_pending() {
-        let body = "---\nartifact_kind: feature\n---\nbody";
+        let body = "---\nartifact_kind: story\n---\nbody";
         let fm = parse(body);
         assert_eq!(fm.status, ArtifactStatus::Pending);
     }
@@ -685,7 +681,7 @@ mod tests {
         // Newlines have to be escaped so the single-line frontmatter
         // serializer doesn't split the value across multiple keys.
         let mut fm = ArtifactFrontmatter::default();
-        fm.artifact_kind = Some(ArtifactKind::Feature);
+        fm.artifact_kind = Some(ArtifactKind::Story);
         fm.revision_notes = Some(
             "Drop the analytics epic.\nAdd an SLO epic instead.".into(),
         );

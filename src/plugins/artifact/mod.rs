@@ -1,5 +1,5 @@
-//! Artifact note plugin: SDLC pipeline output (Epics, Features,
-//! Stories, Tasks, Plans, TestCases, Summaries). Each artifact is a
+//! Artifact note plugin: SDLC pipeline output (Epics, Stories,
+//! Tasks, Plans, TestCases, Summaries). Each artifact is a
 //! `NoteKind::Artifact` markdown note whose YAML frontmatter declares
 //! its kind / status / parent / source-skill linkage. The artifact
 //! tree under a project is the canonical workflow surface — running a

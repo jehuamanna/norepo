@@ -48,7 +48,6 @@ pub fn role_for_artifact_kind(kind: &ArtifactKind) -> Option<Role> {
         ArtifactKind::MasterRequirement
         | ArtifactKind::Requirements
         | ArtifactKind::Epic
-        | ArtifactKind::Feature
         | ArtifactKind::Story
         | ArtifactKind::Summary
         | ArtifactKind::Clarification

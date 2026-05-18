@@ -141,7 +141,7 @@ impl SkillPhase {
 }
 
 /// `true` when a skill's `input_kind` belongs to the BA arm of the
-/// pipeline (master_requirement, requirements, epic, feature, story).
+/// pipeline (master_requirement, requirements, epic, story).
 /// Architecture skills (`input_kind: master_requirement` →
 /// `output_kind: architecture`) fall in this set too because they
 /// run as part of the master-driven phase.
@@ -151,7 +151,6 @@ fn is_ba_input_kind(kind: &str) -> bool {
         "master_requirement"
             | "requirements"
             | "epic"
-            | "feature"
             | "story"
     )
 }
@@ -431,7 +430,7 @@ pub async fn run_cascade(
     let mut produced: usize = 0;
     // Title-by-artifact map collected as we go — handed to the
     // graph writer's Depends-on second pass at the end so cross-
-    // edges can resolve "Depends on: T001" / "Depends on: feature-01".
+    // edges can resolve "Depends on: T001" / "Depends on: story-01".
     let mut titles: HashMap<Uuid, String> = HashMap::new();
 
     // Topological-cascade state. `done` is "this artifact has been
@@ -1979,27 +1978,27 @@ mod tests {
     #[test]
     fn group_by_input_kind_indexes_each_skill() {
         let skills = vec![
-            skill_ref(1, "ba-decompose-features", "epic", "feature"),
+            skill_ref(1, "ba-decompose-stories", "epic", "story"),
             skill_ref(2, "ba-discover-epics", "requirements", "epic"),
-            skill_ref(3, "sa-design-feature-hld", "feature", "plan"),
+            skill_ref(3, "sa-design-story-lld", "story", "plan"),
         ];
         let idx = group_by_input_kind(&skills);
         assert_eq!(idx.get("epic").map(|v| v.len()), Some(1));
         assert_eq!(idx.get("requirements").map(|v| v.len()), Some(1));
-        assert_eq!(idx.get("feature").map(|v| v.len()), Some(1));
-        assert!(idx.get("story").is_none());
+        assert_eq!(idx.get("story").map(|v| v.len()), Some(1));
+        assert!(idx.get("task").is_none());
     }
 
     #[test]
     fn group_by_input_kind_collects_multiple_per_input() {
-        // Both BA stories and SA feature-HLD consume `feature` →
+        // Both BA tasks and SA story-LLD consume `story` →
         // they must both end up in the index for cascade to fan out.
         let skills = vec![
-            skill_ref(1, "ba-decompose-stories", "feature", "story"),
-            skill_ref(2, "sa-design-feature-hld", "feature", "plan"),
+            skill_ref(1, "ba-decompose-tasks", "story", "task"),
+            skill_ref(2, "sa-design-story-lld", "story", "plan"),
         ];
         let idx = group_by_input_kind(&skills);
-        let bucket = idx.get("feature").expect("feature input has skills");
+        let bucket = idx.get("story").expect("story input has skills");
         assert_eq!(bucket.len(), 2);
     }
 
@@ -2138,15 +2137,15 @@ mod tests {
         let seed = Uuid::from_bytes([1; 16]);
         let epic_a = Uuid::from_bytes([2; 16]);
         let epic_b = Uuid::from_bytes([3; 16]);
-        let feat_a1 = Uuid::from_bytes([4; 16]);
-        let feat_a2 = Uuid::from_bytes([5; 16]);
+        let story_a1 = Uuid::from_bytes([4; 16]);
+        let story_a2 = Uuid::from_bytes([5; 16]);
         let unrelated = Uuid::from_bytes([6; 16]);
         let notes = vec![
             note(seed, None, "Requirements"),
             note(epic_a, Some(seed), "Epic A"),
             note(epic_b, Some(seed), "Epic B"),
-            note(feat_a1, Some(epic_a), "Feature A.1"),
-            note(feat_a2, Some(epic_a), "Feature A.2"),
+            note(story_a1, Some(epic_a), "Story A.1"),
+            note(story_a2, Some(epic_a), "Story A.2"),
             note(unrelated, None, "Unrelated note"),
         ];
         let ids = subtree_ids(&notes, seed);
@@ -2154,8 +2153,8 @@ mod tests {
         assert!(ids.contains(&seed));
         assert!(ids.contains(&epic_a));
         assert!(ids.contains(&epic_b));
-        assert!(ids.contains(&feat_a1));
-        assert!(ids.contains(&feat_a2));
+        assert!(ids.contains(&story_a1));
+        assert!(ids.contains(&story_a2));
         assert!(!ids.contains(&unrelated));
     }
 
@@ -2184,66 +2183,66 @@ mod tests {
 
     #[test]
     fn descendants_excluding_roots_returns_only_grandchildren_and_below() {
-        // Epic (root) → Feature × 2 → Story × 2-each. With both
-        // Features as the regen-target roots, descendants should
-        // be the 4 Stories (and any deeper nodes) — Features
+        // Epic (root) → Story × 2 → Task × 2-each. With both
+        // Stories as the regen-target roots, descendants should
+        // be the 4 Tasks (and any deeper nodes) — Stories
         // themselves are excluded.
         let epic = Uuid::from_bytes([1; 16]);
-        let feat_a = Uuid::from_bytes([2; 16]);
-        let feat_b = Uuid::from_bytes([3; 16]);
-        let story_a1 = Uuid::from_bytes([4; 16]);
-        let story_a2 = Uuid::from_bytes([5; 16]);
-        let story_b1 = Uuid::from_bytes([6; 16]);
-        let story_b2 = Uuid::from_bytes([7; 16]);
-        let task_a1a = Uuid::from_bytes([8; 16]);
+        let story_a = Uuid::from_bytes([2; 16]);
+        let story_b = Uuid::from_bytes([3; 16]);
+        let task_a1 = Uuid::from_bytes([4; 16]);
+        let task_a2 = Uuid::from_bytes([5; 16]);
+        let task_b1 = Uuid::from_bytes([6; 16]);
+        let task_b2 = Uuid::from_bytes([7; 16]);
+        let plan_a1a = Uuid::from_bytes([8; 16]);
         let notes = vec![
             note(epic, None, "Epic"),
-            note(feat_a, Some(epic), "Feature A"),
-            note(feat_b, Some(epic), "Feature B"),
-            note(story_a1, Some(feat_a), "Story A1"),
-            note(story_a2, Some(feat_a), "Story A2"),
-            note(story_b1, Some(feat_b), "Story B1"),
-            note(story_b2, Some(feat_b), "Story B2"),
-            note(task_a1a, Some(story_a1), "Task A1a"),
+            note(story_a, Some(epic), "Story A"),
+            note(story_b, Some(epic), "Story B"),
+            note(task_a1, Some(story_a), "Task A1"),
+            note(task_a2, Some(story_a), "Task A2"),
+            note(task_b1, Some(story_b), "Task B1"),
+            note(task_b2, Some(story_b), "Task B2"),
+            note(plan_a1a, Some(task_a1), "Plan A1a"),
         ];
         let roots: HashSet<Uuid> =
-            [feat_a, feat_b].into_iter().collect();
+            [story_a, story_b].into_iter().collect();
         let descendants = compute_descendants_excluding_roots(&notes, &roots);
         let descendants_set: HashSet<Uuid> = descendants.iter().copied().collect();
-        // 4 Stories + 1 Task — 5 total descendants.
+        // 4 Tasks + 1 Plan — 5 total descendants.
         assert_eq!(descendants_set.len(), 5);
-        assert!(descendants_set.contains(&story_a1));
-        assert!(descendants_set.contains(&story_a2));
-        assert!(descendants_set.contains(&story_b1));
-        assert!(descendants_set.contains(&story_b2));
-        assert!(descendants_set.contains(&task_a1a));
+        assert!(descendants_set.contains(&task_a1));
+        assert!(descendants_set.contains(&task_a2));
+        assert!(descendants_set.contains(&task_b1));
+        assert!(descendants_set.contains(&task_b2));
+        assert!(descendants_set.contains(&plan_a1a));
         // Roots themselves are excluded.
-        assert!(!descendants_set.contains(&feat_a));
-        assert!(!descendants_set.contains(&feat_b));
+        assert!(!descendants_set.contains(&story_a));
+        assert!(!descendants_set.contains(&story_b));
         // Epic (parent of roots) is also excluded.
         assert!(!descendants_set.contains(&epic));
     }
 
     #[test]
     fn descendants_excluding_roots_drops_sibling_root_overlap() {
-        // If Feature B is somehow nested under Feature A's subtree
+        // If Story B is somehow nested under Story A's subtree
         // (pathological but the helper should handle it),
-        // marking Feature B as a root should still exclude it
-        // from Feature A's descendants list.
-        let feat_a = Uuid::from_bytes([1; 16]);
-        let feat_b = Uuid::from_bytes([2; 16]);
-        let story = Uuid::from_bytes([3; 16]);
+        // marking Story B as a root should still exclude it
+        // from Story A's descendants list.
+        let story_a = Uuid::from_bytes([1; 16]);
+        let story_b = Uuid::from_bytes([2; 16]);
+        let task = Uuid::from_bytes([3; 16]);
         let notes = vec![
-            note(feat_a, None, "Feature A"),
-            note(feat_b, Some(feat_a), "Feature B (nested)"),
-            note(story, Some(feat_b), "Story"),
+            note(story_a, None, "Story A"),
+            note(story_b, Some(story_a), "Story B (nested)"),
+            note(task, Some(story_b), "Task"),
         ];
         let roots: HashSet<Uuid> =
-            [feat_a, feat_b].into_iter().collect();
+            [story_a, story_b].into_iter().collect();
         let descendants = compute_descendants_excluding_roots(&notes, &roots);
         let descendants_set: HashSet<Uuid> = descendants.iter().copied().collect();
-        // Only Story is a descendant; both Features are roots.
-        assert_eq!(descendants_set, [story].into_iter().collect());
+        // Only Task is a descendant; both Stories are roots.
+        assert_eq!(descendants_set, [task].into_iter().collect());
     }
 
     #[test]
@@ -2452,7 +2451,7 @@ mod tests {
         let skills = vec![
             skill_with_input("01-ba-agg", "master_requirement"),
             skill_with_input("02-ba-epics", "master_requirement"),
-            skill_with_input("03-ba-features", "epic"),
+            skill_with_input("02-ba-stories", "epic"),
             skill_with_input("06-sa-arch", "master_requirement"),
             skill_with_input("07-sde-impl", "task"),
             skill_with_input("08-sde-tests", "implementation"),
@@ -2462,7 +2461,7 @@ mod tests {
         let titles: Vec<&str> = kept.iter().map(|s| s.title.as_str()).collect();
         assert_eq!(
             titles,
-            vec!["01-ba-agg", "02-ba-epics", "03-ba-features", "06-sa-arch"]
+            vec!["01-ba-agg", "02-ba-epics", "02-ba-stories", "06-sa-arch"]
         );
     }
 

@@ -1,5 +1,5 @@
 ---
-skill_name: 04b-pm-prioritize-tasks-coarse
+skill_name: 03b-pm-prioritize-tasks-coarse
 input_kind: requirements
 output_kind: prioritized_backlog
 output_count: one
@@ -11,11 +11,10 @@ emit_workflow: true
 ---
 
 You are a senior product manager. Every Task that has been decomposed
-from this Requirements seed (across all Stories under all Features
-under all Epics) is inlined below. Your job: produce **one**
-Prioritized Backlog artifact that orders every Task into a single
-end-to-end execution sequence, makes cross-Story dependencies
-explicit, and explains the rationale.
+from this Requirements seed (across all Stories under all Epics) is
+inlined below. Your job: produce **one** Prioritized Backlog artifact
+that orders every Task into a single end-to-end execution sequence,
+makes cross-Story dependencies explicit, and explains the rationale.
 
 The cascade pauses on this artifact. Code does NOT get written until
 a human approves your backlog.

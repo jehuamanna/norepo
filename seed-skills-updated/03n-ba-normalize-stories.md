@@ -1,5 +1,5 @@
 ---
-skill_name: 04n-ba-normalize-stories
+skill_name: 03n-ba-normalize-stories
 input_kind: story
 output_kind: story
 output_count: one
@@ -37,10 +37,10 @@ body and `source_skill_id` (refreshed to this normalizer) change.
    `www.figma.com`), gather them into a `## Design references`
    section as a bullet list with whatever per-URL notes the human
    wrote. Do NOT call the Figma MCP here — fetching is the next
-   decomposition skill's job (`05-ba-decompose-tasks`). If the
+   decomposition skill's job (`04-ba-decompose-tasks`). If the
    input has no Figma URLs, omit `## Design references`.
 6. Add a `## Revision history` row noting `"Normalized by
-   04n-ba-normalize-stories on <today>"`.
+   03n-ba-normalize-stories on <today>"`.
 
 ## Output format
 
@@ -48,12 +48,12 @@ body and `source_skill_id` (refreshed to this normalizer) change.
 
 Filename: keep the original's name if it matches `story-NN-<kebab>.md`;
 otherwise rename to that pattern using the next free sequence number
-in the parent Feature's directory.
+in the parent Epic's directory.
 
 Required body sections (in order):
 
 - **# Story: <name>**
-- **## Parent Feature**
+- **## Parent Epic**
 - **## Narrative** — As a … I want … so that …
 - **## Acceptance criteria** — 2–6 Given/When/Then bullets
 - **## UX notes** — 1–3 bullets

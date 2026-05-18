@@ -71,7 +71,6 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
     let pretty_initial = serde_json::to_string_pretty(&entry.input).unwrap_or_default();
     let mut input_json = use_signal(|| pretty_initial.clone());
     let mut parse_error = use_signal(|| Option::<String>::None);
-    let mut json_expanded = use_signal(|| false);
 
     // Skip dialog: synthetic-result text the user can override before
     // sending. Default reads naturally as a tool failure message.
@@ -242,14 +241,18 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                 }
             }
 
+            // `<details>` is left uncontrolled — the browser owns the
+            // open/closed state. A previous controlled-attribute
+            // implementation (`open: *json_expanded.read()` + ontoggle
+            // signal flip) raced with the elapsed-ticker's 500ms
+            // re-renders while pending: clicking to open fired a
+            // toggle, but a tick that landed in the same frame
+            // reapplied the stale `open=false` attr before ontoggle
+            // updated the signal, slamming the details shut and
+            // back open as the user clicked. Letting the browser hold
+            // the open state avoids the race.
             details { class: "operon-permission-prompt-rawinput",
-                open: *json_expanded.read(),
-                ontoggle: move |_| {
-                    // Flip the local state on every native toggle.
-                    let cur = *json_expanded.read();
-                    json_expanded.set(!cur);
-                },
-                summary { "Raw input (editable)" }
+                summary { if pending { "Raw input (editable)" } else { "Raw input" } }
                 textarea {
                     class: "operon-permission-prompt-jsoneditor",
                     "data-testid": "permission-json-editor",
@@ -287,42 +290,44 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                 }
             }
 
-            div { class: "operon-permission-prompt-actions",
-                button {
-                    class: "operon-permission-prompt-btn operon-permission-prompt-btn-allow",
-                    "data-testid": "permission-allow",
-                    disabled: allow_disabled,
-                    onclick: on_allow,
-                    "Allow"
-                }
-                button {
-                    class: "operon-permission-prompt-btn operon-permission-prompt-btn-always",
-                    "data-testid": "permission-allow-always",
-                    disabled: allow_disabled,
-                    onclick: on_allow_always,
-                    "Allow always"
-                }
-                button {
-                    class: "operon-permission-prompt-btn operon-permission-prompt-btn-skip",
-                    "data-testid": "permission-skip",
-                    disabled: buttons_disabled,
-                    onclick: move |_| skip_open.set(true),
-                    "Skip"
-                }
-                button {
-                    class: "operon-permission-prompt-btn operon-permission-prompt-btn-deny",
-                    "data-testid": "permission-deny",
-                    disabled: buttons_disabled,
-                    onclick: on_deny,
-                    "Deny"
-                }
-                if cancel_supported {
+            if pending {
+                div { class: "operon-permission-prompt-actions",
                     button {
-                        class: "operon-permission-prompt-btn operon-permission-prompt-btn-cancel",
-                        "data-testid": "permission-cancel",
-                        title: "Cancel just this tool call (runtime backend)",
-                        onclick: on_cancel,
-                        "Cancel call"
+                        class: "operon-permission-prompt-btn operon-permission-prompt-btn-allow",
+                        "data-testid": "permission-allow",
+                        disabled: allow_disabled,
+                        onclick: on_allow,
+                        "Allow"
+                    }
+                    button {
+                        class: "operon-permission-prompt-btn operon-permission-prompt-btn-always",
+                        "data-testid": "permission-allow-always",
+                        disabled: allow_disabled,
+                        onclick: on_allow_always,
+                        "Allow always"
+                    }
+                    button {
+                        class: "operon-permission-prompt-btn operon-permission-prompt-btn-skip",
+                        "data-testid": "permission-skip",
+                        disabled: buttons_disabled,
+                        onclick: move |_| skip_open.set(true),
+                        "Skip"
+                    }
+                    button {
+                        class: "operon-permission-prompt-btn operon-permission-prompt-btn-deny",
+                        "data-testid": "permission-deny",
+                        disabled: buttons_disabled,
+                        onclick: on_deny,
+                        "Deny"
+                    }
+                    if cancel_supported {
+                        button {
+                            class: "operon-permission-prompt-btn operon-permission-prompt-btn-cancel",
+                            "data-testid": "permission-cancel",
+                            title: "Cancel just this tool call (runtime backend)",
+                            onclick: on_cancel,
+                            "Cancel call"
+                        }
                     }
                 }
             }

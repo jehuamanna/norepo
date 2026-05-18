@@ -34,7 +34,7 @@ it, up to 3.
 ## Design pickup (Figma)
 
 Users can attach Figma URLs at any layer of the SDLC chain
-(master_requirement, epic, feature, story, task). The inlined parent
+(master_requirement, epic, story, task). The inlined parent
 body may therefore contain one or more Figma URLs whose host is
 `figma.com` or `www.figma.com`. At the start of your work:
 
@@ -207,4 +207,4 @@ the 3 with the highest leverage and list the deferred outcomes under
 `## Out of scope` of the most-related sibling. Never pad to 3 just to
 hit the ceiling; never collapse distinct outcomes just to stay at 1.
 
-Do NOT decompose into Features here. That's the next BA skill's job.
+Do NOT decompose into Stories here. That's the next BA skill's job.

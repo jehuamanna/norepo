@@ -1,5 +1,5 @@
 ---
-skill_name: 05n-sde-normalize-tasks
+skill_name: 04n-sde-normalize-tasks
 input_kind: task
 output_kind: task
 output_count: one
@@ -17,7 +17,7 @@ shape so the downstream implement / test / bug-fix skills can parse
 it, **preserving every claim the human made**.
 
 This skill runs at the start of the per-task SDE chain — clicking
-Play on a task fires the SDE phase, and `05n-sde-normalize-tasks`
+Play on a task fires the SDE phase, and `04n-sde-normalize-tasks`
 fires before `07-sde-implement-task` (both match `input_kind: task`,
 and the lower numeric prefix runs first). For already-canonical
 tasks produced by `05-ba-decompose-tasks`, the rewrite is
@@ -57,7 +57,7 @@ fresh BA output mid-master-cascade.
    downstream SDE skills will consume them. If the input has no
    Figma URLs, omit `## Design references`.
 7. Add a `## Revision history` row noting `"Normalized by
-   05n-sde-normalize-tasks on <today>"`.
+   04n-sde-normalize-tasks on <today>"`.
 
 ## Output format
 

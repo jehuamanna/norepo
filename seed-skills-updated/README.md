@@ -2,9 +2,9 @@
 
 A redesigned seed-skill chain for full-SDLC work: BA decomposes a
 project from a **master_requirement** down through detailed
-Requirements → Epics → Features → Stories → Tasks; SA produces a
-single, iteratively-revised Architecture; SDE implements, tests, and
-patches bugs against that Architecture.
+Requirements → Epics → Stories → Tasks; SA produces a single,
+iteratively-revised Architecture; SDE implements, tests, and patches
+bugs against that Architecture.
 
 Compared to `seed-skills-employee/`:
 
@@ -14,12 +14,12 @@ Compared to `seed-skills-employee/`:
   cascade starts from master.
 - BA produces **multiple detailed Requirements (A0)** beneath master,
   rather than collapsing everything into one Requirements note.
-- Every level transition (A0 → A1 → A2 → A3 → A4) is a **hard gate**
+- Every level transition (A0 → A1 → A2 → A3) is a **hard gate**
   (`gate: approval`, `cascade_stop: true`) — the user reviews each
   level before the next runs.
-- **Format normalizers** (`02n` / `03n` / `04n` / `05n`) restructure
-  manually-added Epics / Features / Stories / Tasks into the
-  canonical shape so downstream skills can consume them.
+- **Format normalizers** (`02n` / `03n` / `04n`) restructure
+  manually-added Epics / Stories / Tasks into the canonical shape
+  so downstream skills can consume them.
 - A **coherence-check** skill (`00`) walks the whole tree on every
   Play and emits `clarification` artifacts for cross-level
   contradictions. The user answers in-place (single/multi choice
@@ -51,17 +51,16 @@ Compared to `seed-skills-employee/`:
 
 ```
 master_requirement   [PROJECT ROOT — the only Play button]
-├── requirements × N           [A0, BA-produced from master + CE inputs]
+├── requirements × N           [A0, BA-authored from master + CE inputs]
 │   └── epic × N                [A1]
-│       └── feature × N          [A2]
-│           └── story × N         [A3]
-│               └── task × N      [A4]
-│                   └── implementation_plan         [07a, plan only — no code]
-│                       └── implementation         [07b, code edits + commit]
-│                           ├── test_cases
-│                           │   └── test_results
-│                           └── bug × N
-│                               └── implementation (revision, via 10-sde-fix-bug)
+│       └── story × N            [A2]
+│           └── task × N          [A3]
+│               └── implementation_plan         [07a, plan only — no code]
+│                   └── implementation         [07b, code edits + commit]
+│                       ├── test_cases
+│                       │   └── test_results
+│                       └── bug × N
+│                           └── implementation (revision, via 10-sde-fix-bug)
 └── architecture                 [SA, iteratively revised in-place]
 ```
 
@@ -70,15 +69,13 @@ master_requirement   [PROJECT ROOT — the only Play button]
 | Order | Skill | Phase | input_kind | output_kind | Count | Gate | Persona |
 |---|---|---|---|---|---|---|---|
 | 00 | `00-coherence-check` | BA | master_requirement (aggregator over `task`) | clarification | many (0–N) | approval | BA |
-| 02 | `02-ba-discover-epics` | BA | master_requirement (aggregator over `requirements`) | epic *or* clarification¹ | many (1–3) | approval | BA |
+| 02 | `02-ba-discover-epics` | BA | master_requirement (aggregator over `requirements`) | epic *or* clarification¹ | many (dynamic N) | approval | BA |
 | 02n | `02n-ba-normalize-epics` | BA | epic | epic | one | auto | BA |
-| 03 | `03-ba-decompose-features` | BA | epic | feature *or* clarification¹ | many (1–2) | approval | BA |
-| 03n | `03n-ba-normalize-features` | BA | feature | feature | one | auto | BA |
-| 04 | `04-ba-decompose-stories` | BA | feature | story *or* clarification¹ | many (1–3) | approval | BA |
-| 04n | `04n-ba-normalize-stories` | BA | story | story | one | auto | BA |
-| 05 | `05-ba-decompose-tasks` | BA | story | task *or* clarification¹ | many (1–3) | approval | BA |
+| 03 | `03-ba-decompose-stories` | BA | epic | story *or* clarification¹ | many (dynamic N) | approval | BA |
+| 03n | `03n-ba-normalize-stories` | BA | story | story | one | auto | BA |
+| 04 | `04-ba-decompose-tasks` | BA | story | task *or* clarification¹ | many (dynamic N) | approval | BA |
 | 06 | `06-sa-draft-architecture` | BA | master_requirement (aggregator over `requirements`) | architecture *or* clarification¹ | one | approval | SA |
-| 05n | `05n-sde-normalize-tasks` | SDE | task | task | one | auto | SDE |
+| 04n | `04n-sde-normalize-tasks` | SDE | task | task | one | auto | SDE |
 | 07a | `07a-sde-plan-task` | SDE | task (inherits `architecture`) | implementation_plan *or* clarification¹ | one | approval | SDE |
 | 07b | `07b-sde-execute-implementation` | SDE | implementation_plan (inherits `architecture`) | implementation *or* clarification¹ | one | approval | SDE |
 | 08 | `08-sde-generate-tests` | SDE | implementation | test_cases *or* clarification¹ | one | approval | SDE |
@@ -126,21 +123,21 @@ and clicking Play again.
 
 **BA phase — triggered by Play on a `master_requirement` artifact.**
 Runs every skill whose `input_kind` is `master_requirement` /
-`requirements` / `epic` / `feature` / `story`. The chain produces
-requirements → epics → features → stories → tasks, plus the
-architecture artifact. The cascade naturally stops once tasks and
-architecture exist — no BA-phase skill has `input_kind: task`, so
-the orchestrator finds nothing to enqueue against the produced tasks
-and ends. At every level transition (A0→A1→A2→A3→A4) `cascade_stop:
-true` pauses for human review.
+`requirements` / `epic` / `story`. The chain produces requirements
+→ epics → stories → tasks, plus the architecture artifact. The
+cascade naturally stops once tasks and architecture exist — no
+BA-phase skill has `input_kind: task`, so the orchestrator finds
+nothing to enqueue against the produced tasks and ends. At every
+level transition (A0→A1→A2→A3) `cascade_stop: true` pauses for
+human review.
 
 **SDE phase — triggered by Play on a `task` artifact.**
 Runs every skill whose `input_kind` is `task` / `implementation_plan`
 / `implementation` / `test_cases` / `test_results` / `bug`. Per-task
 chain:
 `task → implementation_plan → implementation → test_cases → test_results`,
-with `05n-sde-normalize-tasks` running first as a pre-flight reformat
-(idempotent for tasks already produced by `05-ba-decompose-tasks`).
+with `04n-sde-normalize-tasks` running first as a pre-flight reformat
+(idempotent for tasks already produced by `04-ba-decompose-tasks`).
 
 **Task Play stops at the plan.** When you click Play on a task, the
 runtime fires `07a-sde-plan-task` and **stops** — it writes an
@@ -188,26 +185,26 @@ Only `master_requirement` and `task` artifacts show the full Play /
 Generate Cascade / Run skill toolbar. **Implementation Plan** and
 **Implementation** each show just a Play button (Implementation
 also surfaces the conditional "Create test cases" button on Dirty).
-Every other artifact (Requirements, Epics, Features, Stories,
-Architecture, Test Cases, Test Results, Bug, Clarification) keeps
-just Approve / Reject / Mark dirty / Revise.
+Every other artifact (Requirements, Epics, Stories, Architecture,
+Test Cases, Test Results, Bug, Clarification) keeps just Approve /
+Reject / Mark dirty / Revise.
 
 ## Design pickup (Figma)
 
 Users can paste Figma URLs (host `figma.com` or `www.figma.com`)
 into any artifact in the BA chain — the master_requirement, any
-detailed Requirement, an Epic, a Feature, a Story, or a Task.
-On the next cascade step, the downstream skill scans its parent
-body for those URLs, calls the Figma MCP "get figma data" tool
-(name: `mcp__<server>__get_figma_data` — `<server>` depends on
-the user's config, commonly `figma`, `figma-mcp`, or
-`figma-developer-mcp`), and folds the returned frame inventory /
-text into how it decomposes:
+detailed Requirement, an Epic, a Story, or a Task. On the next
+cascade step, the downstream skill scans its parent body for those
+URLs, calls the Figma MCP "get figma data" tool (name:
+`mcp__<server>__get_figma_data` — `<server>` depends on the user's
+config, commonly `figma`, `figma-mcp`, or `figma-developer-mcp`),
+and folds the returned frame inventory / text into how it
+decomposes:
 
 - design boundaries → Epic boundaries (in `02-ba-discover-epics`)
-- screens / flows → Story boundaries (in `04-ba-decompose-stories`)
+- screens / flows → Story boundaries (in `03-ba-decompose-stories`)
 - specific frames / components → Task scope (in
-  `05-ba-decompose-tasks`)
+  `04-ba-decompose-tasks`)
 
 Each output artifact carries a `## Design references` section
 listing the Figma URLs relevant to it with one-line per-URL notes.
@@ -234,8 +231,8 @@ unreachable, the skill does NOT block decomposition. It:
    the gap is preserved in the artifact body and the next reviewer
    sees what was skipped.
 
-**Normalizers (`02n` / `03n` / `04n` / `05n`)** preserve any Figma
-URLs they find in hand-authored artifacts by gathering them into
+**Normalizers (`02n` / `03n` / `04n`)** preserve any Figma URLs
+they find in hand-authored artifacts by gathering them into
 `## Design references`, but they do NOT call MCP — they leave
 fetching to the next decomposition skill in the chain.
 
@@ -330,7 +327,7 @@ create one:
 
 ## Per-tier dep ordering (engine-enforced)
 
-Every BA artifact (Requirement, Epic, Feature, Story, Task) carries a
+Every BA artifact (Requirement, Epic, Story, Task) carries a
 `## Depends on` section with sibling slugs (or
 `None (parallel-safe)`). The cascade engine reads these and sequences
 work topologically. Same engine semantics as `seed-skills-employee/`:
@@ -376,10 +373,16 @@ the body).
 
 ## Tuning
 
-Skill bodies are prompts. Adjust calibration sections (Requirement
-count, Epic count, Feature count, Story count, Task count) to match
-your team's norms. Each re-run reads the current skill body — no
-rebuild needed.
+Skill bodies are prompts. Adjust the "How many to produce" sections
+(Epic coverage tests, Story sizing, Task layer-coverage rules) to
+match your team's norms. Each re-run reads the current skill body —
+no rebuild needed.
+
+The decomposition skills (`02`, `03`, `04`) emit **dynamic N**: each
+derives the count from coverage / singularity / size tests against
+its parent (Master Requirement, Epic, or Story). There is no fixed
+"emit exactly N" rule — the prompt instructs the model to pick the
+smallest N that fully covers the input without overlap.
 
 If you want lighter gating (e.g. auto-approve through A0 → A1, gate
 only at A2), flip `gate: approval` to `gate: auto` and

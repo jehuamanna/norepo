@@ -1,5 +1,5 @@
 ---
-skill_name: 06b-pm-prioritize-tasks-refined
+skill_name: 05b-pm-prioritize-tasks-refined
 input_kind: requirements
 output_kind: prioritized_backlog
 output_count: one
@@ -80,4 +80,4 @@ order — the runtime parses `## Priority order`):
 If the coarse backlog is missing entirely, do NOT silently re-do its
 job. Write the artifact pointing at the missing coarse backlog and
 mark it `Rejected` — the cascade should be re-run from
-`04b-pm-prioritize-tasks-coarse` first.
+`03b-pm-prioritize-tasks-coarse` first.

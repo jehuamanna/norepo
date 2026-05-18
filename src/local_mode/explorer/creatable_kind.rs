@@ -4,7 +4,7 @@
 //! - **Plain note kinds** (`NoteKind::Markdown`, `Mdx`, `Code`, `Skill`,
 //!   `Workflow`, `Image`, …): create an empty note of that file-level
 //!   kind. Same flow that existed before this module landed.
-//! - **Typed artifacts** (`ArtifactKind::Epic`, `Feature`, `Story`, …):
+//! - **Typed artifacts** (`ArtifactKind::Epic`, `Story`, `Task`, …):
 //!   create a `NoteKind::Artifact` *and* seed its body with frontmatter
 //!   (`artifact_kind: <kind>`) plus the `##` section headers the
 //!   corresponding cascade skill produces, so the manually-created note
@@ -39,7 +39,7 @@ pub enum CreatableKind {
 }
 
 impl CreatableKind {
-    /// The 10 cascade pipeline kinds in the order the user listed them.
+    /// The cascade pipeline kinds in the order the user listed them.
     /// Drives the `Artifact ▶` submenu, the scaffold tests, and the
     /// integration roundtrip. Anything outside this list (`Plan`,
     /// `Summary`, `Bug`, `Clarification`, `PrioritizedBacklog`,
@@ -53,7 +53,6 @@ impl CreatableKind {
             ArtifactKind::MasterRequirement,
             ArtifactKind::Requirements,
             ArtifactKind::Epic,
-            ArtifactKind::Feature,
             ArtifactKind::Story,
             ArtifactKind::Task,
             ArtifactKind::Architecture,
@@ -119,19 +118,9 @@ pub fn scaffold_body(kind: &ArtifactKind) -> String {
              ## Depends on\nNone (parallel-safe)\n\n"
                 .to_string()
         }
-        ArtifactKind::Feature => {
-            "# Feature: \n\n\
-             ## Parent Epic\n\n\
-             ## User-visible behavior\n\n\
-             ## Acceptance criteria\n\n\
-             ## Depends on\nNone (parallel-safe)\n\n\
-             ## Out of scope\n\n\
-             ## Open questions\n\n"
-                .to_string()
-        }
         ArtifactKind::Story => {
             "# Story: \n\n\
-             ## Parent Feature\n\n\
+             ## Parent Epic\n\n\
              ## Narrative\nAs a … I want … so that …\n\n\
              ## Acceptance criteria\n\n\
              ## UX notes\n\n\
@@ -238,7 +227,7 @@ pub enum MenuNode {
     /// A leaf that creates a plain note of this kind.
     Plain(NoteKind),
     /// The "Artifact" anchor with `pipeline_artifacts()` as its children.
-    /// All 10 kinds always present — there's no per-context filtering.
+    /// All kinds always present — there's no per-context filtering.
     ArtifactSubmenu,
 }
 
@@ -263,7 +252,7 @@ pub fn creatable_menu_layout() -> Vec<MenuNode> {
 /// Build the menu shown by "Add child / sibling note" submenus and the
 /// hover "+" / project "+" dropdowns. Top-level entries are the plain
 /// note kinds from `NoteKind::all_creatable()` *with `Artifact` replaced
-/// by* a nested "Artifact" submenu listing the 10 pipeline kinds.
+/// by* a nested "Artifact" submenu listing the pipeline kinds.
 ///
 /// `on_pick` is invoked with whichever leaf the user clicks.
 pub fn build_creatable_menu(on_pick: Callback<CreatableKind>) -> Vec<ContextMenuItem> {
@@ -318,7 +307,6 @@ mod tests {
                 "master_requirement",
                 "requirements",
                 "epic",
-                "feature",
                 "story",
                 "task",
                 "architecture",

@@ -197,12 +197,12 @@ mod tests {
 
     #[test]
     fn normalize_body_overrides_mismatched_kind() {
-        // Model claimed "feature" in frontmatter but the typed tool
+        // Model claimed "story" in frontmatter but the typed tool
         // call says "epic" — typed args win.
-        let body = "---\nartifact_kind: feature\n---\n\nbody";
+        let body = "---\nartifact_kind: story\n---\n\nbody";
         let out = normalize_body(body, &ArtifactKind::Epic);
         assert!(out.contains("artifact_kind: epic"));
-        assert!(!out.contains("artifact_kind: feature"));
+        assert!(!out.contains("artifact_kind: story"));
     }
 
     #[test]

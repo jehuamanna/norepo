@@ -144,13 +144,13 @@ mod tests {
         let notes = vec![
             art(root, None, "ce-inputs"),
             art(mid, Some(root), "epic-01"),
-            art(leaf, Some(mid), "feature-01"),
+            art(leaf, Some(mid), "story-01"),
         ];
         let artifacts_root = Path::new("/vault/.operon/00000000-0000-0000-0000-000000000000/artifacts");
         let r = ArtifactPathResolver::new(artifacts_root, &notes);
         assert_eq!(
             r.artifact_index_path(leaf).unwrap(),
-            artifacts_root.join("ce-inputs/epic-01/feature-01/index.md")
+            artifacts_root.join("ce-inputs/epic-01/story-01/index.md")
         );
         assert_eq!(
             r.artifact_dir(root).unwrap(),

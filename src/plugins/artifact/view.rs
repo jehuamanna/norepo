@@ -296,7 +296,7 @@ pub fn ArtifactView(props: ArtifactViewProps) -> Element {
                 // risks (a) breaking skill input-kind matching so
                 // downstream cascade runs silently skip the artifact,
                 // (b) decoupling on-disk YAML from the implied SDLC
-                // hierarchy (Epic > Feature > Story > Task) that
+                // hierarchy (Epic > Story > Task) that
                 // sibling notes and the explorer assume. If a
                 // mislabeled artifact needs fixing today, the right
                 // path is hand-editing the YAML or regenerating from
@@ -1702,7 +1702,7 @@ pub fn clarification_body_with_answer(
 /// it to Dirty so the next cascade Play regenerates it with the
 /// resolved direction. Returns the count of artifacts mutated.
 ///
-/// Slug matching strips a leading `epic-`/`feature-`/etc. prefix is
+/// Slug matching strips a leading `epic-`/`story-`/etc. prefix is
 /// NOT necessary — the seed-skill convention names artifacts by
 /// their full slug (e.g. `epic-02-billing`) and the corresponding
 /// note title is the same string. Falls back to exact title match
@@ -2367,7 +2367,7 @@ fn open_cascade_workflow_tab(
 
 /// Inline panel rendered under the Play button: lists every project
 /// skill as a checkbox row, in pipeline order (Requirements → Epic →
-/// Feature → … → Summary inferred from `input_kind`/`output_kind`).
+/// Story → … → Summary inferred from `input_kind`/`output_kind`).
 /// Persists toggles to `<vault>/.operon/<project-id>/cascade-stages.json`
 /// via the `cascade::stages_sidecar` helpers.
 #[derive(Props, Clone, PartialEq)]
@@ -2579,7 +2579,6 @@ fn artifact_kind_tag(kind: &crate::plugins::artifact::frontmatter::ArtifactKind)
         ArtifactKind::MasterRequirement => "MR",
         ArtifactKind::Requirements => "req",
         ArtifactKind::Epic => "epic",
-        ArtifactKind::Feature => "feat",
         ArtifactKind::Story => "story",
         ArtifactKind::Task => "task",
         ArtifactKind::Plan => "plan",
