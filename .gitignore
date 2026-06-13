@@ -28,3 +28,4 @@ pkg/
 # Cross-compiled release binaries dropped at repo root by scripts/build-release.sh
 operon-mcp-permission-*-unknown-*
 operon-posttool-hook-*-unknown-*
+build/
