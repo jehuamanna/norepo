@@ -396,7 +396,7 @@ mod tests {
 
     #[tokio::test]
     async fn env_store_reads_env() {
-        let key = "_";
+        let key = "__";
         std::env::set_var(key, "value-from-env");
         let s = EnvSecretStore::new("OPERON_TEST_PHASE1_");
         assert_eq!(s.get("KEY").await.unwrap().as_deref(), Some("value-from-env"));
